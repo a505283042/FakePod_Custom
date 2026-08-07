@@ -22,10 +22,40 @@
 
 
 // ============================================================
+// CST820 触摸控制
+// ============================================================
+
+#define FAKEPOD_TOUCH_INT      4
+#define FAKEPOD_TOUCH_RST      5
+
+
+// ============================================================
+// CO5300 AMOLED
+// 2.0 英寸 460 × 460
+// QSPI 接口
+// ============================================================
+
+#define FAKEPOD_LCD_TE         6
+#define FAKEPOD_LCD_RST        7
+#define FAKEPOD_LCD_CS         8
+#define FAKEPOD_LCD_CLK        9
+
+#define FAKEPOD_LCD_D0         10
+#define FAKEPOD_LCD_D1         11
+#define FAKEPOD_LCD_D2         12
+#define FAKEPOD_LCD_D3         13
+
+#define FAKEPOD_LCD_WIDTH      460
+#define FAKEPOD_LCD_HEIGHT     460
+
+// 这块屏实际显存窗口从 X=10 开始
+#define FAKEPOD_LCD_X_OFFSET   10
+#define FAKEPOD_LCD_Y_OFFSET   0
+
+
+// ============================================================
 // TF 卡 - SDMMC 4-bit
 // ============================================================
-//
-// 原理图连接：
 //
 // DAT2 -> GPIO21
 // DAT3 -> GPIO18

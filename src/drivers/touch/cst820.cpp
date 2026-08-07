@@ -24,6 +24,8 @@ static bool g_ready = false;
 
 // CST820 芯片 ID 寄存器
 static constexpr uint8_t REG_CHIP_ID = 0xA7;
+static constexpr uint8_t REG_GESTURE = 0x01;
+static constexpr uint8_t REG_FINGER_NUM = 0x02;
 
 
 // ============================================================
@@ -123,4 +125,61 @@ uint8_t cst820_get_chip_id()
 bool cst820_is_ready()
 {
     return g_ready;
+}
+
+// ============================================================
+// 读取触摸状态和原始坐标
+// ============================================================
+
+esp_err_t cst820_read_point(CST820Point *point)
+{
+    if (point == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    point->pressed = false;
+    point->x = 0;
+    point->y = 0;
+    point->gesture = 0;
+
+    if (!g_ready || g_device == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t ret = i2c_bus_read_reg8(
+        g_device,
+        REG_GESTURE,
+        &point->gesture
+    );
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    // 从 0x02 连续读取：触点数、X高、X低、Y高、Y低。
+    uint8_t data[5] = {};
+    ret = i2c_bus_read_bytes(
+        g_device,
+        REG_FINGER_NUM,
+        data,
+        sizeof(data)
+    );
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    point->pressed = (data[0] & 0x0F) > 0;
+    if (!point->pressed) {
+        return ESP_OK;
+    }
+
+    point->x = static_cast<uint16_t>(
+        ((data[1] & 0x0F) << 8) | data[2]
+    );
+    point->y = static_cast<uint16_t>(
+        ((data[3] & 0x0F) << 8) | data[4]
+    );
+
+    return ESP_OK;
 }

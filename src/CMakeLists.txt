@@ -14,6 +14,10 @@ idf_component_register(
 
         "drivers/storage/sdcard.cpp"
 
+        "drivers/display/display.cpp"
+
+        "ui/ui_manager.cpp"
+
     INCLUDE_DIRS
         "."
 
@@ -31,9 +35,15 @@ idf_component_register(
 
         "drivers/storage"
 
+        "drivers/display"
+
+        "ui"
+
     REQUIRES
         esp_driver_i2c
         esp_driver_sdmmc
+        esp_driver_spi
+        esp_lcd
         esp_psram
         fatfs
 )

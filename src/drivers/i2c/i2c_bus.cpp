@@ -241,6 +241,32 @@ esp_err_t i2c_bus_read_reg8(
 
 
 // ============================================================
+// 连续读取多个寄存器字节
+// ============================================================
+
+esp_err_t i2c_bus_read_bytes(
+    i2c_master_dev_handle_t device,
+    uint8_t reg,
+    uint8_t *data,
+    size_t length
+)
+{
+    if (device == nullptr || data == nullptr || length == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return i2c_master_transmit_receive(
+        device,
+        &reg,
+        1,
+        data,
+        length,
+        100
+    );
+}
+
+
+// ============================================================
 // 写入单字节寄存器
 // ============================================================
 

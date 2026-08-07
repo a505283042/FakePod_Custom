@@ -11,18 +11,18 @@
 #include "cst820.h"
 #include "qmi8658.h"
 #include "sdcard.h"
+#include "display.h"
+#include "ui_manager.h"
 
 
 static const char *TAG =
     "启动";
 
 
-// 当前启动状态
 static BootState g_state =
     BootState::WaitStart;
 
 
-// 启动状态机开始时间
 static TickType_t g_start_tick =
     0;
 
@@ -78,7 +78,7 @@ void boot_state_update()
     switch (g_state) {
 
         // ====================================================
-        // 等待串口
+        // 等待串口监视器
         // ====================================================
 
         case BootState::WaitStart:
@@ -105,14 +105,14 @@ void boot_state_update()
 
 
         // ====================================================
-        // PSRAM
+        // 1. PSRAM
         // ====================================================
 
         case BootState::CheckPsram:
         {
             ESP_LOGI(
                 TAG,
-                "步骤 1/5：检查 PSRAM"
+                "步骤 1/7：检查 PSRAM"
             );
 
 
@@ -155,22 +155,21 @@ void boot_state_update()
 
 
         // ====================================================
-        // I2C
+        // 2. I2C
         // ====================================================
 
         case BootState::InitI2C:
         {
             ESP_LOGI(
                 TAG,
-                "步骤 2/5：初始化 I2C"
+                "步骤 2/7：初始化 I2C"
             );
 
 
-            esp_err_t ret =
-                i2c_bus_init();
-
-
-            if (ret != ESP_OK) {
+            if (
+                i2c_bus_init() !=
+                ESP_OK
+            ) {
 
                 ESP_LOGE(
                     TAG,
@@ -184,8 +183,6 @@ void boot_state_update()
             }
 
 
-            // 调试阶段保留扫描。
-            // 正式版本后可关闭。
             i2c_bus_scan();
 
 
@@ -197,22 +194,21 @@ void boot_state_update()
 
 
         // ====================================================
-        // CST820
+        // 3. CST820
         // ====================================================
 
         case BootState::InitTouch:
         {
             ESP_LOGI(
                 TAG,
-                "步骤 3/5：初始化触摸"
+                "步骤 3/7：初始化触摸"
             );
 
 
-            esp_err_t ret =
-                cst820_init();
-
-
-            if (ret != ESP_OK) {
+            if (
+                cst820_init() !=
+                ESP_OK
+            ) {
 
                 ESP_LOGE(
                     TAG,
@@ -234,22 +230,21 @@ void boot_state_update()
 
 
         // ====================================================
-        // QMI8658
+        // 4. QMI8658
         // ====================================================
 
         case BootState::InitIMU:
         {
             ESP_LOGI(
                 TAG,
-                "步骤 4/5：初始化 IMU"
+                "步骤 4/7：初始化 IMU"
             );
 
 
-            esp_err_t ret =
-                qmi8658_init();
-
-
-            if (ret != ESP_OK) {
+            if (
+                qmi8658_init() !=
+                ESP_OK
+            ) {
 
                 ESP_LOGE(
                     TAG,
@@ -271,22 +266,21 @@ void boot_state_update()
 
 
         // ====================================================
-        // TF 卡
+        // 5. TF 卡
         // ====================================================
 
         case BootState::InitSDCard:
         {
             ESP_LOGI(
                 TAG,
-                "步骤 5/5：初始化 TF 卡"
+                "步骤 5/7：初始化 TF 卡"
             );
 
 
-            esp_err_t ret =
-                sdcard_init();
-
-
-            if (ret != ESP_OK) {
+            if (
+                sdcard_init() !=
+                ESP_OK
+            ) {
 
                 ESP_LOGE(
                     TAG,
@@ -300,54 +294,106 @@ void boot_state_update()
             }
 
 
-            // 当前 Bring-up 阶段打印一次根目录。
+            // Bring-up 阶段保留目录打印
             sdcard_debug_list_root();
 
 
             g_state =
-                BootState::Ready;
-
-
-            ESP_LOGI(
-                TAG,
-                "========================================"
-            );
-
-            ESP_LOGI(
-                TAG,
-                "FakePod 基础硬件启动完成"
-            );
-
-            ESP_LOGI(
-                TAG,
-                "========================================"
-            );
-
+                BootState::InitDisplay;
 
             break;
         }
 
 
         // ====================================================
-        // 已经启动完成
+        // 6. CO5300 AMOLED
         // ====================================================
+
+        case BootState::InitDisplay:
+        {
+            ESP_LOGI(
+                TAG,
+                "步骤 6/7：初始化 AMOLED"
+            );
+
+
+            if (
+                display_init() !=
+                ESP_OK
+            ) {
+
+                ESP_LOGE(
+                    TAG,
+                    "AMOLED 初始化失败"
+                );
+
+                g_state =
+                    BootState::Error;
+
+                break;
+            }
+
+
+            g_state =
+                BootState::InitUI;
+
+            break;
+        }
+
+
+        // ====================================================
+        // 7. LVGL 用户界面
+        // ====================================================
+
+        case BootState::InitUI:
+        {
+            ESP_LOGI(
+                TAG,
+                "步骤 7/7：初始化 LVGL 用户界面"
+            );
+
+            if (ui_manager_init() != ESP_OK) {
+                ESP_LOGE(
+                    TAG,
+                    "LVGL 用户界面初始化失败"
+                );
+
+                g_state =
+                    BootState::Error;
+
+                break;
+            }
+
+            g_state =
+                BootState::Ready;
+
+            ESP_LOGI(
+                TAG,
+                "========================================"
+            );
+
+            ESP_LOGI(
+                TAG,
+                "FakePod 基础硬件与界面启动完成"
+            );
+
+            ESP_LOGI(
+                TAG,
+                "========================================"
+            );
+
+            break;
+        }
+
 
         case BootState::Ready:
         {
-            // 什么也不做。
-            // 系统已经交给 system_loop。
             break;
         }
 
 
-        // ====================================================
-        // 启动失败
-        // ====================================================
-
         case BootState::Error:
         {
-            // 保持错误状态。
-            // 以后屏幕点亮后可以在这里显示错误页面。
             break;
         }
     }
@@ -379,7 +425,7 @@ bool boot_state_has_error()
 
 
 // ============================================================
-// 获取当前状态
+// 获取当前启动状态
 // ============================================================
 
 BootState boot_state_get()

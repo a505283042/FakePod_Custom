@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -26,6 +27,15 @@ esp_err_t i2c_bus_read_reg8(
     i2c_master_dev_handle_t device,
     uint8_t reg,
     uint8_t *value
+);
+
+
+// 从指定寄存器开始连续读取多个字节
+esp_err_t i2c_bus_read_bytes(
+    i2c_master_dev_handle_t device,
+    uint8_t reg,
+    uint8_t *data,
+    size_t length
 );
 
 
