@@ -19,6 +19,8 @@ enum class BootState
 
     InitSDCard,
 
+    ScanMediaLibrary,
+
     InitDisplay,
 
     InitUI,

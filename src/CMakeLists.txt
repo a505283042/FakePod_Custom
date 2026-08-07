@@ -16,7 +16,14 @@ idf_component_register(
 
         "drivers/display/display.cpp"
 
+        "media/library/media_library.cpp"
+
+        "player/player_state.cpp"
+
         "ui/ui_manager.cpp"
+        "ui/ui_common.cpp"
+        "ui/font/font_manager.cpp"
+        "ui/screens/player_home.cpp"
 
     INCLUDE_DIRS
         "."
@@ -37,6 +44,10 @@ idf_component_register(
 
         "drivers/display"
 
+        "media/library"
+
+        "player"
+
         "ui"
 
     REQUIRES
@@ -45,5 +56,6 @@ idf_component_register(
         esp_driver_spi
         esp_lcd
         esp_psram
+        esp_timer
         fatfs
 )

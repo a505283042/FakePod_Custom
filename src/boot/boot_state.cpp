@@ -12,6 +12,8 @@
 #include "qmi8658.h"
 #include "sdcard.h"
 #include "display.h"
+#include "media_library.h"
+#include "player_state.h"
 #include "ui_manager.h"
 
 
@@ -112,7 +114,7 @@ void boot_state_update()
         {
             ESP_LOGI(
                 TAG,
-                "步骤 1/7：检查 PSRAM"
+                "步骤 1/8：检查 PSRAM"
             );
 
 
@@ -162,7 +164,7 @@ void boot_state_update()
         {
             ESP_LOGI(
                 TAG,
-                "步骤 2/7：初始化 I2C"
+                "步骤 2/8：初始化 I2C"
             );
 
 
@@ -201,7 +203,7 @@ void boot_state_update()
         {
             ESP_LOGI(
                 TAG,
-                "步骤 3/7：初始化触摸"
+                "步骤 3/8：初始化触摸"
             );
 
 
@@ -237,7 +239,7 @@ void boot_state_update()
         {
             ESP_LOGI(
                 TAG,
-                "步骤 4/7：初始化 IMU"
+                "步骤 4/8：初始化 IMU"
             );
 
 
@@ -273,7 +275,7 @@ void boot_state_update()
         {
             ESP_LOGI(
                 TAG,
-                "步骤 5/7：初始化 TF 卡"
+                "步骤 5/8：初始化 TF 卡"
             );
 
 
@@ -299,21 +301,58 @@ void boot_state_update()
 
 
             g_state =
+                BootState::ScanMediaLibrary;
+
+            break;
+        }
+
+        // ====================================================
+        // 6. 音乐库
+        // ====================================================
+
+        case BootState::ScanMediaLibrary:
+        {
+            ESP_LOGI(
+                TAG,
+                "步骤 6/8：扫描音乐库"
+            );
+
+            if (
+                media_library_scan() !=
+                ESP_OK
+            ) {
+                ESP_LOGE(
+                    TAG,
+                    "音乐库扫描失败"
+                );
+
+                g_state =
+                    BootState::Error;
+
+                break;
+            }
+
+            if (player_state_init() != ESP_OK) {
+                ESP_LOGE(TAG, "播放器选择状态初始化失败");
+                g_state = BootState::Error;
+                break;
+            }
+
+            g_state =
                 BootState::InitDisplay;
 
             break;
         }
 
-
         // ====================================================
-        // 6. CO5300 AMOLED
+        // 7. CO5300 AMOLED
         // ====================================================
 
         case BootState::InitDisplay:
         {
             ESP_LOGI(
                 TAG,
-                "步骤 6/7：初始化 AMOLED"
+                "步骤 7/8：初始化 AMOLED"
             );
 
 
@@ -342,14 +381,14 @@ void boot_state_update()
 
 
         // ====================================================
-        // 7. LVGL 用户界面
+        // 8. LVGL 用户界面
         // ====================================================
 
         case BootState::InitUI:
         {
             ESP_LOGI(
                 TAG,
-                "步骤 7/7：初始化 LVGL 用户界面"
+                "步骤 8/8：初始化 LVGL 用户界面"
             );
 
             if (ui_manager_init() != ESP_OK) {
@@ -374,7 +413,7 @@ void boot_state_update()
 
             ESP_LOGI(
                 TAG,
-                "FakePod 基础硬件与界面启动完成"
+                "FakePod 基础硬件、音乐库与界面启动完成"
             );
 
             ESP_LOGI(
