@@ -8,6 +8,9 @@
 
 #include "boot_state.h"
 #include "player_control.h"
+#include "player_state.h"
+#include "media_catalog_v2.h"
+#include "artwork_loader.h"
 #include "app_diag_config.h"
 #if APP_DIAG_FLAC_PERFORMANCE
 #include "flac_decoder.h"
@@ -33,6 +36,10 @@ static uint32_t g_last_mp3_perf_sequence =
     0;
 #endif
 
+// Stage 12.1：只观察当前 Track 身份变化并投递异步封面请求；真正 fread 永远不在 loopTask 执行。
+static uint32_t g_last_artwork_catalog_generation = 0U;
+static uint32_t g_last_artwork_track_index = UINT32_MAX;
+
 
 // ============================================================
 // 系统主循环
@@ -52,6 +59,20 @@ void system_loop_update()
     // Player transport 只观察 AudioTask POD Snapshot；自然 EOF 的续播决策在 loopTask 执行，
     // AudioTask 本身不依赖 Player/Catalog，也不会直接选择下一首。
     player_control_update();
+
+    // 首页尚未接图片解码，但先让 Stage 12.1 自动缓存当前歌曲压缩封面。
+    // 这也让实机可以直接验证“192k FLAC 播放 + 低优先级封面分块读取”的并发行为。
+    if (artwork_loader_is_ready() && player_state_is_ready()) {
+        const uint32_t catalog_generation = media_catalog_v2_generation();
+        const uint32_t track_index = static_cast<uint32_t>(player_state_get_index());
+        if (catalog_generation != g_last_artwork_catalog_generation ||
+            track_index != g_last_artwork_track_index) {
+            if (artwork_loader_request_track(track_index, nullptr)) {
+                g_last_artwork_catalog_generation = catalog_generation;
+                g_last_artwork_track_index = track_index;
+            }
+        }
+    }
 
 
     // ========================================================

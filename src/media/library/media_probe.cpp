@@ -1,4 +1,5 @@
 #include "media_probe.h"
+#include "storage_io.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -517,6 +518,11 @@ esp_err_t media_probe_file(
     *out_info = {};
     if (format != MediaFormat::FLAC && format != MediaFormat::MP3) {
         return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    StorageSdLockGuard sd_lock;
+    if (!sd_lock.locked()) {
+        return ESP_ERR_TIMEOUT;
     }
 
     FILE *file = fopen(path, "rb");

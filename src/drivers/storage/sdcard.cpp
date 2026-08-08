@@ -11,6 +11,7 @@
 #include "sdmmc_cmd.h"
 
 #include "board_pins.h"
+#include "storage_io.h"
 
 
 static const char *TAG = "TF卡";
@@ -36,6 +37,23 @@ esp_err_t sdcard_init()
 {
     if (g_mounted) {
         return ESP_OK;
+    }
+
+
+    const esp_err_t storage_ret =
+        storage_io_init();
+
+
+    if (storage_ret != ESP_OK) {
+        return storage_ret;
+    }
+
+
+    // 挂载本身也属于 SD 总线生命周期的一部分。启动阶段没有竞争者，
+    // 但仍统一经过中央锁，保证后续热插拔/重新挂载时不会形成旁路。
+    StorageSdLockGuard sd_lock;
+    if (!sd_lock.locked()) {
+        return ESP_ERR_TIMEOUT;
     }
 
 
@@ -265,6 +283,13 @@ void sdcard_debug_list_root()
         TAG,
         "TF 卡根目录："
     );
+
+
+    StorageSdLockGuard sd_lock;
+    if (!sd_lock.locked()) {
+        ESP_LOGE(TAG, "读取根目录前获取 SD 锁失败");
+        return;
+    }
 
 
     DIR *dir =

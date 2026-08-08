@@ -11,6 +11,7 @@
 #include "cst820.h"
 #include "qmi8658.h"
 #include "audio_service.h"
+#include "artwork_loader.h"
 #include "sdcard.h"
 #include "display.h"
 #include "media_library.h"
@@ -362,6 +363,12 @@ void boot_state_update()
                 ESP_LOGE(TAG, "播放器控制初始化失败");
                 g_state = BootState::Error;
                 break;
+            }
+
+            // 封面是可选资产服务：失败时不阻断播放器启动，Stage 12.2 UI 会回退默认封面。
+            const esp_err_t artwork_ret = artwork_loader_start();
+            if (artwork_ret != ESP_OK) {
+                ESP_LOGW(TAG, "异步封面加载服务启动失败，继续无封面运行：%s", esp_err_to_name(artwork_ret));
             }
 
             g_state =

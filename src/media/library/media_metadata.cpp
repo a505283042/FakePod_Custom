@@ -1,4 +1,5 @@
 #include "media_metadata.h"
+#include "storage_io.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -1214,6 +1215,11 @@ esp_err_t media_metadata_scan_file_v2(
         return ESP_ERR_INVALID_ARG;
     }
     media_metadata_build_release(out_metadata);
+
+    StorageSdLockGuard sd_lock;
+    if (!sd_lock.locked()) {
+        return ESP_ERR_TIMEOUT;
+    }
 
     if (format != MediaFormat::FLAC && format != MediaFormat::MP3) {
         out_metadata->metadata_flags |= MEDIA_TRACK_META_SCANNED_V2;

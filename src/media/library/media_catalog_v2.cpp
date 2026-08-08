@@ -9,6 +9,7 @@
 #include "media_index_store.h"
 #include "media_groups_v2.h"
 #include "media_metadata.h"
+#include "media_artwork.h"
 
 static const char *TAG = "曲库V2";
 static MusicCatalogV2 s_catalog = {};
@@ -107,6 +108,7 @@ void media_catalog_v2_release(MusicCatalogV2 *catalog)
     heap_caps_free(catalog->albums);
     heap_caps_free(catalog->track_artist_refs);
     heap_caps_free(catalog->lyrics_refs);
+    heap_caps_free(catalog->artwork_refs);
     *catalog = {};
 }
 
@@ -120,7 +122,8 @@ esp_err_t media_catalog_v2_validate(const MusicCatalogV2 *catalog)
         (catalog->artist_count > 0 && catalog->artists == nullptr) ||
         (catalog->album_count > 0 && catalog->albums == nullptr) ||
         (catalog->track_artist_ref_count > 0 && catalog->track_artist_refs == nullptr) ||
-        (catalog->lyrics_ref_count > 0 && catalog->lyrics_refs == nullptr)) {
+        (catalog->lyrics_ref_count > 0 && catalog->lyrics_refs == nullptr) ||
+        (catalog->artwork_ref_count > 0 && catalog->artwork_refs == nullptr)) {
         return ESP_ERR_INVALID_RESPONSE;
     }
 
@@ -167,6 +170,7 @@ esp_err_t media_catalog_v2_validate(const MusicCatalogV2 *catalog)
             !pool_offset_valid(catalog->pool, track.display_artist_off) ||
             track.format > MediaFormat::NSFE ||
             (track.album_id != MEDIA_CATALOG_INVALID_ID_V2 && track.album_id >= catalog->album_count) ||
+            (track.artwork_ref_id != MEDIA_CATALOG_INVALID_ID_V2 && track.artwork_ref_id >= catalog->artwork_ref_count) ||
             track.reserved0 != 0U || track.reserved1 != 0U ||
             expected_artist_ref_start > catalog->track_artist_ref_count ||
             track.artist_ref_start != expected_artist_ref_start ||
@@ -237,6 +241,36 @@ esp_err_t media_catalog_v2_validate(const MusicCatalogV2 *catalog)
             }
         }
         expected_lyrics_ref_start += track.lyrics_ref_count;
+
+        if (track.artwork_ref_id != MEDIA_CATALOG_INVALID_ID_V2) {
+            const ArtworkRefV2 &artwork = catalog->artwork_refs[track.artwork_ref_id];
+            const bool source_valid = artwork.source == MediaArtworkSourceV2::Mp3Apic ||
+                artwork.source == MediaArtworkSourceV2::FlacPicture ||
+                artwork.source == MediaArtworkSourceV2::ExternalFile;
+            const bool format_valid = artwork.format == MediaArtworkFormatV2::Jpeg ||
+                artwork.format == MediaArtworkFormatV2::Png;
+            if (!source_valid || !format_valid || artwork.data_size == 0U || artwork.reserved0 != 0U ||
+                (artwork.flags & ~MEDIA_ARTWORK_REF_NEEDS_ID3_UNSYNC_V2) != 0U) {
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+            if (artwork.source == MediaArtworkSourceV2::ExternalFile) {
+                const char *artwork_path = media_catalog_v2_pool_str(catalog, artwork.path_off);
+                if (artwork_path == nullptr || artwork_path[0] == '\0' || artwork.data_offset != 0U ||
+                    artwork.flags != MEDIA_ARTWORK_REF_NONE_V2) {
+                    return ESP_ERR_INVALID_RESPONSE;
+                }
+            } else {
+                if (artwork.path_off != 0U || artwork.source_modified_time != 0 ||
+                    artwork.data_offset > track.file_size_bytes ||
+                    static_cast<uint64_t>(artwork.data_size) > track.file_size_bytes - artwork.data_offset ||
+                    (artwork.source == MediaArtworkSourceV2::Mp3Apic && track.format != MediaFormat::MP3) ||
+                    (artwork.source == MediaArtworkSourceV2::FlacPicture && track.format != MediaFormat::FLAC) ||
+                    ((artwork.flags & MEDIA_ARTWORK_REF_NEEDS_ID3_UNSYNC_V2) != 0U &&
+                     artwork.source != MediaArtworkSourceV2::Mp3Apic)) {
+                    return ESP_ERR_INVALID_SIZE;
+                }
+            }
+        }
 
         if ((track.metadata_flags & ~TRACK_METADATA_KNOWN_MASK_V2) != 0U ||
             !metadata_value_matches_flag(track.metadata_flags, MEDIA_TRACK_META_HAS_TRACK_NUMBER_V2, track.track_number) ||
@@ -443,6 +477,7 @@ esp_err_t media_catalog_v2_build_from_index_records(
     uint32_t album_capacity = 0;
     uint32_t artist_ref_count = 0;
     uint32_t lyrics_ref_count = 0;
+    uint32_t artwork_ref_count = 0;
 
     // 第一遍只建立实体关系和计数，不复制字符串。metadata_build 的生命周期覆盖整个构建过程。
     for (size_t i = 0; i < record_count; ++i) {
@@ -454,6 +489,15 @@ esp_err_t media_catalog_v2_build_from_index_records(
             return ESP_ERR_INVALID_RESPONSE;
         }
         const MediaMetadataBuildV2 *metadata = record.metadata_build;
+        const MediaArtworkBuildV2 *artwork = record.artwork_build;
+        if (artwork != nullptr && artwork->source != MediaArtworkSourceV2::None) {
+            if (artwork_ref_count == UINT32_MAX) {
+                heap_caps_free(artist_builds);
+                heap_caps_free(album_builds);
+                return ESP_ERR_INVALID_SIZE;
+            }
+            artwork_ref_count++;
+        }
         if (metadata == nullptr) {
             continue;
         }
@@ -519,7 +563,7 @@ esp_err_t media_catalog_v2_build_from_index_records(
             }
             CatalogAlbumBuildV2 &album = album_builds[album_id];
             if (album.artwork_track_id == MEDIA_CATALOG_INVALID_ID_V2 &&
-                (record.technical.flags & MEDIA_TECH_HAS_ARTWORK) != 0U) {
+                artwork != nullptr && artwork->source != MediaArtworkSourceV2::None) {
                 album.artwork_track_id = static_cast<uint32_t>(i);
             }
             merge_album_year(metadata->metadata_flags, MEDIA_TRACK_META_HAS_RELEASE_YEAR_V2,
@@ -562,6 +606,14 @@ esp_err_t media_catalog_v2_build_from_index_records(
             heap_caps_free(album_builds);
             return ESP_ERR_INVALID_SIZE;
         }
+        const MediaArtworkBuildV2 *artwork = records[i].artwork_build;
+        if (artwork != nullptr && artwork->source == MediaArtworkSourceV2::ExternalFile &&
+            artwork->external_path != nullptr && artwork->external_path[0] != '\0' &&
+            !checked_add_size(&string_bytes, strlen(artwork->external_path) + 1U)) {
+            heap_caps_free(artist_builds);
+            heap_caps_free(album_builds);
+            return ESP_ERR_INVALID_SIZE;
+        }
         if (metadata != nullptr) {
             for (uint16_t l = 0; l < metadata->lyrics_count; ++l) {
                 const MediaMetadataLyricsBuildV2 &lyrics = metadata->lyrics[l];
@@ -588,15 +640,19 @@ esp_err_t media_catalog_v2_build_from_index_records(
         ? static_cast<TrackArtistRefV2 *>(catalog_psram_alloc(static_cast<size_t>(artist_ref_count) * sizeof(TrackArtistRefV2))) : nullptr;
     LyricsRefV2 *lyrics_refs = lyrics_ref_count > 0
         ? static_cast<LyricsRefV2 *>(catalog_psram_alloc(static_cast<size_t>(lyrics_ref_count) * sizeof(LyricsRefV2))) : nullptr;
+    ArtworkRefV2 *artwork_refs = artwork_ref_count > 0
+        ? static_cast<ArtworkRefV2 *>(catalog_psram_alloc(static_cast<size_t>(artwork_ref_count) * sizeof(ArtworkRefV2))) : nullptr;
     if (strings == nullptr || (record_count > 0 && tracks == nullptr) ||
         (artist_count > 0 && artists == nullptr) || (album_count > 0 && albums == nullptr) ||
-        (artist_ref_count > 0 && artist_refs == nullptr) || (lyrics_ref_count > 0 && lyrics_refs == nullptr)) {
+        (artist_ref_count > 0 && artist_refs == nullptr) || (lyrics_ref_count > 0 && lyrics_refs == nullptr) ||
+        (artwork_ref_count > 0 && artwork_refs == nullptr)) {
         heap_caps_free(strings);
         heap_caps_free(tracks);
         heap_caps_free(artists);
         heap_caps_free(albums);
         heap_caps_free(artist_refs);
         heap_caps_free(lyrics_refs);
+        heap_caps_free(artwork_refs);
         heap_caps_free(artist_builds);
         heap_caps_free(album_builds);
         return ESP_ERR_NO_MEM;
@@ -607,6 +663,7 @@ esp_err_t media_catalog_v2_build_from_index_records(
     for (uint32_t i = 0; i < album_count; ++i) albums[i] = {};
     for (uint32_t i = 0; i < artist_ref_count; ++i) artist_refs[i] = {};
     for (uint32_t i = 0; i < lyrics_ref_count; ++i) lyrics_refs[i] = {};
+    for (uint32_t i = 0; i < artwork_ref_count; ++i) artwork_refs[i] = {};
 
     size_t next_string = 1U;
     for (uint32_t i = 0; i < artist_count; ++i) {
@@ -625,9 +682,11 @@ esp_err_t media_catalog_v2_build_from_index_records(
 
     uint32_t next_artist_ref = 0;
     uint32_t next_lyrics_ref = 0;
+    uint32_t next_artwork_ref = 0;
     for (size_t i = 0; i < record_count; ++i) {
         const MediaIndexRecord &source = records[i];
         const MediaMetadataBuildV2 *metadata = source.metadata_build;
+        const MediaArtworkBuildV2 *artwork = source.artwork_build;
         const char *path = path_pool + source.path_offset;
         const char *filename = filename_from_path(path);
         TrackRowV2 &track = tracks[i];
@@ -639,9 +698,13 @@ esp_err_t media_catalog_v2_build_from_index_records(
             if (next_string + title_len + 1U > string_bytes) {
                 heap_caps_free(artist_builds);
                 heap_caps_free(album_builds);
-                MusicCatalogV2 failed = { {strings, static_cast<uint32_t>(string_bytes)}, tracks, artists, albums,
-                    artist_refs, lyrics_refs, static_cast<uint32_t>(record_count), artist_count, album_count,
-                    artist_ref_count, lyrics_ref_count, 0, 0 };
+                MusicCatalogV2 failed = {};
+                failed.pool = {strings, static_cast<uint32_t>(string_bytes)};
+                failed.tracks = tracks; failed.artists = artists; failed.albums = albums;
+                failed.track_artist_refs = artist_refs; failed.lyrics_refs = lyrics_refs; failed.artwork_refs = artwork_refs;
+                failed.track_count = static_cast<uint32_t>(record_count); failed.artist_count = artist_count;
+                failed.album_count = album_count; failed.track_artist_ref_count = artist_ref_count;
+                failed.lyrics_ref_count = lyrics_ref_count; failed.artwork_ref_count = artwork_ref_count;
                 media_catalog_v2_release(&failed);
                 return ESP_ERR_INVALID_SIZE;
             }
@@ -661,9 +724,13 @@ esp_err_t media_catalog_v2_build_from_index_records(
                 if (artist_id == MEDIA_CATALOG_INVALID_ID_V2) {
                     heap_caps_free(artist_builds);
                     heap_caps_free(album_builds);
-                    MusicCatalogV2 failed = { {strings, static_cast<uint32_t>(string_bytes)}, tracks, artists, albums,
-                        artist_refs, lyrics_refs, static_cast<uint32_t>(record_count), artist_count, album_count,
-                        artist_ref_count, lyrics_ref_count, 0, 0 };
+                    MusicCatalogV2 failed = {};
+                    failed.pool = {strings, static_cast<uint32_t>(string_bytes)};
+                    failed.tracks = tracks; failed.artists = artists; failed.albums = albums;
+                    failed.track_artist_refs = artist_refs; failed.lyrics_refs = lyrics_refs; failed.artwork_refs = artwork_refs;
+                    failed.track_count = static_cast<uint32_t>(record_count); failed.artist_count = artist_count;
+                    failed.album_count = album_count; failed.track_artist_ref_count = artist_ref_count;
+                    failed.lyrics_ref_count = lyrics_ref_count; failed.artwork_ref_count = artwork_ref_count;
                     media_catalog_v2_release(&failed);
                     return ESP_ERR_INVALID_RESPONSE;
                 }
@@ -694,6 +761,22 @@ esp_err_t media_catalog_v2_build_from_index_records(
                 ? metadata->album_artist : (metadata->display_artist != nullptr ? metadata->display_artist : "");
             track.album_id = find_album_build(album_builds, album_count, metadata->album, album_artist);
         }
+        track.artwork_ref_id = MEDIA_CATALOG_INVALID_ID_V2;
+        if (artwork != nullptr && artwork->source != MediaArtworkSourceV2::None) {
+            ArtworkRefV2 &dest = artwork_refs[next_artwork_ref];
+            dest.data_offset = artwork->data_offset;
+            dest.data_size = artwork->data_size;
+            dest.source_modified_time = artwork->source_modified_time;
+            dest.path_off = artwork->source == MediaArtworkSourceV2::ExternalFile
+                ? append_pool_string(strings, string_bytes, &next_string, artwork->external_path) : 0U;
+            dest.flags = artwork->flags;
+            dest.width = artwork->width;
+            dest.height = artwork->height;
+            dest.source = artwork->source;
+            dest.format = artwork->format;
+            dest.picture_type = artwork->picture_type;
+            track.artwork_ref_id = next_artwork_ref++;
+        }
         track.metadata_flags = metadata != nullptr ? metadata->metadata_flags : MEDIA_TRACK_META_NONE_V2;
         track.track_number = metadata != nullptr ? metadata->track_number : 0U;
         track.track_total = metadata != nullptr ? metadata->track_total : 0U;
@@ -708,10 +791,15 @@ esp_err_t media_catalog_v2_build_from_index_records(
 
     heap_caps_free(artist_builds);
     heap_caps_free(album_builds);
-    if (next_string != string_bytes || next_artist_ref != artist_ref_count || next_lyrics_ref != lyrics_ref_count) {
-        MusicCatalogV2 failed = { {strings, static_cast<uint32_t>(string_bytes)}, tracks, artists, albums,
-            artist_refs, lyrics_refs, static_cast<uint32_t>(record_count), artist_count, album_count,
-            artist_ref_count, lyrics_ref_count, 0, 0 };
+    if (next_string != string_bytes || next_artist_ref != artist_ref_count || next_lyrics_ref != lyrics_ref_count ||
+        next_artwork_ref != artwork_ref_count) {
+        MusicCatalogV2 failed = {};
+        failed.pool = {strings, static_cast<uint32_t>(string_bytes)};
+        failed.tracks = tracks; failed.artists = artists; failed.albums = albums;
+        failed.track_artist_refs = artist_refs; failed.lyrics_refs = lyrics_refs; failed.artwork_refs = artwork_refs;
+        failed.track_count = static_cast<uint32_t>(record_count); failed.artist_count = artist_count;
+        failed.album_count = album_count; failed.track_artist_ref_count = artist_ref_count;
+        failed.lyrics_ref_count = lyrics_ref_count; failed.artwork_ref_count = artwork_ref_count;
         media_catalog_v2_release(&failed);
         return ESP_ERR_INVALID_SIZE;
     }
@@ -723,11 +811,13 @@ esp_err_t media_catalog_v2_build_from_index_records(
     out_catalog->albums = albums;
     out_catalog->track_artist_refs = artist_refs;
     out_catalog->lyrics_refs = lyrics_refs;
+    out_catalog->artwork_refs = artwork_refs;
     out_catalog->track_count = static_cast<uint32_t>(record_count);
     out_catalog->artist_count = artist_count;
     out_catalog->album_count = album_count;
     out_catalog->track_artist_ref_count = artist_ref_count;
     out_catalog->lyrics_ref_count = lyrics_ref_count;
+    out_catalog->artwork_ref_count = artwork_ref_count;
 
     const esp_err_t validate_ret = media_catalog_v2_validate(out_catalog);
     if (validate_ret != ESP_OK) {
@@ -762,13 +852,14 @@ esp_err_t media_catalog_v2_publish(MusicCatalogV2 *catalog, uint32_t source_crc3
     }
     s_ready = true;
 
-    ESP_LOGI(TAG, "Catalog 已发布：generation=%lu tracks=%lu artists=%lu albums=%lu artist_refs=%lu lyrics_refs=%lu groups(A/AL/D)=%lu/%lu/%lu strings=%luB crc=0x%08lX",
+    ESP_LOGI(TAG, "Catalog 已发布：generation=%lu tracks=%lu artists=%lu albums=%lu artist_refs=%lu lyrics_refs=%lu artwork_refs=%lu groups(A/AL/D)=%lu/%lu/%lu strings=%luB crc=0x%08lX",
         static_cast<unsigned long>(s_catalog.generation),
         static_cast<unsigned long>(s_catalog.track_count),
         static_cast<unsigned long>(s_catalog.artist_count),
         static_cast<unsigned long>(s_catalog.album_count),
         static_cast<unsigned long>(s_catalog.track_artist_ref_count),
         static_cast<unsigned long>(s_catalog.lyrics_ref_count),
+        static_cast<unsigned long>(s_catalog.artwork_ref_count),
         static_cast<unsigned long>(s_catalog.artist_group_count),
         static_cast<unsigned long>(s_catalog.album_group_count),
         static_cast<unsigned long>(s_catalog.decade_group_count),
@@ -821,5 +912,31 @@ bool media_catalog_v2_copy_technical(size_t index, MediaTechnicalInfo *out_info)
         return false;
     }
     *out_info = s_catalog.tracks[index].technical;
+    return true;
+}
+
+
+bool media_catalog_v2_get_artwork_view(size_t index, MediaArtworkViewV2 *out_view)
+{
+    if (!s_ready || out_view == nullptr || index >= s_catalog.track_count) {
+        return false;
+    }
+    const TrackRowV2 &track = s_catalog.tracks[index];
+    if (track.artwork_ref_id == MEDIA_CATALOG_INVALID_ID_V2 ||
+        track.artwork_ref_id >= s_catalog.artwork_ref_count) {
+        return false;
+    }
+    const ArtworkRefV2 &ref = s_catalog.artwork_refs[track.artwork_ref_id];
+    MediaArtworkViewV2 view = {};
+    view.generation = s_catalog.generation;
+    view.track_index = static_cast<uint32_t>(index);
+    view.ref = &ref;
+    if (ref.source == MediaArtworkSourceV2::ExternalFile) {
+        view.external_path = media_catalog_v2_pool_str(&s_catalog, ref.path_off);
+        if (view.external_path == nullptr || view.external_path[0] == '\0') {
+            return false;
+        }
+    }
+    *out_view = view;
     return true;
 }

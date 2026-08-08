@@ -1,4 +1,5 @@
 #include "media_catalog_store_v2.h"
+#include "storage_io.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -13,8 +14,8 @@
 #include "system_paths.h"
 
 static const char *TAG = "曲库索引V2";
-// Stage 10.2.2 冻结 V2 Row schema；旧 10.2 试验版会因 section.row_size 不匹配自动失效并重建。
-static constexpr uint16_t CATALOG_VERSION_V2 = 2;
+// Stage 12.0 扩展 V2 Catalog 的磁盘 schema：加入 artwork refs。旧 version=2 会自动失效并一次性重建。
+static constexpr uint16_t CATALOG_VERSION_V2 = 3;
 static constexpr uint16_t MANIFEST_VERSION_V2 = 2;
 static constexpr uint32_t SIGNATURE_MODE_FAST_V2 = 1;
 static constexpr uint32_t MAX_TRACKS_V2 = 100000;
@@ -22,8 +23,9 @@ static constexpr uint32_t MAX_ARTISTS_V2 = 100000;
 static constexpr uint32_t MAX_ALBUMS_V2 = 100000;
 static constexpr uint32_t MAX_TRACK_ARTIST_REFS_V2 = 1000000;
 static constexpr uint32_t MAX_LYRICS_REFS_V2 = 400000;
+static constexpr uint32_t MAX_ARTWORK_REFS_V2 = 100000;
 static constexpr uint32_t MAX_STRING_POOL_V2 = 32U * 1024U * 1024U;
-static constexpr uint16_t SECTION_COUNT_V2 = 6;
+static constexpr uint16_t SECTION_COUNT_V2 = 7;
 
 enum CatalogSectionTypeV2 : uint32_t
 {
@@ -32,7 +34,8 @@ enum CatalogSectionTypeV2 : uint32_t
     SEC_V2_ALBUMS = 3,
     SEC_V2_TRACK_ARTIST_REFS = 4,
     SEC_V2_LYRICS_REFS = 5,
-    SEC_V2_TRACKS = 6,
+    SEC_V2_ARTWORK_REFS = 6,
+    SEC_V2_TRACKS = 7,
 };
 
 #pragma pack(push, 1)
@@ -51,6 +54,7 @@ struct CatalogFileHeaderV2
     uint32_t album_count;
     uint32_t track_artist_ref_count;
     uint32_t lyrics_ref_count;
+    uint32_t artwork_ref_count;
 };
 
 struct CatalogSectionV2
@@ -100,6 +104,21 @@ struct LyricsDiskRefV2
     uint8_t reserved0;
 };
 
+struct ArtworkDiskRefV2
+{
+    uint64_t data_offset;
+    uint32_t data_size;
+    uint32_t path_off;
+    int64_t source_modified_time;
+    uint32_t flags;
+    uint16_t width;
+    uint16_t height;
+    uint8_t source;
+    uint8_t format;
+    uint8_t picture_type;
+    uint8_t reserved0;
+};
+
 struct TrackDiskRowV2
 {
     uint32_t path_off;
@@ -112,6 +131,7 @@ struct TrackDiskRowV2
     uint16_t lyrics_ref_count;
     uint16_t reserved1;
     uint32_t album_id;
+    uint32_t artwork_ref_id;
     uint32_t metadata_flags;
     uint16_t track_number;
     uint16_t track_total;
@@ -161,15 +181,43 @@ struct ManifestDiskRowV2
 };
 #pragma pack(pop)
 
-static_assert(sizeof(CatalogFileHeaderV2) == 48, "CatalogFileHeaderV2 layout changed");
+static_assert(sizeof(CatalogFileHeaderV2) == 52, "CatalogFileHeaderV2 layout changed");
 static_assert(sizeof(CatalogSectionV2) == 24, "CatalogSectionV2 layout changed");
 static_assert(sizeof(ArtistDiskRowV2) == 8, "ArtistDiskRowV2 layout changed");
 static_assert(sizeof(AlbumDiskRowV2) == 24, "AlbumDiskRowV2 layout changed");
 static_assert(sizeof(TrackArtistDiskRefV2) == 8, "TrackArtistDiskRefV2 layout changed");
 static_assert(sizeof(LyricsDiskRefV2) == 28, "LyricsDiskRefV2 layout changed");
-static_assert(sizeof(TrackDiskRowV2) == 120, "TrackDiskRowV2 layout changed");
+static_assert(sizeof(ArtworkDiskRefV2) == 36, "ArtworkDiskRefV2 layout changed");
+static_assert(sizeof(TrackDiskRowV2) == 124, "TrackDiskRowV2 layout changed");
 static_assert(sizeof(ManifestFileHeaderV2) == 32, "ManifestFileHeaderV2 layout changed");
 static_assert(sizeof(ManifestDiskRowV2) == 24, "ManifestDiskRowV2 layout changed");
+
+// Stage 12.0.1：Catalog 事务会在 main task 的曲库扫描调用栈内执行。
+// 读回校验涉及 header/section/stat/row scratch；这些是事务工作区，不应长期占用任务栈。
+union CatalogDiskRowScratchV2
+{
+    ArtistDiskRowV2 artist;
+    AlbumDiskRowV2 album;
+    TrackArtistDiskRefV2 track_artist;
+    LyricsDiskRefV2 lyrics;
+    ArtworkDiskRefV2 artwork;
+    TrackDiskRowV2 track;
+};
+
+struct CatalogLoadScratchV2
+{
+    CatalogFileHeaderV2 header = {};
+    CatalogSectionV2 sections[SECTION_COUNT_V2] = {};
+    struct stat file_info = {};
+    MusicCatalogV2 loaded = {};
+    CatalogDiskRowScratchV2 row = {};
+};
+
+struct CatalogCommitScratchV2
+{
+    CatalogSectionV2 sections[SECTION_COUNT_V2] = {};
+    MediaCatalogSnapshotV2 verify = {};
+};
 
 static uint32_t crc32_begin()
 {
@@ -306,6 +354,40 @@ static LyricsRefV2 from_disk_lyrics_ref(const LyricsDiskRefV2 &source)
     return row;
 }
 
+static ArtworkDiskRefV2 to_disk_artwork_ref(const ArtworkRefV2 &source)
+{
+    ArtworkDiskRefV2 row = {};
+    row.data_offset = source.data_offset;
+    row.data_size = source.data_size;
+    row.path_off = source.path_off;
+    row.source_modified_time = source.source_modified_time;
+    row.flags = source.flags;
+    row.width = source.width;
+    row.height = source.height;
+    row.source = static_cast<uint8_t>(source.source);
+    row.format = static_cast<uint8_t>(source.format);
+    row.picture_type = source.picture_type;
+    row.reserved0 = source.reserved0;
+    return row;
+}
+
+static ArtworkRefV2 from_disk_artwork_ref(const ArtworkDiskRefV2 &source)
+{
+    ArtworkRefV2 row = {};
+    row.data_offset = source.data_offset;
+    row.data_size = source.data_size;
+    row.path_off = source.path_off;
+    row.source_modified_time = source.source_modified_time;
+    row.flags = source.flags;
+    row.width = source.width;
+    row.height = source.height;
+    row.source = static_cast<MediaArtworkSourceV2>(source.source);
+    row.format = static_cast<MediaArtworkFormatV2>(source.format);
+    row.picture_type = source.picture_type;
+    row.reserved0 = source.reserved0;
+    return row;
+}
+
 static TrackDiskRowV2 to_disk_track(const TrackRowV2 &source)
 {
     TrackDiskRowV2 row = {};
@@ -319,6 +401,7 @@ static TrackDiskRowV2 to_disk_track(const TrackRowV2 &source)
     row.lyrics_ref_count = source.lyrics_ref_count;
     row.reserved1 = source.reserved1;
     row.album_id = source.album_id;
+    row.artwork_ref_id = source.artwork_ref_id;
     row.metadata_flags = source.metadata_flags;
     row.track_number = source.track_number;
     row.track_total = source.track_total;
@@ -358,6 +441,7 @@ static TrackRowV2 from_disk_track(const TrackDiskRowV2 &source)
     row.lyrics_ref_count = source.lyrics_ref_count;
     row.reserved1 = source.reserved1;
     row.album_id = source.album_id;
+    row.artwork_ref_id = source.artwork_ref_id;
     row.metadata_flags = source.metadata_flags;
     row.track_number = source.track_number;
     row.track_total = source.track_total;
@@ -407,11 +491,13 @@ static esp_err_t build_section_table(
     uint32_t albums_size = 0;
     uint32_t track_artist_refs_size = 0;
     uint32_t lyrics_refs_size = 0;
+    uint32_t artwork_refs_size = 0;
     uint32_t tracks_size = 0;
     if (!checked_u32_mul(catalog->artist_count, sizeof(ArtistDiskRowV2), &artists_size) ||
         !checked_u32_mul(catalog->album_count, sizeof(AlbumDiskRowV2), &albums_size) ||
         !checked_u32_mul(catalog->track_artist_ref_count, sizeof(TrackArtistDiskRefV2), &track_artist_refs_size) ||
         !checked_u32_mul(catalog->lyrics_ref_count, sizeof(LyricsDiskRefV2), &lyrics_refs_size) ||
+        !checked_u32_mul(catalog->artwork_ref_count, sizeof(ArtworkDiskRefV2), &artwork_refs_size) ||
         !checked_u32_mul(catalog->track_count, sizeof(TrackDiskRowV2), &tracks_size)) {
         return ESP_ERR_INVALID_SIZE;
     }
@@ -457,12 +543,21 @@ static esp_err_t build_section_table(
         sizeof(LyricsDiskRefV2), 0, crc32_end(lyrics_refs_crc)};
     offset += lyrics_refs_size;
 
+    uint32_t artwork_refs_crc = crc32_begin();
+    for (uint32_t i = 0; i < catalog->artwork_ref_count; ++i) {
+        const ArtworkDiskRefV2 row = to_disk_artwork_ref(catalog->artwork_refs[i]);
+        artwork_refs_crc = crc32_update(artwork_refs_crc, &row, sizeof(row));
+    }
+    sections[5] = {SEC_V2_ARTWORK_REFS, offset, artwork_refs_size, catalog->artwork_ref_count,
+        sizeof(ArtworkDiskRefV2), 0, crc32_end(artwork_refs_crc)};
+    offset += artwork_refs_size;
+
     uint32_t tracks_crc = crc32_begin();
     for (uint32_t i = 0; i < catalog->track_count; ++i) {
         const TrackDiskRowV2 row = to_disk_track(catalog->tracks[i]);
         tracks_crc = crc32_update(tracks_crc, &row, sizeof(row));
     }
-    sections[5] = {SEC_V2_TRACKS, offset, tracks_size, catalog->track_count,
+    sections[6] = {SEC_V2_TRACKS, offset, tracks_size, catalog->track_count,
         sizeof(TrackDiskRowV2), 0, crc32_end(tracks_crc)};
     offset += tracks_size;
 
@@ -484,6 +579,10 @@ static esp_err_t build_section_table(
         const LyricsDiskRefV2 row = to_disk_lyrics_ref(catalog->lyrics_refs[i]);
         payload_crc = crc32_update(payload_crc, &row, sizeof(row));
     }
+    for (uint32_t i = 0; i < catalog->artwork_ref_count; ++i) {
+        const ArtworkDiskRefV2 row = to_disk_artwork_ref(catalog->artwork_refs[i]);
+        payload_crc = crc32_update(payload_crc, &row, sizeof(row));
+    }
     for (uint32_t i = 0; i < catalog->track_count; ++i) {
         const TrackDiskRowV2 row = to_disk_track(catalog->tracks[i]);
         payload_crc = crc32_update(payload_crc, &row, sizeof(row));
@@ -494,14 +593,16 @@ static esp_err_t build_section_table(
     return ESP_OK;
 }
 
-static esp_err_t write_catalog_file(const char *path, const MusicCatalogV2 *catalog, uint32_t *out_crc)
+static esp_err_t write_catalog_file(
+    const char *path,
+    const MusicCatalogV2 *catalog,
+    const CatalogSectionV2 *sections,
+    uint32_t file_size,
+    uint32_t payload_crc
+)
 {
-    CatalogSectionV2 sections[SECTION_COUNT_V2] = {};
-    uint32_t file_size = 0;
-    uint32_t payload_crc = 0;
-    esp_err_t ret = build_section_table(catalog, sections, &file_size, &payload_crc);
-    if (ret != ESP_OK) {
-        return ret;
+    if (path == nullptr || catalog == nullptr || sections == nullptr) {
+        return ESP_ERR_INVALID_ARG;
     }
 
     FILE *file = fopen(path, "wb");
@@ -522,9 +623,11 @@ static esp_err_t write_catalog_file(const char *path, const MusicCatalogV2 *cata
     header.album_count = catalog->album_count;
     header.track_artist_ref_count = catalog->track_artist_ref_count;
     header.lyrics_ref_count = catalog->lyrics_ref_count;
+    header.artwork_ref_count = catalog->artwork_ref_count;
 
     bool ok = fwrite(&header, 1, sizeof(header), file) == sizeof(header) &&
-        fwrite(sections, 1, sizeof(sections), file) == sizeof(sections) &&
+        fwrite(sections, 1, sizeof(CatalogSectionV2) * SECTION_COUNT_V2, file) ==
+            sizeof(CatalogSectionV2) * SECTION_COUNT_V2 &&
         fwrite(catalog->pool.data, 1, catalog->pool.size, file) == catalog->pool.size;
 
     for (uint32_t i = 0; ok && i < catalog->artist_count; ++i) {
@@ -543,6 +646,10 @@ static esp_err_t write_catalog_file(const char *path, const MusicCatalogV2 *cata
         const LyricsDiskRefV2 row = to_disk_lyrics_ref(catalog->lyrics_refs[i]);
         ok = fwrite(&row, 1, sizeof(row), file) == sizeof(row);
     }
+    for (uint32_t i = 0; ok && i < catalog->artwork_ref_count; ++i) {
+        const ArtworkDiskRefV2 row = to_disk_artwork_ref(catalog->artwork_refs[i]);
+        ok = fwrite(&row, 1, sizeof(row), file) == sizeof(row);
+    }
     for (uint32_t i = 0; ok && i < catalog->track_count; ++i) {
         const TrackDiskRowV2 row = to_disk_track(catalog->tracks[i]);
         ok = fwrite(&row, 1, sizeof(row), file) == sizeof(row);
@@ -551,9 +658,6 @@ static esp_err_t write_catalog_file(const char *path, const MusicCatalogV2 *cata
         ok = flush_file(file);
     }
     fclose(file);
-    if (ok && out_crc != nullptr) {
-        *out_crc = payload_crc;
-    }
     return ok ? ESP_OK : ESP_FAIL;
 }
 
@@ -621,7 +725,7 @@ static bool section_table_valid(const CatalogFileHeaderV2 &header, const Catalog
     const uint32_t payload_start = sizeof(CatalogFileHeaderV2) + SECTION_COUNT_V2 * sizeof(CatalogSectionV2);
     const uint32_t expected_types[SECTION_COUNT_V2] = {
         SEC_V2_STR_POOL, SEC_V2_ARTISTS, SEC_V2_ALBUMS,
-        SEC_V2_TRACK_ARTIST_REFS, SEC_V2_LYRICS_REFS, SEC_V2_TRACKS,
+        SEC_V2_TRACK_ARTIST_REFS, SEC_V2_LYRICS_REFS, SEC_V2_ARTWORK_REFS, SEC_V2_TRACKS,
     };
     uint32_t previous_end = payload_start;
     for (uint32_t i = 0; i < SECTION_COUNT_V2; ++i) {
@@ -648,30 +752,42 @@ static bool section_table_valid(const CatalogFileHeaderV2 &header, const Catalog
         sections[2].count == header.album_count &&
         sections[3].count == header.track_artist_ref_count &&
         sections[4].count == header.lyrics_ref_count &&
-        sections[5].count == header.track_count &&
+        sections[5].count == header.artwork_ref_count &&
+        sections[6].count == header.track_count &&
         sections[1].row_size == sizeof(ArtistDiskRowV2) &&
         sections[2].row_size == sizeof(AlbumDiskRowV2) &&
         sections[3].row_size == sizeof(TrackArtistDiskRefV2) &&
         sections[4].row_size == sizeof(LyricsDiskRefV2) &&
-        sections[5].row_size == sizeof(TrackDiskRowV2);
+        sections[5].row_size == sizeof(ArtworkDiskRefV2) &&
+        sections[6].row_size == sizeof(TrackDiskRowV2);
 }
 
-static esp_err_t load_catalog_file(const char *path, MusicCatalogV2 *catalog, uint32_t *out_crc)
+static __attribute__((noinline)) esp_err_t load_catalog_file(const char *path, MusicCatalogV2 *catalog, uint32_t *out_crc)
 {
     if (catalog == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
     media_catalog_v2_release(catalog);
+    CatalogLoadScratchV2 *scratch = static_cast<CatalogLoadScratchV2 *>(
+        heap_caps_calloc(1, sizeof(CatalogLoadScratchV2), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+    );
+    if (scratch == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    CatalogFileHeaderV2 &header = scratch->header;
+    CatalogSectionV2 *sections = scratch->sections;
+    struct stat &info = scratch->file_info;
+    MusicCatalogV2 &loaded = scratch->loaded;
+
     FILE *file = fopen(path, "rb");
     if (file == nullptr) {
+        heap_caps_free(scratch);
         return ESP_ERR_NOT_FOUND;
     }
 
-    CatalogFileHeaderV2 header = {};
-    CatalogSectionV2 sections[SECTION_COUNT_V2] = {};
-    struct stat info = {};
     const bool header_ok = fread(&header, 1, sizeof(header), file) == sizeof(header) &&
-        fread(sections, 1, sizeof(sections), file) == sizeof(sections) &&
+        fread(sections, 1, sizeof(CatalogSectionV2) * SECTION_COUNT_V2, file) ==
+            sizeof(CatalogSectionV2) * SECTION_COUNT_V2 &&
         memcmp(header.magic, "FPCATV2", 7) == 0 &&
         header.version == CATALOG_VERSION_V2 &&
         header.header_size == sizeof(CatalogFileHeaderV2) &&
@@ -683,19 +799,20 @@ static esp_err_t load_catalog_file(const char *path, MusicCatalogV2 *catalog, ui
         header.album_count <= MAX_ALBUMS_V2 &&
         header.track_artist_ref_count <= MAX_TRACK_ARTIST_REFS_V2 &&
         header.lyrics_ref_count <= MAX_LYRICS_REFS_V2 &&
+        header.artwork_ref_count <= MAX_ARTWORK_REFS_V2 &&
         stat(path, &info) == 0 && info.st_size >= 0 &&
         static_cast<uint64_t>(info.st_size) == header.file_size &&
         section_table_valid(header, sections);
     if (!header_ok) {
         fclose(file);
+        heap_caps_free(scratch);
         return ESP_ERR_INVALID_RESPONSE;
     }
-
-    MusicCatalogV2 loaded = {};
     loaded.pool.size = sections[0].size;
     loaded.pool.data = static_cast<char *>(store_psram_alloc(loaded.pool.size));
     if (loaded.pool.data == nullptr) {
         fclose(file);
+        heap_caps_free(scratch);
         return ESP_ERR_NO_MEM;
     }
     if (header.artist_count > 0) {
@@ -714,6 +831,11 @@ static esp_err_t load_catalog_file(const char *path, MusicCatalogV2 *catalog, ui
             store_psram_alloc(header.lyrics_ref_count * sizeof(LyricsRefV2))
         );
     }
+    if (header.artwork_ref_count > 0) {
+        loaded.artwork_refs = static_cast<ArtworkRefV2 *>(
+            store_psram_alloc(header.artwork_ref_count * sizeof(ArtworkRefV2))
+        );
+    }
     if (header.track_count > 0) {
         loaded.tracks = static_cast<TrackRowV2 *>(store_psram_alloc(header.track_count * sizeof(TrackRowV2)));
     }
@@ -721,15 +843,18 @@ static esp_err_t load_catalog_file(const char *path, MusicCatalogV2 *catalog, ui
         (header.album_count > 0 && loaded.albums == nullptr) ||
         (header.track_artist_ref_count > 0 && loaded.track_artist_refs == nullptr) ||
         (header.lyrics_ref_count > 0 && loaded.lyrics_refs == nullptr) ||
+        (header.artwork_ref_count > 0 && loaded.artwork_refs == nullptr) ||
         (header.track_count > 0 && loaded.tracks == nullptr)) {
         fclose(file);
         media_catalog_v2_release(&loaded);
+        heap_caps_free(scratch);
         return ESP_ERR_NO_MEM;
     }
     loaded.artist_count = header.artist_count;
     loaded.album_count = header.album_count;
     loaded.track_artist_ref_count = header.track_artist_ref_count;
     loaded.lyrics_ref_count = header.lyrics_ref_count;
+    loaded.artwork_ref_count = header.artwork_ref_count;
     loaded.track_count = header.track_count;
 
     uint32_t payload_crc = crc32_begin();
@@ -742,7 +867,8 @@ static esp_err_t load_catalog_file(const char *path, MusicCatalogV2 *catalog, ui
     }
 
     for (uint32_t i = 0; ok && i < header.artist_count; ++i) {
-        ArtistDiskRowV2 row = {};
+        ArtistDiskRowV2 &row = scratch->row.artist;
+        row = {};
         ok = fread(&row, 1, sizeof(row), file) == sizeof(row);
         if (ok) {
             loaded.artists[i] = {row.name_off, row.flags};
@@ -759,7 +885,8 @@ static esp_err_t load_catalog_file(const char *path, MusicCatalogV2 *catalog, ui
     }
 
     for (uint32_t i = 0; ok && i < header.album_count; ++i) {
-        AlbumDiskRowV2 row = {};
+        AlbumDiskRowV2 &row = scratch->row.album;
+        row = {};
         ok = fread(&row, 1, sizeof(row), file) == sizeof(row);
         if (ok) {
             loaded.albums[i] = from_disk_album(row);
@@ -776,7 +903,8 @@ static esp_err_t load_catalog_file(const char *path, MusicCatalogV2 *catalog, ui
     }
 
     for (uint32_t i = 0; ok && i < header.track_artist_ref_count; ++i) {
-        TrackArtistDiskRefV2 row = {};
+        TrackArtistDiskRefV2 &row = scratch->row.track_artist;
+        row = {};
         ok = fread(&row, 1, sizeof(row), file) == sizeof(row);
         if (ok) {
             loaded.track_artist_refs[i] = from_disk_track_artist_ref(row);
@@ -793,7 +921,8 @@ static esp_err_t load_catalog_file(const char *path, MusicCatalogV2 *catalog, ui
     }
 
     for (uint32_t i = 0; ok && i < header.lyrics_ref_count; ++i) {
-        LyricsDiskRefV2 row = {};
+        LyricsDiskRefV2 &row = scratch->row.lyrics;
+        row = {};
         ok = fread(&row, 1, sizeof(row), file) == sizeof(row);
         if (ok) {
             loaded.lyrics_refs[i] = from_disk_lyrics_ref(row);
@@ -809,8 +938,27 @@ static esp_err_t load_catalog_file(const char *path, MusicCatalogV2 *catalog, ui
         ok = crc32_end(crc) == sections[4].crc32;
     }
 
+    for (uint32_t i = 0; ok && i < header.artwork_ref_count; ++i) {
+        ArtworkDiskRefV2 &row = scratch->row.artwork;
+        row = {};
+        ok = fread(&row, 1, sizeof(row), file) == sizeof(row);
+        if (ok) {
+            loaded.artwork_refs[i] = from_disk_artwork_ref(row);
+            payload_crc = crc32_update(payload_crc, &row, sizeof(row));
+        }
+    }
+    if (ok) {
+        uint32_t crc = crc32_begin();
+        for (uint32_t i = 0; i < header.artwork_ref_count; ++i) {
+            const ArtworkDiskRefV2 row = to_disk_artwork_ref(loaded.artwork_refs[i]);
+            crc = crc32_update(crc, &row, sizeof(row));
+        }
+        ok = crc32_end(crc) == sections[5].crc32;
+    }
+
     for (uint32_t i = 0; ok && i < header.track_count; ++i) {
-        TrackDiskRowV2 row = {};
+        TrackDiskRowV2 &row = scratch->row.track;
+        row = {};
         ok = fread(&row, 1, sizeof(row), file) == sizeof(row);
         if (ok) {
             ok = row.reserved0 == 0U && row.reserved1 == 0U && row.reserved2 == 0U;
@@ -826,28 +974,32 @@ static esp_err_t load_catalog_file(const char *path, MusicCatalogV2 *catalog, ui
             const TrackDiskRowV2 row = to_disk_track(loaded.tracks[i]);
             crc = crc32_update(crc, &row, sizeof(row));
         }
-        ok = crc32_end(crc) == sections[5].crc32;
+        ok = crc32_end(crc) == sections[6].crc32;
     }
     fclose(file);
 
     if (!ok || crc32_end(payload_crc) != header.payload_crc32) {
         media_catalog_v2_release(&loaded);
+        heap_caps_free(scratch);
         return ESP_ERR_INVALID_CRC;
     }
     const esp_err_t semantic_ret = media_catalog_v2_validate(&loaded);
     if (semantic_ret != ESP_OK) {
         media_catalog_v2_release(&loaded);
+        heap_caps_free(scratch);
         return semantic_ret;
     }
     loaded.source_crc32 = header.payload_crc32;
     *catalog = loaded;
+    loaded = {};
     if (out_crc != nullptr) {
         *out_crc = header.payload_crc32;
     }
+    heap_caps_free(scratch);
     return ESP_OK;
 }
 
-static esp_err_t load_manifest_file(
+static __attribute__((noinline)) esp_err_t load_manifest_file(
     const char *path,
     const MusicCatalogV2 *catalog,
     uint32_t expected_index_crc,
@@ -923,7 +1075,7 @@ static esp_err_t load_manifest_file(
     return ESP_OK;
 }
 
-static esp_err_t load_pair(
+static __attribute__((noinline)) esp_err_t load_pair(
     const char *index_path,
     const char *manifest_path,
     MediaCatalogLoadSourceV2 source,
@@ -973,6 +1125,11 @@ esp_err_t media_catalog_store_v2_load(MediaCatalogSnapshotV2 *snapshot)
     }
     media_catalog_store_v2_release(snapshot);
 
+    StorageSdLockGuard sd_lock;
+    if (!sd_lock.locked()) {
+        return ESP_ERR_TIMEOUT;
+    }
+
     struct Candidate
     {
         const char *index_path;
@@ -994,13 +1151,14 @@ esp_err_t media_catalog_store_v2_load(MediaCatalogSnapshotV2 *snapshot)
         );
         if (ret == ESP_OK) {
             *snapshot = loaded;
-            ESP_LOGI(TAG, "已加载 V2 Catalog：来源=%s tracks=%lu artists=%lu albums=%lu artist_refs=%lu lyrics_refs=%lu strings=%luB CRC=0x%08lX",
+            ESP_LOGI(TAG, "已加载 V2 Catalog：来源=%s tracks=%lu artists=%lu albums=%lu artist_refs=%lu lyrics_refs=%lu artwork_refs=%lu strings=%luB CRC=0x%08lX",
                 candidate.name,
                 static_cast<unsigned long>(snapshot->catalog.track_count),
                 static_cast<unsigned long>(snapshot->catalog.artist_count),
                 static_cast<unsigned long>(snapshot->catalog.album_count),
                 static_cast<unsigned long>(snapshot->catalog.track_artist_ref_count),
                 static_cast<unsigned long>(snapshot->catalog.lyrics_ref_count),
+                static_cast<unsigned long>(snapshot->catalog.artwork_ref_count),
                 static_cast<unsigned long>(snapshot->catalog.pool.size),
                 static_cast<unsigned long>(snapshot->index_crc32));
             return ESP_OK;
@@ -1096,20 +1254,35 @@ esp_err_t media_catalog_store_v2_commit(
     if (semantic_ret != ESP_OK) {
         return semantic_ret;
     }
-    if (!ensure_library_directory()) {
-        return ESP_FAIL;
+
+    CatalogCommitScratchV2 *scratch = static_cast<CatalogCommitScratchV2 *>(
+        heap_caps_calloc(1, sizeof(CatalogCommitScratchV2), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+    );
+    if (scratch == nullptr) {
+        return ESP_ERR_NO_MEM;
     }
 
-    CatalogSectionV2 sections[SECTION_COUNT_V2] = {};
     uint32_t file_size = 0;
     uint32_t index_crc = 0;
-    esp_err_t ret = build_section_table(catalog, sections, &file_size, &index_crc);
+    esp_err_t ret = build_section_table(catalog, scratch->sections, &file_size, &index_crc);
     if (ret != ESP_OK) {
+        heap_caps_free(scratch);
         return ret;
     }
     const uint32_t manifest_crc = calculate_manifest_crc(source_records, source_record_count);
     if (out_index_crc32 != nullptr) {
         *out_index_crc32 = index_crc;
+    }
+
+    // Catalog build/CRC 全部在锁外完成；从目录检查开始才进入全局 SD 事务。
+    StorageSdLockGuard sd_lock;
+    if (!sd_lock.locked()) {
+        heap_caps_free(scratch);
+        return ESP_ERR_TIMEOUT;
+    }
+    if (!ensure_library_directory()) {
+        heap_caps_free(scratch);
+        return ESP_FAIL;
     }
 
     if (previous_snapshot != nullptr &&
@@ -1118,16 +1291,19 @@ esp_err_t media_catalog_store_v2_commit(
         previous_snapshot->manifest_crc32 == manifest_crc) {
         ESP_LOGI(TAG, "V2 Catalog 内容未变化，跳过写盘：CRC=0x%08lX",
             static_cast<unsigned long>(index_crc));
+        heap_caps_free(scratch);
         return ESP_OK;
     }
 
     remove(SystemPaths::kMusicIndexV2Temp);
     remove(SystemPaths::kMusicManifestV2Temp);
-    uint32_t written_index_crc = 0;
-    ret = write_catalog_file(SystemPaths::kMusicIndexV2Temp, catalog, &written_index_crc);
-    if (ret != ESP_OK || written_index_crc != index_crc) {
+    ret = write_catalog_file(
+        SystemPaths::kMusicIndexV2Temp, catalog, scratch->sections, file_size, index_crc
+    );
+    if (ret != ESP_OK) {
         ESP_LOGE(TAG, "写入 V2 Catalog tmp 失败：%s", esp_err_to_name(ret));
-        return ret == ESP_OK ? ESP_FAIL : ret;
+        heap_caps_free(scratch);
+        return ret;
     }
     uint32_t written_manifest_crc = 0;
     ret = write_manifest_file(
@@ -1140,21 +1316,22 @@ esp_err_t media_catalog_store_v2_commit(
     if (ret != ESP_OK || written_manifest_crc != manifest_crc) {
         remove(SystemPaths::kMusicIndexV2Temp);
         remove(SystemPaths::kMusicManifestV2Temp);
+        heap_caps_free(scratch);
         return ret == ESP_OK ? ESP_FAIL : ret;
     }
 
-    MediaCatalogSnapshotV2 verify = {};
     ret = load_pair(
         SystemPaths::kMusicIndexV2Temp,
         SystemPaths::kMusicManifestV2Temp,
         MediaCatalogLoadSourceV2::Temp,
-        &verify
+        &scratch->verify
     );
-    media_catalog_store_v2_release(&verify);
+    media_catalog_store_v2_release(&scratch->verify);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "V2 tmp 成对校验失败：%s", esp_err_to_name(ret));
         remove(SystemPaths::kMusicIndexV2Temp);
         remove(SystemPaths::kMusicManifestV2Temp);
+        heap_caps_free(scratch);
         return ret;
     }
 
@@ -1165,6 +1342,7 @@ esp_err_t media_catalog_store_v2_commit(
     );
     if (ret != ESP_OK) {
         remove(SystemPaths::kMusicManifestV2Temp);
+        heap_caps_free(scratch);
         return ret;
     }
     ret = rotate_atomic_file(
@@ -1175,34 +1353,38 @@ esp_err_t media_catalog_store_v2_commit(
     if (ret != ESP_OK) {
         remove(SystemPaths::kMusicIndexV2);
         rename(SystemPaths::kMusicIndexV2Backup, SystemPaths::kMusicIndexV2);
+        heap_caps_free(scratch);
         return ret;
     }
 
-    MediaCatalogSnapshotV2 final_verify = {};
     ret = load_pair(
         SystemPaths::kMusicIndexV2,
         SystemPaths::kMusicManifestV2,
         MediaCatalogLoadSourceV2::Final,
-        &final_verify
+        &scratch->verify
     );
-    if (ret != ESP_OK || final_verify.index_crc32 != index_crc ||
-        final_verify.manifest_crc32 != manifest_crc) {
+    if (ret != ESP_OK || scratch->verify.index_crc32 != index_crc ||
+        scratch->verify.manifest_crc32 != manifest_crc) {
         ESP_LOGE(TAG, "V2 final 二次校验失败，回滚 bak：%s", esp_err_to_name(ret));
-        media_catalog_store_v2_release(&final_verify);
+        media_catalog_store_v2_release(&scratch->verify);
         remove(SystemPaths::kMusicIndexV2);
         remove(SystemPaths::kMusicManifestV2);
         rename(SystemPaths::kMusicIndexV2Backup, SystemPaths::kMusicIndexV2);
         rename(SystemPaths::kMusicManifestV2Backup, SystemPaths::kMusicManifestV2);
+        heap_caps_free(scratch);
         return ESP_FAIL;
     }
-    media_catalog_store_v2_release(&final_verify);
+    media_catalog_store_v2_release(&scratch->verify);
 
-    ESP_LOGI(TAG, "V2 Catalog 事务提交完成：tracks=%lu artists=%lu albums=%lu artist_refs=%lu lyrics_refs=%lu strings=%luB index_crc=0x%08lX manifest_crc=0x%08lX",
+    heap_caps_free(scratch);
+
+    ESP_LOGI(TAG, "V2 Catalog 事务提交完成：tracks=%lu artists=%lu albums=%lu artist_refs=%lu lyrics_refs=%lu artwork_refs=%lu strings=%luB index_crc=0x%08lX manifest_crc=0x%08lX",
         static_cast<unsigned long>(catalog->track_count),
         static_cast<unsigned long>(catalog->artist_count),
         static_cast<unsigned long>(catalog->album_count),
         static_cast<unsigned long>(catalog->track_artist_ref_count),
         static_cast<unsigned long>(catalog->lyrics_ref_count),
+        static_cast<unsigned long>(catalog->artwork_ref_count),
         static_cast<unsigned long>(catalog->pool.size),
         static_cast<unsigned long>(index_crc),
         static_cast<unsigned long>(manifest_crc));

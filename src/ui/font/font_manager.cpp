@@ -1,4 +1,5 @@
 #include "font_manager.h"
+#include "storage_io.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -305,9 +306,15 @@ esp_err_t font_manager_init()
     }
 
     struct stat info = {};
-    if (stat(FONT_PATH, &info) != 0 || info.st_size <= 0) {
-        ESP_LOGE(TAG, "中文字体不存在：%s", FONT_PATH);
-        return ESP_ERR_NOT_FOUND;
+    {
+        StorageSdLockGuard sd_lock;
+        if (!sd_lock.locked()) {
+            return ESP_ERR_TIMEOUT;
+        }
+        if (stat(FONT_PATH, &info) != 0 || info.st_size <= 0) {
+            ESP_LOGE(TAG, "中文字体不存在：%s", FONT_PATH);
+            return ESP_ERR_NOT_FOUND;
+        }
     }
 
     const size_t font_size = static_cast<size_t>(info.st_size);
@@ -319,16 +326,24 @@ esp_err_t font_manager_init()
         return ESP_ERR_NO_MEM;
     }
 
-    FILE *file = fopen(FONT_PATH, "rb");
-    if (file == nullptr) {
-        heap_caps_free(font_data);
-        ESP_LOGE(TAG, "打开中文字体失败：%s", FONT_PATH);
-        return ESP_FAIL;
-    }
+    size_t read_count = 0U;
+    {
+        StorageSdLockGuard sd_lock;
+        if (!sd_lock.locked()) {
+            heap_caps_free(font_data);
+            return ESP_ERR_TIMEOUT;
+        }
+        FILE *file = fopen(FONT_PATH, "rb");
+        if (file == nullptr) {
+            heap_caps_free(font_data);
+            ESP_LOGE(TAG, "打开中文字体失败：%s", FONT_PATH);
+            return ESP_FAIL;
+        }
 
-    ESP_LOGI(TAG, "正在将中文字体载入 PSRAM：%s", FONT_PATH);
-    const size_t read_count = fread(font_data, 1, font_size, file);
-    fclose(file);
+        ESP_LOGI(TAG, "正在将中文字体载入 PSRAM：%s", FONT_PATH);
+        read_count = fread(font_data, 1, font_size, file);
+        fclose(file);
+    }
     if (read_count != font_size) {
         heap_caps_free(font_data);
         ESP_LOGE(TAG, "读取中文字体不完整：期望=%u，实际=%u",

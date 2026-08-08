@@ -7,6 +7,7 @@
 #include "media_types.h"
 
 struct MediaMetadataBuildV2;
+struct MediaArtworkBuildV2;
 
 // Stage 10.0 V1 兼容记录。Stage 10.2 起只用于从旧索引迁移技术信息，正式运行索引改用 MusicCatalogV2。
 // 路径字符串单独放入 path pool，避免每条记录固定占用大数组。
@@ -20,6 +21,7 @@ struct MediaIndexRecord
 
     // 仅扫描期使用，不参与 V1/V2 磁盘序列化。排序时随记录一起移动，Catalog 构建完成后释放。
     MediaMetadataBuildV2 *metadata_build = nullptr;
+    MediaArtworkBuildV2 *artwork_build = nullptr;
 };
 
 struct MediaIndexSnapshot

@@ -29,6 +29,29 @@ inline const char *media_format_name(MediaFormat format)
 }
 
 // 持久化索引中的技术信息标志。
+// Stage 12.0 统一封面来源/格式。Catalog 只保存 locator，图片正文始终留在原文件。
+enum class MediaArtworkSourceV2 : uint8_t
+{
+    None = 0,
+    Mp3Apic = 1,
+    FlacPicture = 2,
+    ExternalFile = 3,
+};
+
+enum class MediaArtworkFormatV2 : uint8_t
+{
+    Unknown = 0,
+    Jpeg = 1,
+    Png = 2,
+};
+
+enum MediaArtworkRefFlagsV2 : uint32_t
+{
+    MEDIA_ARTWORK_REF_NONE_V2 = 0,
+    // ID3 unsynchronisation 会在原始图片字节中插入 0x00；12.1 读取时必须反转义。
+    MEDIA_ARTWORK_REF_NEEDS_ID3_UNSYNC_V2 = 1U << 0,
+};
+
 enum MediaTechnicalFlags : uint32_t
 {
     MEDIA_TECH_NONE = 0,

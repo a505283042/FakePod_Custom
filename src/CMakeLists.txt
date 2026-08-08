@@ -13,6 +13,7 @@ idf_component_register(
         "drivers/imu/qmi8658.cpp"
 
         "drivers/storage/sdcard.cpp"
+        "drivers/storage/storage_io.cpp"
 
         "drivers/display/display.cpp"
 
@@ -28,6 +29,8 @@ idf_component_register(
         "audio/decoders/flac_decoder.cpp"
         "audio/decoders/mp3_decoder.cpp"
 
+        "assets/artwork_loader.cpp"
+
         "media/library/media_library.cpp"
         "media/library/media_index_store.cpp"
         "media/library/media_catalog_v2.cpp"
@@ -35,6 +38,7 @@ idf_component_register(
         "media/library/media_catalog_store_v2.cpp"
         "media/library/media_probe.cpp"
         "media/library/media_metadata.cpp"
+        "media/library/media_artwork.cpp"
 
         "player/player_playlist.cpp"
         "player/player_state.cpp"
@@ -71,6 +75,8 @@ idf_component_register(
         "audio"
         "audio/decoders"
         "audio/sources"
+
+        "assets"
 
         "media/library"
 

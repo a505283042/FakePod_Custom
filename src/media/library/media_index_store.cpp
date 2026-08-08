@@ -1,4 +1,5 @@
 #include "media_index_store.h"
+#include "storage_io.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -415,6 +416,11 @@ esp_err_t media_index_store_load(MediaIndexSnapshot *snapshot)
     }
     media_index_store_release(snapshot);
 
+    StorageSdLockGuard sd_lock;
+    if (!sd_lock.locked()) {
+        return ESP_ERR_TIMEOUT;
+    }
+
     esp_err_t ret = load_index_file(SystemPaths::kMusicIndex, snapshot);
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "已加载旧索引：%u 首，CRC=0x%08lX",
@@ -547,9 +553,6 @@ esp_err_t media_index_store_commit(
         record_count > UINT32_MAX || path_pool_size > UINT32_MAX) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!ensure_system_directory()) {
-        return ESP_FAIL;
-    }
 
     const uint32_t index_crc = calculate_index_payload_crc(
         records, record_count, path_pool, path_pool_size
@@ -557,6 +560,15 @@ esp_err_t media_index_store_commit(
     const uint32_t manifest_crc = calculate_manifest_payload_crc(
         records, record_count, path_pool, path_pool_size
     );
+
+    // CRC/去重计算不占用 SD 锁；只有真正文件系统事务进入全局串行通道。
+    StorageSdLockGuard sd_lock;
+    if (!sd_lock.locked()) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (!ensure_system_directory()) {
+        return ESP_FAIL;
+    }
 
     // 当前内容与已经完整校验过的 final 索引一致时，不重复写 TF 卡。
     // 若上一轮是从 .bak 恢复，则仍重新提交一次，把 final 修复回来。

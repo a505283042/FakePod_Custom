@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "esp_err.h"
 #include "media_types.h"
+#include "media_catalog_v2.h"
 
 // 扫描 TF 卡音乐目录并建立运行时 MusicCatalogV2，同时维护 /sdcard/System/library 下的 V2 Index/Manifest。
 // 未变化文件通过 FAST(size+mtime) Manifest 复用旧技术信息；V1 仅作为首次升级迁移源。
@@ -30,3 +31,7 @@ bool media_library_copy_display_name(size_t index, char *buffer, size_t buffer_s
 
 // 获取扫描/持久化索引中的技术参数。未深度解析的格式也会返回 true，但 flags 不含 MEDIA_TECH_PARSED。
 bool media_library_get_technical_info(size_t index, MediaTechnicalInfo *out_info);
+
+// 获取指定歌曲的首选封面 locator；没有有效封面时返回 false。
+// 返回的 ref/path 只在对应 Catalog generation 未变化期间有效。
+bool media_library_get_artwork_view(size_t index, MediaArtworkViewV2 *out_view);

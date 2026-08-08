@@ -3,6 +3,7 @@
 
 #include <limits.h>
 #include "esp_log.h"
+#include "storage_io.h"
 
 static const char *TAG = "音频源";
 
@@ -16,6 +17,10 @@ static esp_err_t sd_file_read(void *context, void *buffer, size_t bytes, size_t 
         return ESP_ERR_INVALID_ARG;
     }
 
+    StorageSdLockGuard sd_lock;
+    if (!sd_lock.locked()) {
+        return ESP_ERR_TIMEOUT;
+    }
     *out_bytes = fread(buffer, 1, bytes, source->file);
     if (*out_bytes < bytes && ferror(source->file)) {
         return ESP_FAIL;
@@ -41,6 +46,10 @@ static esp_err_t sd_file_seek(void *context, int64_t offset, AudioSourceSeekOrig
         default: return ESP_ERR_INVALID_ARG;
     }
 
+    StorageSdLockGuard sd_lock;
+    if (!sd_lock.locked()) {
+        return ESP_ERR_TIMEOUT;
+    }
     if (fseek(source->file, static_cast<long>(offset), whence) != 0) {
         return ESP_FAIL;
     }
@@ -54,6 +63,10 @@ static esp_err_t sd_file_tell(void *context, uint64_t *out_position)
     SdFileAudioSource *source = static_cast<SdFileAudioSource *>(context);
     if (source == nullptr || source->file == nullptr || out_position == nullptr) {
         return ESP_ERR_INVALID_ARG;
+    }
+    StorageSdLockGuard sd_lock;
+    if (!sd_lock.locked()) {
+        return ESP_ERR_TIMEOUT;
     }
     const long position = ftell(source->file);
     if (position < 0) {
@@ -76,7 +89,11 @@ static esp_err_t sd_file_size(void *context, uint64_t *out_size)
 static bool sd_file_eof(void *context)
 {
     SdFileAudioSource *source = static_cast<SdFileAudioSource *>(context);
-    return source != nullptr && source->file != nullptr && feof(source->file) != 0;
+    if (source == nullptr || source->file == nullptr) {
+        return false;
+    }
+    StorageSdLockGuard sd_lock;
+    return sd_lock.locked() && feof(source->file) != 0;
 }
 
 static esp_err_t sd_file_close(void *context)
@@ -86,6 +103,10 @@ static esp_err_t sd_file_close(void *context)
         return ESP_ERR_INVALID_ARG;
     }
     if (source->file != nullptr) {
+        StorageSdLockGuard sd_lock;
+        if (!sd_lock.locked()) {
+            return ESP_ERR_TIMEOUT;
+        }
         fclose(source->file);
     }
     *source = {};
@@ -119,25 +140,32 @@ esp_err_t sd_file_audio_source_open(
     audio_source_close(out_source);
     *storage = {};
 
-    storage->file = fopen(path, "rb");
-    if (storage->file == nullptr) {
-        ESP_LOGE(TAG, "打开 SD 音频源失败：%s", path);
-        return ESP_ERR_NOT_FOUND;
-    }
+    {
+        StorageSdLockGuard sd_lock;
+        if (!sd_lock.locked()) {
+            return ESP_ERR_TIMEOUT;
+        }
 
-    if (fseek(storage->file, 0, SEEK_END) != 0) {
-        fclose(storage->file);
-        *storage = {};
-        return ESP_FAIL;
+        storage->file = fopen(path, "rb");
+        if (storage->file == nullptr) {
+            ESP_LOGE(TAG, "打开 SD 音频源失败：%s", path);
+            return ESP_ERR_NOT_FOUND;
+        }
+
+        if (fseek(storage->file, 0, SEEK_END) != 0) {
+            fclose(storage->file);
+            *storage = {};
+            return ESP_FAIL;
+        }
+        const long end = ftell(storage->file);
+        if (end <= 0 || fseek(storage->file, 0, SEEK_SET) != 0) {
+            fclose(storage->file);
+            *storage = {};
+            return ESP_ERR_INVALID_SIZE;
+        }
+        clearerr(storage->file);
+        storage->size_bytes = static_cast<uint64_t>(end);
     }
-    const long end = ftell(storage->file);
-    if (end <= 0 || fseek(storage->file, 0, SEEK_SET) != 0) {
-        fclose(storage->file);
-        *storage = {};
-        return ESP_ERR_INVALID_SIZE;
-    }
-    clearerr(storage->file);
-    storage->size_bytes = static_cast<uint64_t>(end);
 
     out_source->ops = &SD_FILE_OPS;
     out_source->context = storage;

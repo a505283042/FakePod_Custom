@@ -113,6 +113,23 @@ struct LyricsRefV2
     uint8_t reserved0 = 0;
 };
 
+// Stage 12.0：每首歌最多选择一个首选封面 locator。
+// Embedded source 使用 track 音频文件 + data_offset/data_size；ExternalFile 使用 path_off。
+struct ArtworkRefV2
+{
+    uint64_t data_offset = 0;
+    uint32_t data_size = 0;
+    uint32_t path_off = 0;
+    int64_t source_modified_time = 0;
+    uint32_t flags = MEDIA_ARTWORK_REF_NONE_V2;
+    uint16_t width = 0;
+    uint16_t height = 0;
+    MediaArtworkSourceV2 source = MediaArtworkSourceV2::None;
+    MediaArtworkFormatV2 format = MediaArtworkFormatV2::Unknown;
+    uint8_t picture_type = 0;
+    uint8_t reserved0 = 0;
+};
+
 struct AlbumRowV2
 {
     uint32_t title_off = 0;
@@ -141,6 +158,7 @@ struct TrackRowV2
     uint16_t reserved1 = 0;
 
     uint32_t album_id = MEDIA_CATALOG_INVALID_ID_V2;
+    uint32_t artwork_ref_id = MEDIA_CATALOG_INVALID_ID_V2;
 
     // Stage 10.2.2 冻结专辑排序/年代播放所需的基础 metadata schema。
     uint32_t metadata_flags = MEDIA_TRACK_META_NONE_V2;
@@ -164,11 +182,13 @@ struct MusicCatalogV2
     AlbumRowV2 *albums = nullptr;
     TrackArtistRefV2 *track_artist_refs = nullptr;
     LyricsRefV2 *lyrics_refs = nullptr;
+    ArtworkRefV2 *artwork_refs = nullptr;
     uint32_t track_count = 0;
     uint32_t artist_count = 0;
     uint32_t album_count = 0;
     uint32_t track_artist_ref_count = 0;
     uint32_t lyrics_ref_count = 0;
+    uint32_t artwork_ref_count = 0;
     uint32_t generation = 0;
     uint32_t source_crc32 = 0;
 
@@ -196,6 +216,14 @@ struct MediaTrackViewV2
     const char *title = nullptr;
     const char *artist = nullptr; // display_artist_off 的原始显示字符串。
     const char *album = nullptr;
+};
+
+struct MediaArtworkViewV2
+{
+    uint32_t generation = 0;
+    uint32_t track_index = MEDIA_CATALOG_INVALID_ID_V2;
+    const ArtworkRefV2 *ref = nullptr;
+    const char *external_path = nullptr;
 };
 
 struct MediaIndexRecord;
@@ -230,3 +258,6 @@ const char *media_catalog_v2_pool_str(const MusicCatalogV2 *catalog, uint32_t of
 
 // 从 TrackRow 复制稳定 POD 技术快照，供 Player/AudioTask 使用。
 bool media_catalog_v2_copy_technical(size_t index, MediaTechnicalInfo *out_info);
+
+// 获取当前首选封面 locator。没有封面返回 false；返回指针仅在 generation 未变化期间有效。
+bool media_catalog_v2_get_artwork_view(size_t index, MediaArtworkViewV2 *out_view);
