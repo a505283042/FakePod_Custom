@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include "esp_err.h"
+#include "audio_diag_config.h"
 
 // FLAC 解码器只负责“压缩数据 -> PCM”，不拥有 I2S、DAC 或播放状态。
 // 当前已进入 44.1~192kHz 受控实机验证；高采样率是否长期保留由实时预算和缓存水位决定。
@@ -37,6 +38,7 @@ struct FlacDecoder
     uint64_t total_frames = 0;
     uint64_t frames_read = 0;
 
+#if APP_DIAG_FLAC_PERFORMANCE
     // 仅保存少量累计计数，用于定位 SD 读取或 FLAC process 是否超过 I2S DMA 安全窗口。
     uint64_t perf_decode_total_us = 0;
     uint64_t perf_refill_total_us = 0;
@@ -69,10 +71,13 @@ struct FlacDecoder
     uint32_t perf_prefetch_starve_count = 0;
     size_t perf_prefetch_min_buffered_bytes = 0;
 
+#endif
+
     bool runtime_info_verified = false;
     bool eof = false;
 };
 
+#if APP_DIAG_FLAC_PERFORMANCE
 // FLAC 性能统计通过只读快照跨任务发布。AudioTask 只更新 POD 数值，
 // 长日志由系统 loopTask 输出，避免串口格式化阻塞实时解码路径。
 struct FlacPerfSnapshot
@@ -127,6 +132,8 @@ struct FlacPerfSnapshot
 
 // 获取最近一次由 AudioTask 发布的性能快照。
 bool flac_decoder_get_perf_snapshot(FlacPerfSnapshot *out_snapshot);
+
+#endif
 
 // AudioTask 启动时调用一次，只注册 FLAC 后端，不注册无关编解码器。
 esp_err_t flac_decoder_register_backend();

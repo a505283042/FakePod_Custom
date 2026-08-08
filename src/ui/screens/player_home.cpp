@@ -73,7 +73,7 @@ static void player_home_refresh_track(const AudioStateSnapshot *audio_snapshot)
             audio_snapshot->last_error == ESP_ERR_NOT_SUPPORTED
         ) {
             const MediaFormat format = player_state_get_format();
-            if (format == MediaFormat::WAV || format == MediaFormat::FLAC) {
+            if (format == MediaFormat::WAV || format == MediaFormat::FLAC || format == MediaFormat::MP3) {
                 snprintf(suffix, sizeof(suffix), "  · 参数暂不支持");
             } else {
                 snprintf(suffix, sizeof(suffix), "  · 解码器待接入");
@@ -267,7 +267,7 @@ void player_home_create(lv_obj_t *screen)
     g_last_audio_state_revision = snapshot.state_revision;
     lv_timer_create(player_home_audio_timer_cb, 100, nullptr);
 
-    ESP_LOGI(TAG, "Stage 9.3 播放器首页已接入 WAV/FLAC 统一 PCM Core 与进度快照，当前歌曲=%u/%u",
+    ESP_LOGI(TAG, "Stage 9.5.1 播放器首页已接入 WAV/FLAC/MP3 统一 PCM Core 与进度快照，当前歌曲=%u/%u",
         static_cast<unsigned>(media_library_get_count() > 0 ? player_state_get_index() + 1 : 0),
         static_cast<unsigned>(media_library_get_count()));
 }

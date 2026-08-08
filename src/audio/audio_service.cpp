@@ -42,7 +42,7 @@ static void audio_task_log_ram(const char *stage)
         static_cast<unsigned>(stack_hwm));
 }
 
-static constexpr uint32_t AUDIO_TASK_STACK_BYTES = 20480;
+static constexpr uint32_t AUDIO_TASK_STACK_BYTES = 12288;
 static constexpr UBaseType_t AUDIO_TASK_PRIORITY = 5;
 static constexpr BaseType_t AUDIO_TASK_CORE = 0;
 static constexpr UBaseType_t AUDIO_COMMAND_QUEUE_LENGTH = 8;
@@ -59,7 +59,7 @@ static constexpr TickType_t AUDIO_START_WAIT_TIMEOUT = pdMS_TO_TICKS(1500);
 
 // Stage 9.3 继续保持 Stage 8.3 已实机验证过的安全低音量：
 // CS43131 0.5Vrms 满量程 + PCM -40dB。后续再独立做用户音量系统。
-// AudioTask 当前保持 20KB；后续只依据实测 stack high-water mark 继续回收内部 RAM。
+// 192kHz 长时间实测显示 AudioTask 峰值栈使用约 5.3KB；先保守收敛到 12KB，仍保留超过一倍的观测余量。
 
 
 enum class AudioCommandType : uint8_t
@@ -118,7 +118,7 @@ static uint32_t g_pcm_fade_in_done_frames = 0;
 static bool g_pcm_fade_in_logged_done = true;
 
 // 正式播放资源也只属于 AudioTask。
-// WAV/FLAC 都通过统一 PcmDecoder 产出 32bit stereo PCM，I2S/DAC 不关心源格式。
+// WAV/FLAC/MP3 都通过统一 PcmDecoder 产出 32bit stereo PCM，I2S/DAC 不关心源格式。
 static PcmDecoder g_decoder = {};
 static bool g_pipeline_clock_prepared = false;
 static bool g_pipeline_i2s_started = false;
@@ -787,8 +787,10 @@ static void audio_task_handle_play(AudioRequest *request)
         decoder_type = PcmDecoderType::Wav;
     } else if (request->format == MediaFormat::FLAC) {
         decoder_type = PcmDecoderType::Flac;
+    } else if (request->format == MediaFormat::MP3) {
+        decoder_type = PcmDecoderType::Mp3;
     } else {
-        ESP_LOGW(TAG, "Stage 9.3 当前统一PCM Core 已接入 WAV/FLAC；%s 解码器尚未接入",
+        ESP_LOGW(TAG, "Stage 9.5.1 当前统一PCM Core 已接入 WAV/FLAC/MP3；%s 解码器尚未接入",
             media_library_format_name(request->format));
         audio_task_set_state(AudioPlaybackState::Error, ESP_ERR_NOT_SUPPORTED);
         audio_request_complete(request, false, ESP_ERR_NOT_SUPPORTED);

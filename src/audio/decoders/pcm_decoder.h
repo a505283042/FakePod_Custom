@@ -4,13 +4,15 @@
 #include <stdint.h>
 #include "esp_err.h"
 #include "flac_decoder.h"
+#include "mp3_decoder.h"
 #include "wav_decoder.h"
 
 enum class PcmDecoderType : uint8_t
 {
     None = 0,
     Wav,
-    Flac
+    Flac,
+    Mp3
 };
 
 struct PcmDecoderInfo
@@ -21,14 +23,15 @@ struct PcmDecoderInfo
     uint64_t total_frames = 0;
 };
 
-// AudioTask 唯一持有的统一解码器对象。后续 MP3 只需在这里增加后端，
-// AudioTask -> I2S -> CS43131 的 PCM 播放链路无需复制。
+// AudioTask 唯一持有的统一解码器对象。WAV/FLAC/MP3 后端都只产出 PCM，
+// AudioTask -> I2S -> CS43131 的播放链路不因源格式复制。
 struct PcmDecoder
 {
     PcmDecoderType type = PcmDecoderType::None;
     PcmDecoderInfo info = {};
     WavDecoder wav = {};
     FlacDecoder flac = {};
+    Mp3Decoder mp3 = {};
 };
 
 esp_err_t pcm_decoder_register_backends();

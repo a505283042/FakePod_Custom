@@ -23,6 +23,7 @@ idf_component_register(
         "audio/decoders/pcm_decoder.cpp"
         "audio/decoders/wav_decoder.cpp"
         "audio/decoders/flac_decoder.cpp"
+        "audio/decoders/mp3_decoder.cpp"
 
         "media/library/media_library.cpp"
 

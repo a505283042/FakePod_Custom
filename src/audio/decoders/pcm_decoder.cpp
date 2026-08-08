@@ -10,7 +10,11 @@ esp_err_t pcm_decoder_register_backends()
     // 真正选择 FLAC 时 open() 会再次尝试注册并返回明确错误。
     const esp_err_t flac_ret = flac_decoder_register_backend();
     if (flac_ret != ESP_OK) {
-        ESP_LOGW(TAG, "FLAC 后端暂未就绪：%s；WAV 播放仍可继续", esp_err_to_name(flac_ret));
+        ESP_LOGW(TAG, "FLAC 后端暂未就绪：%s；其他格式仍可继续", esp_err_to_name(flac_ret));
+    }
+    const esp_err_t mp3_ret = mp3_decoder_register_backend();
+    if (mp3_ret != ESP_OK) {
+        ESP_LOGW(TAG, "MP3 后端暂未就绪：%s；其他格式仍可继续", esp_err_to_name(mp3_ret));
     }
     return ESP_OK;
 }
@@ -40,6 +44,15 @@ esp_err_t pcm_decoder_open(PcmDecoder *decoder, PcmDecoderType type, const char 
                 decoder->info.channels = decoder->flac.channels;
                 decoder->info.bits_per_sample = decoder->flac.bits_per_sample;
                 decoder->info.total_frames = decoder->flac.total_frames;
+            }
+            break;
+        case PcmDecoderType::Mp3:
+            ret = mp3_decoder_open(&decoder->mp3, path);
+            if (ret == ESP_OK) {
+                decoder->info.sample_rate_hz = decoder->mp3.sample_rate_hz;
+                decoder->info.channels = decoder->mp3.channels;
+                decoder->info.bits_per_sample = decoder->mp3.bits_per_sample;
+                decoder->info.total_frames = decoder->mp3.total_frames;
             }
             break;
         default:
@@ -75,6 +88,8 @@ esp_err_t pcm_decoder_read_pcm32(
             return wav_decoder_read_pcm32(&decoder->wav, out_interleaved_stereo, max_frames, out_frames);
         case PcmDecoderType::Flac:
             return flac_decoder_read_pcm32(&decoder->flac, out_interleaved_stereo, max_frames, out_frames);
+        case PcmDecoderType::Mp3:
+            return mp3_decoder_read_pcm32(&decoder->mp3, out_interleaved_stereo, max_frames, out_frames);
         default:
             return ESP_ERR_INVALID_STATE;
     }
@@ -91,6 +106,9 @@ void pcm_decoder_close(PcmDecoder *decoder)
     if (flac_decoder_is_open(&decoder->flac)) {
         flac_decoder_close(&decoder->flac);
     }
+    if (mp3_decoder_is_open(&decoder->mp3)) {
+        mp3_decoder_close(&decoder->mp3);
+    }
     decoder->type = PcmDecoderType::None;
     decoder->info = {};
 }
@@ -105,6 +123,8 @@ bool pcm_decoder_is_open(const PcmDecoder *decoder)
             return wav_decoder_is_open(&decoder->wav);
         case PcmDecoderType::Flac:
             return flac_decoder_is_open(&decoder->flac);
+        case PcmDecoderType::Mp3:
+            return mp3_decoder_is_open(&decoder->mp3);
         default:
             return false;
     }
@@ -120,6 +140,8 @@ bool pcm_decoder_is_eof(const PcmDecoder *decoder)
             return wav_decoder_is_eof(&decoder->wav);
         case PcmDecoderType::Flac:
             return flac_decoder_is_eof(&decoder->flac);
+        case PcmDecoderType::Mp3:
+            return mp3_decoder_is_eof(&decoder->mp3);
         default:
             return false;
     }
@@ -135,6 +157,8 @@ uint64_t pcm_decoder_position_frames(const PcmDecoder *decoder)
             return decoder->wav.frames_read;
         case PcmDecoderType::Flac:
             return decoder->flac.frames_read;
+        case PcmDecoderType::Mp3:
+            return decoder->mp3.frames_read;
         default:
             return 0;
     }
@@ -145,6 +169,7 @@ const char *pcm_decoder_type_name(PcmDecoderType type)
     switch (type) {
         case PcmDecoderType::Wav: return "WAV";
         case PcmDecoderType::Flac: return "FLAC";
+        case PcmDecoderType::Mp3: return "MP3";
         default: return "NONE";
     }
 }

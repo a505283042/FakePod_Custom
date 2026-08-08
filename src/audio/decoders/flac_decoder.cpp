@@ -85,28 +85,30 @@ struct FlacPrefetchContext
     volatile bool stop_requested = false;
     volatile bool eof = false;
     volatile bool io_error = false;
+#if APP_DIAG_FLAC_PERFORMANCE
     volatile UBaseType_t stack_hwm = 0;
     uint64_t perf_read_total_us = 0;
     uint32_t perf_read_calls = 0;
     uint32_t perf_read_max_us = 0;
     uint32_t perf_read_over_10ms = 0;
+#endif
 };
 
 static bool g_flac_backend_registered = false;
+
+#if APP_DIAG_FLAC_PERFORMANCE
 static portMUX_TYPE g_flac_prefetch_metrics_mux = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_flac_perf_snapshot_mux = portMUX_INITIALIZER_UNLOCKED;
 static FlacPerfSnapshot g_flac_perf_snapshot = {};
 
-// 只累计耗时并每 5 秒发布一次轻量快照；真正日志由 loopTask 输出，
-// 避免 ESP_LOGI 的格式化和串口输出进入 AudioTask 实时路径。
+// FLAC 专项核查已通过，正式固件默认不编译这些计时/统计；需要性能回归时再打开。
 static constexpr uint32_t FLAC_PERF_REPORT_INTERVAL_US = 5000000U;
 static constexpr uint32_t FLAC_SLOW_READ_US = 10000U;
 static constexpr uint32_t FLAC_SLOW_DECODE_US = 20000U;
 static constexpr uint32_t FLAC_CRITICAL_DECODE_US = 40000U;
-// refill 阈值改为与固定 DMA 数量解耦：20ms 对 192kHz/4096 帧已经接近整块播放预算，
-// 30ms 则可提前暴露 96kHz 及更高采样率下的实时风险。
 static constexpr uint32_t FLAC_SLOW_REFILL_US = 20000U;
 static constexpr uint32_t FLAC_CRITICAL_REFILL_US = 30000U;
+#endif
 
 static FlacPrefetchContext *flac_prefetch_context(FlacDecoder *decoder)
 {
@@ -115,6 +117,7 @@ static FlacPrefetchContext *flac_prefetch_context(FlacDecoder *decoder)
         : nullptr;
 }
 
+#if APP_DIAG_FLAC_PERFORMANCE
 static void flac_perf_reset_runtime(FlacDecoder *decoder)
 {
     if (decoder == nullptr) {
@@ -305,9 +308,12 @@ bool flac_decoder_get_perf_snapshot(FlacPerfSnapshot *out_snapshot)
     return out_snapshot->sequence != 0;
 }
 
+#endif
+
 static uint8_t *flac_alloc_buffer(size_t size);
 static void flac_free_buffer(void *buffer);
 
+#if APP_DIAG_FLAC_PERFORMANCE
 static void flac_prefetch_record_read(FlacPrefetchContext *context, uint32_t read_us)
 {
     if (context == nullptr) {
@@ -326,6 +332,8 @@ static void flac_prefetch_record_read(FlacPrefetchContext *context, uint32_t rea
     portEXIT_CRITICAL(&g_flac_prefetch_metrics_mux);
 }
 
+#endif
+
 static void flac_prefetch_task(void *arg)
 {
     FlacPrefetchContext *context = static_cast<FlacPrefetchContext *>(arg);
@@ -337,7 +345,9 @@ static void flac_prefetch_task(void *arg)
     ) {
         if (context != nullptr) {
             context->io_error = true;
+#if APP_DIAG_FLAC_PERFORMANCE
             context->stack_hwm = uxTaskGetStackHighWaterMark(nullptr);
+#endif
             if (context->done != nullptr) {
                 xSemaphoreGive(context->done);
             }
@@ -349,7 +359,9 @@ static void flac_prefetch_task(void *arg)
     context->core_id = xPortGetCoreID();
     if (context->core_id != FLAC_PREFETCH_TASK_CORE) {
         context->io_error = true;
+#if APP_DIAG_FLAC_PERFORMANCE
         context->stack_hwm = uxTaskGetStackHighWaterMark(nullptr);
+#endif
         ESP_LOGE(TAG, "FLAC预取任务核心绑定异常：当前=%d，期望=%d",
             static_cast<int>(context->core_id),
             static_cast<int>(FLAC_PREFETCH_TASK_CORE));
@@ -366,11 +378,15 @@ static void flac_prefetch_task(void *arg)
         static_cast<unsigned>(FLAC_PREFETCH_TASK_STACK_BYTES),
         static_cast<unsigned>(context->read_chunk_bytes));
 
+#if APP_DIAG_FLAC_PERFORMANCE
     uint32_t stack_sample_counter = 0;
+#endif
     while (!context->stop_requested) {
+#if APP_DIAG_FLAC_PERFORMANCE
         if ((stack_sample_counter++ & 0x3FU) == 0U) {
             context->stack_hwm = uxTaskGetStackHighWaterMark(nullptr);
         }
+#endif
 
         const size_t free_bytes = xStreamBufferSpacesAvailable(context->stream);
         if (free_bytes < context->read_chunk_bytes) {
@@ -378,15 +394,19 @@ static void flac_prefetch_task(void *arg)
             continue;
         }
 
+#if APP_DIAG_FLAC_PERFORMANCE
         const int64_t read_begin_us = esp_timer_get_time();
+#endif
         const size_t bytes_read = fread(
             context->read_buffer,
             1,
             context->read_chunk_bytes,
             context->file
         );
+#if APP_DIAG_FLAC_PERFORMANCE
         const uint32_t read_us = static_cast<uint32_t>(esp_timer_get_time() - read_begin_us);
         flac_prefetch_record_read(context, read_us);
+#endif
 
         if (bytes_read > 0) {
             size_t sent = 0;
@@ -412,7 +432,9 @@ static void flac_prefetch_task(void *arg)
         }
     }
 
+#if APP_DIAG_FLAC_PERFORMANCE
     context->stack_hwm = uxTaskGetStackHighWaterMark(nullptr);
+#endif
     if (context->done != nullptr) {
         xSemaphoreGive(context->done);
     }
@@ -898,8 +920,10 @@ static esp_err_t flac_prepare_input_window(FlacDecoder *decoder, bool *out_recei
             decoder->input_buffer + decoder->input_offset,
             remaining
         );
+#if APP_DIAG_FLAC_PERFORMANCE
         ++decoder->perf_input_compact_calls;
         decoder->perf_input_compact_bytes += remaining;
+#endif
         decoder->input_offset = 0;
         decoder->input_size = remaining;
     } else if (remaining == 0) {
@@ -908,6 +932,7 @@ static esp_err_t flac_prepare_input_window(FlacDecoder *decoder, bool *out_recei
     }
 
     while ((decoder->input_size - decoder->input_offset) < target) {
+#if APP_DIAG_FLAC_PERFORMANCE
         const size_t buffered_before = xStreamBufferBytesAvailable(context->stream);
         if (
             decoder->perf_prefetch_wait_calls == 0 ||
@@ -915,14 +940,17 @@ static esp_err_t flac_prepare_input_window(FlacDecoder *decoder, bool *out_recei
         ) {
             decoder->perf_prefetch_min_buffered_bytes = buffered_before;
         }
+#endif
 
         // 已经保留有可用压缩数据时，补窗只是优化，不为等待更多数据阻塞 AudioTask。
         // 只有输入完全耗尽时才允许按当前 FLAC 块预算等待预取任务。
         const size_t available_now = decoder->input_size - decoder->input_offset;
         const bool must_wait = available_now == 0 && !context->eof;
+#if APP_DIAG_FLAC_PERFORMANCE
         if (must_wait && buffered_before == 0) {
             ++decoder->perf_prefetch_starve_count;
         }
+#endif
         const TickType_t receive_wait = must_wait
             ? flac_prefetch_receive_wait(decoder)
             : 0;
@@ -941,13 +969,16 @@ static esp_err_t flac_prepare_input_window(FlacDecoder *decoder, bool *out_recei
             return ESP_ERR_INVALID_SIZE;
         }
 
+#if APP_DIAG_FLAC_PERFORMANCE
         const int64_t wait_begin_us = esp_timer_get_time();
+#endif
         const size_t received = xStreamBufferReceive(
             context->stream,
             decoder->input_buffer + decoder->input_size,
             receive_capacity,
             receive_wait
         );
+#if APP_DIAG_FLAC_PERFORMANCE
         const uint32_t wait_us = static_cast<uint32_t>(esp_timer_get_time() - wait_begin_us);
         decoder->perf_prefetch_wait_total_us += wait_us;
         ++decoder->perf_prefetch_wait_calls;
@@ -957,14 +988,17 @@ static esp_err_t flac_prepare_input_window(FlacDecoder *decoder, bool *out_recei
         if (wait_us >= 2000U) {
             ++decoder->perf_prefetch_wait_over_2ms;
         }
+#endif
 
         if (received > 0) {
             decoder->input_size += received;
+#if APP_DIAG_FLAC_PERFORMANCE
             decoder->perf_input_topup_bytes += received;
             ++decoder->perf_input_topup_calls;
             if (received > decoder->perf_input_topup_max_bytes) {
                 decoder->perf_input_topup_max_bytes = static_cast<uint32_t>(received);
             }
+#endif
             if (out_received != nullptr) {
                 *out_received = true;
             }
@@ -1004,18 +1038,24 @@ static esp_err_t flac_decode_next_output(FlacDecoder *decoder)
         return ESP_ERR_INVALID_ARG;
     }
 
+#if APP_DIAG_FLAC_PERFORMANCE
     const int64_t refill_begin_us = esp_timer_get_time();
-    decoder->decoded_offset = 0;
-    decoder->decoded_size = 0;
     uint32_t refill_process_calls = 0;
     uint32_t refill_input_fills = 0;
+#endif
+    decoder->decoded_offset = 0;
+    decoder->decoded_size = 0;
 
     while (!decoder->eof) {
+#if APP_DIAG_FLAC_PERFORMANCE
         bool input_received = false;
         esp_err_t ret = flac_prepare_input_window(decoder, &input_received);
         if (input_received && ret == ESP_OK) {
             ++refill_input_fills;
         }
+#else
+        esp_err_t ret = flac_prepare_input_window(decoder, nullptr);
+#endif
         if (ret != ESP_OK || decoder->eof) {
             return ret;
         }
@@ -1029,13 +1069,16 @@ static esp_err_t flac_decode_next_output(FlacDecoder *decoder)
         out.buffer = decoder->decoded_buffer;
         out.len = static_cast<uint32_t>(decoder->decoded_capacity);
 
+#if APP_DIAG_FLAC_PERFORMANCE
         const int64_t decode_begin_us = esp_timer_get_time();
         ++refill_process_calls;
+#endif
         esp_audio_err_t codec_ret = esp_audio_simple_dec_process(
             static_cast<esp_audio_simple_dec_handle_t>(decoder->simple_handle),
             &raw,
             &out
         );
+#if APP_DIAG_FLAC_PERFORMANCE
         const uint32_t decode_us = static_cast<uint32_t>(esp_timer_get_time() - decode_begin_us);
         decoder->perf_decode_total_us += decode_us;
         ++decoder->perf_decode_calls;
@@ -1048,6 +1091,7 @@ static esp_err_t flac_decode_next_output(FlacDecoder *decoder)
         if (decode_us >= FLAC_CRITICAL_DECODE_US) {
             ++decoder->perf_decode_over_40ms;
         }
+#endif
         if (codec_ret == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
             if (out.needed_size == 0 || out.needed_size > FLAC_MAX_DECODED_BUFFER_BYTES) {
                 ESP_LOGE(TAG, "FLAC 解码器请求异常输出缓冲：%lu字节",
@@ -1080,6 +1124,7 @@ static esp_err_t flac_decode_next_output(FlacDecoder *decoder)
             decoder->decoded_size = out.decoded_size;
             decoder->decoded_offset = 0;
 
+#if APP_DIAG_FLAC_PERFORMANCE
             const uint32_t refill_us = static_cast<uint32_t>(
                 esp_timer_get_time() - refill_begin_us
             );
@@ -1128,6 +1173,7 @@ static esp_err_t flac_decode_next_output(FlacDecoder *decoder)
             // refill 计时到这里已经结束；性能快照发布放在计时之后，
             // 避免诊断逻辑污染真实解码峰值。
             flac_perf_maybe_publish(decoder, static_cast<uint64_t>(esp_timer_get_time()));
+#endif
             return ESP_OK;
         }
 
@@ -1318,9 +1364,11 @@ esp_err_t flac_decoder_open(FlacDecoder *decoder, const char *path)
         return ESP_ERR_INVALID_SIZE;
     }
 
+#if APP_DIAG_FLAC_PERFORMANCE
     // 首块 PCM 是在 I2S 启动前预解码的，不会造成播放期 DMA 欠料。
     // 运行期统计从正式播放开始重新计数，避免把首块预热耗时误判成 underrun 根因。
     flac_perf_reset_runtime(decoder);
+#endif
 
     const FlacPrefetchContext *ready_prefetch = flac_prefetch_context(decoder);
     ESP_LOGI(TAG, "FLAC流式解码已就绪：解码输入=%uB，预取环形=%uKB，PCM缓冲=%uB，首块PCM=%uB，优先使用PSRAM",
@@ -1419,10 +1467,12 @@ void flac_decoder_close(FlacDecoder *decoder)
     flac_free_buffer(decoder->input_buffer);
     flac_free_buffer(decoder->decoded_buffer);
 
+#if APP_DIAG_FLAC_PERFORMANCE
     portENTER_CRITICAL(&g_flac_perf_snapshot_mux);
     g_flac_perf_snapshot.active = false;
     ++g_flac_perf_snapshot.sequence;
     portEXIT_CRITICAL(&g_flac_perf_snapshot_mux);
+#endif
 
     *decoder = {};
 }
