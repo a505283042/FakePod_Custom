@@ -2,6 +2,7 @@
 
 #include <string.h>
 #include "esp_log.h"
+#include "app_diag_config.h"
 
 static const char *TAG = "WAV";
 static constexpr size_t WAV_READ_FRAMES_MAX = 256;
@@ -219,12 +220,14 @@ esp_err_t wav_decoder_open(WavDecoder *decoder, AudioSource *source)
         return bounds_ret;
     }
 
+#if APP_DIAG_AUDIO_CODEC
     ESP_LOGI(TAG, "WAV解析成功：%luHz / %ubit / %u声道，PCM=%lu字节，总帧=%llu",
         static_cast<unsigned long>(decoder->sample_rate_hz),
         static_cast<unsigned>(decoder->bits_per_sample),
         static_cast<unsigned>(decoder->channels),
         static_cast<unsigned long>(decoder->data_size_bytes),
         static_cast<unsigned long long>(decoder->total_frames));
+#endif
     return ESP_OK;
 }
 
@@ -328,10 +331,12 @@ esp_err_t wav_decoder_seek_frame(WavDecoder *decoder, uint64_t target_frame, uin
     if (out_frame != nullptr) {
         *out_frame = target_frame;
     }
+#if APP_DIAG_AUDIO_SEEK
     ESP_LOGI(TAG, "SEEK_TRACE: WAV exact frame=%llu/%llu byte=%llu",
         static_cast<unsigned long long>(target_frame),
         static_cast<unsigned long long>(decoder->total_frames),
         static_cast<unsigned long long>(byte_offset));
+#endif
     return ESP_OK;
 }
 

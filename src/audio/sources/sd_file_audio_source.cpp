@@ -1,4 +1,5 @@
 #include "sd_file_audio_source.h"
+#include "app_diag_config.h"
 
 #include <limits.h>
 #include "esp_log.h"
@@ -149,9 +150,11 @@ esp_err_t sd_file_audio_source_open(
         AUDIO_SOURCE_CAP_RANDOM_ACCESS;
     out_source->stats = {};
 
+#if APP_DIAG_AUDIO_SOURCE
     ESP_LOGI(TAG,
         "SOURCE_TRACE: OPEN type=SD_FILE size=%llu caps=READ|SEEK|TELL|SIZE|EOF|RANDOM path=%s",
         static_cast<unsigned long long>(storage->size_bytes),
         path);
+#endif
     return ESP_OK;
 }

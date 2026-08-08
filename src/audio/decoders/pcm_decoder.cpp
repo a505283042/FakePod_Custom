@@ -1,6 +1,7 @@
 #include "pcm_decoder.h"
 
 #include "esp_log.h"
+#include "app_diag_config.h"
 
 static const char *TAG = "PCM解码";
 
@@ -75,12 +76,14 @@ esp_err_t pcm_decoder_open(
     }
 
     decoder->type = type;
+#if APP_DIAG_AUDIO_CODEC
     ESP_LOGI(TAG, "统一PCM解码器已打开：格式=%s %luHz/%ubit/%u声道，总帧=%llu",
         pcm_decoder_type_name(type),
         static_cast<unsigned long>(decoder->info.sample_rate_hz),
         static_cast<unsigned>(decoder->info.bits_per_sample),
         static_cast<unsigned>(decoder->info.channels),
         static_cast<unsigned long long>(decoder->info.total_frames));
+#endif
     return ESP_OK;
 }
 
@@ -122,6 +125,7 @@ void pcm_decoder_close(PcmDecoder *decoder)
 
     // FLAC close 会先停止 Core1 PrefetchTask；确认所有 Codec 都不再访问 Source 后，最后关闭底层文件。
     if (audio_source_is_open(&decoder->source)) {
+#if APP_DIAG_AUDIO_SOURCE
         const AudioSourceStats *stats = audio_source_stats(&decoder->source);
         ESP_LOGI(TAG,
             "SOURCE_TRACE: CLOSE type=%s reads=%lu bytes=%llu seeks=%lu tells=%lu",
@@ -130,6 +134,7 @@ void pcm_decoder_close(PcmDecoder *decoder)
             static_cast<unsigned long long>(stats != nullptr ? stats->bytes_read : 0ULL),
             static_cast<unsigned long>(stats != nullptr ? stats->seek_calls : 0U),
             static_cast<unsigned long>(stats != nullptr ? stats->tell_calls : 0U));
+#endif
         audio_source_close(&decoder->source);
     }
     decoder->sd_file_source = {};
@@ -188,22 +193,19 @@ esp_err_t pcm_decoder_seek_frame(
         }
 
         case PcmDecoderType::Flac:
-            // 当前乐鑫 FLAC Simple Decoder 没有公开 PCM-frame seek API。
-            // frame=0 可通过在同一 Source 上重建 codec 精确回到曲首；非零 seek 等 SEEKTABLE
-            // + synthetic-header 路径完成实机验证后再开放，避免未经验证地从原始 frame 中途喂 parser。
-            if (target_frame == 0) {
-                AudioSource *source = &decoder->source;
-                AudioDecodeWorkspace *workspace = decoder->flac.workspace;
-                ret = flac_decoder_open(&decoder->flac, source, workspace);
-                if (ret == ESP_OK) {
-                    decoder->info.sample_rate_hz = decoder->flac.sample_rate_hz;
-                    decoder->info.channels = decoder->flac.channels;
-                    decoder->info.bits_per_sample = decoder->flac.bits_per_sample;
-                    decoder->info.total_frames = decoder->flac.total_frames;
-                    actual_frame = 0;
-                    source_offset = decoder->flac.flac_offset_bytes;
-                    method = PcmSeekMethod::RestartFromBeginning;
-                }
+            ret = flac_decoder_seek_frame(
+                &decoder->flac,
+                target_frame,
+                &actual_frame,
+                &source_offset);
+            if (ret == ESP_OK) {
+                decoder->info.sample_rate_hz = decoder->flac.sample_rate_hz;
+                decoder->info.channels = decoder->flac.channels;
+                decoder->info.bits_per_sample = decoder->flac.bits_per_sample;
+                decoder->info.total_frames = decoder->flac.total_frames;
+                method = target_frame == 0
+                    ? PcmSeekMethod::RestartFromBeginning
+                    : PcmSeekMethod::FlacSeektable;
             }
             break;
 
@@ -220,14 +222,17 @@ esp_err_t pcm_decoder_seek_frame(
     return ret;
 }
 
-bool pcm_decoder_seek_supported(PcmDecoderType type, uint64_t target_frame)
+bool pcm_decoder_seek_supported(const PcmDecoder *decoder, uint64_t target_frame)
 {
-    switch (type) {
+    if (decoder == nullptr || !pcm_decoder_is_open(decoder)) {
+        return false;
+    }
+    switch (decoder->type) {
         case PcmDecoderType::Wav:
         case PcmDecoderType::Mp3:
             return true;
         case PcmDecoderType::Flac:
-            return target_frame == 0;
+            return target_frame == 0 || flac_decoder_has_seektable(&decoder->flac);
         default:
             return false;
     }
@@ -302,6 +307,7 @@ const char *pcm_seek_method_name(PcmSeekMethod method)
         case PcmSeekMethod::Mp3Vbri: return "MP3_VBRI";
         case PcmSeekMethod::Mp3CbrLinear: return "MP3_CBR_LINEAR";
         case PcmSeekMethod::Mp3VbrLinearFallback: return "MP3_VBR_LINEAR";
+        case PcmSeekMethod::FlacSeektable: return "FLAC_SEEKTABLE";
         case PcmSeekMethod::RestartFromBeginning: return "RESTART_BEGIN";
         default: return "NONE";
     }

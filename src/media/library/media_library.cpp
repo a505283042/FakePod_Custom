@@ -17,13 +17,16 @@
 #include "media_catalog_store_v2.h"
 #include "media_probe.h"
 #include "media_metadata.h"
+#include "app_diag_config.h"
 
 static const char *TAG = "音乐库";
 static constexpr const char *MUSIC_ROOT = "/sdcard/MUSIC";
 static constexpr size_t INITIAL_ENTRY_CAPACITY = 128;
 static constexpr size_t INITIAL_PATH_CAPACITY = 16 * 1024;
 static constexpr size_t INITIAL_DIR_CAPACITY = 16;
+#if APP_DIAG_LIBRARY_ITEMS || APP_DIAG_LIBRARY_METADATA
 static constexpr size_t LOG_TRACK_LIMIT = 10;
+#endif
 
 using MediaEntry = MediaIndexRecord;
 
@@ -517,6 +520,7 @@ esp_err_t media_library_scan()
                         break;
                     }
                     format_count[static_cast<size_t>(format)]++;
+#if APP_DIAG_LIBRARY_ITEMS
                     if (g_entry_count <= LOG_TRACK_LIMIT) {
                         const MediaMetadataBuildV2 *meta = g_entries[g_entry_count - 1].metadata_build;
                         ESP_LOGI(TAG, "发现歌曲[%u] %s [%s] index=%s metadata=%s rate=%luHz offset=%llu",
@@ -527,6 +531,11 @@ esp_err_t media_library_scan()
                             metadata_reused ? "复用" : (meta != nullptr ? "新解析" : "基础"),
                             static_cast<unsigned long>(technical.sample_rate_hz),
                             static_cast<unsigned long long>(technical.audio_data_offset));
+                    }
+#endif
+#if APP_DIAG_LIBRARY_METADATA
+                    if (g_entry_count <= LOG_TRACK_LIMIT) {
+                        const MediaMetadataBuildV2 *meta = g_entries[g_entry_count - 1].metadata_build;
                         if (meta != nullptr && (meta->metadata_flags & MEDIA_TRACK_META_SCANNED_V2) != 0U) {
                             ESP_LOGI(TAG, "META_TRACE[%u]: title=%s artist=%s album=%s track=%u/%u disc=%u/%u year=%u original=%u artists=%u lyrics=%u",
                                 static_cast<unsigned>(g_entry_count),
@@ -543,6 +552,7 @@ esp_err_t media_library_scan()
                                 static_cast<unsigned>(meta->lyrics_count));
                         }
                     }
+#endif
                 }
             }
             heap_caps_free(full_path);

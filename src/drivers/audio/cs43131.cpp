@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "board_pins.h"
 #include "i2c_bus.h"
+#include "app_diag_config.h"
 #include "../../audio/audio_rate_profile.h"
 
 static const char *TAG = "DAC";
@@ -222,8 +223,10 @@ esp_err_t cs43131_prepare_pcm_playback_32bit(uint32_t sample_rate_hz)
         return ESP_ERR_NOT_SUPPORTED;
     }
 
+#if APP_DIAG_AUDIO_POP
     ESP_LOGI(TAG, "正在准备 CS43131 ASP：%luHz / I2S / 32bit slot / Slave",
         static_cast<unsigned long>(sample_rate_hz));
+#endif
 
     // 先读取一次中断状态，清除上电阶段可能残留的 sticky 状态。
     uint8_t status1 = 0;
@@ -272,7 +275,9 @@ esp_err_t cs43131_prepare_pcm_playback_32bit(uint32_t sample_rate_hz)
         return ret;
     }
 
+#if APP_DIAG_AUDIO_POP
     ESP_LOGI(TAG, "XTAL配置：BIAS=0x06，MASK1=0x%02X，POWER_DOWN=0x%02X", mask1, power);
+#endif
 
     // XTAL_READY/XTAL_ERROR 为 sticky 状态。轮询最多 20ms，
     // 比数据手册给出的启动时间留出更充分裕量。
@@ -297,7 +302,9 @@ esp_err_t cs43131_prepare_pcm_playback_32bit(uint32_t sample_rate_hz)
 
         if ((status1 & 0x10) != 0) {
             xtal_ready = true;
+#if APP_DIAG_AUDIO_POP
             ESP_LOGI(TAG, "24.576MHz 晶振已就绪：等待=%dms，INT_STATUS1=0x%02X", attempt + 1, status1);
+#endif
             break;
         }
     }
@@ -352,9 +359,11 @@ esp_err_t cs43131_prepare_pcm_playback_32bit(uint32_t sample_rate_hz)
         }
     }
 
+#if APP_DIAG_AUDIO_POP
     ESP_LOGI(TAG, "CS43131 ASP 参数配置完成：采样率=%luHz，ASP_SPRATE=0x%02X，当前仍保持 PDN_ASP=1、PDN_HP=1",
         static_cast<unsigned long>(sample_rate_hz),
         static_cast<unsigned>(sample_rate_reg));
+#endif
     return ESP_OK;
 }
 
@@ -383,7 +392,9 @@ esp_err_t cs43131_enable_asp_input()
         return ret;
     }
 
+#if APP_DIAG_AUDIO_POP
     ESP_LOGI(TAG, "ASP 输入已开启：POWER_DOWN=0x%02X，耳放仍保持关闭", power);
+#endif
     return ESP_OK;
 }
 
@@ -402,7 +413,9 @@ esp_err_t cs43131_prepare_headphone_playback_low_volume()
         return ESP_ERR_INVALID_STATE;
     }
 
+#if APP_DIAG_AUDIO_POP
     ESP_LOGI(TAG, "正在配置低音量 PCM 耳放输出：0.5Vrms满量程，PCM数字音量=-20dB");
+#endif
 
     struct RegValue {
         uint32_t reg;
@@ -462,7 +475,9 @@ esp_err_t cs43131_prepare_headphone_playback_low_volume()
         return ret;
     }
 
+#if APP_DIAG_AUDIO_POP
     ESP_LOGI(TAG, "耳放 pop-free 上电完成：POWER_DOWN=0x%02X，PCM仍保持手动静音", power);
+#endif
     return ESP_OK;
 }
 
@@ -477,10 +492,12 @@ esp_err_t cs43131_set_pcm_volume_attenuation(uint8_t half_db_steps)
         ret = cs43131_write_reg(REG_PCM_VOLUME_A, half_db_steps);
     }
     if (ret == ESP_OK) {
+#if APP_DIAG_AUDIO_POP
         ESP_LOGI(TAG, "PCM数字音量：衰减=%u.%udB，寄存器=0x%02X",
             static_cast<unsigned>(half_db_steps / 2U),
             static_cast<unsigned>((half_db_steps & 1U) ? 5U : 0U),
             half_db_steps);
+#endif
     }
     return ret;
 }
@@ -494,7 +511,9 @@ esp_err_t cs43131_set_pcm_mute(bool mute)
     const uint8_t value = mute ? PCM_PATH_SOFT_RAMP_MUTED : PCM_PATH_SOFT_RAMP_UNMUTED;
     esp_err_t ret = cs43131_write_reg(REG_PCM_PATH_CONTROL_1, value);
     if (ret == ESP_OK) {
+#if APP_DIAG_AUDIO_POP
         ESP_LOGI(TAG, "PCM输出：%s，路径控制=0x%02X", mute ? "静音" : "解除静音", value);
+#endif
     }
     return ret;
 }
@@ -549,7 +568,9 @@ esp_err_t cs43131_power_down_headphone_playback()
         last_status = status1;
         if ((status1 & 0x01) != 0) {
             pdn_done = true;
+#if APP_DIAG_AUDIO_POP
             ESP_LOGI(TAG, "耳放掉电完成：等待=%dms，INT_STATUS1=0x%02X", attempt + 1, status1);
+#endif
             break;
         }
     }
@@ -573,7 +594,9 @@ esp_err_t cs43131_power_down_headphone_playback()
         return ret;
     }
 
+#if APP_DIAG_AUDIO_POP
     ESP_LOGI(TAG, "耳放与ASP已安全关闭：POWER_DOWN=0x%02X", power);
+#endif
     return ESP_OK;
 }
 
@@ -610,7 +633,9 @@ esp_err_t cs43131_finish_pcm_playback()
         return ret;
     }
 
+#if APP_DIAG_AUDIO_POP
     ESP_LOGI(TAG, "PCM播放链路已关闭：ASP和XTAL已关闭，当前POWER_DOWN=0x%02X", power);
+#endif
     return ESP_OK;
 }
 

@@ -557,9 +557,11 @@ static esp_err_t mp3_resize_decoded_buffer(Mp3Decoder *decoder, size_t requested
     decoder->decoded_capacity = requested;
     decoder->decoded_offset = 0;
     decoder->decoded_size = 0;
+#if APP_DIAG_AUDIO_CODEC
     ESP_LOGI(TAG, "MP3 PCM 输出缓冲调整为 %u 字节（shared=%u）",
         static_cast<unsigned>(requested),
         static_cast<unsigned>(decoder->workspace != nullptr));
+#endif
     return ESP_OK;
 }
 
@@ -669,11 +671,13 @@ static esp_err_t mp3_verify_runtime_info(Mp3Decoder *decoder)
         return mp3_audio_error_to_esp(codec_ret);
     }
 
+#if APP_DIAG_AUDIO_CODEC
     ESP_LOGI(TAG, "乐鑫 MP3 解码输出：%luHz / %ubit / %u声道，bitrate=%lu",
         static_cast<unsigned long>(info.sample_rate),
         static_cast<unsigned>(info.bits_per_sample),
         static_cast<unsigned>(info.channel),
         static_cast<unsigned long>(info.bitrate));
+#endif
 
     if ((info.sample_rate != 44100U && info.sample_rate != 48000U) ||
         !audio_rate_profile_get(info.sample_rate, nullptr)) {
@@ -1052,6 +1056,7 @@ esp_err_t mp3_decoder_seek_frame(
     if (out_frame != nullptr) *out_frame = decoder->frames_read;
     if (out_source_offset != nullptr) *out_source_offset = sync_offset;
     if (out_method != nullptr) *out_method = method;
+#if APP_DIAG_AUDIO_SEEK
     ESP_LOGI(TAG,
         "SEEK_TRACE: MP3 method=%u requested=%llu base=%llu actual=%llu estimate=%llu sync=%llu preroll=%llums",
         static_cast<unsigned>(method),
@@ -1061,6 +1066,7 @@ esp_err_t mp3_decoder_seek_frame(
         static_cast<unsigned long long>(estimate),
         static_cast<unsigned long long>(sync_offset),
         static_cast<unsigned long long>(MP3_SEEK_PREROLL_MS));
+#endif
     return ESP_OK;
 }
 
@@ -1183,11 +1189,13 @@ esp_err_t mp3_decoder_open(Mp3Decoder *decoder, AudioSource *source, AudioDecode
     mp3_perf_reset_runtime(decoder);
 #endif
 
+#if APP_DIAG_AUDIO_CODEC
     ESP_LOGI(TAG, "MP3流式解码已就绪：文件=%lluB，输入缓冲=%uB，PCM缓冲=%uB，首块PCM=%uB，工作区使用PSRAM",
         static_cast<unsigned long long>(decoder->file_size_bytes),
         static_cast<unsigned>(decoder->input_capacity),
         static_cast<unsigned>(decoder->decoded_capacity),
         static_cast<unsigned>(decoder->decoded_size));
+#endif
     return ESP_OK;
 }
 

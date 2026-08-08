@@ -7,6 +7,7 @@
 #include "media_catalog_v2.h"
 #include "media_groups_v2.h"
 #include "media_library.h"
+#include "app_diag_config.h"
 
 static const char *TAG = "播放列表";
 
@@ -152,6 +153,7 @@ static void playlist_log_selection(const char *action)
         ESP_LOGW(TAG, "%s后列表已失效", action != nullptr ? action : "选择");
         return;
     }
+#if APP_DIAG_PLAYER_PLAYLIST
     ESP_LOGI(TAG, "%s：类型=%s group=%lu 位置=%lu/%lu track=%lu generation=%lu",
         action != nullptr ? action : "选择",
         player_playlist_type_name(snapshot.type),
@@ -160,6 +162,9 @@ static void playlist_log_selection(const char *action)
         static_cast<unsigned long>(snapshot.track_count),
         static_cast<unsigned long>(snapshot.track_index),
         static_cast<unsigned long>(snapshot.catalog_generation));
+#else
+    (void)action;
+#endif
 }
 
 static bool playlist_bind_base(PlayerListType type, size_t group_index, size_t position)
@@ -257,12 +262,14 @@ esp_err_t player_playlist_init()
     if (!player_playlist_bind_all(0U)) {
         return ESP_FAIL;
     }
+#if APP_DIAG_PLAYER_PLAYLIST
     ESP_LOGI(TAG, "PLAYLIST_TRACE: READY generation=%lu all=%u artist_groups=%u album_groups=%u decade_groups=%u",
         static_cast<unsigned long>(media_catalog_v2_generation()),
         static_cast<unsigned>(media_library_get_count()),
         static_cast<unsigned>(media_groups_v2_artist_count()),
         static_cast<unsigned>(media_groups_v2_album_count()),
         static_cast<unsigned>(media_groups_v2_decade_count()));
+#endif
     return ESP_OK;
 }
 

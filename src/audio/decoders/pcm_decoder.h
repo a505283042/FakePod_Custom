@@ -28,6 +28,7 @@ enum class PcmSeekMethod : uint8_t
     Mp3Vbri,
     Mp3CbrLinear,
     Mp3VbrLinearFallback,
+    FlacSeektable,
     RestartFromBeginning,
 };
 
@@ -78,7 +79,7 @@ esp_err_t pcm_decoder_read_pcm32(
 void pcm_decoder_close(PcmDecoder *decoder);
 bool pcm_decoder_is_open(const PcmDecoder *decoder);
 // 在 I2S/DAC 尚未重新启动前执行 codec 定位。WAV 为帧精确；MP3 使用 Xing/VBRI/线性估算后做 MPEG 帧重同步；
-// 当前 FLAC 仅保证 frame=0 的安全重启，非零 seek 在验证 SEEKTABLE + 乐鑫 decoder 重入语义前明确返回 NOT_SUPPORTED。
+// FLAC 在存在有效 SEEKTABLE 时用 seekpoint 粗定位，再通过 PCM discard 精确落到目标帧。
 esp_err_t pcm_decoder_seek_frame(
     PcmDecoder *decoder,
     uint64_t target_frame,
@@ -86,7 +87,8 @@ esp_err_t pcm_decoder_seek_frame(
     PcmSeekResult *out_result
 );
 
-bool pcm_decoder_seek_supported(PcmDecoderType type, uint64_t target_frame);
+// 查询当前已打开实例是否能执行目标 Seek。FLAC 非零 Seek 需要当前文件存在有效 SEEKTABLE。
+bool pcm_decoder_seek_supported(const PcmDecoder *decoder, uint64_t target_frame);
 bool pcm_decoder_is_eof(const PcmDecoder *decoder);
 uint64_t pcm_decoder_position_frames(const PcmDecoder *decoder);
 const char *pcm_decoder_type_name(PcmDecoderType type);

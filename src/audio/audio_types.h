@@ -43,8 +43,8 @@ struct AudioStateSnapshot
     uint64_t position_ms = 0;
     uint64_t total_frames = 0;
 
-    // Seek 只由 AudioTask 串行执行。seek_supported 表示当前格式已开放任意位置 seek；
-    // seek_revision 每次成功定位递增，便于 UI/恢复层识别新的时间轴。
+    // Seek 只由 AudioTask 串行执行。seek_supported 表示当前文件已开放任意位置 seek；
+    // FLAC 只有存在有效 SEEKTABLE 时才为 true。seek_revision 每次成功定位递增。
     bool seek_supported = false;
     uint32_t seek_revision = 0;
     uint32_t last_seek_request_id = 0;

@@ -1,4 +1,5 @@
 #include "audio_source.h"
+#include "app_diag_config.h"
 
 static bool audio_source_has_ops(const AudioSource *source)
 {
@@ -37,8 +38,10 @@ esp_err_t audio_source_read(
     }
 
     const esp_err_t ret = source->ops->read(source->context, buffer, bytes, out_bytes);
+#if APP_DIAG_AUDIO_SOURCE
     ++source->stats.read_calls;
     source->stats.bytes_read += *out_bytes;
+#endif
     return ret;
 }
 
@@ -55,7 +58,9 @@ esp_err_t audio_source_seek(
     }
 
     const esp_err_t ret = source->ops->seek(source->context, offset, origin);
+#if APP_DIAG_AUDIO_SOURCE
     ++source->stats.seek_calls;
+#endif
     return ret;
 }
 
@@ -72,7 +77,9 @@ esp_err_t audio_source_tell(AudioSource *source, uint64_t *out_position)
     }
 
     const esp_err_t ret = source->ops->tell(source->context, out_position);
+#if APP_DIAG_AUDIO_SOURCE
     ++source->stats.tell_calls;
+#endif
     return ret;
 }
 

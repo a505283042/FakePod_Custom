@@ -30,6 +30,19 @@ struct FlacDecoder
 
     uint64_t file_size_bytes = 0;
     uint64_t flac_offset_bytes = 0;
+    // 第一帧真实 FLAC 音频相对整个文件的绝对偏移；SEEKTABLE.stream_offset 以此为基准。
+    uint64_t audio_data_offset_bytes = 0;
+    uint64_t seektable_offset_bytes = 0;
+    uint32_t seektable_length_bytes = 0;
+    // 保留原始 STREAMINFO payload，用于非零 seek 时合成最小合法 FLAC 头。
+    uint8_t streaminfo_payload[34] = {};
+
+    // Prefetch 默认从原始 fLaC marker 开始。非零 seek 时先向 ring 注入合成头，
+    // 再从选中的真实 seekpoint 继续读取底层 Source。
+    uint64_t prefetch_source_offset_bytes = 0;
+    uint8_t prefetch_prefix[42] = {};
+    size_t prefetch_prefix_size = 0;
+
     uint16_t max_block_size = 0;
     uint32_t min_frame_size = 0;
     uint32_t max_frame_size = 0;
@@ -156,6 +169,16 @@ esp_err_t flac_decoder_read_pcm32(
     size_t *out_frames
 );
 
+// 基于 FLAC SEEKTABLE 选择不超过目标帧的最近 seekpoint，重建 Simple Decoder，
+// 再丢弃 seekpoint 到目标之间的 PCM。没有可用 SEEKTABLE 时明确返回 NOT_SUPPORTED。
+esp_err_t flac_decoder_seek_frame(
+    FlacDecoder *decoder,
+    uint64_t target_frame,
+    uint64_t *out_actual_frame,
+    uint64_t *out_source_offset
+);
+
 void flac_decoder_close(FlacDecoder *decoder);
 bool flac_decoder_is_open(const FlacDecoder *decoder);
 bool flac_decoder_is_eof(const FlacDecoder *decoder);
+bool flac_decoder_has_seektable(const FlacDecoder *decoder);

@@ -8,7 +8,7 @@
 
 #include "boot_state.h"
 #include "player_control.h"
-#include "audio_diag_config.h"
+#include "app_diag_config.h"
 #if APP_DIAG_FLAC_PERFORMANCE
 #include "flac_decoder.h"
 #endif
@@ -19,8 +19,9 @@
 static const char *TAG =
     "系统";
 
-static TickType_t g_last_alive_tick =
-    0;
+#if APP_DIAG_SYSTEM_HEARTBEAT || APP_DIAG_FLAC_PERFORMANCE || APP_DIAG_MP3_PERFORMANCE
+static TickType_t g_last_diag_tick = 0;
+#endif
 
 #if APP_DIAG_FLAC_PERFORMANCE
 static uint32_t g_last_flac_perf_sequence =
@@ -65,20 +66,12 @@ void system_loop_update()
     // ========================================================
 
 
-    TickType_t now =
-        xTaskGetTickCount();
+#if APP_DIAG_SYSTEM_HEARTBEAT || APP_DIAG_FLAC_PERFORMANCE || APP_DIAG_MP3_PERFORMANCE
+    const TickType_t now = xTaskGetTickCount();
+    if (now - g_last_diag_tick >= pdMS_TO_TICKS(5000)) {
+        g_last_diag_tick = now;
 
-
-    // 每 5 秒打印一次系统状态
-    if (
-        now - g_last_alive_tick >=
-        pdMS_TO_TICKS(5000)
-    ) {
-
-        g_last_alive_tick =
-            now;
-
-
+#if APP_DIAG_SYSTEM_HEARTBEAT
         ESP_LOGI(
             TAG,
             "运行正常：内部 RAM=%u KB，PSRAM=%u KB",
@@ -95,6 +88,7 @@ void system_loop_update()
                 ) / 1024
             )
         );
+#endif
 
 #if APP_DIAG_FLAC_PERFORMANCE
         // FLAC 专项核查完成后默认不编译；需要回归高采样率性能时再打开编译期开关。
@@ -211,4 +205,5 @@ void system_loop_update()
         }
 #endif
     }
+#endif
 }

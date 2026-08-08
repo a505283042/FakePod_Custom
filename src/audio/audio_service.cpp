@@ -13,14 +13,20 @@
 #include "pcm_decoder.h"
 #include "audio_decode_workspace.h"
 #include "audio_playback_clock.h"
+#include "app_diag_config.h"
 
 static const char *TAG = "音频服务";
 
+#if APP_DIAG_AUDIO_POP
 #define AUDIO_POP_TRACE_LOG(...) \
     ESP_LOGI(TAG, "POP_TRACE: " __VA_ARGS__)
+#else
+#define AUDIO_POP_TRACE_LOG(...) do { } while (0)
+#endif
 
 // 仅在控制路径关键节点采样，不进入 PCM 热循环。
 // 用于判断 AudioTask 栈是否可以后续从 24KB 安全下调，以及播放链路是否侵蚀内部 RAM。
+#if APP_DIAG_AUDIO_RAM
 static void audio_task_log_ram(const char *stage)
 {
     const size_t internal_free =
@@ -43,6 +49,9 @@ static void audio_task_log_ram(const char *stage)
         static_cast<unsigned>(psram_free),
         static_cast<unsigned>(stack_hwm));
 }
+#else
+static inline void audio_task_log_ram(const char *) {}
+#endif
 
 static constexpr uint32_t AUDIO_TASK_STACK_BYTES = 12288;
 static constexpr UBaseType_t AUDIO_TASK_PRIORITY = 5;
@@ -83,6 +92,7 @@ struct AudioRequest
 {
     AudioCommandType type = AudioCommandType::Stop;
     uint32_t request_id = 0;
+    uint32_t transport_intent_revision = 0;
     uint32_t track_index = UINT32_MAX;
     MediaFormat format = MediaFormat::Unknown;
     bool has_technical_info = false;
@@ -96,6 +106,7 @@ struct AudioRequest
     SemaphoreHandle_t done = nullptr;
     bool success = false;
     esp_err_t result = ESP_FAIL;
+    bool completed = false;
     uint8_t refs = 1;
 };
 
@@ -106,7 +117,15 @@ static esp_err_t g_start_result = ESP_ERR_INVALID_STATE;
 
 static portMUX_TYPE g_request_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t g_next_request_id = 1;
-static uint32_t g_latest_seek_request_id = 0;
+
+// Stage 11.0.1：Play/Seek 属于“目标型 transport intent”。
+// 待处理 intent 只保留最新一份；队列里最多挂一个 transport 唤醒请求，避免快速连续 NEXT/Seek
+// 把 AudioTask 队列塞满。正在执行的旧 intent 则通过 revision 在安全检查点主动退出。
+static SemaphoreHandle_t g_transport_submit_mutex = nullptr;
+static AudioRequest *g_pending_transport_request = nullptr;
+static bool g_transport_wake_pending = false;
+static uint32_t g_next_transport_intent_revision = 1;
+static uint32_t g_latest_transport_intent_revision = 0;
 
 static portMUX_TYPE g_snapshot_mux = portMUX_INITIALIZER_UNLOCKED;
 static AudioStateSnapshot g_snapshot = {};
@@ -302,8 +321,7 @@ static void audio_task_publish_snapshot()
     snapshot.decoder_position_frames = g_playback_clock.decoder_frames;
     snapshot.position_ms = audio_playback_clock_position_ms(&g_playback_clock);
     snapshot.total_frames = g_task_total_frames;
-    snapshot.seek_supported =
-        g_task_format == MediaFormat::WAV || g_task_format == MediaFormat::MP3;
+    snapshot.seek_supported = pcm_decoder_seek_supported(&g_decoder, 1);
     snapshot.seek_revision = g_task_seek_revision;
     snapshot.last_seek_request_id = g_task_last_seek_request_id;
     snapshot.last_seek_target_ms = g_task_last_seek_target_ms;
@@ -345,11 +363,82 @@ static void audio_request_complete(AudioRequest *request, bool success, esp_err_
     if (request == nullptr) {
         return;
     }
-    request->success = success;
-    request->result = result;
-    if (request->done != nullptr) {
+
+    // Pending intent 被新 intent 覆盖时，提交任务和 AudioTask 可能同时尝试完成同一个请求。
+    // 完成状态必须幂等，避免同步请求的 binary semaphore 被重复 give。
+    bool signal_done = false;
+    portENTER_CRITICAL(&g_request_mux);
+    if (!request->completed) {
+        request->success = success;
+        request->result = result;
+        request->completed = true;
+        signal_done = request->done != nullptr;
+    }
+    portEXIT_CRITICAL(&g_request_mux);
+
+    if (signal_done) {
         xSemaphoreGive(request->done);
     }
+}
+
+static bool audio_command_is_transport_intent(AudioCommandType type)
+{
+    return type == AudioCommandType::Play || type == AudioCommandType::Seek;
+}
+
+#if APP_DIAG_TRANSPORT_INTENT
+static const char *audio_command_name(AudioCommandType type)
+{
+    switch (type) {
+        case AudioCommandType::Play: return "PLAY";
+        case AudioCommandType::Stop: return "STOP";
+        case AudioCommandType::Pause: return "PAUSE";
+        case AudioCommandType::Resume: return "RESUME";
+        case AudioCommandType::Seek: return "SEEK";
+        case AudioCommandType::SetVolume: return "VOLUME";
+        case AudioCommandType::SetMute: return "MUTE";
+    }
+    return "UNKNOWN";
+}
+#endif
+
+static uint32_t audio_transport_latest_revision()
+{
+    uint32_t revision = 0;
+    portENTER_CRITICAL(&g_request_mux);
+    revision = g_latest_transport_intent_revision;
+    portEXIT_CRITICAL(&g_request_mux);
+    return revision;
+}
+
+static bool audio_transport_request_is_latest(const AudioRequest *request)
+{
+    if (request == nullptr || !audio_command_is_transport_intent(request->type) ||
+        request->transport_intent_revision == 0U) {
+        return false;
+    }
+    return request->transport_intent_revision == audio_transport_latest_revision();
+}
+
+static bool audio_task_transport_request_superseded(
+    const AudioRequest *request,
+    const char *stage)
+{
+    if (audio_transport_request_is_latest(request)) {
+        return false;
+    }
+#if APP_DIAG_TRANSPORT_INTENT
+    ESP_LOGI(TAG,
+        "INTENT_TRACE: SUPERSEDED request=%lu intent=%lu latest=%lu type=%s stage=%s",
+        request != nullptr ? static_cast<unsigned long>(request->request_id) : 0UL,
+        request != nullptr ? static_cast<unsigned long>(request->transport_intent_revision) : 0UL,
+        static_cast<unsigned long>(audio_transport_latest_revision()),
+        request != nullptr ? audio_command_name(request->type) : "UNKNOWN",
+        stage != nullptr ? stage : "unknown");
+#else
+    (void)stage;
+#endif
+    return true;
 }
 
 static void audio_task_remember_first_error(esp_err_t candidate, esp_err_t *first_error)
@@ -505,9 +594,11 @@ static esp_err_t audio_task_shutdown_pipeline()
             );
 
             if (g_pipeline_i2s_started && i2s_output_is_started()) {
+#if APP_DIAG_AUDIO_POP
                 ESP_LOGI(TAG, "PCM软静音收敛：保持%lums全零PCM，帧=%u",
                     static_cast<unsigned long>(AUDIO_PCM_MUTE_SETTLE_MS),
                     static_cast<unsigned>(settle_frames));
+#endif
                 audio_task_remember_first_error(
                     i2s_output_stream_write_silence(settle_frames, AUDIO_I2S_WRITE_TIMEOUT_MS),
                     &first_error);
@@ -558,6 +649,7 @@ static void audio_task_log_index_snapshot(const AudioRequest *request)
         return;
     }
 
+#if APP_DIAG_AUDIO_INDEX
     const MediaTechnicalInfo &info = request->technical_info;
     ESP_LOGI(TAG,
         "INDEX_TRACE: RECEIVED 曲目=%lu 格式=%s parsed=%u rate=%luHz bits=%u ch=%u duration=%lums total=%llu audio_offset=%llu metadata_end=%llu artwork=%llu+%lu max_block=%u max_frame=%lu bitrate=%lu flags=0x%08lX",
@@ -577,6 +669,7 @@ static void audio_task_log_index_snapshot(const AudioRequest *request)
         static_cast<unsigned long>(info.max_frame_size),
         static_cast<unsigned long>(info.bitrate_kbps),
         static_cast<unsigned long>(info.flags));
+#endif
 }
 
 static void audio_task_verify_index_snapshot(
@@ -590,8 +683,10 @@ static void audio_task_verify_index_snapshot(
 
     const MediaTechnicalInfo &index = request->technical_info;
     if ((index.flags & MEDIA_TECH_PARSED) == 0U) {
+#if APP_DIAG_AUDIO_INDEX
         ESP_LOGI(TAG, "INDEX_TRACE: BASIC 格式=%s 尚无深度技术索引，decoder结果作为真值",
             media_format_name(request->format));
+#endif
         return;
     }
 
@@ -621,6 +716,10 @@ static void audio_task_verify_index_snapshot(
         if (index.max_frame_size != 0U && index.max_frame_size != g_decoder.flac.max_frame_size) {
             mismatch = true;
         }
+        if (index.audio_data_offset != 0ULL &&
+            index.audio_data_offset != g_decoder.flac.audio_data_offset_bytes) {
+            mismatch = true;
+        }
     } else if (decoder_type == PcmDecoderType::Mp3) {
         if (
             index.bitrate_kbps != 0U &&
@@ -646,6 +745,7 @@ static void audio_task_verify_index_snapshot(
         return;
     }
 
+#if APP_DIAG_AUDIO_INDEX
     ESP_LOGI(TAG,
         "INDEX_TRACE: VERIFIED 格式=%s rate=%luHz bits=%u ch=%u total=%llu audio_offset=%llu",
         media_format_name(request->format),
@@ -655,6 +755,7 @@ static void audio_task_verify_index_snapshot(
         static_cast<unsigned long long>(
             g_decoder.info.total_frames != 0ULL ? g_decoder.info.total_frames : index.total_frames),
         static_cast<unsigned long long>(index.audio_data_offset));
+#endif
 }
 
 static esp_err_t audio_task_start_pcm_pipeline(
@@ -703,6 +804,7 @@ static esp_err_t audio_task_start_pcm_pipeline(
         if (out_seek_result != nullptr) {
             *out_seek_result = seek_result;
         }
+#if APP_DIAG_AUDIO_SEEK
         ESP_LOGI(TAG,
             "SEEK_TRACE: PREPARED format=%s method=%s target=%llums requested_frame=%llu actual_frame=%llu source_offset=%llu",
             pcm_decoder_type_name(decoder_type),
@@ -711,15 +813,29 @@ static esp_err_t audio_task_start_pcm_pipeline(
             static_cast<unsigned long long>(seek_result.requested_frame),
             static_cast<unsigned long long>(seek_result.actual_frame),
             static_cast<unsigned long long>(seek_result.source_offset));
+#endif
+    }
+
+    // decoder/source open 可能需要几十到数百毫秒。若用户在这期间又选择了更新目标，
+    // 立即关闭旧 decoder，不再为已经过期的 Track 启动 I2S/DAC。
+    if (request != nullptr && audio_task_transport_request_superseded(request, "after_decoder_open")) {
+        pcm_decoder_close(&g_decoder);
+        audio_decode_workspace_trim(
+            &g_decode_workspace,
+            AUDIO_DECODE_WORKSPACE_RETAIN_INPUT_BYTES,
+            AUDIO_DECODE_WORKSPACE_RETAIN_PCM_BYTES);
+        return ESP_ERR_INVALID_STATE;
     }
 
     audio_task_log_ram("after_decoder_open");
+#if APP_DIAG_AUDIO_WORKSPACE
     ESP_LOGI(TAG,
         "WORKSPACE_TRACE: codec=%s input=%uB pcm=%uB total=%uB（PSRAM共享，FLAC ring独立）",
         pcm_decoder_type_name(decoder_type),
         static_cast<unsigned>(g_decode_workspace.input_capacity),
         static_cast<unsigned>(g_decode_workspace.decoded_capacity),
         static_cast<unsigned>(audio_decode_workspace_total_bytes(&g_decode_workspace)));
+#endif
 
     g_task_sample_rate_hz = g_decoder.info.sample_rate_hz;
     g_task_channels = g_decoder.info.channels;
@@ -738,15 +854,19 @@ static esp_err_t audio_task_start_pcm_pipeline(
         request->technical_info.total_frames > 0
     ) {
         g_task_total_frames = request->technical_info.total_frames;
+#if APP_DIAG_AUDIO_CLOCK
         ESP_LOGI(TAG,
             "CLOCK_TRACE: TOTAL_SOURCE=index total=%llu duration=%lums estimated=%u",
             static_cast<unsigned long long>(g_task_total_frames),
             static_cast<unsigned long>(request->technical_info.duration_ms),
             static_cast<unsigned>(
                 (request->technical_info.flags & MEDIA_TECH_DURATION_ESTIMATED) != 0U));
+#endif
     } else {
+#if APP_DIAG_AUDIO_CLOCK
         ESP_LOGI(TAG, "CLOCK_TRACE: TOTAL_SOURCE=decoder total=%llu",
             static_cast<unsigned long long>(g_task_total_frames));
+#endif
     }
     g_last_progress_publish_frame = g_playback_clock.submitted_frames;
     g_ram_trace_first_pcm_done = false;
@@ -767,6 +887,10 @@ static esp_err_t audio_task_start_pcm_pipeline(
         audio_task_shutdown_pipeline();
         return ret;
     }
+    if (request != nullptr && audio_task_transport_request_superseded(request, "after_dac_prepare")) {
+        audio_task_shutdown_pipeline();
+        return ESP_ERR_INVALID_STATE;
+    }
 
     ret = i2s_output_stream_start_32bit(g_task_sample_rate_hz);
     if (ret != ESP_OK) {
@@ -778,6 +902,10 @@ static esp_err_t audio_task_start_pcm_pipeline(
         "I2S_START rate=%lu bclk=%lu",
         static_cast<unsigned long>(g_task_sample_rate_hz),
         static_cast<unsigned long>(g_task_sample_rate_hz * 64UL));
+    if (request != nullptr && audio_task_transport_request_superseded(request, "after_i2s_start")) {
+        audio_task_shutdown_pipeline();
+        return ESP_ERR_INVALID_STATE;
+    }
 
     // 先给 I2S DMA 填入全零 PCM，再开启 CS43131 ASP，避免 ASP 上电瞬间面对不稳定时钟。
     ret = i2s_output_stream_write_silence(AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
@@ -823,12 +951,18 @@ static esp_err_t audio_task_start_pcm_pipeline(
         audio_task_shutdown_pipeline();
         return ret;
     }
+#if APP_DIAG_AUDIO_POP
     ESP_LOGI(TAG, "%s起播前 ASP 稳定状态：0x%02X", pcm_decoder_type_name(decoder_type), asp_status);
+#endif
     AUDIO_POP_TRACE_LOG("ASP_STABLE status=0x%02X", asp_status);
     if ((asp_status & 0xF8U) != 0) {
         ESP_LOGE(TAG, "ASP 时序异常，拒绝开启耳放：INT_STATUS2=0x%02X", asp_status);
         audio_task_shutdown_pipeline();
         return ESP_FAIL;
+    }
+    if (request != nullptr && audio_task_transport_request_superseded(request, "before_headphone_enable")) {
+        audio_task_shutdown_pipeline();
+        return ESP_ERR_INVALID_STATE;
     }
 
     // 预先标记“耳放可能已被触及”，保证寄存器写到一半失败时仍会尝试安全掉电。
@@ -854,6 +988,11 @@ static esp_err_t audio_task_start_pcm_pipeline(
             audio_task_shutdown_pipeline();
             return ret;
         }
+    }
+
+    if (request != nullptr && audio_task_transport_request_superseded(request, "before_pipeline_commit")) {
+        audio_task_shutdown_pipeline();
+        return ESP_ERR_INVALID_STATE;
     }
 
     // 耳放保持手动静音，等第一块真实 PCM 已经解码完成后再解除。
@@ -899,6 +1038,7 @@ static void audio_task_finish_stream()
     }
     audio_task_publish_snapshot();
 
+#if APP_DIAG_AUDIO_CLOCK
     const int64_t total_delta = static_cast<int64_t>(g_playback_clock.submitted_frames) -
         static_cast<int64_t>(g_task_total_frames);
     ESP_LOGI(TAG,
@@ -909,6 +1049,11 @@ static void audio_task_finish_stream()
         static_cast<unsigned long long>(g_task_total_frames),
         static_cast<long long>(total_delta),
         static_cast<unsigned long long>(audio_playback_clock_position_ms(&g_playback_clock)));
+#else
+    ESP_LOGI(TAG, "%s 播放完成：时长=%llums",
+        media_format_name(g_task_format),
+        static_cast<unsigned long long>(audio_playback_clock_position_ms(&g_playback_clock)));
+#endif
 
     // i2s_channel_write() 返回代表 PCM 已复制进 DMA，不等于最后一个样本已经从引脚送出。
     // 文件尾先追加 4 个静音块，让已排队的最后 PCM 块自然播放完，再执行 DAC 软静音/掉电。
@@ -989,8 +1134,10 @@ static void audio_task_service_pcm_playback()
 
     // FLAC/simple-decoder 可能在真正 process 首帧时才完成内部工作区的延迟分配。
     // 这里只采样一次首个 PCM 块和一次 5 秒稳定态，避免 RAM 诊断日志进入实时热循环。
+#if APP_DIAG_AUDIO_CLOCK || APP_DIAG_AUDIO_RAM
     if (!g_ram_trace_first_pcm_done) {
         g_ram_trace_first_pcm_done = true;
+#if APP_DIAG_AUDIO_CLOCK
         ESP_LOGI(TAG,
             "CLOCK_TRACE: FIRST_PCM submitted=%llu decoder=%llu delta=%lld",
             static_cast<unsigned long long>(g_playback_clock.submitted_frames),
@@ -998,6 +1145,7 @@ static void audio_task_service_pcm_playback()
             static_cast<long long>(
                 static_cast<int64_t>(g_playback_clock.decoder_frames) -
                 static_cast<int64_t>(g_playback_clock.submitted_frames)));
+#endif
         audio_task_log_ram("first_pcm");
     }
     if (
@@ -1005,6 +1153,7 @@ static void audio_task_service_pcm_playback()
         audio_playback_clock_position_ms(&g_playback_clock) >= 5000ULL
     ) {
         g_ram_trace_steady_5s_done = true;
+#if APP_DIAG_AUDIO_CLOCK
         ESP_LOGI(TAG,
             "CLOCK_TRACE: STEADY submitted=%llu decoder=%llu delta=%lld time=%llums",
             static_cast<unsigned long long>(g_playback_clock.submitted_frames),
@@ -1013,8 +1162,10 @@ static void audio_task_service_pcm_playback()
                 static_cast<int64_t>(g_playback_clock.decoder_frames) -
                 static_cast<int64_t>(g_playback_clock.submitted_frames)),
             static_cast<unsigned long long>(audio_playback_clock_position_ms(&g_playback_clock)));
+#endif
         audio_task_log_ram("steady_5s");
     }
+#endif
 
     const uint64_t publish_interval = g_task_sample_rate_hz >= 4
         ? g_task_sample_rate_hz / 4U
@@ -1059,18 +1210,15 @@ static PcmDecoderType audio_decoder_type_for_format(MediaFormat format)
     }
 }
 
-static bool audio_seek_request_is_latest(uint32_t request_id)
-{
-    bool latest = false;
-    portENTER_CRITICAL(&g_request_mux);
-    latest = request_id != 0U && request_id == g_latest_seek_request_id;
-    portEXIT_CRITICAL(&g_request_mux);
-    return latest;
-}
-
 static void audio_task_handle_play(AudioRequest *request)
 {
     const char *path = audio_request_path(request);
+
+    // 队列中的 transport 唤醒项可能已经被更新 intent 覆盖；这种请求不能触碰当前 pipeline。
+    if (audio_task_transport_request_superseded(request, "play_dequeue")) {
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
 
     // 新播放请求只在旧 pipeline 仍持有资源时执行 shutdown。
     // EOF 已经完整收尾、或显式 Stop 后直接起播时跳过空 shutdown，减少切歌延迟和日志噪声。
@@ -1084,6 +1232,13 @@ static void audio_task_handle_play(AudioRequest *request)
         }
     } else {
         AUDIO_POP_TRACE_LOG("PLAY_REUSE_IDLE_PIPELINE no_shutdown");
+    }
+
+    // 150ms soft-ramp shutdown 本身足以让用户产生新的 NEXT/选歌意图。
+    // 旧请求在关闭完旧链路后必须再次确认，否则会无意义地打开已过期文件。
+    if (audio_task_transport_request_superseded(request, "after_previous_shutdown")) {
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
     }
 
     g_task_last_request_id = request->request_id;
@@ -1120,8 +1275,22 @@ static void audio_task_handle_play(AudioRequest *request)
 
     esp_err_t ret = audio_task_start_pcm_pipeline(decoder_type, path, request);
     if (ret != ESP_OK) {
+        if (!audio_transport_request_is_latest(request)) {
+            // 最新 intent 已经在等待，旧请求失败属于主动取消而不是播放器错误。
+            // 保留 Preparing 短暂过渡状态，下一条最新 Play 会立即接管并发布自己的 Track。
+            audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+            return;
+        }
         audio_task_set_state(AudioPlaybackState::Error, ret);
         audio_request_complete(request, false, ret);
+        return;
+    }
+
+    // pipeline 完整建立后再做一次最终提交检查；若用户恰好在最后一个硬件阶段更新目标，
+    // 旧链路不会进入真实 PCM 播放，而是安全关闭后交给最新 intent。
+    if (audio_task_transport_request_superseded(request, "play_commit")) {
+        audio_task_shutdown_pipeline();
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
         return;
     }
 
@@ -1136,16 +1305,14 @@ static void audio_task_handle_seek(AudioRequest *request)
     }
     g_task_last_request_id = request->request_id;
 
-    if (!audio_seek_request_is_latest(request->request_id)) {
-        ESP_LOGI(TAG, "SEEK_TRACE: 丢弃已被更新请求覆盖的 Seek request=%lu latest=%lu",
-            static_cast<unsigned long>(request->request_id),
-            static_cast<unsigned long>(g_latest_seek_request_id));
+    if (audio_task_transport_request_superseded(request, "seek_dequeue")) {
         audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
         return;
     }
     if (request->expected_playback_revision == 0U ||
         request->expected_playback_revision != g_task_playback_revision ||
         request->track_index != g_task_track_index || request->format != g_task_format) {
+#if APP_DIAG_AUDIO_SEEK
         ESP_LOGI(TAG,
             "SEEK_TRACE: 忽略过期 Seek request=%lu expected_rev=%lu current_rev=%lu req_track=%lu current_track=%lu",
             static_cast<unsigned long>(request->request_id),
@@ -1153,10 +1320,13 @@ static void audio_task_handle_seek(AudioRequest *request)
             static_cast<unsigned long>(g_task_playback_revision),
             static_cast<unsigned long>(request->track_index),
             static_cast<unsigned long>(g_task_track_index));
+#endif
         audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
         return;
     }
-    if (g_task_state != AudioPlaybackState::Playing && g_task_state != AudioPlaybackState::Paused) {
+    if (g_task_state != AudioPlaybackState::Playing &&
+        g_task_state != AudioPlaybackState::Paused &&
+        g_task_state != AudioPlaybackState::Seeking) {
         ESP_LOGW(TAG, "SEEK_TRACE: 当前状态不允许 Seek：%s", audio_playback_state_name_cn(g_task_state));
         audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
         return;
@@ -1179,9 +1349,9 @@ static void audio_task_handle_seek(AudioRequest *request)
     }
     const uint64_t target_frame = known_rate > 0
         ? (target_ms * static_cast<uint64_t>(known_rate)) / 1000ULL : 0ULL;
-    if (!pcm_decoder_seek_supported(decoder_type, target_frame)) {
+    if (!pcm_decoder_seek_supported(&g_decoder, target_frame)) {
         ESP_LOGW(TAG,
-            "SEEK_TRACE: 当前后端尚未开放非零 Seek format=%s target=%llums；保持原播放位置",
+            "SEEK_TRACE: 当前文件/后端不支持该 Seek format=%s target=%llums；保持原播放位置",
             pcm_decoder_type_name(decoder_type),
             static_cast<unsigned long long>(target_ms));
         audio_request_complete(request, false, ESP_ERR_NOT_SUPPORTED);
@@ -1197,6 +1367,7 @@ static void audio_task_handle_seek(AudioRequest *request)
 
     const bool was_paused = g_task_state == AudioPlaybackState::Paused;
     audio_task_set_state(AudioPlaybackState::Seeking, ESP_OK);
+#if APP_DIAG_AUDIO_SEEK
     ESP_LOGI(TAG,
         "SEEK_TRACE: BEGIN request=%lu rev=%lu track=%lu format=%s from=%llums target=%llums paused=%u",
         static_cast<unsigned long>(request->request_id),
@@ -1206,11 +1377,18 @@ static void audio_task_handle_seek(AudioRequest *request)
         static_cast<unsigned long long>(audio_playback_clock_position_ms(&g_playback_clock)),
         static_cast<unsigned long long>(target_ms),
         static_cast<unsigned>(was_paused));
+#endif
 
     esp_err_t ret = audio_task_shutdown_pipeline();
     if (ret != ESP_OK) {
         audio_task_set_state(AudioPlaybackState::Error, ret);
         audio_request_complete(request, false, ret);
+        return;
+    }
+
+    if (audio_task_transport_request_superseded(request, "seek_after_shutdown")) {
+        // 新 Seek/Play 已经成为最新意图；保持当前 Track/revision，便于后续同 Track Seek 继续接管。
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
         return;
     }
 
@@ -1223,8 +1401,18 @@ static void audio_task_handle_seek(AudioRequest *request)
         target_ms,
         &seek_result);
     if (ret != ESP_OK) {
+        if (!audio_transport_request_is_latest(request)) {
+            audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+            return;
+        }
         audio_task_set_state(AudioPlaybackState::Error, ret);
         audio_request_complete(request, false, ret);
+        return;
+    }
+
+    if (audio_task_transport_request_superseded(request, "seek_commit")) {
+        audio_task_shutdown_pipeline();
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
         return;
     }
 
@@ -1244,6 +1432,7 @@ static void audio_task_handle_seek(AudioRequest *request)
         audio_task_set_state(AudioPlaybackState::Playing, ESP_OK);
     }
 
+#if APP_DIAG_AUDIO_SEEK
     ESP_LOGI(TAG,
         "SEEK_TRACE: DONE request=%lu method=%s requested=%llums actual=%llums frame=%llu source_offset=%llu state=%s",
         static_cast<unsigned long>(request->request_id),
@@ -1253,6 +1442,7 @@ static void audio_task_handle_seek(AudioRequest *request)
         static_cast<unsigned long long>(seek_result.actual_frame),
         static_cast<unsigned long long>(seek_result.source_offset),
         audio_playback_state_name_cn(g_task_state));
+#endif
     audio_request_complete(request, true, ESP_OK);
 }
 
@@ -1429,10 +1619,73 @@ static void audio_task_process_request(AudioRequest *request)
     }
 }
 
+static AudioRequest *audio_transport_take_pending_for_wake()
+{
+    AudioRequest *pending = nullptr;
+    portENTER_CRITICAL(&g_request_mux);
+    pending = g_pending_transport_request;
+    g_pending_transport_request = nullptr;
+    g_transport_wake_pending = false;
+    portEXIT_CRITICAL(&g_request_mux);
+    return pending;
+}
+
+static void audio_task_process_queue_request(AudioRequest *queue_request)
+{
+    if (queue_request == nullptr) {
+        return;
+    }
+    if (!audio_command_is_transport_intent(queue_request->type)) {
+        audio_task_process_request(queue_request);
+        return;
+    }
+
+    // transport 队列项只负责唤醒。真正执行的请求从 latest-intent 单槽中取出，
+    // 因而连续 NEXT/Seek 不会在队列里逐条积压。返回的 pending 持有 slot 引用。
+    AudioRequest *effective = audio_transport_take_pending_for_wake();
+    if (effective == nullptr) {
+#if APP_DIAG_TRANSPORT_INTENT
+        ESP_LOGI(TAG,
+            "INTENT_TRACE: WAKE_EMPTY wake_request=%lu type=%s",
+            static_cast<unsigned long>(queue_request->request_id),
+            audio_command_name(queue_request->type));
+#endif
+        return;
+    }
+
+#if APP_DIAG_TRANSPORT_INTENT
+    if (effective != queue_request) {
+        ESP_LOGI(TAG,
+            "INTENT_TRACE: DISPATCH wake_request=%lu -> request=%lu intent=%lu type=%s track=%lu",
+            static_cast<unsigned long>(queue_request->request_id),
+            static_cast<unsigned long>(effective->request_id),
+            static_cast<unsigned long>(effective->transport_intent_revision),
+            audio_command_name(effective->type),
+            static_cast<unsigned long>(effective->track_index));
+    } else {
+        ESP_LOGI(TAG,
+            "INTENT_TRACE: DISPATCH request=%lu intent=%lu type=%s track=%lu",
+            static_cast<unsigned long>(effective->request_id),
+            static_cast<unsigned long>(effective->transport_intent_revision),
+            audio_command_name(effective->type),
+            static_cast<unsigned long>(effective->track_index));
+    }
+#endif
+
+    audio_task_process_request(effective);
+    audio_request_release(effective); // 释放 pending slot 引用
+}
+
 static void audio_task_main(void *arg)
 {
     (void)arg;
     const BaseType_t current_core = xPortGetCoreID();
+#if !APP_DIAG_AUDIO_CODEC
+    // 乐鑫 Simple Decoder 内部 INFO 在每次 open 时都会重复打印 parser/stream 参数。
+    // 正式固件只保留其 W/E；专项解码诊断打开时恢复 INFO，便于核对 parser 行为。
+    esp_log_level_set("ESP_ES_PARSER", ESP_LOG_WARN);
+    esp_log_level_set("AUD_Dec_Parse", ESP_LOG_WARN);
+#endif
     ESP_LOGI(TAG, "AudioTask 已启动：核心=%d，优先级=%u，栈=%u字节",
         static_cast<int>(current_core),
         static_cast<unsigned>(uxTaskPriorityGet(nullptr)),
@@ -1492,8 +1745,8 @@ static void audio_task_main(void *arg)
         const TickType_t wait_ticks = stream_needs_service ? 0 : portMAX_DELAY;
 
         if (xQueueReceive(g_command_queue, &request, wait_ticks) == pdTRUE && request != nullptr) {
-            audio_task_process_request(request);
-            audio_request_release(request);
+            audio_task_process_queue_request(request);
+            audio_request_release(request); // 释放 queue 引用
         }
 
         if (g_task_state == AudioPlaybackState::Playing) {
@@ -1504,23 +1757,8 @@ static void audio_task_main(void *arg)
     }
 }
 
-static bool audio_service_submit(AudioRequest *request, bool wait)
+static bool audio_service_finish_submit_caller(AudioRequest *request, bool wait)
 {
-    if (request == nullptr || g_command_queue == nullptr || !audio_service_is_ready()) {
-        audio_request_release(request);
-        return false;
-    }
-
-    // 队列持有独立引用。调用方无论同步还是异步，都可以安全释放自己的引用。
-    audio_request_retain(request);
-    if (xQueueSend(g_command_queue, &request, AUDIO_QUEUE_SEND_TIMEOUT) != pdTRUE) {
-        ESP_LOGE(TAG, "音频命令队列已满：请求=%lu",
-            static_cast<unsigned long>(request->request_id));
-        audio_request_release(request);
-        audio_request_release(request);
-        return false;
-    }
-
     if (!wait) {
         audio_request_release(request);
         return true;
@@ -1541,6 +1779,116 @@ static bool audio_service_submit(AudioRequest *request, bool wait)
     }
     audio_request_release(request);
     return success;
+}
+
+static bool audio_service_submit_transport_intent(AudioRequest *request, bool wait)
+{
+    if (request == nullptr || g_command_queue == nullptr || g_transport_submit_mutex == nullptr ||
+        !audio_service_is_ready() || !audio_command_is_transport_intent(request->type)) {
+        audio_request_release(request);
+        return false;
+    }
+
+    if (xSemaphoreTake(g_transport_submit_mutex, AUDIO_QUEUE_SEND_TIMEOUT) != pdTRUE) {
+        ESP_LOGE(TAG, "等待 transport intent 提交锁超时：请求=%lu",
+            static_cast<unsigned long>(request->request_id));
+        audio_request_release(request);
+        return false;
+    }
+
+    AudioRequest *replaced = nullptr;
+    bool need_wake = false;
+    uint32_t previous_latest_revision = 0;
+
+    // slot 持有独立引用；即使调用方异步立即返回，请求仍能活到 AudioTask 取走。
+    audio_request_retain(request);
+    portENTER_CRITICAL(&g_request_mux);
+    previous_latest_revision = g_latest_transport_intent_revision;
+    request->transport_intent_revision = g_next_transport_intent_revision++;
+    if (g_next_transport_intent_revision == 0U) {
+        g_next_transport_intent_revision = 1U;
+    }
+    replaced = g_pending_transport_request;
+    g_pending_transport_request = request;
+    g_latest_transport_intent_revision = request->transport_intent_revision;
+    need_wake = !g_transport_wake_pending;
+    if (need_wake) {
+        g_transport_wake_pending = true;
+    }
+    portEXIT_CRITICAL(&g_request_mux);
+
+    if (replaced != nullptr && replaced != request) {
+#if APP_DIAG_TRANSPORT_INTENT
+        ESP_LOGI(TAG,
+            "INTENT_TRACE: COALESCE old_request=%lu old_intent=%lu old_type=%s -> request=%lu intent=%lu type=%s",
+            static_cast<unsigned long>(replaced->request_id),
+            static_cast<unsigned long>(replaced->transport_intent_revision),
+            audio_command_name(replaced->type),
+            static_cast<unsigned long>(request->request_id),
+            static_cast<unsigned long>(request->transport_intent_revision),
+            audio_command_name(request->type));
+#endif
+        audio_request_complete(replaced, false, ESP_ERR_INVALID_STATE);
+        audio_request_release(replaced); // 释放被覆盖请求的 slot 引用
+    }
+
+    if (need_wake) {
+        // queue 仍持有一份引用。这个请求对象仅作为 transport wake token；真正执行目标
+        // 会在 AudioTask 出队时从 pending slot 读取，因此后续替换不会继续占队列。
+        audio_request_retain(request);
+        if (xQueueSend(g_command_queue, &request, AUDIO_QUEUE_SEND_TIMEOUT) != pdTRUE) {
+            ESP_LOGE(TAG, "transport intent 唤醒入队失败：请求=%lu intent=%lu",
+                static_cast<unsigned long>(request->request_id),
+                static_cast<unsigned long>(request->transport_intent_revision));
+
+            portENTER_CRITICAL(&g_request_mux);
+            if (g_pending_transport_request == request) {
+                g_pending_transport_request = nullptr;
+                g_transport_wake_pending = false;
+                g_latest_transport_intent_revision = previous_latest_revision;
+            }
+            portEXIT_CRITICAL(&g_request_mux);
+
+            audio_request_release(request); // queue 引用
+            audio_request_release(request); // slot 引用
+            xSemaphoreGive(g_transport_submit_mutex);
+            audio_request_complete(request, false, ESP_ERR_TIMEOUT);
+            return audio_service_finish_submit_caller(request, wait);
+        }
+    }
+
+#if APP_DIAG_TRANSPORT_INTENT
+    ESP_LOGI(TAG,
+        "INTENT_TRACE: PUBLISH request=%lu intent=%lu type=%s track=%lu wake=%u",
+        static_cast<unsigned long>(request->request_id),
+        static_cast<unsigned long>(request->transport_intent_revision),
+        audio_command_name(request->type),
+        static_cast<unsigned long>(request->track_index),
+        static_cast<unsigned>(need_wake));
+#endif
+
+    xSemaphoreGive(g_transport_submit_mutex);
+    return audio_service_finish_submit_caller(request, wait);
+}
+
+static bool audio_service_submit(AudioRequest *request, bool wait)
+{
+    if (request == nullptr || g_command_queue == nullptr || !audio_service_is_ready()) {
+        audio_request_release(request);
+        return false;
+    }
+
+    // 队列持有独立引用。调用方无论同步还是异步，都可以安全释放自己的引用。
+    audio_request_retain(request);
+    if (xQueueSend(g_command_queue, &request, AUDIO_QUEUE_SEND_TIMEOUT) != pdTRUE) {
+        ESP_LOGE(TAG, "音频命令队列已满：请求=%lu",
+            static_cast<unsigned long>(request->request_id));
+        audio_request_release(request);
+        audio_request_release(request);
+        return false;
+    }
+
+    return audio_service_finish_submit_caller(request, wait);
 }
 
 const char *audio_playback_state_name_cn(AudioPlaybackState state)
@@ -1570,6 +1918,14 @@ esp_err_t audio_service_start()
         g_command_queue = xQueueCreate(AUDIO_COMMAND_QUEUE_LENGTH, sizeof(AudioRequest *));
         if (g_command_queue == nullptr) {
             ESP_LOGE(TAG, "创建音频命令队列失败");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (g_transport_submit_mutex == nullptr) {
+        g_transport_submit_mutex = xSemaphoreCreateMutex();
+        if (g_transport_submit_mutex == nullptr) {
+            ESP_LOGE(TAG, "创建 transport intent 提交锁失败");
             return ESP_ERR_NO_MEM;
         }
     }
@@ -1654,7 +2010,7 @@ bool audio_service_play_track(
         audio_request_release(request);
         return false;
     }
-    return audio_service_submit(request, wait);
+    return audio_service_submit_transport_intent(request, wait);
 }
 
 bool audio_service_stop(bool wait)
@@ -1710,12 +2066,8 @@ bool audio_service_seek_track(
         return false;
     }
 
-    // 对尚未开始处理的快速拖动请求只保留最后一次；正在执行的 Seek 不被跨任务强杀，
-    // 下一次请求会在其完成后继续定位到最终目标。
-    portENTER_CRITICAL(&g_request_mux);
-    g_latest_seek_request_id = request->request_id;
-    portEXIT_CRITICAL(&g_request_mux);
-    return audio_service_submit(request, wait);
+    // Play/Seek 共用 latest-intent 单槽；快速拖动或快速切歌都只保留最后目标。
+    return audio_service_submit_transport_intent(request, wait);
 }
 
 bool audio_service_set_volume(uint8_t percent, bool wait)

@@ -28,8 +28,8 @@ bool audio_service_stop(bool wait = true);
 bool audio_service_pause(bool wait = true);
 bool audio_service_resume(bool wait = true);
 
-// Stage 11.0：对当前选中 Track 发起 Seek。路径/技术索引仍复制进请求，AudioTask 会核对
-// 当前 track + playback_revision，并丢弃队列中已经过期的旧 Seek。
+// Stage 11.x：对当前选中 Track 发起 Seek。Play/Seek 共用 latest-intent 单槽；
+// 路径/技术索引仍复制进请求，AudioTask 会核对 track + playback_revision，并丢弃被更新意图覆盖的旧请求。
 bool audio_service_seek_track(
     uint32_t track_index,
     const char *path,

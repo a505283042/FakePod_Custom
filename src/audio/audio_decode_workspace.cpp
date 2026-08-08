@@ -2,6 +2,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "app_diag_config.h"
 
 static const char *TAG = "解码工作区";
 
@@ -43,9 +44,11 @@ static esp_err_t audio_decode_workspace_reserve(
     *capacity = required_bytes;
     *out_buffer = replacement;
 
+#if APP_DIAG_AUDIO_WORKSPACE
     ESP_LOGI(TAG, "%s 扩容：capacity=%uB",
         name != nullptr ? name : "workspace",
         static_cast<unsigned>(required_bytes));
+#endif
     return ESP_OK;
 }
 
@@ -91,17 +94,21 @@ void audio_decode_workspace_trim(
     }
 
     if (workspace->input != nullptr && workspace->input_capacity > max_retained_input_bytes) {
+#if APP_DIAG_AUDIO_WORKSPACE
         ESP_LOGI(TAG, "释放异常膨胀输入工作区：%uB > %uB",
             static_cast<unsigned>(workspace->input_capacity),
             static_cast<unsigned>(max_retained_input_bytes));
+#endif
         heap_caps_free(workspace->input);
         workspace->input = nullptr;
         workspace->input_capacity = 0;
     }
     if (workspace->decoded != nullptr && workspace->decoded_capacity > max_retained_decoded_bytes) {
+#if APP_DIAG_AUDIO_WORKSPACE
         ESP_LOGI(TAG, "释放异常膨胀PCM工作区：%uB > %uB",
             static_cast<unsigned>(workspace->decoded_capacity),
             static_cast<unsigned>(max_retained_decoded_bytes));
+#endif
         heap_caps_free(workspace->decoded);
         workspace->decoded = nullptr;
         workspace->decoded_capacity = 0;

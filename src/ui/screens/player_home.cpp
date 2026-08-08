@@ -15,6 +15,18 @@ static lv_obj_t *g_title = nullptr;
 static lv_obj_t *g_track_info = nullptr;
 static lv_obj_t *g_play_symbol = nullptr;
 static lv_obj_t *g_progress = nullptr;
+
+// Stage 11.2：进度条使用 0~10000 的归一化范围，避免把超长音频毫秒数直接塞进 LVGL int32_t range。
+// 拖动期间只做 UI 本地预览；松手时才向 Player 提交一次 Seek。
+static constexpr int32_t kProgressScale = 10000;
+static bool g_progress_dragging = false;
+static bool g_progress_seek_pending = false;
+static uint64_t g_progress_total_ms = 0;
+static uint64_t g_progress_preview_ms = 0;
+static uint32_t g_progress_track_index = UINT32_MAX;
+static uint32_t g_progress_playback_revision = 0;
+static uint32_t g_progress_seek_base_revision = 0;
+static uint32_t g_progress_seek_started_tick = 0;
 static lv_obj_t *g_loop_label = nullptr;
 static lv_obj_t *g_volume_label = nullptr;
 static uint32_t g_last_audio_state_revision = UINT32_MAX;
@@ -47,6 +59,237 @@ static lv_obj_t *player_home_create_round_button(lv_obj_t *parent, int32_t size,
         button, symbol, lv_color_hex(0xFFFFFF), lv_font_default());
     lv_obj_center(label);
     return button;
+}
+
+static uint64_t player_home_snapshot_total_ms(const AudioStateSnapshot &snapshot)
+{
+    if (snapshot.sample_rate_hz == 0U || snapshot.total_frames == 0U) {
+        return 0U;
+    }
+    return (snapshot.total_frames * 1000ULL) / snapshot.sample_rate_hz;
+}
+
+static int32_t player_home_progress_value_from_ms(uint64_t position_ms, uint64_t total_ms)
+{
+    if (total_ms == 0U) {
+        return 0;
+    }
+    if (position_ms >= total_ms) {
+        return kProgressScale;
+    }
+    return static_cast<int32_t>((position_ms * static_cast<uint64_t>(kProgressScale)) / total_ms);
+}
+
+static uint64_t player_home_progress_ms_from_value(int32_t value, uint64_t total_ms)
+{
+    if (total_ms == 0U || value <= 0) {
+        return 0U;
+    }
+    if (value >= kProgressScale) {
+        // AudioTask 会把“正好等于总时长”的目标夹到最后一个有效采样点；UI 也提前保持同一语义。
+        return total_ms > 0U ? total_ms - 1U : 0U;
+    }
+    return (total_ms * static_cast<uint64_t>(value)) / static_cast<uint64_t>(kProgressScale);
+}
+
+static void player_home_format_time(uint64_t ms, char *buffer, size_t buffer_size)
+{
+    if (buffer == nullptr || buffer_size == 0U) {
+        return;
+    }
+    const uint64_t total_seconds = ms / 1000ULL;
+    const uint64_t hours = total_seconds / 3600ULL;
+    const uint64_t minutes = (total_seconds / 60ULL) % 60ULL;
+    const uint64_t seconds = total_seconds % 60ULL;
+    if (hours > 0U) {
+        snprintf(buffer, buffer_size, "%llu:%02llu:%02llu",
+            static_cast<unsigned long long>(hours),
+            static_cast<unsigned long long>(minutes),
+            static_cast<unsigned long long>(seconds));
+    } else {
+        snprintf(buffer, buffer_size, "%llu:%02llu",
+            static_cast<unsigned long long>(total_seconds / 60ULL),
+            static_cast<unsigned long long>(seconds));
+    }
+}
+
+static void player_home_show_seek_preview(bool pending)
+{
+    if (g_track_info == nullptr || g_progress_total_ms == 0U) {
+        return;
+    }
+    char target[24] = {};
+    char total[24] = {};
+    player_home_format_time(g_progress_preview_ms, target, sizeof(target));
+    player_home_format_time(g_progress_total_ms, total, sizeof(total));
+    lv_label_set_text_fmt(
+        g_track_info,
+        pending ? "跳转中  %s / %s" : "预览  %s / %s  · 松手跳转",
+        target,
+        total);
+}
+
+static bool player_home_snapshot_can_scrub(const AudioStateSnapshot &snapshot)
+{
+    if (!snapshot.ready || !snapshot.seek_supported || snapshot.track_index == UINT32_MAX) {
+        return false;
+    }
+    if (snapshot.track_index != player_state_get_index()) {
+        return false;
+    }
+    if (snapshot.sample_rate_hz == 0U || snapshot.total_frames == 0U) {
+        return false;
+    }
+    return snapshot.state == AudioPlaybackState::Playing ||
+        snapshot.state == AudioPlaybackState::Paused ||
+        snapshot.state == AudioPlaybackState::Seeking;
+}
+
+static void player_home_progress_set_enabled(bool enabled)
+{
+    if (g_progress == nullptr) {
+        return;
+    }
+    if (enabled) {
+        lv_obj_remove_state(g_progress, LV_STATE_DISABLED);
+    } else {
+        lv_obj_add_state(g_progress, LV_STATE_DISABLED);
+    }
+}
+
+static void player_home_cancel_progress_interaction()
+{
+    g_progress_dragging = false;
+    g_progress_seek_pending = false;
+    g_progress_total_ms = 0U;
+    g_progress_preview_ms = 0U;
+    g_progress_track_index = UINT32_MAX;
+    g_progress_playback_revision = 0U;
+    g_progress_seek_base_revision = 0U;
+    g_progress_seek_started_tick = 0U;
+}
+
+static void player_home_progress_sync(const AudioStateSnapshot &snapshot)
+{
+    if (g_progress == nullptr) {
+        return;
+    }
+
+    const uint64_t total_ms = player_home_snapshot_total_ms(snapshot);
+    const bool same_track = snapshot.track_index != UINT32_MAX &&
+        snapshot.track_index == player_state_get_index();
+
+    // 拖动中如果歌曲/播放世代被实体按键或曲库切换，立即取消旧 UI 手势，不能把旧 Track 的目标提交给新歌。
+    if (g_progress_dragging &&
+        (!same_track || snapshot.track_index != g_progress_track_index ||
+         snapshot.playback_revision != g_progress_playback_revision)) {
+        player_home_cancel_progress_interaction();
+    }
+
+    if (g_progress_seek_pending) {
+        const bool request_context_stale = !same_track ||
+            snapshot.track_index != g_progress_track_index ||
+            snapshot.playback_revision != g_progress_playback_revision;
+        const bool seek_committed = snapshot.seek_revision != g_progress_seek_base_revision;
+        const bool seek_failed = snapshot.state == AudioPlaybackState::Error;
+        // 异步请求正常应在很短时间内进入 Seeking/完成；10 秒只是防止极端异常时 UI 永久锁在预览值。
+        const bool seek_wait_expired = snapshot.state != AudioPlaybackState::Seeking &&
+            lv_tick_elaps(g_progress_seek_started_tick) > 10000U;
+        if (request_context_stale || seek_committed || seek_failed || seek_wait_expired) {
+            g_progress_seek_pending = false;
+        }
+    }
+
+    player_home_progress_set_enabled(player_home_snapshot_can_scrub(snapshot));
+
+    if (g_progress_dragging || g_progress_seek_pending) {
+        player_home_show_seek_preview(g_progress_seek_pending);
+        return;
+    }
+
+    if (!same_track || total_ms == 0U) {
+        lv_slider_set_value(g_progress, 0, LV_ANIM_OFF);
+        return;
+    }
+
+    lv_slider_set_value(
+        g_progress,
+        player_home_progress_value_from_ms(snapshot.position_ms, total_ms),
+        LV_ANIM_OFF);
+}
+
+static void player_home_progress_cb(lv_event_t *event)
+{
+    if (event == nullptr || g_progress == nullptr) {
+        return;
+    }
+
+    const lv_event_code_t code = lv_event_get_code(event);
+    if (code == LV_EVENT_PRESSED) {
+        AudioStateSnapshot snapshot = {};
+        if (!audio_service_get_snapshot(&snapshot) || !player_home_snapshot_can_scrub(snapshot)) {
+            return;
+        }
+        const uint64_t total_ms = player_home_snapshot_total_ms(snapshot);
+        if (total_ms == 0U) {
+            return;
+        }
+        g_progress_dragging = true;
+        g_progress_seek_pending = false;
+        g_progress_total_ms = total_ms;
+        g_progress_track_index = snapshot.track_index;
+        g_progress_playback_revision = snapshot.playback_revision;
+        g_progress_seek_base_revision = snapshot.seek_revision;
+        g_progress_preview_ms = player_home_progress_ms_from_value(
+            lv_slider_get_value(g_progress), total_ms);
+        player_home_show_seek_preview(false);
+        return;
+    }
+
+    if (code == LV_EVENT_VALUE_CHANGED && g_progress_dragging) {
+        g_progress_preview_ms = player_home_progress_ms_from_value(
+            lv_slider_get_value(g_progress), g_progress_total_ms);
+        player_home_show_seek_preview(false);
+        return;
+    }
+
+    if (code == LV_EVENT_PRESS_LOST && g_progress_dragging) {
+        player_home_cancel_progress_interaction();
+        player_home_refresh();
+        return;
+    }
+
+    if (code != LV_EVENT_RELEASED || !g_progress_dragging) {
+        return;
+    }
+
+    AudioStateSnapshot snapshot = {};
+    const bool snapshot_ok = audio_service_get_snapshot(&snapshot);
+    const bool context_ok = snapshot_ok && player_home_snapshot_can_scrub(snapshot) &&
+        snapshot.track_index == g_progress_track_index &&
+        snapshot.playback_revision == g_progress_playback_revision;
+    if (!context_ok) {
+        player_home_cancel_progress_interaction();
+        if (snapshot_ok) {
+            player_home_refresh();
+        }
+        return;
+    }
+
+    g_progress_preview_ms = player_home_progress_ms_from_value(
+        lv_slider_get_value(g_progress), g_progress_total_ms);
+    g_progress_dragging = false;
+    g_progress_seek_base_revision = snapshot.seek_revision;
+    g_progress_seek_started_tick = lv_tick_get();
+
+    // Stage 11.2：只在松手时提交一次。连续手势不会生成每像素 Seek；后端仍由 11.0.1 intent coalescing 兜底。
+    if (player_control_seek_ms(g_progress_preview_ms)) {
+        g_progress_seek_pending = true;
+        player_home_show_seek_preview(true);
+    } else {
+        player_home_cancel_progress_interaction();
+        player_home_refresh();
+    }
 }
 
 static lv_obj_t *player_home_create_top_button(
@@ -168,22 +411,12 @@ static void player_home_apply_audio_snapshot(const AudioStateSnapshot &snapshot)
         lv_label_set_text(g_play_symbol, show_pause ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
     }
 
-    if (g_progress != nullptr) {
-        int32_t progress = 0;
-        if (
-            snapshot.track_index == player_state_get_index() &&
-            snapshot.total_frames > 0
-        ) {
-            uint64_t percent = (snapshot.position_frames * 100ULL) / snapshot.total_frames;
-            if (percent > 100) {
-                percent = 100;
-            }
-            progress = static_cast<int32_t>(percent);
-        }
-        lv_bar_set_value(g_progress, progress, LV_ANIM_OFF);
-    }
+    player_home_progress_sync(snapshot);
 
-    player_home_refresh_track(&snapshot);
+    // 拖动/异步 Seek 等待期间 track_info 用作目标时间预览，避免 100ms snapshot 刷新把提示覆盖掉。
+    if (!g_progress_dragging && !g_progress_seek_pending) {
+        player_home_refresh_track(&snapshot);
+    }
     player_home_refresh_transport_controls(&snapshot);
 }
 
@@ -291,6 +524,7 @@ void player_home_create(lv_obj_t *screen)
         return;
     }
 
+    player_home_cancel_progress_interaction();
     ui_common_lock_object(screen);
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x0E1117), 0);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
@@ -330,25 +564,37 @@ void player_home_create(lv_obj_t *screen)
     lv_label_set_long_mode(g_title, LV_LABEL_LONG_DOT);
     lv_obj_set_size(g_title, 400, 32);
     lv_obj_set_style_text_align(g_title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(g_title, LV_ALIGN_TOP_MID, 0, 294);
+    lv_obj_align(g_title, LV_ALIGN_TOP_MID, 0, 288);
 
     g_track_info = player_home_create_label(
         screen, "", lv_color_hex(0x7E8795), font_manager_get_ui_font());
     lv_label_set_long_mode(g_track_info, LV_LABEL_LONG_DOT);
     lv_obj_set_size(g_track_info, 420, 32);
     lv_obj_set_style_text_align(g_track_info, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(g_track_info, LV_ALIGN_TOP_MID, 0, 329);
+    lv_obj_align(g_track_info, LV_ALIGN_TOP_MID, 0, 320);
 
-    g_progress = lv_bar_create(screen);
+    // Stage 11.2：用 Slider 替换只读 Bar。视觉仍保持细轨道，但增加圆形 knob，提供可拖动反馈。
+    g_progress = lv_slider_create(screen);
     ui_common_lock_object(g_progress);
-    lv_obj_set_size(g_progress, 330, 6);
-    lv_obj_align(g_progress, LV_ALIGN_TOP_MID, 0, 365);
-    lv_bar_set_range(g_progress, 0, 100);
-    lv_bar_set_value(g_progress, 0, LV_ANIM_OFF);
+    lv_obj_set_size(g_progress, 330, 12);
+    lv_obj_align(g_progress, LV_ALIGN_TOP_MID, 0, 354);
+    lv_slider_set_range(g_progress, 0, kProgressScale);
+    lv_slider_set_value(g_progress, 0, LV_ANIM_OFF);
+    lv_obj_set_style_radius(g_progress, LV_RADIUS_CIRCLE, LV_PART_MAIN);
     lv_obj_set_style_bg_color(g_progress, lv_color_hex(0x282E38), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(g_progress, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(g_progress, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(g_progress, lv_color_hex(0xF2F3F5), LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(g_progress, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_width(g_progress, 18, LV_PART_KNOB);
+    lv_obj_set_style_height(g_progress, 18, LV_PART_KNOB);
+    lv_obj_set_style_radius(g_progress, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+    lv_obj_set_style_bg_color(g_progress, lv_color_hex(0xF2F3F5), LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(g_progress, LV_OPA_COVER, LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(g_progress, LV_OPA_40, LV_PART_INDICATOR | LV_STATE_DISABLED);
+    lv_obj_set_style_bg_opa(g_progress, LV_OPA_40, LV_PART_KNOB | LV_STATE_DISABLED);
+    lv_obj_add_event_cb(g_progress, player_home_progress_cb, LV_EVENT_ALL, nullptr);
+    player_home_progress_set_enabled(false);
 
     lv_obj_t *prev = player_home_create_round_button(screen, 58, LV_SYMBOL_PREV);
     lv_obj_align(prev, LV_ALIGN_BOTTOM_MID, -92, -24);
@@ -377,7 +623,7 @@ void player_home_create(lv_obj_t *screen)
     if (!player_state_copy_list_label(list_label, sizeof(list_label))) {
         snprintf(list_label, sizeof(list_label), "未知列表");
     }
-    ESP_LOGI(TAG, "Stage 10.7 播放器首页已接入 Transport：列表=%s 位置=%u/%u 全局track=%u loop=%s volume=%u%% mute=%u",
+    ESP_LOGI(TAG, "Stage 11.2 播放器首页已接入可拖动进度：列表=%s 位置=%u/%u 全局track=%u loop=%s volume=%u%% mute=%u",
         list_label,
         static_cast<unsigned>(player_state_get_list_count() > 0 ? player_state_get_list_position() + 1 : 0),
         static_cast<unsigned>(player_state_get_list_count()),

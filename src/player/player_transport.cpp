@@ -6,6 +6,7 @@
 #include "audio_service.h"
 #include "media_library.h"
 #include "player_state.h"
+#include "app_diag_config.h"
 
 static const char *TAG = "播放传输";
 
@@ -79,10 +80,14 @@ bool player_transport_play_current(const char *reason)
     MediaTechnicalInfo technical = {};
     const bool has_technical_info = media_library_get_technical_info(track_index, &technical);
 
+#if APP_DIAG_PLAYER_TRANSPORT
     ESP_LOGI(TAG, "播放当前歌曲：原因=%s track=%u 路径=%s",
         reason != nullptr ? reason : "显式播放",
         static_cast<unsigned>(track_index),
         path);
+#else
+    (void)reason;
+#endif
 
     return audio_service_play_track(
         static_cast<uint32_t>(track_index),
@@ -107,7 +112,9 @@ bool player_transport_previous()
         (snapshot.state == AudioPlaybackState::Playing || snapshot.state == AudioPlaybackState::Paused) &&
         snapshot.position_ms >= 3000ULL
     ) {
+#if APP_DIAG_PLAYER_TRANSPORT
         ESP_LOGI(TAG, "手动上一曲：当前已播放超过3秒，Seek回曲首");
+#endif
         return player_transport_seek_ms(0);
     }
 
@@ -140,9 +147,11 @@ bool player_transport_seek_ms(uint64_t target_ms)
     const size_t track_index = player_state_get_index();
     MediaTechnicalInfo technical = {};
     const bool has_technical = media_library_get_technical_info(track_index, &technical);
+#if APP_DIAG_AUDIO_SEEK
     ESP_LOGI(TAG, "SEEK_TRACE: Player请求 track=%u target=%llums",
         static_cast<unsigned>(track_index),
         static_cast<unsigned long long>(target_ms));
+#endif
     return audio_service_seek_track(
         static_cast<uint32_t>(track_index),
         path,
@@ -170,15 +179,18 @@ static void player_transport_handle_finished(const AudioStateSnapshot &audio)
 
     // 若用户刚好在 EOF 边沿切换了 UI 列表，旧 AudioTask 的 Finished 不能推进新列表。
     if (audio.track_index == UINT32_MAX || audio.track_index != list.track_index) {
+#if APP_DIAG_PLAYER_TRANSPORT
         ESP_LOGI(TAG,
             "AUTO_NEXT_TRACE: 忽略过期 EOF audio_track=%lu list_track=%lu generation=%lu",
             static_cast<unsigned long>(audio.track_index),
             static_cast<unsigned long>(list.track_index),
             static_cast<unsigned long>(list.catalog_generation));
+#endif
         return;
     }
 
     const PlayerLoopMode mode = player_transport_get_loop_mode();
+#if APP_DIAG_PLAYER_TRANSPORT
     ESP_LOGI(TAG,
         "AUTO_NEXT_TRACE: EOF mode=%s list=%s pos=%lu/%lu track=%lu playback_rev=%lu",
         player_transport_loop_mode_name(mode),
@@ -187,6 +199,7 @@ static void player_transport_handle_finished(const AudioStateSnapshot &audio)
         static_cast<unsigned long>(list.track_count),
         static_cast<unsigned long>(list.track_index),
         static_cast<unsigned long>(audio.playback_revision));
+#endif
 
     if (mode == PlayerLoopMode::SingleRepeat) {
         if (!player_transport_play_current("单曲循环 EOF")) {
@@ -196,7 +209,9 @@ static void player_transport_handle_finished(const AudioStateSnapshot &audio)
     }
 
     if (mode == PlayerLoopMode::Sequential && list.position + 1U >= list.track_count) {
+#if APP_DIAG_PLAYER_TRANSPORT
         ESP_LOGI(TAG, "AUTO_NEXT_TRACE: 顺序播放已到列表末尾，保持 Finished");
+#endif
         return;
     }
 

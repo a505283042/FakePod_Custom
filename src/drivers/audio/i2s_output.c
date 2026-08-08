@@ -8,6 +8,7 @@
 #include "driver/i2s_std.h"
 #include "esp_log.h"
 #include "board_pins.h"
+#include "app_diag_config.h"
 #include "../../audio/audio_rate_profile.h"
 
 static const char *TAG = "I2S";
@@ -64,10 +65,12 @@ static esp_err_t i2s_output_create_channel(uint32_t sample_rate_hz)
         return ESP_ERR_NOT_SUPPORTED;
     }
 
+#if APP_DIAG_AUDIO_POP
     ESP_LOGI(TAG, "正在初始化 I2S TX：%luHz / 32bit slot / 立体声 / Philips I2S",
         (unsigned long)sample_rate_hz);
     ESP_LOGI(TAG, "BCLK=GPIO%d LRCK=GPIO%d DOUT=GPIO%d，MCLK不从ESP32输出",
         FAKEPOD_I2S_BCLK, FAKEPOD_I2S_LRCK, FAKEPOD_I2S_DOUT);
+#endif
 
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     chan_cfg.dma_desc_num = rate_profile.i2s_dma_desc_num;
@@ -118,6 +121,7 @@ static esp_err_t i2s_output_create_channel(uint32_t sample_rate_hz)
     g_sample_rate_hz = sample_rate_hz;
     g_started = true;
 
+#if APP_DIAG_AUDIO_POP
     const uint32_t bclk_hz = sample_rate_hz * 64U;
     ESP_LOGI(TAG, "I2S TX 初始化成功：BCLK=%luHz，LRCK=%luHz",
         (unsigned long)bclk_hz,
@@ -131,6 +135,7 @@ static esp_err_t i2s_output_create_channel(uint32_t sample_rate_hz)
         (unsigned)sizeof(g_silence),
         (unsigned long)(dma_runway_us / 1000U),
         (unsigned long)(dma_runway_us % 1000U));
+#endif
     return ESP_OK;
 }
 
@@ -386,7 +391,9 @@ esp_err_t i2s_output_stop(void)
                 I2S_TASK_STOP_TIMEOUT_MS);
             return ESP_ERR_TIMEOUT;
         }
+#if APP_DIAG_AUDIO_POP
         ESP_LOGI(TAG, "I2S 发送任务已正常退出");
+#endif
         vSemaphoreDelete(g_stream_task_done);
         g_stream_task_done = NULL;
     }
@@ -407,7 +414,9 @@ esp_err_t i2s_output_stop(void)
     g_stream_task = NULL;
     g_started = false;
     g_sample_rate_hz = 0;
+#if APP_DIAG_AUDIO_POP
     ESP_LOGI(TAG, "I2S TX 已正常停止并释放");
+#endif
     return ESP_OK;
 }
 
