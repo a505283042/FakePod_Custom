@@ -73,6 +73,9 @@ struct FlacDecoder
 
 #endif
 
+    // 首块 PCM 在 I2S 启动前预解码，此阶段没有实时播放截止时间；
+    // 若 64KB 起播预充被较大的 FLAC 元数据耗尽，可允许等待后台预取继续补充。
+    bool startup_predecode_active = false;
     bool runtime_info_verified = false;
     bool eof = false;
 };

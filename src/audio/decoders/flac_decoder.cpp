@@ -31,12 +31,19 @@ static constexpr size_t FLAC_PREFETCH_READ_96K_BYTES = 16384;
 static constexpr size_t FLAC_PREFETCH_READ_192K_BYTES = 32768;
 static constexpr size_t FLAC_PREFETCH_START_48K_BYTES = 64 * 1024;
 static constexpr size_t FLAC_PREFETCH_START_96K_BYTES = 96 * 1024;
-static constexpr size_t FLAC_PREFETCH_START_192K_BYTES = 128 * 1024;
+// 176.4/192k 长测中 256KB ring 最低仍约 198KB、starve=0，128KB 起播预充偏保守。
+// Stage 9.5.4 将高采样率起播目标降到 64KB，预计减少约两次 32KB SD 读取的等待；
+// 稳态 ring、SD read chunk 和解码窗口均保持不变。
+static constexpr size_t FLAC_PREFETCH_START_192K_BYTES = 64 * 1024;
 static constexpr uint32_t FLAC_PREFETCH_TASK_STACK_BYTES = 4096;
 static constexpr UBaseType_t FLAC_PREFETCH_TASK_PRIORITY = 4;
 static constexpr BaseType_t FLAC_PREFETCH_TASK_CORE = 1;
 static constexpr TickType_t FLAC_PREFETCH_SEND_WAIT = pdMS_TO_TICKS(20);
 static constexpr TickType_t FLAC_PREFETCH_RECEIVE_WAIT = pdMS_TO_TICKS(20);
+// 首块 PCM 预解码发生在 I2S 启动前，不受实时播放预算约束。
+// 允许等待完整一次较慢的 SD 读取，避免较大的 Vorbis Comment/PICTURE 元数据
+// 在 64KB 起播预充后把 ring 短暂耗空时直接判定失败。
+static constexpr TickType_t FLAC_PREFETCH_STARTUP_RECEIVE_WAIT = pdMS_TO_TICKS(100);
 static constexpr TickType_t FLAC_PREFETCH_START_WAIT = pdMS_TO_TICKS(750);
 static constexpr TickType_t FLAC_PREFETCH_STOP_WAIT = pdMS_TO_TICKS(1000);
 static constexpr size_t FLAC_MIN_DECODED_BUFFER_BYTES = 16384;
@@ -834,8 +841,14 @@ static esp_err_t flac_verify_runtime_info(FlacDecoder *decoder)
 
 static TickType_t flac_prefetch_receive_wait(const FlacDecoder *decoder)
 {
-    // 等待上限按单个 FLAC 块播放预算的约 1/4 缩放：
-    // 48k/4096帧约20ms，96k约10ms，192k约5ms，避免高采样率下等待本身吃光实时预算。
+    // 首块 PCM 尚未交给 I2S 时不存在 DMA underrun 截止时间。此阶段若 64KB 起播预充
+    // 被 FLAC 元数据/parser 消耗完，允许等待后台完成下一次 SD 读取，而不是立即失败。
+    if (decoder != nullptr && decoder->startup_predecode_active) {
+        return FLAC_PREFETCH_STARTUP_RECEIVE_WAIT;
+    }
+
+    // 正式播放后仍按单个 FLAC 块播放预算的约 1/4 缩放等待：
+    // 48k/4096帧约20ms，96k约10ms，192k约5ms，避免等待本身吃光实时预算。
     if (decoder == nullptr || decoder->sample_rate_hz == 0 || decoder->max_block_size == 0) {
         return FLAC_PREFETCH_RECEIVE_WAIT;
     }
@@ -850,7 +863,11 @@ static TickType_t flac_prefetch_receive_wait(const FlacDecoder *decoder)
     if (wait_ms > max_wait_ms) {
         wait_ms = max_wait_ms;
     }
-    return pdMS_TO_TICKS(wait_ms);
+
+    // FreeRTOS tick 粒度可能大于 1ms；pdMS_TO_TICKS(5) 被截断为 0 时，
+    // 必须至少保留 1 tick，否则会把“允许短暂等待”错误变成非阻塞读取。
+    const TickType_t wait_ticks = pdMS_TO_TICKS(wait_ms);
+    return wait_ticks > 0 ? wait_ticks : 1;
 }
 
 static size_t flac_input_window_target(const FlacDecoder *decoder)
@@ -1342,7 +1359,9 @@ esp_err_t flac_decoder_open(FlacDecoder *decoder, const char *path)
 
     // 在触碰 I2S/DAC 之前先解出第一块 PCM：既验证 Simple Decoder 真正可用，
     // 又让正式起播后的第一批数据已经在 PSRAM 中，避免首帧解码造成时钟欠料。
+    decoder->startup_predecode_active = true;
     ret = flac_decode_next_output(decoder);
+    decoder->startup_predecode_active = false;
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "FLAC 首块 PCM 预解码失败：%s", esp_err_to_name(ret));
         flac_decoder_close(decoder);

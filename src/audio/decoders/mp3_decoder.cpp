@@ -15,10 +15,10 @@
 
 static const char *TAG = "MP3";
 
-// MP3 压缩输入工作区放 PSRAM。320kbps/44.1k 实测 8KB 窗口平均约每 6 个 MP3 frame
-// 触发一次同步 fread，而 refill 峰值仍只有约 11.2ms / 26.1ms 预算。Stage 9.5.3
-// 只把窗口小步放大到 12KB，降低 FAT/SD 调用和 compact 频率；不引入额外预取任务。
-static constexpr size_t MP3_INPUT_BUFFER_BYTES = 12 * 1024;
+// MP3 压缩输入工作区放 PSRAM。320kbps/44.1k 对比实测：8KB 窗口虽然 fread 更频繁，
+// 但同步阻塞峰值约 6.9ms、refill 峰值约 11.2ms，优于 12KB 窗口的约 10.7/15.0ms。
+// 正式配置保留 8KB，优先保证 AudioTask 最坏实时延迟；MP3 无需额外预取任务。
+static constexpr size_t MP3_INPUT_BUFFER_BYTES = 8 * 1024;
 // 继续保留 2KB 低水位。它高于常见 320kbps/44.1k 单帧约 1KB 的压缩尺寸，
 // 可避免 parser 面对不完整帧时在“尚未低于补读阈值”的窗口中反复无进度。
 static constexpr size_t MP3_INPUT_REFILL_LOW_WATER_BYTES = 2048;
