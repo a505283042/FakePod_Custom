@@ -35,6 +35,9 @@ bool player_control_volume_up(uint8_t step = 5U);
 bool player_control_volume_down(uint8_t step = 5U);
 bool player_control_toggle_mute();
 
+// Stage 11.0：按当前 Track 的真实 Playback Clock 时间轴定位。
+bool player_control_seek_ms(uint64_t target_ms);
+
 // Stage 10.5：由 UI/列表页绑定新的播放上下文。position 是目标 Group 内位置。
 // 这里只切 Player Context，不先单独 Stop；后续 Play 由 AudioTask 串行关闭旧 pipeline。
 bool player_control_select_all_tracks(size_t position);

@@ -191,6 +191,7 @@ esp_err_t wav_decoder_open(WavDecoder *decoder, AudioSource *source)
                 return ESP_FAIL;
             }
 
+            decoder->data_offset_bytes = data_offset;
             decoder->data_size_bytes = chunk_size;
             decoder->data_remaining_bytes = chunk_size;
             decoder->total_frames = chunk_size / decoder->block_align;
@@ -286,6 +287,51 @@ esp_err_t wav_decoder_read_pcm32(
     decoder->data_remaining_bytes -= static_cast<uint32_t>(bytes_read);
     decoder->frames_read += frames_read;
     *out_frames = frames_read;
+    return ESP_OK;
+}
+
+esp_err_t wav_decoder_seek_frame(WavDecoder *decoder, uint64_t target_frame, uint64_t *out_frame)
+{
+    if (out_frame != nullptr) {
+        *out_frame = 0;
+    }
+    if (decoder == nullptr || decoder->source == nullptr || decoder->block_align == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!audio_source_has_capability(decoder->source, AUDIO_SOURCE_CAP_SEEK)) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    if (target_frame > decoder->total_frames) {
+        target_frame = decoder->total_frames;
+    }
+    const uint64_t byte_offset = decoder->data_offset_bytes +
+        target_frame * static_cast<uint64_t>(decoder->block_align);
+    if (byte_offset > static_cast<uint64_t>(INT64_MAX)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    const esp_err_t ret = audio_source_seek(
+        decoder->source,
+        static_cast<int64_t>(byte_offset),
+        AudioSourceSeekOrigin::Begin);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    decoder->frames_read = target_frame;
+    const uint64_t remaining_frames = decoder->total_frames - target_frame;
+    const uint64_t remaining_bytes = remaining_frames * decoder->block_align;
+    decoder->data_remaining_bytes = remaining_bytes > UINT32_MAX
+        ? UINT32_MAX
+        : static_cast<uint32_t>(remaining_bytes);
+    if (out_frame != nullptr) {
+        *out_frame = target_frame;
+    }
+    ESP_LOGI(TAG, "SEEK_TRACE: WAV exact frame=%llu/%llu byte=%llu",
+        static_cast<unsigned long long>(target_frame),
+        static_cast<unsigned long long>(decoder->total_frames),
+        static_cast<unsigned long long>(byte_offset));
     return ESP_OK;
 }
 

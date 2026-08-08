@@ -15,6 +15,7 @@ struct WavDecoder
     uint16_t bits_per_sample = 0;
     uint16_t block_align = 0;
     uint32_t byte_rate = 0;
+    uint64_t data_offset_bytes = 0;
     uint32_t data_size_bytes = 0;
     uint32_t data_remaining_bytes = 0;
     uint64_t total_frames = 0;
@@ -35,5 +36,8 @@ esp_err_t wav_decoder_read_pcm32(
 );
 
 void wav_decoder_close(WavDecoder *decoder);
+// 按 PCM 帧精确定位；target_frame 会被夹到 [0, total_frames]。
+esp_err_t wav_decoder_seek_frame(WavDecoder *decoder, uint64_t target_frame, uint64_t *out_frame);
+
 bool wav_decoder_is_open(const WavDecoder *decoder);
 bool wav_decoder_is_eof(const WavDecoder *decoder);

@@ -28,6 +28,17 @@ bool audio_service_stop(bool wait = true);
 bool audio_service_pause(bool wait = true);
 bool audio_service_resume(bool wait = true);
 
+// Stage 11.0：对当前选中 Track 发起 Seek。路径/技术索引仍复制进请求，AudioTask 会核对
+// 当前 track + playback_revision，并丢弃队列中已经过期的旧 Seek。
+bool audio_service_seek_track(
+    uint32_t track_index,
+    const char *path,
+    MediaFormat format,
+    const MediaTechnicalInfo *technical_info,
+    uint64_t target_ms,
+    bool wait = false
+);
+
 // 用户音量/静音同样只能通过 AudioTask 命令队列改变。
 // percent 范围 0~100；默认 80 保持 Stage 9.x 已实机验证的 -20dB 起始音量。
 bool audio_service_set_volume(uint8_t percent, bool wait = false);

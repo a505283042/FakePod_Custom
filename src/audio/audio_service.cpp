@@ -74,6 +74,7 @@ enum class AudioCommandType : uint8_t
     Stop,
     Pause,
     Resume,
+    Seek,
     SetVolume,
     SetMute
 };
@@ -88,6 +89,8 @@ struct AudioRequest
     MediaTechnicalInfo technical_info = {};
     uint8_t volume_percent = 80;
     bool mute = false;
+    uint32_t expected_playback_revision = 0;
+    uint64_t seek_target_ms = 0;
     char path[AUDIO_INLINE_PATH_SIZE] = {};
     char *extended_path = nullptr;
     SemaphoreHandle_t done = nullptr;
@@ -103,6 +106,7 @@ static esp_err_t g_start_result = ESP_ERR_INVALID_STATE;
 
 static portMUX_TYPE g_request_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t g_next_request_id = 1;
+static uint32_t g_latest_seek_request_id = 0;
 
 static portMUX_TYPE g_snapshot_mux = portMUX_INITIALIZER_UNLOCKED;
 static AudioStateSnapshot g_snapshot = {};
@@ -121,6 +125,9 @@ static uint16_t g_task_channels = 0;
 static uint16_t g_task_bits_per_sample = 0;
 static AudioPlaybackClock g_playback_clock = {};
 static uint64_t g_task_total_frames = 0;
+static uint32_t g_task_seek_revision = 0;
+static uint32_t g_task_last_seek_request_id = 0;
+static uint64_t g_task_last_seek_target_ms = 0;
 static uint64_t g_last_progress_publish_frame = 0;
 static bool g_ram_trace_first_pcm_done = false;
 static bool g_ram_trace_steady_5s_done = false;
@@ -295,6 +302,11 @@ static void audio_task_publish_snapshot()
     snapshot.decoder_position_frames = g_playback_clock.decoder_frames;
     snapshot.position_ms = audio_playback_clock_position_ms(&g_playback_clock);
     snapshot.total_frames = g_task_total_frames;
+    snapshot.seek_supported =
+        g_task_format == MediaFormat::WAV || g_task_format == MediaFormat::MP3;
+    snapshot.seek_revision = g_task_seek_revision;
+    snapshot.last_seek_request_id = g_task_last_seek_request_id;
+    snapshot.last_seek_target_ms = g_task_last_seek_target_ms;
     snapshot.decode_workspace_input_bytes = static_cast<uint32_t>(
         g_decode_workspace.input_capacity > UINT32_MAX
             ? UINT32_MAX
@@ -648,7 +660,10 @@ static void audio_task_verify_index_snapshot(
 static esp_err_t audio_task_start_pcm_pipeline(
     PcmDecoderType decoder_type,
     const char *path,
-    const AudioRequest *request
+    const AudioRequest *request,
+    bool apply_seek = false,
+    uint64_t seek_target_ms = 0,
+    PcmSeekResult *out_seek_result = nullptr
 )
 {
     audio_task_log_ram("before_decoder_open");
@@ -658,6 +673,46 @@ static esp_err_t audio_task_start_pcm_pipeline(
         return ret;
     }
     audio_task_verify_index_snapshot(request, decoder_type);
+
+    PcmSeekResult seek_result = {};
+    if (apply_seek) {
+        const uint64_t target_frame = g_decoder.info.sample_rate_hz > 0
+            ? (seek_target_ms * static_cast<uint64_t>(g_decoder.info.sample_rate_hz)) / 1000ULL
+            : 0ULL;
+        seek_result.requested_frame = target_frame;
+        if (target_frame == 0) {
+            // Decoder open 本身已经在曲首完成首块预解码，不再做一次重复 reopen。
+            seek_result.actual_frame = 0;
+            seek_result.method = PcmSeekMethod::RestartFromBeginning;
+        } else {
+            ret = pcm_decoder_seek_frame(
+                &g_decoder,
+                target_frame,
+                request != nullptr && request->has_technical_info ? &request->technical_info : nullptr,
+                &seek_result);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "SEEK_TRACE: codec定位失败 format=%s target=%llums frame=%llu ret=%s",
+                    pcm_decoder_type_name(decoder_type),
+                    static_cast<unsigned long long>(seek_target_ms),
+                    static_cast<unsigned long long>(target_frame),
+                    esp_err_to_name(ret));
+                pcm_decoder_close(&g_decoder);
+                return ret;
+            }
+        }
+        if (out_seek_result != nullptr) {
+            *out_seek_result = seek_result;
+        }
+        ESP_LOGI(TAG,
+            "SEEK_TRACE: PREPARED format=%s method=%s target=%llums requested_frame=%llu actual_frame=%llu source_offset=%llu",
+            pcm_decoder_type_name(decoder_type),
+            pcm_seek_method_name(seek_result.method),
+            static_cast<unsigned long long>(seek_target_ms),
+            static_cast<unsigned long long>(seek_result.requested_frame),
+            static_cast<unsigned long long>(seek_result.actual_frame),
+            static_cast<unsigned long long>(seek_result.source_offset));
+    }
+
     audio_task_log_ram("after_decoder_open");
     ESP_LOGI(TAG,
         "WORKSPACE_TRACE: codec=%s input=%uB pcm=%uB total=%uB（PSRAM共享，FLAC ring独立）",
@@ -670,6 +725,9 @@ static esp_err_t audio_task_start_pcm_pipeline(
     g_task_channels = g_decoder.info.channels;
     g_task_bits_per_sample = g_decoder.info.bits_per_sample;
     audio_playback_clock_reset(&g_playback_clock, g_decoder.info.sample_rate_hz);
+    if (apply_seek) {
+        audio_playback_clock_seek(&g_playback_clock, seek_result.actual_frame);
+    }
     g_task_total_frames = g_decoder.info.total_frames;
     if (
         g_task_total_frames == 0 &&
@@ -690,7 +748,7 @@ static esp_err_t audio_task_start_pcm_pipeline(
         ESP_LOGI(TAG, "CLOCK_TRACE: TOTAL_SOURCE=decoder total=%llu",
             static_cast<unsigned long long>(g_task_total_frames));
     }
-    g_last_progress_publish_frame = 0;
+    g_last_progress_publish_frame = g_playback_clock.submitted_frames;
     g_ram_trace_first_pcm_done = false;
     g_ram_trace_steady_5s_done = false;
     audio_task_publish_snapshot();
@@ -991,6 +1049,25 @@ static bool audio_task_pipeline_has_resources()
         pcm_decoder_is_open(&g_decoder);
 }
 
+static PcmDecoderType audio_decoder_type_for_format(MediaFormat format)
+{
+    switch (format) {
+        case MediaFormat::WAV: return PcmDecoderType::Wav;
+        case MediaFormat::FLAC: return PcmDecoderType::Flac;
+        case MediaFormat::MP3: return PcmDecoderType::Mp3;
+        default: return PcmDecoderType::None;
+    }
+}
+
+static bool audio_seek_request_is_latest(uint32_t request_id)
+{
+    bool latest = false;
+    portENTER_CRITICAL(&g_request_mux);
+    latest = request_id != 0U && request_id == g_latest_seek_request_id;
+    portEXIT_CRITICAL(&g_request_mux);
+    return latest;
+}
+
 static void audio_task_handle_play(AudioRequest *request)
 {
     const char *path = audio_request_path(request);
@@ -1012,6 +1089,8 @@ static void audio_task_handle_play(AudioRequest *request)
     g_task_last_request_id = request->request_id;
     g_task_track_index = request->track_index;
     g_task_format = request->format;
+    g_task_last_seek_request_id = 0;
+    g_task_last_seek_target_ms = 0;
     audio_task_reset_media_fields();
     audio_task_advance_playback_revision();
     audio_task_set_state(AudioPlaybackState::Preparing);
@@ -1030,14 +1109,8 @@ static void audio_task_handle_play(AudioRequest *request)
         return;
     }
 
-    PcmDecoderType decoder_type = PcmDecoderType::None;
-    if (request->format == MediaFormat::WAV) {
-        decoder_type = PcmDecoderType::Wav;
-    } else if (request->format == MediaFormat::FLAC) {
-        decoder_type = PcmDecoderType::Flac;
-    } else if (request->format == MediaFormat::MP3) {
-        decoder_type = PcmDecoderType::Mp3;
-    } else {
+    const PcmDecoderType decoder_type = audio_decoder_type_for_format(request->format);
+    if (decoder_type == PcmDecoderType::None) {
         ESP_LOGW(TAG, "Stage 9.5.1 当前统一PCM Core 已接入 WAV/FLAC/MP3；%s 解码器尚未接入",
             media_format_name(request->format));
         audio_task_set_state(AudioPlaybackState::Error, ESP_ERR_NOT_SUPPORTED);
@@ -1056,6 +1129,133 @@ static void audio_task_handle_play(AudioRequest *request)
     audio_request_complete(request, true, ESP_OK);
 }
 
+static void audio_task_handle_seek(AudioRequest *request)
+{
+    if (request == nullptr) {
+        return;
+    }
+    g_task_last_request_id = request->request_id;
+
+    if (!audio_seek_request_is_latest(request->request_id)) {
+        ESP_LOGI(TAG, "SEEK_TRACE: 丢弃已被更新请求覆盖的 Seek request=%lu latest=%lu",
+            static_cast<unsigned long>(request->request_id),
+            static_cast<unsigned long>(g_latest_seek_request_id));
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+    if (request->expected_playback_revision == 0U ||
+        request->expected_playback_revision != g_task_playback_revision ||
+        request->track_index != g_task_track_index || request->format != g_task_format) {
+        ESP_LOGI(TAG,
+            "SEEK_TRACE: 忽略过期 Seek request=%lu expected_rev=%lu current_rev=%lu req_track=%lu current_track=%lu",
+            static_cast<unsigned long>(request->request_id),
+            static_cast<unsigned long>(request->expected_playback_revision),
+            static_cast<unsigned long>(g_task_playback_revision),
+            static_cast<unsigned long>(request->track_index),
+            static_cast<unsigned long>(g_task_track_index));
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+    if (g_task_state != AudioPlaybackState::Playing && g_task_state != AudioPlaybackState::Paused) {
+        ESP_LOGW(TAG, "SEEK_TRACE: 当前状态不允许 Seek：%s", audio_playback_state_name_cn(g_task_state));
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+
+    const PcmDecoderType decoder_type = audio_decoder_type_for_format(request->format);
+    if (decoder_type == PcmDecoderType::None) {
+        audio_request_complete(request, false, ESP_ERR_NOT_SUPPORTED);
+        return;
+    }
+
+    uint64_t target_ms = request->seek_target_ms;
+    const uint64_t known_total_frames = g_task_total_frames;
+    const uint32_t known_rate = g_task_sample_rate_hz;
+    if (known_total_frames > 0 && known_rate > 0) {
+        const uint64_t duration_ms = (known_total_frames * 1000ULL) / known_rate;
+        if (duration_ms > 0 && target_ms >= duration_ms) {
+            target_ms = duration_ms - 1ULL;
+        }
+    }
+    const uint64_t target_frame = known_rate > 0
+        ? (target_ms * static_cast<uint64_t>(known_rate)) / 1000ULL : 0ULL;
+    if (!pcm_decoder_seek_supported(decoder_type, target_frame)) {
+        ESP_LOGW(TAG,
+            "SEEK_TRACE: 当前后端尚未开放非零 Seek format=%s target=%llums；保持原播放位置",
+            pcm_decoder_type_name(decoder_type),
+            static_cast<unsigned long long>(target_ms));
+        audio_request_complete(request, false, ESP_ERR_NOT_SUPPORTED);
+        return;
+    }
+    if (decoder_type == PcmDecoderType::Mp3 &&
+        (!request->has_technical_info ||
+         (request->technical_info.flags & MEDIA_TECH_PARSED) == 0U)) {
+        ESP_LOGW(TAG, "SEEK_TRACE: MP3 缺少技术索引，拒绝无依据的字节定位");
+        audio_request_complete(request, false, ESP_ERR_NOT_SUPPORTED);
+        return;
+    }
+
+    const bool was_paused = g_task_state == AudioPlaybackState::Paused;
+    audio_task_set_state(AudioPlaybackState::Seeking, ESP_OK);
+    ESP_LOGI(TAG,
+        "SEEK_TRACE: BEGIN request=%lu rev=%lu track=%lu format=%s from=%llums target=%llums paused=%u",
+        static_cast<unsigned long>(request->request_id),
+        static_cast<unsigned long>(g_task_playback_revision),
+        static_cast<unsigned long>(g_task_track_index),
+        media_format_name(g_task_format),
+        static_cast<unsigned long long>(audio_playback_clock_position_ms(&g_playback_clock)),
+        static_cast<unsigned long long>(target_ms),
+        static_cast<unsigned>(was_paused));
+
+    esp_err_t ret = audio_task_shutdown_pipeline();
+    if (ret != ESP_OK) {
+        audio_task_set_state(AudioPlaybackState::Error, ret);
+        audio_request_complete(request, false, ret);
+        return;
+    }
+
+    PcmSeekResult seek_result = {};
+    ret = audio_task_start_pcm_pipeline(
+        decoder_type,
+        audio_request_path(request),
+        request,
+        true,
+        target_ms,
+        &seek_result);
+    if (ret != ESP_OK) {
+        audio_task_set_state(AudioPlaybackState::Error, ret);
+        audio_request_complete(request, false, ret);
+        return;
+    }
+
+    ++g_task_seek_revision;
+    if (g_task_seek_revision == 0U) {
+        ++g_task_seek_revision;
+    }
+    g_task_last_seek_request_id = request->request_id;
+    g_task_last_seek_target_ms = target_ms;
+
+    if (was_paused) {
+        // start pipeline 尚未发送真实 PCM，因此 DAC 仍保持手动静音；Paused 下继续送零维持时钟。
+        g_pcm_unmute_pending = false;
+        audio_task_reset_pcm_fade_in();
+        audio_task_set_state(AudioPlaybackState::Paused, ESP_OK);
+    } else {
+        audio_task_set_state(AudioPlaybackState::Playing, ESP_OK);
+    }
+
+    ESP_LOGI(TAG,
+        "SEEK_TRACE: DONE request=%lu method=%s requested=%llums actual=%llums frame=%llu source_offset=%llu state=%s",
+        static_cast<unsigned long>(request->request_id),
+        pcm_seek_method_name(seek_result.method),
+        static_cast<unsigned long long>(request->seek_target_ms),
+        static_cast<unsigned long long>(audio_playback_clock_position_ms(&g_playback_clock)),
+        static_cast<unsigned long long>(seek_result.actual_frame),
+        static_cast<unsigned long long>(seek_result.source_offset),
+        audio_playback_state_name_cn(g_task_state));
+    audio_request_complete(request, true, ESP_OK);
+}
+
 static void audio_task_handle_stop(AudioRequest *request)
 {
     g_task_last_request_id = request->request_id;
@@ -1063,6 +1263,8 @@ static void audio_task_handle_stop(AudioRequest *request)
     audio_task_advance_playback_revision();
     g_task_track_index = UINT32_MAX;
     g_task_format = MediaFormat::Unknown;
+    g_task_last_seek_request_id = 0;
+    g_task_last_seek_target_ms = 0;
     audio_task_reset_media_fields();
 
     if (ret != ESP_OK) {
@@ -1215,6 +1417,9 @@ static void audio_task_process_request(AudioRequest *request)
         case AudioCommandType::Resume:
             audio_task_handle_resume(request);
             break;
+        case AudioCommandType::Seek:
+            audio_task_handle_seek(request);
+            break;
         case AudioCommandType::SetVolume:
             audio_task_handle_set_volume(request);
             break;
@@ -1346,6 +1551,7 @@ const char *audio_playback_state_name_cn(AudioPlaybackState state)
         case AudioPlaybackState::Preparing: return "准备中";
         case AudioPlaybackState::Prepared: return "已准备";
         case AudioPlaybackState::Playing: return "播放中";
+        case AudioPlaybackState::Seeking: return "定位中";
         case AudioPlaybackState::Paused: return "已暂停";
         case AudioPlaybackState::Finished: return "播放结束";
         case AudioPlaybackState::Stopped: return "已停止";
@@ -1466,6 +1672,49 @@ bool audio_service_pause(bool wait)
 bool audio_service_resume(bool wait)
 {
     AudioRequest *request = audio_request_create(AudioCommandType::Resume, wait);
+    return audio_service_submit(request, wait);
+}
+
+
+bool audio_service_seek_track(
+    uint32_t track_index,
+    const char *path,
+    MediaFormat format,
+    const MediaTechnicalInfo *technical_info,
+    uint64_t target_ms,
+    bool wait)
+{
+    AudioStateSnapshot snapshot = {};
+    if (!audio_service_get_snapshot(&snapshot) || !snapshot.ready ||
+        snapshot.track_index != track_index ||
+        (snapshot.state != AudioPlaybackState::Playing &&
+         snapshot.state != AudioPlaybackState::Paused &&
+         snapshot.state != AudioPlaybackState::Seeking)) {
+        return false;
+    }
+
+    AudioRequest *request = audio_request_create(AudioCommandType::Seek, wait);
+    if (request == nullptr) {
+        return false;
+    }
+    request->track_index = track_index;
+    request->format = format;
+    request->expected_playback_revision = snapshot.playback_revision;
+    request->seek_target_ms = target_ms;
+    if (technical_info != nullptr) {
+        request->technical_info = *technical_info;
+        request->has_technical_info = true;
+    }
+    if (!audio_request_set_path(request, path)) {
+        audio_request_release(request);
+        return false;
+    }
+
+    // 对尚未开始处理的快速拖动请求只保留最后一次；正在执行的 Seek 不被跨任务强杀，
+    // 下一次请求会在其完成后继续定位到最终目标。
+    portENTER_CRITICAL(&g_request_mux);
+    g_latest_seek_request_id = request->request_id;
+    portEXIT_CRITICAL(&g_request_mux);
     return audio_service_submit(request, wait);
 }
 

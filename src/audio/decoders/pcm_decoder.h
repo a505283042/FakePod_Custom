@@ -9,6 +9,7 @@
 #include "../audio_decode_workspace.h"
 #include "../sources/audio_source.h"
 #include "../sources/sd_file_audio_source.h"
+#include "media_types.h"
 
 enum class PcmDecoderType : uint8_t
 {
@@ -16,6 +17,26 @@ enum class PcmDecoderType : uint8_t
     Wav,
     Flac,
     Mp3
+};
+
+
+enum class PcmSeekMethod : uint8_t
+{
+    None = 0,
+    WavExact,
+    Mp3XingToc,
+    Mp3Vbri,
+    Mp3CbrLinear,
+    Mp3VbrLinearFallback,
+    RestartFromBeginning,
+};
+
+struct PcmSeekResult
+{
+    uint64_t requested_frame = 0;
+    uint64_t actual_frame = 0;
+    uint64_t source_offset = 0;
+    PcmSeekMethod method = PcmSeekMethod::None;
 };
 
 struct PcmDecoderInfo
@@ -56,6 +77,17 @@ esp_err_t pcm_decoder_read_pcm32(
 );
 void pcm_decoder_close(PcmDecoder *decoder);
 bool pcm_decoder_is_open(const PcmDecoder *decoder);
+// 在 I2S/DAC 尚未重新启动前执行 codec 定位。WAV 为帧精确；MP3 使用 Xing/VBRI/线性估算后做 MPEG 帧重同步；
+// 当前 FLAC 仅保证 frame=0 的安全重启，非零 seek 在验证 SEEKTABLE + 乐鑫 decoder 重入语义前明确返回 NOT_SUPPORTED。
+esp_err_t pcm_decoder_seek_frame(
+    PcmDecoder *decoder,
+    uint64_t target_frame,
+    const MediaTechnicalInfo *technical_info,
+    PcmSeekResult *out_result
+);
+
+bool pcm_decoder_seek_supported(PcmDecoderType type, uint64_t target_frame);
 bool pcm_decoder_is_eof(const PcmDecoder *decoder);
 uint64_t pcm_decoder_position_frames(const PcmDecoder *decoder);
 const char *pcm_decoder_type_name(PcmDecoderType type);
+const char *pcm_seek_method_name(PcmSeekMethod method);

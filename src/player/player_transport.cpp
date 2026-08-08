@@ -99,16 +99,16 @@ bool player_transport_previous()
     const bool has_audio = audio_service_get_snapshot(&snapshot) && snapshot.ready;
     const size_t current_track = player_state_get_index();
 
-    // 在 seek 尚未接入前，用“重新发 Play 当前曲”实现标准的 >3 秒回到曲首语义。
-    // 这会经过现有 pop-free shutdown/start 序列，不直接修改 decoder 文件位置。
+    // Stage 11.0 后，>3 秒上一曲直接走统一 Seek(0)，列表位置保持不变。
+    // AudioTask 内部仍通过 pop-free 重建 pipeline，避免在 I2S 正在运行时硬改 Source。
     if (
         has_audio &&
         snapshot.track_index == current_track &&
         (snapshot.state == AudioPlaybackState::Playing || snapshot.state == AudioPlaybackState::Paused) &&
         snapshot.position_ms >= 3000ULL
     ) {
-        ESP_LOGI(TAG, "手动上一曲：当前已播放超过3秒，重播当前首");
-        return player_transport_play_current("手动上一曲重播");
+        ESP_LOGI(TAG, "手动上一曲：当前已播放超过3秒，Seek回曲首");
+        return player_transport_seek_ms(0);
     }
 
     if (!player_state_previous()) {
@@ -125,6 +125,31 @@ bool player_transport_next()
         return false;
     }
     return player_transport_play_current("手动下一曲");
+}
+
+
+bool player_transport_seek_ms(uint64_t target_ms)
+{
+    if (!player_state_is_ready()) {
+        return false;
+    }
+    const char *path = player_state_get_path();
+    if (path == nullptr || path[0] == '\0') {
+        return false;
+    }
+    const size_t track_index = player_state_get_index();
+    MediaTechnicalInfo technical = {};
+    const bool has_technical = media_library_get_technical_info(track_index, &technical);
+    ESP_LOGI(TAG, "SEEK_TRACE: Player请求 track=%u target=%llums",
+        static_cast<unsigned>(track_index),
+        static_cast<unsigned long long>(target_ms));
+    return audio_service_seek_track(
+        static_cast<uint32_t>(track_index),
+        path,
+        player_state_get_format(),
+        has_technical ? &technical : nullptr,
+        target_ms,
+        false);
 }
 
 static void player_transport_handle_finished(const AudioStateSnapshot &audio)

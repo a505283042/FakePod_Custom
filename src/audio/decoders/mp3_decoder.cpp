@@ -76,6 +76,311 @@ static esp_err_t mp3_audio_error_to_esp(esp_audio_err_t error)
     }
 }
 
+
+static constexpr uint64_t MP3_SEEK_PREROLL_MS = 500ULL;
+static constexpr uint64_t MP3_SEEK_SCAN_FORWARD_BYTES = 256ULL * 1024ULL;
+
+struct Mp3SeekFrameHeader
+{
+    uint32_t sample_rate_hz = 0;
+    uint32_t bitrate_kbps = 0;
+    uint32_t frame_size_bytes = 0;
+    uint16_t samples_per_frame = 0;
+    uint8_t channels = 0;
+    uint8_t version_id = 0;
+    bool has_crc = false;
+};
+
+static uint16_t mp3_seek_read_be16(const uint8_t *p)
+{
+    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
+}
+
+static uint32_t mp3_seek_read_be32(const uint8_t *p)
+{
+    return (static_cast<uint32_t>(p[0]) << 24) |
+        (static_cast<uint32_t>(p[1]) << 16) |
+        (static_cast<uint32_t>(p[2]) << 8) |
+        static_cast<uint32_t>(p[3]);
+}
+
+static bool mp3_seek_parse_frame_header(const uint8_t *h, Mp3SeekFrameHeader *out)
+{
+    if (h == nullptr || out == nullptr || h[0] != 0xFFU || (h[1] & 0xE0U) != 0xE0U) {
+        return false;
+    }
+    const uint8_t version_id = (h[1] >> 3) & 0x03U;
+    const uint8_t layer = (h[1] >> 1) & 0x03U;
+    if (version_id == 1U || layer != 1U) {
+        return false;
+    }
+    const uint8_t bitrate_index = (h[2] >> 4) & 0x0FU;
+    const uint8_t sample_index = (h[2] >> 2) & 0x03U;
+    if (bitrate_index == 0U || bitrate_index == 15U || sample_index == 3U) {
+        return false;
+    }
+
+    static constexpr uint16_t kBitrateMpeg1[16] = {
+        0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0
+    };
+    static constexpr uint16_t kBitrateMpeg2[16] = {
+        0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0
+    };
+    static constexpr uint32_t kMpeg1Rates[3] = {44100, 48000, 32000};
+
+    uint32_t sample_rate = kMpeg1Rates[sample_index];
+    if (version_id == 2U) {
+        sample_rate /= 2U;
+    } else if (version_id == 0U) {
+        sample_rate /= 4U;
+    }
+    const bool mpeg1 = version_id == 3U;
+    const uint32_t bitrate = mpeg1 ? kBitrateMpeg1[bitrate_index] : kBitrateMpeg2[bitrate_index];
+    const uint32_t padding = (h[2] >> 1) & 0x01U;
+    const uint32_t frame_size = ((mpeg1 ? 144000U : 72000U) * bitrate) / sample_rate + padding;
+    if (frame_size < 24U) {
+        return false;
+    }
+
+    out->sample_rate_hz = sample_rate;
+    out->bitrate_kbps = bitrate;
+    out->frame_size_bytes = frame_size;
+    out->samples_per_frame = mpeg1 ? 1152U : 576U;
+    out->channels = ((h[3] >> 6) & 0x03U) == 3U ? 1U : 2U;
+    out->version_id = version_id;
+    out->has_crc = (h[1] & 0x01U) == 0U;
+    return true;
+}
+
+static bool mp3_seek_headers_compatible(const Mp3SeekFrameHeader &a, const Mp3SeekFrameHeader &b)
+{
+    return a.sample_rate_hz == b.sample_rate_hz &&
+        a.samples_per_frame == b.samples_per_frame &&
+        a.version_id == b.version_id;
+}
+
+static uint32_t mp3_seek_side_info_size(const Mp3SeekFrameHeader &header)
+{
+    if (header.version_id == 3U) {
+        return header.channels == 1U ? 17U : 32U;
+    }
+    return header.channels == 1U ? 9U : 17U;
+}
+
+static esp_err_t mp3_seek_read_exact_at(
+    AudioSource *source,
+    uint64_t offset,
+    void *buffer,
+    size_t bytes)
+{
+    if (source == nullptr || buffer == nullptr || offset > static_cast<uint64_t>(INT64_MAX)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t ret = audio_source_seek(source, static_cast<int64_t>(offset), AudioSourceSeekOrigin::Begin);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    size_t got = 0;
+    ret = audio_source_read(source, buffer, bytes, &got);
+    return ret == ESP_OK && got == bytes ? ESP_OK : (ret != ESP_OK ? ret : ESP_ERR_INVALID_SIZE);
+}
+
+static esp_err_t mp3_seek_read_first_header(
+    Mp3Decoder *decoder,
+    const MediaTechnicalInfo *technical,
+    Mp3SeekFrameHeader *out_header)
+{
+    if (decoder == nullptr || technical == nullptr || out_header == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint8_t h[4] = {};
+    esp_err_t ret = mp3_seek_read_exact_at(decoder->source, technical->audio_data_offset, h, sizeof(h));
+    if (ret != ESP_OK || !mp3_seek_parse_frame_header(h, out_header)) {
+        return ret != ESP_OK ? ret : ESP_ERR_INVALID_RESPONSE;
+    }
+    return ESP_OK;
+}
+
+static bool mp3_seek_estimate_xing(
+    Mp3Decoder *decoder,
+    const MediaTechnicalInfo *technical,
+    const Mp3SeekFrameHeader &first,
+    uint64_t target_frame,
+    uint64_t *out_offset)
+{
+    if (decoder == nullptr || technical == nullptr || out_offset == nullptr || technical->total_frames == 0) {
+        return false;
+    }
+    const uint64_t xing_offset = technical->audio_data_offset + 4ULL +
+        (first.has_crc ? 2ULL : 0ULL) + mp3_seek_side_info_size(first);
+    uint8_t data[120] = {};
+    if (mp3_seek_read_exact_at(decoder->source, xing_offset, data, sizeof(data)) != ESP_OK ||
+        (memcmp(data, "Xing", 4) != 0 && memcmp(data, "Info", 4) != 0)) {
+        return false;
+    }
+
+    const uint32_t flags = mp3_seek_read_be32(data + 4);
+    size_t cursor = 8;
+    if ((flags & 0x1U) != 0U) {
+        cursor += 4;
+    }
+    uint64_t audio_bytes = decoder->file_size_bytes > technical->audio_data_offset
+        ? decoder->file_size_bytes - technical->audio_data_offset
+        : 0;
+    if ((flags & 0x2U) != 0U) {
+        if (cursor + 4 > sizeof(data)) {
+            return false;
+        }
+        const uint32_t xing_bytes = mp3_seek_read_be32(data + cursor);
+        if (xing_bytes > 0) {
+            audio_bytes = xing_bytes;
+        }
+        cursor += 4;
+    }
+    if ((flags & 0x4U) == 0U || cursor + 100 > sizeof(data) || audio_bytes == 0) {
+        return false;
+    }
+
+    const uint8_t *toc = data + cursor;
+    uint64_t scaled = (target_frame * 10000ULL) / technical->total_frames;
+    if (scaled > 9999ULL) {
+        scaled = 9999ULL;
+    }
+    const uint32_t index = static_cast<uint32_t>(scaled / 100ULL);
+    const uint32_t rem = static_cast<uint32_t>(scaled % 100ULL);
+    const int32_t a = toc[index];
+    const int32_t b = index < 99U ? toc[index + 1U] : 256;
+    if (b < a) {
+        return false;
+    }
+    const int32_t interp_x100 = a * 100 + (b - a) * static_cast<int32_t>(rem);
+    const uint64_t rel = (audio_bytes * static_cast<uint64_t>(interp_x100)) / 25600ULL;
+    *out_offset = technical->audio_data_offset + rel;
+    return true;
+}
+
+static bool mp3_seek_estimate_vbri(
+    Mp3Decoder *decoder,
+    const MediaTechnicalInfo *technical,
+    const Mp3SeekFrameHeader &first,
+    uint64_t target_frame,
+    uint64_t *out_offset)
+{
+    if (decoder == nullptr || technical == nullptr || out_offset == nullptr || first.samples_per_frame == 0) {
+        return false;
+    }
+    const uint64_t vbri_offset = technical->audio_data_offset + 36ULL;
+    uint8_t header[26] = {};
+    if (mp3_seek_read_exact_at(decoder->source, vbri_offset, header, sizeof(header)) != ESP_OK ||
+        memcmp(header, "VBRI", 4) != 0) {
+        return false;
+    }
+    const uint32_t total_mpeg_frames = mp3_seek_read_be32(header + 14);
+    const uint16_t entries = mp3_seek_read_be16(header + 18);
+    const uint16_t scale = mp3_seek_read_be16(header + 20);
+    const uint16_t entry_bytes = mp3_seek_read_be16(header + 22);
+    const uint16_t frames_per_entry = mp3_seek_read_be16(header + 24);
+    if (total_mpeg_frames == 0 || entries == 0 || entries > 4096U || scale == 0 ||
+        entry_bytes == 0 || entry_bytes > 4U || frames_per_entry == 0) {
+        return false;
+    }
+
+    uint64_t target_mpeg = target_frame / first.samples_per_frame;
+    if (target_mpeg >= total_mpeg_frames) {
+        target_mpeg = total_mpeg_frames - 1ULL;
+    }
+    uint64_t accumulated_frames = 0;
+    uint64_t accumulated_bytes = 0;
+    uint64_t table_cursor = vbri_offset + sizeof(header);
+    for (uint16_t i = 0; i < entries; ++i) {
+        uint8_t raw[4] = {};
+        if (mp3_seek_read_exact_at(decoder->source, table_cursor, raw, entry_bytes) != ESP_OK) {
+            return false;
+        }
+        table_cursor += entry_bytes;
+        uint32_t value = 0;
+        for (uint16_t j = 0; j < entry_bytes; ++j) {
+            value = (value << 8) | raw[j];
+        }
+        const uint64_t span_bytes = static_cast<uint64_t>(value) * scale;
+        const uint64_t next_frames = accumulated_frames + frames_per_entry;
+        if (target_mpeg < next_frames) {
+            const uint64_t inside = target_mpeg - accumulated_frames;
+            accumulated_bytes += (span_bytes * inside) / frames_per_entry;
+            *out_offset = technical->audio_data_offset + accumulated_bytes;
+            return true;
+        }
+        accumulated_frames = next_frames;
+        accumulated_bytes += span_bytes;
+    }
+    return false;
+}
+
+static esp_err_t mp3_seek_find_resync(
+    Mp3Decoder *decoder,
+    uint64_t estimate,
+    const Mp3SeekFrameHeader &reference,
+    uint64_t audio_start,
+    uint64_t *out_offset)
+{
+    if (decoder == nullptr || decoder->source == nullptr || decoder->input_buffer == nullptr ||
+        decoder->input_capacity < 8 || out_offset == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // estimate 已经针对 500ms pre-roll 计算；从估算点向前找下一帧，避免再向前
+    // 额外回退字节后却仍把时间轴记成 base_frame，造成可预见的时间偏差。
+    uint64_t cursor = estimate < audio_start ? audio_start : estimate;
+    const uint64_t remaining_after_estimate = decoder->file_size_bytes > estimate
+        ? decoder->file_size_bytes - estimate : 0ULL;
+    const uint64_t limit = remaining_after_estimate > MP3_SEEK_SCAN_FORWARD_BYTES
+        ? estimate + MP3_SEEK_SCAN_FORWARD_BYTES
+        : decoder->file_size_bytes;
+
+    while (cursor + 8ULL <= limit) {
+        const size_t max_read = static_cast<size_t>(
+            (limit - cursor) < decoder->input_capacity ? (limit - cursor) : decoder->input_capacity);
+        if (max_read < 4) {
+            break;
+        }
+        if (audio_source_seek(decoder->source, static_cast<int64_t>(cursor), AudioSourceSeekOrigin::Begin) != ESP_OK) {
+            return ESP_FAIL;
+        }
+        size_t got = 0;
+        esp_err_t ret = audio_source_read(decoder->source, decoder->input_buffer, max_read, &got);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        for (size_t i = 0; i + 4 <= got; ++i) {
+            Mp3SeekFrameHeader current = {};
+            if (!mp3_seek_parse_frame_header(decoder->input_buffer + i, &current) ||
+                !mp3_seek_headers_compatible(reference, current)) {
+                continue;
+            }
+            const uint64_t frame_offset = cursor + i;
+            const uint64_t next_offset = frame_offset + current.frame_size_bytes;
+            if (next_offset + 4ULL > decoder->file_size_bytes) {
+                continue;
+            }
+            uint8_t next_raw[4] = {};
+            if (mp3_seek_read_exact_at(decoder->source, next_offset, next_raw, sizeof(next_raw)) != ESP_OK) {
+                continue;
+            }
+            Mp3SeekFrameHeader next = {};
+            if (!mp3_seek_parse_frame_header(next_raw, &next) || !mp3_seek_headers_compatible(current, next)) {
+                continue;
+            }
+            *out_offset = frame_offset;
+            return audio_source_seek(decoder->source, static_cast<int64_t>(frame_offset), AudioSourceSeekOrigin::Begin);
+        }
+        if (got < max_read) {
+            break;
+        }
+        cursor += got > 3 ? got - 3 : got;
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
 #if APP_DIAG_MP3_PERFORMANCE
 static void mp3_perf_reset_runtime(Mp3Decoder *decoder)
 {
@@ -571,6 +876,191 @@ static esp_err_t mp3_decode_next_output(Mp3Decoder *decoder)
             }
         }
     }
+    return ESP_OK;
+}
+
+
+static esp_err_t mp3_seek_reopen_at(
+    Mp3Decoder *decoder,
+    uint64_t source_offset,
+    uint64_t base_frame)
+{
+    if (decoder == nullptr || decoder->source == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const uint32_t expected_rate = decoder->sample_rate_hz;
+    const uint16_t expected_channels = decoder->channels;
+    const uint16_t expected_bits = decoder->bits_per_sample;
+
+    if (decoder->simple_handle != nullptr) {
+        esp_audio_simple_dec_close(static_cast<esp_audio_simple_dec_handle_t>(decoder->simple_handle));
+        decoder->simple_handle = nullptr;
+    }
+    esp_err_t ret = audio_source_seek(
+        decoder->source, static_cast<int64_t>(source_offset), AudioSourceSeekOrigin::Begin);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    decoder->input_offset = 0;
+    decoder->input_size = 0;
+    decoder->input_chunk_eos = false;
+    decoder->decoded_offset = 0;
+    decoder->decoded_size = 0;
+    decoder->runtime_info_verified = false;
+    decoder->eof = false;
+    decoder->frames_read = base_frame;
+
+    esp_audio_simple_dec_cfg_t cfg = {};
+    cfg.dec_type = ESP_AUDIO_SIMPLE_DEC_TYPE_MP3;
+    cfg.dec_cfg = nullptr;
+    cfg.cfg_size = 0;
+    cfg.use_frame_dec = false;
+    esp_audio_simple_dec_handle_t handle = nullptr;
+    const esp_audio_err_t codec_ret = esp_audio_simple_dec_open(&cfg, &handle);
+    if (codec_ret != ESP_AUDIO_ERR_OK || handle == nullptr) {
+        return mp3_audio_error_to_esp(codec_ret);
+    }
+    decoder->simple_handle = handle;
+
+    ret = mp3_decode_next_output(decoder);
+    if (ret != ESP_OK || decoder->decoded_size == 0 || !decoder->runtime_info_verified) {
+        return ret != ESP_OK ? ret : ESP_ERR_INVALID_RESPONSE;
+    }
+    if (decoder->sample_rate_hz != expected_rate || decoder->channels != expected_channels ||
+        decoder->bits_per_sample != expected_bits) {
+        ESP_LOGE(TAG, "MP3 seek 后输出格式变化：before=%lu/%u/%u after=%lu/%u/%u",
+            static_cast<unsigned long>(expected_rate),
+            static_cast<unsigned>(expected_bits),
+            static_cast<unsigned>(expected_channels),
+            static_cast<unsigned long>(decoder->sample_rate_hz),
+            static_cast<unsigned>(decoder->bits_per_sample),
+            static_cast<unsigned>(decoder->channels));
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+#if APP_DIAG_MP3_PERFORMANCE
+    mp3_perf_reset_runtime(decoder);
+#endif
+    return ESP_OK;
+}
+
+static esp_err_t mp3_seek_discard_to(Mp3Decoder *decoder, uint64_t target_frame)
+{
+    if (decoder == nullptr || decoder->channels == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const size_t frame_bytes = sizeof(int16_t) * decoder->channels;
+    while (decoder->frames_read < target_frame) {
+        if (decoder->decoded_offset >= decoder->decoded_size) {
+            esp_err_t ret = mp3_decode_next_output(decoder);
+            if (ret != ESP_OK) {
+                return ret;
+            }
+            if (decoder->decoded_offset >= decoder->decoded_size) {
+                return decoder->eof ? ESP_ERR_INVALID_SIZE : ESP_ERR_INVALID_STATE;
+            }
+        }
+        const uint64_t needed = target_frame - decoder->frames_read;
+        const size_t available = (decoder->decoded_size - decoder->decoded_offset) / frame_bytes;
+        const size_t discard = needed < available ? static_cast<size_t>(needed) : available;
+        decoder->decoded_offset += discard * frame_bytes;
+        decoder->frames_read += discard;
+    }
+    return ESP_OK;
+}
+
+esp_err_t mp3_decoder_seek_frame(
+    Mp3Decoder *decoder,
+    uint64_t target_frame,
+    const MediaTechnicalInfo *technical_info,
+    uint64_t *out_frame,
+    uint64_t *out_source_offset,
+    Mp3SeekMethod *out_method)
+{
+    if (out_frame != nullptr) *out_frame = 0;
+    if (out_source_offset != nullptr) *out_source_offset = 0;
+    if (out_method != nullptr) *out_method = Mp3SeekMethod::None;
+    if (decoder == nullptr || !mp3_decoder_is_open(decoder) || technical_info == nullptr ||
+        (technical_info->flags & MEDIA_TECH_PARSED) == 0U ||
+        technical_info->audio_data_offset >= decoder->file_size_bytes ||
+        technical_info->sample_rate_hz != decoder->sample_rate_hz) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    uint64_t total_frames = technical_info->total_frames;
+    if (total_frames == 0) {
+        total_frames = decoder->total_frames;
+    }
+    if (total_frames > 0 && target_frame >= total_frames) {
+        target_frame = total_frames - 1ULL;
+    }
+
+    Mp3SeekFrameHeader first = {};
+    esp_err_t ret = mp3_seek_read_first_header(decoder, technical_info, &first);
+    if (ret != ESP_OK || first.sample_rate_hz != decoder->sample_rate_hz) {
+        return ret != ESP_OK ? ret : ESP_ERR_INVALID_RESPONSE;
+    }
+
+    const uint64_t preroll_frames =
+        (static_cast<uint64_t>(decoder->sample_rate_hz) * MP3_SEEK_PREROLL_MS) / 1000ULL;
+    const uint64_t base_frame = target_frame > preroll_frames ? target_frame - preroll_frames : 0ULL;
+    uint64_t estimate = technical_info->audio_data_offset;
+    Mp3SeekMethod method = Mp3SeekMethod::None;
+
+    if ((technical_info->flags & MEDIA_TECH_HAS_VBR_HEADER) != 0U && total_frames > 0 &&
+        mp3_seek_estimate_xing(decoder, technical_info, first, base_frame, &estimate)) {
+        method = Mp3SeekMethod::XingToc;
+    } else if ((technical_info->flags & MEDIA_TECH_HAS_VBR_HEADER) != 0U &&
+        mp3_seek_estimate_vbri(decoder, technical_info, first, base_frame, &estimate)) {
+        method = Mp3SeekMethod::Vbri;
+    } else if ((technical_info->flags & MEDIA_TECH_DURATION_ESTIMATED) != 0U &&
+        technical_info->bitrate_kbps > 0U) {
+        const uint64_t base_ms = decoder->sample_rate_hz > 0
+            ? (base_frame * 1000ULL) / decoder->sample_rate_hz : 0ULL;
+        estimate = technical_info->audio_data_offset +
+            (base_ms * static_cast<uint64_t>(technical_info->bitrate_kbps)) / 8ULL;
+        method = Mp3SeekMethod::CbrLinear;
+    } else if (total_frames > 0 && decoder->file_size_bytes > technical_info->audio_data_offset) {
+        const uint64_t audio_bytes = decoder->file_size_bytes - technical_info->audio_data_offset;
+        estimate = technical_info->audio_data_offset + (audio_bytes * base_frame) / total_frames;
+        method = Mp3SeekMethod::VbrLinearFallback;
+    } else {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (estimate >= decoder->file_size_bytes) {
+        estimate = decoder->file_size_bytes - 1ULL;
+    }
+
+    uint64_t sync_offset = 0;
+    ret = mp3_seek_find_resync(
+        decoder, estimate, first, technical_info->audio_data_offset, &sync_offset);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "MP3 seek 未能在估算位置附近重新同步 MPEG frame：estimate=%llu ret=%s",
+            static_cast<unsigned long long>(estimate), esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = mp3_seek_reopen_at(decoder, sync_offset, base_frame);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    ret = mp3_seek_discard_to(decoder, target_frame);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    if (out_frame != nullptr) *out_frame = decoder->frames_read;
+    if (out_source_offset != nullptr) *out_source_offset = sync_offset;
+    if (out_method != nullptr) *out_method = method;
+    ESP_LOGI(TAG,
+        "SEEK_TRACE: MP3 method=%u requested=%llu base=%llu actual=%llu estimate=%llu sync=%llu preroll=%llums",
+        static_cast<unsigned>(method),
+        static_cast<unsigned long long>(target_frame),
+        static_cast<unsigned long long>(base_frame),
+        static_cast<unsigned long long>(decoder->frames_read),
+        static_cast<unsigned long long>(estimate),
+        static_cast<unsigned long long>(sync_offset),
+        static_cast<unsigned long long>(MP3_SEEK_PREROLL_MS));
     return ESP_OK;
 }
 

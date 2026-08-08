@@ -6,6 +6,17 @@
 #include "audio_diag_config.h"
 #include "../audio_decode_workspace.h"
 #include "../sources/audio_source.h"
+#include "media_types.h"
+
+
+enum class Mp3SeekMethod : uint8_t
+{
+    None = 0,
+    XingToc,
+    Vbri,
+    CbrLinear,
+    VbrLinearFallback,
+};
 
 // MP3 解码器只负责“压缩数据 -> PCM”，不拥有 I2S、DAC 或播放状态。
 // 当前先开放常见本地 MP3：44.1/48kHz、单/双声道，输出统一转换为 32bit 立体声容器。
@@ -140,6 +151,17 @@ esp_err_t mp3_decoder_read_pcm32(
     int32_t *out_interleaved_stereo,
     size_t max_frames,
     size_t *out_frames
+);
+
+// 利用 Stage 10.x 技术索引定位目标帧；优先 Xing TOC / VBRI，缺失时线性估算，
+// 最终总会在 Source 上重新同步到连续两个兼容 MPEG frame 再重建 Simple Decoder。
+esp_err_t mp3_decoder_seek_frame(
+    Mp3Decoder *decoder,
+    uint64_t target_frame,
+    const MediaTechnicalInfo *technical_info,
+    uint64_t *out_frame,
+    uint64_t *out_source_offset,
+    Mp3SeekMethod *out_method
 );
 
 void mp3_decoder_close(Mp3Decoder *decoder);

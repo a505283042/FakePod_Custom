@@ -33,6 +33,19 @@ static inline void audio_playback_clock_note_decoder(
     }
 }
 
+// Seek 成功后，submitted/decoder 同时跳到新的 PCM 时间轴起点。
+// 后续只有真实 PCM 写入 I2S DMA 才继续推进 submitted_frames。
+static inline void audio_playback_clock_seek(
+    AudioPlaybackClock *clock,
+    uint64_t frame)
+{
+    if (clock == nullptr) {
+        return;
+    }
+    clock->submitted_frames = frame;
+    clock->decoder_frames = frame;
+}
+
 static inline void audio_playback_clock_commit_pcm(
     AudioPlaybackClock *clock,
     size_t frames)

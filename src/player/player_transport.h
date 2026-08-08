@@ -22,6 +22,9 @@ bool player_transport_play_current(const char *reason = nullptr);
 bool player_transport_previous();
 bool player_transport_next();
 
+// 对当前 Playlist 选中的 Track 发起 Seek；不会改变列表 position。
+bool player_transport_seek_ms(uint64_t target_ms);
+
 PlayerLoopMode player_transport_get_loop_mode();
 bool player_transport_set_loop_mode(PlayerLoopMode mode);
 PlayerLoopMode player_transport_cycle_loop_mode();

@@ -137,6 +137,102 @@ void pcm_decoder_close(PcmDecoder *decoder)
     decoder->info = {};
 }
 
+esp_err_t pcm_decoder_seek_frame(
+    PcmDecoder *decoder,
+    uint64_t target_frame,
+    const MediaTechnicalInfo *technical_info,
+    PcmSeekResult *out_result)
+{
+    if (out_result != nullptr) {
+        *out_result = {};
+        out_result->requested_frame = target_frame;
+    }
+    if (decoder == nullptr || !pcm_decoder_is_open(decoder)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint64_t actual_frame = 0;
+    uint64_t source_offset = 0;
+    PcmSeekMethod method = PcmSeekMethod::None;
+    esp_err_t ret = ESP_ERR_NOT_SUPPORTED;
+
+    switch (decoder->type) {
+        case PcmDecoderType::Wav:
+            ret = wav_decoder_seek_frame(&decoder->wav, target_frame, &actual_frame);
+            method = PcmSeekMethod::WavExact;
+            if (ret == ESP_OK) {
+                source_offset = decoder->wav.data_offset_bytes +
+                    actual_frame * decoder->wav.block_align;
+            }
+            break;
+
+        case PcmDecoderType::Mp3: {
+            Mp3SeekMethod mp3_method = Mp3SeekMethod::None;
+            ret = mp3_decoder_seek_frame(
+                &decoder->mp3,
+                target_frame,
+                technical_info,
+                &actual_frame,
+                &source_offset,
+                &mp3_method);
+            if (ret == ESP_OK) {
+                switch (mp3_method) {
+                    case Mp3SeekMethod::XingToc: method = PcmSeekMethod::Mp3XingToc; break;
+                    case Mp3SeekMethod::Vbri: method = PcmSeekMethod::Mp3Vbri; break;
+                    case Mp3SeekMethod::CbrLinear: method = PcmSeekMethod::Mp3CbrLinear; break;
+                    case Mp3SeekMethod::VbrLinearFallback: method = PcmSeekMethod::Mp3VbrLinearFallback; break;
+                    default: method = PcmSeekMethod::None; break;
+                }
+            }
+            break;
+        }
+
+        case PcmDecoderType::Flac:
+            // 当前乐鑫 FLAC Simple Decoder 没有公开 PCM-frame seek API。
+            // frame=0 可通过在同一 Source 上重建 codec 精确回到曲首；非零 seek 等 SEEKTABLE
+            // + synthetic-header 路径完成实机验证后再开放，避免未经验证地从原始 frame 中途喂 parser。
+            if (target_frame == 0) {
+                AudioSource *source = &decoder->source;
+                AudioDecodeWorkspace *workspace = decoder->flac.workspace;
+                ret = flac_decoder_open(&decoder->flac, source, workspace);
+                if (ret == ESP_OK) {
+                    decoder->info.sample_rate_hz = decoder->flac.sample_rate_hz;
+                    decoder->info.channels = decoder->flac.channels;
+                    decoder->info.bits_per_sample = decoder->flac.bits_per_sample;
+                    decoder->info.total_frames = decoder->flac.total_frames;
+                    actual_frame = 0;
+                    source_offset = decoder->flac.flac_offset_bytes;
+                    method = PcmSeekMethod::RestartFromBeginning;
+                }
+            }
+            break;
+
+        default:
+            ret = ESP_ERR_NOT_SUPPORTED;
+            break;
+    }
+
+    if (ret == ESP_OK && out_result != nullptr) {
+        out_result->actual_frame = actual_frame;
+        out_result->source_offset = source_offset;
+        out_result->method = method;
+    }
+    return ret;
+}
+
+bool pcm_decoder_seek_supported(PcmDecoderType type, uint64_t target_frame)
+{
+    switch (type) {
+        case PcmDecoderType::Wav:
+        case PcmDecoderType::Mp3:
+            return true;
+        case PcmDecoderType::Flac:
+            return target_frame == 0;
+        default:
+            return false;
+    }
+}
+
 bool pcm_decoder_is_open(const PcmDecoder *decoder)
 {
     if (decoder == nullptr) {
@@ -194,6 +290,19 @@ const char *pcm_decoder_type_name(PcmDecoderType type)
         case PcmDecoderType::Wav: return "WAV";
         case PcmDecoderType::Flac: return "FLAC";
         case PcmDecoderType::Mp3: return "MP3";
+        default: return "NONE";
+    }
+}
+
+const char *pcm_seek_method_name(PcmSeekMethod method)
+{
+    switch (method) {
+        case PcmSeekMethod::WavExact: return "WAV_EXACT";
+        case PcmSeekMethod::Mp3XingToc: return "MP3_XING_TOC";
+        case PcmSeekMethod::Mp3Vbri: return "MP3_VBRI";
+        case PcmSeekMethod::Mp3CbrLinear: return "MP3_CBR_LINEAR";
+        case PcmSeekMethod::Mp3VbrLinearFallback: return "MP3_VBR_LINEAR";
+        case PcmSeekMethod::RestartFromBeginning: return "RESTART_BEGIN";
         default: return "NONE";
     }
 }

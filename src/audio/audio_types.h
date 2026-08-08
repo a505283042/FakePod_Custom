@@ -12,6 +12,7 @@ enum class AudioPlaybackState : uint8_t
     Preparing,
     Prepared,
     Playing,
+    Seeking,
     Paused,
     Finished,
     Stopped,
@@ -41,6 +42,13 @@ struct AudioStateSnapshot
     uint64_t decoder_position_frames = 0;
     uint64_t position_ms = 0;
     uint64_t total_frames = 0;
+
+    // Seek 只由 AudioTask 串行执行。seek_supported 表示当前格式已开放任意位置 seek；
+    // seek_revision 每次成功定位递增，便于 UI/恢复层识别新的时间轴。
+    bool seek_supported = false;
+    uint32_t seek_revision = 0;
+    uint32_t last_seek_request_id = 0;
+    uint64_t last_seek_target_ms = 0;
 
     // 共享 decoder workspace 只发布容量快照，便于确认 MP3/FLAC 没有重复持有大块 PSRAM。
     uint32_t decode_workspace_input_bytes = 0;

@@ -161,6 +161,17 @@ bool player_control_toggle_mute()
     return audio_service_set_mute(!snapshot.user_muted, true);
 }
 
+
+bool player_control_seek_ms(uint64_t target_ms)
+{
+    if (!player_control_lock(pdMS_TO_TICKS(100))) {
+        return false;
+    }
+    const bool ok = player_transport_seek_ms(target_ms);
+    player_control_unlock();
+    return ok;
+}
+
 static bool player_control_select_context(bool selected)
 {
     if (!selected) {
