@@ -52,14 +52,16 @@ static void player_home_refresh_track(const AudioStateSnapshot *audio_snapshot)
         return;
     }
 
-    const size_t count = media_library_get_count();
-    if (count == 0) {
+    const size_t library_count = media_library_get_count();
+    const size_t list_count = player_state_get_list_count();
+    if (library_count == 0 || list_count == 0) {
         lv_label_set_text(g_title, "暂无歌曲");
         lv_label_set_text(g_track_info, "音乐库为空");
         return;
     }
 
     const size_t index = player_state_get_index();
+    const size_t list_position = player_state_get_list_position();
     char title[512] = {};
     if (!media_library_copy_display_name(index, title, sizeof(title))) {
         snprintf(title, sizeof(title), "歌曲 %u", static_cast<unsigned>(index + 1));
@@ -108,9 +110,9 @@ static void player_home_refresh_track(const AudioStateSnapshot *audio_snapshot)
     lv_label_set_text_fmt(
         g_track_info,
         "第 %u / %u 首  %s%s",
-        static_cast<unsigned>(index + 1),
-        static_cast<unsigned>(count),
-        media_library_format_name(player_state_get_format()),
+        static_cast<unsigned>(list_position + 1),
+        static_cast<unsigned>(list_count),
+        media_format_name(player_state_get_format()),
         suffix);
 }
 
@@ -267,7 +269,13 @@ void player_home_create(lv_obj_t *screen)
     g_last_audio_state_revision = snapshot.state_revision;
     lv_timer_create(player_home_audio_timer_cb, 100, nullptr);
 
-    ESP_LOGI(TAG, "Stage 9.5.1 播放器首页已接入 WAV/FLAC/MP3 统一 PCM Core 与进度快照，当前歌曲=%u/%u",
-        static_cast<unsigned>(media_library_get_count() > 0 ? player_state_get_index() + 1 : 0),
-        static_cast<unsigned>(media_library_get_count()));
+    char list_label[96] = {};
+    if (!player_state_copy_list_label(list_label, sizeof(list_label))) {
+        snprintf(list_label, sizeof(list_label), "未知列表");
+    }
+    ESP_LOGI(TAG, "Stage 10.5 播放器首页已消费列表上下文：列表=%s 位置=%u/%u 全局track=%u",
+        list_label,
+        static_cast<unsigned>(player_state_get_list_count() > 0 ? player_state_get_list_position() + 1 : 0),
+        static_cast<unsigned>(player_state_get_list_count()),
+        static_cast<unsigned>(media_library_get_count() > 0 ? player_state_get_index() : 0));
 }

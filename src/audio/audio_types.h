@@ -2,7 +2,7 @@
 
 #include <stdint.h>
 #include "esp_err.h"
-#include "media_library.h"
+#include "media_types.h"
 
 // 音频任务对外发布的播放状态。
 enum class AudioPlaybackState : uint8_t

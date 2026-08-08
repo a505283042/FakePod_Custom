@@ -13,11 +13,13 @@ bool audio_service_is_ready();
 // 获取 AudioTask 发布的只读状态快照。
 bool audio_service_get_snapshot(AudioStateSnapshot *out_snapshot);
 
-// 请求播放指定曲目。路径会复制到请求对象，避免跨任务悬空指针。
+// 请求播放指定曲目。路径和技术索引都会复制到请求对象，避免跨任务悬空指针。
+// Stage 10.1 只传递/校验索引快照，decoder 仍以实际文件解析结果作为播放真值。
 bool audio_service_play_track(
     uint32_t track_index,
     const char *path,
     MediaFormat format,
+    const MediaTechnicalInfo *technical_info,
     bool wait = false
 );
 

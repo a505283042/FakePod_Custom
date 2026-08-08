@@ -76,6 +76,8 @@ struct AudioRequest
     uint32_t request_id = 0;
     uint32_t track_index = UINT32_MAX;
     MediaFormat format = MediaFormat::Unknown;
+    bool has_technical_info = false;
+    MediaTechnicalInfo technical_info = {};
     char path[AUDIO_INLINE_PATH_SIZE] = {};
     char *extended_path = nullptr;
     SemaphoreHandle_t done = nullptr;
@@ -478,7 +480,118 @@ static esp_err_t audio_task_shutdown_pipeline()
     return first_error;
 }
 
-static esp_err_t audio_task_start_pcm_pipeline(PcmDecoderType decoder_type, const char *path)
+static void audio_task_log_index_snapshot(const AudioRequest *request)
+{
+    if (request == nullptr || !request->has_technical_info) {
+        ESP_LOGW(TAG, "INDEX_TRACE: 曲目=%lu 未携带技术索引快照，继续由decoder直接解析",
+            request != nullptr ? static_cast<unsigned long>(request->track_index + 1U) : 0UL);
+        return;
+    }
+
+    const MediaTechnicalInfo &info = request->technical_info;
+    ESP_LOGI(TAG,
+        "INDEX_TRACE: RECEIVED 曲目=%lu 格式=%s parsed=%u rate=%luHz bits=%u ch=%u duration=%lums total=%llu audio_offset=%llu metadata_end=%llu artwork=%llu+%lu max_block=%u max_frame=%lu bitrate=%lu flags=0x%08lX",
+        static_cast<unsigned long>(request->track_index + 1U),
+        media_format_name(request->format),
+        (info.flags & MEDIA_TECH_PARSED) != 0U ? 1U : 0U,
+        static_cast<unsigned long>(info.sample_rate_hz),
+        static_cast<unsigned>(info.bits_per_sample),
+        static_cast<unsigned>(info.channels),
+        static_cast<unsigned long>(info.duration_ms),
+        static_cast<unsigned long long>(info.total_frames),
+        static_cast<unsigned long long>(info.audio_data_offset),
+        static_cast<unsigned long long>(info.metadata_end_offset),
+        static_cast<unsigned long long>(info.artwork_offset),
+        static_cast<unsigned long>(info.artwork_size),
+        static_cast<unsigned>(info.max_block_size),
+        static_cast<unsigned long>(info.max_frame_size),
+        static_cast<unsigned long>(info.bitrate_kbps),
+        static_cast<unsigned long>(info.flags));
+}
+
+static void audio_task_verify_index_snapshot(
+    const AudioRequest *request,
+    PcmDecoderType decoder_type
+)
+{
+    if (request == nullptr || !request->has_technical_info) {
+        return;
+    }
+
+    const MediaTechnicalInfo &index = request->technical_info;
+    if ((index.flags & MEDIA_TECH_PARSED) == 0U) {
+        ESP_LOGI(TAG, "INDEX_TRACE: BASIC 格式=%s 尚无深度技术索引，decoder结果作为真值",
+            media_format_name(request->format));
+        return;
+    }
+
+    bool mismatch = false;
+    if (index.sample_rate_hz != 0U && index.sample_rate_hz != g_decoder.info.sample_rate_hz) {
+        mismatch = true;
+    }
+    if (index.channels != 0U && index.channels != g_decoder.info.channels) {
+        mismatch = true;
+    }
+    if (index.bits_per_sample != 0U && index.bits_per_sample != g_decoder.info.bits_per_sample) {
+        mismatch = true;
+    }
+    // MP3 Simple Decoder 当前不发布 total_frames，因此只有两边都非零时才核对总帧。
+    if (
+        index.total_frames != 0ULL &&
+        g_decoder.info.total_frames != 0ULL &&
+        index.total_frames != g_decoder.info.total_frames
+    ) {
+        mismatch = true;
+    }
+
+    if (decoder_type == PcmDecoderType::Flac) {
+        if (index.max_block_size != 0U && index.max_block_size != g_decoder.flac.max_block_size) {
+            mismatch = true;
+        }
+        if (index.max_frame_size != 0U && index.max_frame_size != g_decoder.flac.max_frame_size) {
+            mismatch = true;
+        }
+    } else if (decoder_type == PcmDecoderType::Mp3) {
+        if (
+            index.bitrate_kbps != 0U &&
+            g_decoder.mp3.bitrate != 0U &&
+            index.bitrate_kbps != g_decoder.mp3.bitrate
+        ) {
+            mismatch = true;
+        }
+    }
+
+    if (mismatch) {
+        ESP_LOGW(TAG,
+            "INDEX_TRACE: MISMATCH 格式=%s index=%luHz/%ubit/%uch total=%llu decoder=%luHz/%ubit/%uch total=%llu；本次继续以decoder为准",
+            media_format_name(request->format),
+            static_cast<unsigned long>(index.sample_rate_hz),
+            static_cast<unsigned>(index.bits_per_sample),
+            static_cast<unsigned>(index.channels),
+            static_cast<unsigned long long>(index.total_frames),
+            static_cast<unsigned long>(g_decoder.info.sample_rate_hz),
+            static_cast<unsigned>(g_decoder.info.bits_per_sample),
+            static_cast<unsigned>(g_decoder.info.channels),
+            static_cast<unsigned long long>(g_decoder.info.total_frames));
+        return;
+    }
+
+    ESP_LOGI(TAG,
+        "INDEX_TRACE: VERIFIED 格式=%s rate=%luHz bits=%u ch=%u total=%llu audio_offset=%llu",
+        media_format_name(request->format),
+        static_cast<unsigned long>(g_decoder.info.sample_rate_hz),
+        static_cast<unsigned>(g_decoder.info.bits_per_sample),
+        static_cast<unsigned>(g_decoder.info.channels),
+        static_cast<unsigned long long>(
+            g_decoder.info.total_frames != 0ULL ? g_decoder.info.total_frames : index.total_frames),
+        static_cast<unsigned long long>(index.audio_data_offset));
+}
+
+static esp_err_t audio_task_start_pcm_pipeline(
+    PcmDecoderType decoder_type,
+    const char *path,
+    const AudioRequest *request
+)
 {
     audio_task_log_ram("before_decoder_open");
     esp_err_t ret = pcm_decoder_open(&g_decoder, decoder_type, path);
@@ -486,6 +599,7 @@ static esp_err_t audio_task_start_pcm_pipeline(PcmDecoderType decoder_type, cons
         audio_task_log_ram("decoder_open_failed");
         return ret;
     }
+    audio_task_verify_index_snapshot(request, decoder_type);
     audio_task_log_ram("after_decoder_open");
 
     g_task_sample_rate_hz = g_decoder.info.sample_rate_hz;
@@ -616,7 +730,7 @@ static esp_err_t audio_task_start_pcm_pipeline(PcmDecoderType decoder_type, cons
 static void audio_task_fail_stream(esp_err_t error, const char *stage)
 {
     ESP_LOGE(TAG, "%s播放失败：阶段=%s，错误=%s",
-        media_library_format_name(g_task_format),
+        media_format_name(g_task_format),
         stage != nullptr ? stage : "未知",
         esp_err_to_name(error));
     esp_err_t cleanup_error = audio_task_shutdown_pipeline();
@@ -637,7 +751,7 @@ static void audio_task_finish_stream()
     audio_task_publish_snapshot();
 
     ESP_LOGI(TAG, "%s PCM 数据播放完成：帧=%llu/%llu",
-        media_library_format_name(g_task_format),
+        media_format_name(g_task_format),
         static_cast<unsigned long long>(g_task_position_frames),
         static_cast<unsigned long long>(g_task_total_frames));
 
@@ -651,7 +765,7 @@ static void audio_task_finish_stream()
         );
         if (drain_ret != ESP_OK) {
             ESP_LOGE(TAG, "%s 尾部静音排空失败：%s",
-                media_library_format_name(g_task_format), esp_err_to_name(drain_ret));
+                media_format_name(g_task_format), esp_err_to_name(drain_ret));
             audio_task_shutdown_pipeline();
             audio_task_set_state(AudioPlaybackState::Error, drain_ret);
             return;
@@ -773,8 +887,9 @@ static void audio_task_handle_play(AudioRequest *request)
         static_cast<unsigned long>(request->request_id),
         static_cast<unsigned long>(g_task_playback_revision),
         static_cast<unsigned long>(request->track_index + 1),
-        media_library_format_name(request->format),
+        media_format_name(request->format),
         path != nullptr ? path : "(空)");
+    audio_task_log_index_snapshot(request);
 
     if (path == nullptr || path[0] == '\0') {
         audio_task_set_state(AudioPlaybackState::Error, ESP_ERR_INVALID_ARG);
@@ -791,13 +906,13 @@ static void audio_task_handle_play(AudioRequest *request)
         decoder_type = PcmDecoderType::Mp3;
     } else {
         ESP_LOGW(TAG, "Stage 9.5.1 当前统一PCM Core 已接入 WAV/FLAC/MP3；%s 解码器尚未接入",
-            media_library_format_name(request->format));
+            media_format_name(request->format));
         audio_task_set_state(AudioPlaybackState::Error, ESP_ERR_NOT_SUPPORTED);
         audio_request_complete(request, false, ESP_ERR_NOT_SUPPORTED);
         return;
     }
 
-    esp_err_t ret = audio_task_start_pcm_pipeline(decoder_type, path);
+    esp_err_t ret = audio_task_start_pcm_pipeline(decoder_type, path, request);
     if (ret != ESP_OK) {
         audio_task_set_state(AudioPlaybackState::Error, ret);
         audio_request_complete(request, false, ret);
@@ -1116,6 +1231,7 @@ bool audio_service_play_track(
     uint32_t track_index,
     const char *path,
     MediaFormat format,
+    const MediaTechnicalInfo *technical_info,
     bool wait)
 {
     AudioRequest *request = audio_request_create(AudioCommandType::Play, wait);
@@ -1124,6 +1240,11 @@ bool audio_service_play_track(
     }
     request->track_index = track_index;
     request->format = format;
+    if (technical_info != nullptr) {
+        // 跨任务只复制 POD 快照，不把 Catalog 内部指针交给 AudioTask。
+        request->technical_info = *technical_info;
+        request->has_technical_info = true;
+    }
     if (!audio_request_set_path(request, path)) {
         audio_request_release(request);
         return false;

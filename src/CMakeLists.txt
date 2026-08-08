@@ -26,7 +26,14 @@ idf_component_register(
         "audio/decoders/mp3_decoder.cpp"
 
         "media/library/media_library.cpp"
+        "media/library/media_index_store.cpp"
+        "media/library/media_catalog_v2.cpp"
+        "media/library/media_groups_v2.cpp"
+        "media/library/media_catalog_store_v2.cpp"
+        "media/library/media_probe.cpp"
+        "media/library/media_metadata.cpp"
 
+        "player/player_playlist.cpp"
         "player/player_state.cpp"
         "player/player_control.cpp"
 
