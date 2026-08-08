@@ -41,6 +41,7 @@ idf_component_register(
         "ui/ui_common.cpp"
         "ui/font/font_manager.cpp"
         "ui/screens/player_home.cpp"
+        "ui/screens/library_view.cpp"
 
     INCLUDE_DIRS
         "."

@@ -5,6 +5,7 @@
 #include "audio_service.h"
 #include "font/font_manager.h"
 #include "media_library.h"
+#include "library_view.h"
 #include "player_control.h"
 #include "player_state.h"
 #include "ui_common.h"
@@ -189,6 +190,24 @@ static void player_home_play_cb(lv_event_t *event)
     }
 }
 
+static void player_home_library_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+        return;
+    }
+    library_view_open();
+}
+
+void player_home_refresh()
+{
+    AudioStateSnapshot snapshot = {};
+    if (!audio_service_get_snapshot(&snapshot)) {
+        return;
+    }
+    player_home_apply_audio_snapshot(snapshot);
+    g_last_audio_state_revision = snapshot.state_revision;
+}
+
 void player_home_create(lv_obj_t *screen)
 {
     if (screen == nullptr) {
@@ -206,6 +225,21 @@ void player_home_create(lv_obj_t *screen)
     lv_obj_t *sd = player_home_create_label(
         screen, LV_SYMBOL_SD_CARD, lv_color_hex(0xAAB2BF), lv_font_default());
     lv_obj_align(sd, LV_ALIGN_TOP_RIGHT, -32, 26);
+
+    lv_obj_t *library = lv_button_create(screen);
+    ui_common_lock_object(library);
+    lv_obj_set_size(library, 76, 36);
+    lv_obj_align(library, LV_ALIGN_TOP_MID, 0, 12);
+    lv_obj_set_style_radius(library, 12, 0);
+    lv_obj_set_style_bg_color(library, lv_color_hex(0x1B2029), 0);
+    lv_obj_set_style_bg_opa(library, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(library, 0, 0);
+    lv_obj_set_style_shadow_width(library, 0, 0);
+    lv_obj_set_style_pad_all(library, 0, 0);
+    lv_obj_t *library_label = player_home_create_label(
+        library, "曲库", lv_color_hex(0xE9ECF1), font_manager_get_ui_font());
+    lv_obj_center(library_label);
+    lv_obj_add_event_cb(library, player_home_library_cb, LV_EVENT_CLICKED, nullptr);
 
     lv_obj_t *cover = lv_obj_create(screen);
     ui_common_lock_object(cover);
@@ -273,7 +307,7 @@ void player_home_create(lv_obj_t *screen)
     if (!player_state_copy_list_label(list_label, sizeof(list_label))) {
         snprintf(list_label, sizeof(list_label), "未知列表");
     }
-    ESP_LOGI(TAG, "Stage 10.5 播放器首页已消费列表上下文：列表=%s 位置=%u/%u 全局track=%u",
+    ESP_LOGI(TAG, "Stage 10.6 播放器首页已接入曲库列表上下文：列表=%s 位置=%u/%u 全局track=%u",
         list_label,
         static_cast<unsigned>(player_state_get_list_count() > 0 ? player_state_get_list_position() + 1 : 0),
         static_cast<unsigned>(player_state_get_list_count()),

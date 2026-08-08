@@ -10,6 +10,7 @@
 #include "display.h"
 #include "font/font_manager.h"
 #include "screens/player_home.h"
+#include "screens/library_view.h"
 
 static const char *TAG = "界面";
 static lv_display_t *g_display = nullptr;
@@ -154,6 +155,7 @@ esp_err_t ui_manager_init()
         ESP_LOGW(TAG, "原厂中文字体初始化失败，将使用 LVGL 默认字体：%s", esp_err_to_name(font_ret));
     }
     player_home_create(lv_screen_active());
+    library_view_create(lv_screen_active());
     lvgl_port_unlock();
 
     g_ready = true;
