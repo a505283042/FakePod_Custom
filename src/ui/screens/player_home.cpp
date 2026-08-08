@@ -1,10 +1,11 @@
 #include "player_home.h"
 
 #include <stdio.h>
-
 #include "esp_log.h"
+#include "audio_service.h"
 #include "font/font_manager.h"
 #include "media_library.h"
+#include "player_control.h"
 #include "player_state.h"
 #include "ui_common.h"
 
@@ -12,7 +13,8 @@ static const char *TAG = "首页";
 static lv_obj_t *g_title = nullptr;
 static lv_obj_t *g_track_info = nullptr;
 static lv_obj_t *g_play_symbol = nullptr;
-static bool g_fake_playing = false;
+static lv_obj_t *g_progress = nullptr;
+static uint32_t g_last_audio_state_revision = UINT32_MAX;
 
 static lv_obj_t *player_home_create_label(
     lv_obj_t *parent,
@@ -44,11 +46,12 @@ static lv_obj_t *player_home_create_round_button(lv_obj_t *parent, int32_t size,
     return button;
 }
 
-static void player_home_refresh_track()
+static void player_home_refresh_track(const AudioStateSnapshot *audio_snapshot)
 {
     if (g_title == nullptr || g_track_info == nullptr) {
         return;
     }
+
     const size_t count = media_library_get_count();
     if (count == 0) {
         lv_label_set_text(g_title, "暂无歌曲");
@@ -62,12 +65,76 @@ static void player_home_refresh_track()
         snprintf(title, sizeof(title), "歌曲 %u", static_cast<unsigned>(index + 1));
     }
     lv_label_set_text(g_title, title);
+
+    char suffix[96] = {};
+    if (audio_snapshot != nullptr && audio_snapshot->track_index == index) {
+        if (
+            audio_snapshot->state == AudioPlaybackState::Error &&
+            audio_snapshot->last_error == ESP_ERR_NOT_SUPPORTED
+        ) {
+            snprintf(suffix, sizeof(suffix), "  · 解码器待接入");
+        } else if (audio_snapshot->state == AudioPlaybackState::Playing) {
+            if (audio_snapshot->sample_rate_hz == 44100) {
+                snprintf(suffix, sizeof(suffix), "  · 播放中 · 44.1k/16bit");
+            } else if (audio_snapshot->sample_rate_hz > 0) {
+                snprintf(suffix, sizeof(suffix), "  · 播放中 · %luk/16bit",
+                    static_cast<unsigned long>(audio_snapshot->sample_rate_hz / 1000));
+            } else {
+                snprintf(suffix, sizeof(suffix), "  · 播放中");
+            }
+        } else if (audio_snapshot->state == AudioPlaybackState::Paused) {
+            snprintf(suffix, sizeof(suffix), "  · 已暂停");
+        } else if (audio_snapshot->state == AudioPlaybackState::Finished) {
+            snprintf(suffix, sizeof(suffix), "  · 播放结束");
+        }
+    }
+
     lv_label_set_text_fmt(
         g_track_info,
-        "第 %u / %u 首  %s",
+        "第 %u / %u 首  %s%s",
         static_cast<unsigned>(index + 1),
         static_cast<unsigned>(count),
-        media_library_format_name(player_state_get_format()));
+        media_library_format_name(player_state_get_format()),
+        suffix);
+}
+
+static void player_home_apply_audio_snapshot(const AudioStateSnapshot &snapshot)
+{
+    if (g_play_symbol != nullptr) {
+        const bool show_pause = snapshot.state == AudioPlaybackState::Playing;
+        lv_label_set_text(g_play_symbol, show_pause ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+    }
+
+    if (g_progress != nullptr) {
+        int32_t progress = 0;
+        if (
+            snapshot.track_index == player_state_get_index() &&
+            snapshot.total_frames > 0
+        ) {
+            uint64_t percent = (snapshot.position_frames * 100ULL) / snapshot.total_frames;
+            if (percent > 100) {
+                percent = 100;
+            }
+            progress = static_cast<int32_t>(percent);
+        }
+        lv_bar_set_value(g_progress, progress, LV_ANIM_OFF);
+    }
+
+    player_home_refresh_track(&snapshot);
+}
+
+static void player_home_audio_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    AudioStateSnapshot snapshot = {};
+    if (!audio_service_get_snapshot(&snapshot)) {
+        return;
+    }
+    if (snapshot.state_revision == g_last_audio_state_revision) {
+        return;
+    }
+    g_last_audio_state_revision = snapshot.state_revision;
+    player_home_apply_audio_snapshot(snapshot);
 }
 
 static void player_home_prev_cb(lv_event_t *event)
@@ -75,12 +142,10 @@ static void player_home_prev_cb(lv_event_t *event)
     if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
         return;
     }
-    if (player_state_previous()) {
-        g_fake_playing = false;
-        if (g_play_symbol != nullptr) {
-            lv_label_set_text(g_play_symbol, LV_SYMBOL_PLAY);
-        }
-        player_home_refresh_track();
+    if (player_control_previous()) {
+        AudioStateSnapshot snapshot = {};
+        audio_service_get_snapshot(&snapshot);
+        player_home_apply_audio_snapshot(snapshot);
     }
 }
 
@@ -89,12 +154,10 @@ static void player_home_next_cb(lv_event_t *event)
     if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
         return;
     }
-    if (player_state_next()) {
-        g_fake_playing = false;
-        if (g_play_symbol != nullptr) {
-            lv_label_set_text(g_play_symbol, LV_SYMBOL_PLAY);
-        }
-        player_home_refresh_track();
+    if (player_control_next()) {
+        AudioStateSnapshot snapshot = {};
+        audio_service_get_snapshot(&snapshot);
+        player_home_apply_audio_snapshot(snapshot);
     }
 }
 
@@ -103,15 +166,9 @@ static void player_home_play_cb(lv_event_t *event)
     if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
         return;
     }
-    if (media_library_get_count() == 0) {
-        ESP_LOGW(TAG, "音乐库为空，无法切换播放状态");
-        return;
+    if (!player_control_toggle_play_pause()) {
+        ESP_LOGW(TAG, "播放控制请求未能入队");
     }
-    g_fake_playing = !g_fake_playing;
-    if (g_play_symbol != nullptr) {
-        lv_label_set_text(g_play_symbol, g_fake_playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
-    }
-    ESP_LOGI(TAG, "%s：%s", g_fake_playing ? "模拟播放" : "模拟暂停", player_state_get_path());
 }
 
 void player_home_create(lv_obj_t *screen)
@@ -156,20 +213,20 @@ void player_home_create(lv_obj_t *screen)
     g_track_info = player_home_create_label(
         screen, "", lv_color_hex(0x7E8795), font_manager_get_ui_font());
     lv_label_set_long_mode(g_track_info, LV_LABEL_LONG_DOT);
-    lv_obj_set_size(g_track_info, 400, 32);
+    lv_obj_set_size(g_track_info, 420, 32);
     lv_obj_set_style_text_align(g_track_info, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(g_track_info, LV_ALIGN_TOP_MID, 0, 329);
 
-    lv_obj_t *progress = lv_bar_create(screen);
-    ui_common_lock_object(progress);
-    lv_obj_set_size(progress, 330, 6);
-    lv_obj_align(progress, LV_ALIGN_TOP_MID, 0, 365);
-    lv_bar_set_range(progress, 0, 100);
-    lv_bar_set_value(progress, 0, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(progress, lv_color_hex(0x282E38), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(progress, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(progress, lv_color_hex(0xF2F3F5), LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(progress, LV_OPA_COVER, LV_PART_INDICATOR);
+    g_progress = lv_bar_create(screen);
+    ui_common_lock_object(g_progress);
+    lv_obj_set_size(g_progress, 330, 6);
+    lv_obj_align(g_progress, LV_ALIGN_TOP_MID, 0, 365);
+    lv_bar_set_range(g_progress, 0, 100);
+    lv_bar_set_value(g_progress, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(g_progress, lv_color_hex(0x282E38), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(g_progress, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(g_progress, lv_color_hex(0xF2F3F5), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(g_progress, LV_OPA_COVER, LV_PART_INDICATOR);
 
     lv_obj_t *prev = player_home_create_round_button(screen, 58, LV_SYMBOL_PREV);
     lv_obj_align(prev, LV_ALIGN_BOTTOM_MID, -92, -24);
@@ -188,8 +245,13 @@ void player_home_create(lv_obj_t *screen)
     lv_obj_align(next, LV_ALIGN_BOTTOM_MID, 92, -24);
     lv_obj_add_event_cb(next, player_home_next_cb, LV_EVENT_CLICKED, nullptr);
 
-    player_home_refresh_track();
-    ESP_LOGI(TAG, "Stage 7.2 播放器首页创建完成，当前歌曲=%u/%u",
+    AudioStateSnapshot snapshot = {};
+    audio_service_get_snapshot(&snapshot);
+    player_home_apply_audio_snapshot(snapshot);
+    g_last_audio_state_revision = snapshot.state_revision;
+    lv_timer_create(player_home_audio_timer_cb, 100, nullptr);
+
+    ESP_LOGI(TAG, "Stage 9.2 播放器首页已接入 WAV PCM 播放与进度快照，当前歌曲=%u/%u",
         static_cast<unsigned>(media_library_get_count() > 0 ? player_state_get_index() + 1 : 0),
         static_cast<unsigned>(media_library_get_count()));
 }

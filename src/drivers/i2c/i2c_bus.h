@@ -21,6 +21,19 @@ esp_err_t i2c_bus_add_device(
     i2c_master_dev_handle_t *handle
 );
 
+// 按指定总线速度注册 I2C 设备
+esp_err_t i2c_bus_add_device_at_speed(
+    uint8_t address,
+    uint32_t scl_speed_hz,
+    i2c_master_dev_handle_t *handle
+);
+
+// 探测指定 7 位 I2C 地址是否有设备响应
+esp_err_t i2c_bus_probe_address(
+    uint8_t address,
+    int timeout_ms
+);
+
 
 // 读取单字节寄存器
 esp_err_t i2c_bus_read_reg8(

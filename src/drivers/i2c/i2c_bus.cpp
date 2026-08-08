@@ -149,6 +149,9 @@ void i2c_bus_scan()
 
                 name = "QMI8658 六轴";
             }
+            else if (address == FAKEPOD_ADDR_CS43131) {
+                name = "CS43131 DAC";
+            }
 
 
             ESP_LOGI(
@@ -181,31 +184,62 @@ esp_err_t i2c_bus_add_device(
     i2c_master_dev_handle_t *handle
 )
 {
+    return i2c_bus_add_device_at_speed(
+        address,
+        400000,
+        handle
+    );
+}
+
+
+// ============================================================
+// 按指定速度注册 I2C 设备
+// ============================================================
+
+esp_err_t i2c_bus_add_device_at_speed(
+    uint8_t address,
+    uint32_t scl_speed_hz,
+    i2c_master_dev_handle_t *handle
+)
+{
     if (
         g_i2c_bus == nullptr ||
-        handle == nullptr
+        handle == nullptr ||
+        scl_speed_hz == 0
     ) {
-
         return ESP_ERR_INVALID_ARG;
     }
 
-
     i2c_device_config_t config = {};
-
-    config.dev_addr_length =
-        I2C_ADDR_BIT_LEN_7;
-
-    config.device_address =
-        address;
-
-    config.scl_speed_hz =
-        400000;
-
+    config.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    config.device_address = address;
+    config.scl_speed_hz = scl_speed_hz;
 
     return i2c_master_bus_add_device(
         g_i2c_bus,
         &config,
         handle
+    );
+}
+
+
+// ============================================================
+// 探测指定 I2C 地址
+// ============================================================
+
+esp_err_t i2c_bus_probe_address(
+    uint8_t address,
+    int timeout_ms
+)
+{
+    if (g_i2c_bus == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return i2c_master_probe(
+        g_i2c_bus,
+        address,
+        timeout_ms
     );
 }
 

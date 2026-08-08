@@ -1,0 +1,308 @@
+#include "wav_decoder.h"
+
+#include <limits.h>
+#include <string.h>
+#include "esp_log.h"
+
+static const char *TAG = "WAV";
+static constexpr size_t WAV_READ_FRAMES_MAX = 256;
+
+static uint16_t wav_read_le16(const uint8_t *data)
+{
+    return static_cast<uint16_t>(data[0]) |
+        static_cast<uint16_t>(static_cast<uint16_t>(data[1]) << 8);
+}
+
+static uint32_t wav_read_le32(const uint8_t *data)
+{
+    return static_cast<uint32_t>(data[0]) |
+        (static_cast<uint32_t>(data[1]) << 8) |
+        (static_cast<uint32_t>(data[2]) << 16) |
+        (static_cast<uint32_t>(data[3]) << 24);
+}
+
+static bool wav_read_exact(FILE *file, void *buffer, size_t size)
+{
+    return file != nullptr && buffer != nullptr && fread(buffer, 1, size, file) == size;
+}
+
+static esp_err_t wav_skip_bytes(FILE *file, uint32_t bytes)
+{
+    if (file == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (bytes > static_cast<uint32_t>(LONG_MAX)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    return fseek(file, static_cast<long>(bytes), SEEK_CUR) == 0 ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t wav_validate_data_bounds(WavDecoder *decoder, long data_offset)
+{
+    if (decoder == nullptr || decoder->file == nullptr || data_offset < 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (fseek(decoder->file, 0, SEEK_END) != 0) {
+        return ESP_FAIL;
+    }
+    const long file_end = ftell(decoder->file);
+    if (file_end < 0) {
+        return ESP_FAIL;
+    }
+
+    const uint64_t declared_end = static_cast<uint64_t>(data_offset) + decoder->data_size_bytes;
+    if (declared_end > static_cast<uint64_t>(file_end)) {
+        ESP_LOGE(TAG, "WAV data chunk 超出实际文件：data偏移=%ld 声明=%lu 文件=%ld",
+            data_offset,
+            static_cast<unsigned long>(decoder->data_size_bytes),
+            file_end);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    return fseek(decoder->file, data_offset, SEEK_SET) == 0 ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t wav_decoder_open(WavDecoder *decoder, const char *path)
+{
+    if (decoder == nullptr || path == nullptr || path[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    wav_decoder_close(decoder);
+
+    FILE *file = fopen(path, "rb");
+    if (file == nullptr) {
+        ESP_LOGE(TAG, "打开 WAV 失败：%s", path);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    decoder->file = file;
+
+    uint8_t riff_header[12] = {};
+    if (!wav_read_exact(file, riff_header, sizeof(riff_header))) {
+        ESP_LOGE(TAG, "WAV 文件头不足 12 字节：%s", path);
+        wav_decoder_close(decoder);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    if (memcmp(riff_header, "RIFF", 4) != 0 || memcmp(riff_header + 8, "WAVE", 4) != 0) {
+        ESP_LOGE(TAG, "不是标准 RIFF/WAVE 文件：%s", path);
+        wav_decoder_close(decoder);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    bool fmt_found = false;
+    bool data_found = false;
+    long data_offset = -1;
+
+    while (!data_found) {
+        uint8_t chunk_header[8] = {};
+        if (!wav_read_exact(file, chunk_header, sizeof(chunk_header))) {
+            ESP_LOGE(TAG, "WAV 未找到完整 data chunk：%s", path);
+            wav_decoder_close(decoder);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+
+        const uint32_t chunk_size = wav_read_le32(chunk_header + 4);
+        const bool odd_padding = (chunk_size & 1U) != 0;
+
+        if (memcmp(chunk_header, "fmt ", 4) == 0) {
+            if (chunk_size < 16) {
+                ESP_LOGE(TAG, "WAV fmt chunk 太短：%lu", static_cast<unsigned long>(chunk_size));
+                wav_decoder_close(decoder);
+                return ESP_ERR_INVALID_SIZE;
+            }
+
+            uint8_t fmt[16] = {};
+            if (!wav_read_exact(file, fmt, sizeof(fmt))) {
+                wav_decoder_close(decoder);
+                return ESP_ERR_INVALID_SIZE;
+            }
+
+            const uint16_t audio_format = wav_read_le16(fmt + 0);
+            decoder->channels = wav_read_le16(fmt + 2);
+            decoder->sample_rate_hz = wav_read_le32(fmt + 4);
+            decoder->byte_rate = wav_read_le32(fmt + 8);
+            decoder->block_align = wav_read_le16(fmt + 12);
+            decoder->bits_per_sample = wav_read_le16(fmt + 14);
+
+            if (audio_format != 1) {
+                ESP_LOGE(TAG, "暂不支持该 WAV 编码：format=0x%04X（Stage 9.2 仅支持 PCM=1）", audio_format);
+                wav_decoder_close(decoder);
+                return ESP_ERR_NOT_SUPPORTED;
+            }
+            if (decoder->channels != 2 || decoder->bits_per_sample != 16) {
+                ESP_LOGE(TAG, "暂不支持该 WAV 参数：声道=%u 位深=%u（要求双声道16bit）",
+                    static_cast<unsigned>(decoder->channels),
+                    static_cast<unsigned>(decoder->bits_per_sample));
+                wav_decoder_close(decoder);
+                return ESP_ERR_NOT_SUPPORTED;
+            }
+            if (decoder->sample_rate_hz != 44100 && decoder->sample_rate_hz != 48000) {
+                ESP_LOGE(TAG, "暂不支持该 WAV 采样率：%luHz（要求44100或48000）",
+                    static_cast<unsigned long>(decoder->sample_rate_hz));
+                wav_decoder_close(decoder);
+                return ESP_ERR_NOT_SUPPORTED;
+            }
+            if (decoder->block_align != 4 ||
+                decoder->byte_rate != decoder->sample_rate_hz * decoder->block_align) {
+                ESP_LOGE(TAG, "WAV fmt 参数不一致：block_align=%u byte_rate=%lu",
+                    static_cast<unsigned>(decoder->block_align),
+                    static_cast<unsigned long>(decoder->byte_rate));
+                wav_decoder_close(decoder);
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+
+            const uint64_t fmt_skip = static_cast<uint64_t>(chunk_size - 16) + (odd_padding ? 1U : 0U);
+            if (fmt_skip > static_cast<uint64_t>(UINT32_MAX)) {
+                wav_decoder_close(decoder);
+                return ESP_ERR_INVALID_SIZE;
+            }
+            esp_err_t skip_ret = wav_skip_bytes(file, static_cast<uint32_t>(fmt_skip));
+            if (skip_ret != ESP_OK) {
+                wav_decoder_close(decoder);
+                return skip_ret;
+            }
+            fmt_found = true;
+            continue;
+        }
+
+        if (memcmp(chunk_header, "data", 4) == 0) {
+            if (!fmt_found) {
+                ESP_LOGE(TAG, "WAV data chunk 出现在 fmt chunk 之前，Stage 9.2 拒绝该异常布局");
+                wav_decoder_close(decoder);
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+            if (chunk_size == 0 || (chunk_size % decoder->block_align) != 0) {
+                ESP_LOGE(TAG, "WAV data 长度无效：%lu，block_align=%u",
+                    static_cast<unsigned long>(chunk_size),
+                    static_cast<unsigned>(decoder->block_align));
+                wav_decoder_close(decoder);
+                return ESP_ERR_INVALID_SIZE;
+            }
+
+            data_offset = ftell(file);
+            if (data_offset < 0) {
+                wav_decoder_close(decoder);
+                return ESP_FAIL;
+            }
+
+            decoder->data_size_bytes = chunk_size;
+            decoder->data_remaining_bytes = chunk_size;
+            decoder->total_frames = chunk_size / decoder->block_align;
+            decoder->frames_read = 0;
+            data_found = true;
+            break;
+        }
+
+        const uint64_t padded = static_cast<uint64_t>(chunk_size) + (odd_padding ? 1U : 0U);
+        if (padded > static_cast<uint64_t>(UINT32_MAX)) {
+            wav_decoder_close(decoder);
+            return ESP_ERR_INVALID_SIZE;
+        }
+        esp_err_t skip_ret = wav_skip_bytes(file, static_cast<uint32_t>(padded));
+        if (skip_ret != ESP_OK) {
+            ESP_LOGE(TAG, "跳过 WAV chunk %.4s 失败", reinterpret_cast<const char *>(chunk_header));
+            wav_decoder_close(decoder);
+            return skip_ret;
+        }
+    }
+
+    esp_err_t bounds_ret = wav_validate_data_bounds(decoder, data_offset);
+    if (bounds_ret != ESP_OK) {
+        wav_decoder_close(decoder);
+        return bounds_ret;
+    }
+
+    ESP_LOGI(TAG, "WAV解析成功：%luHz / %ubit / %u声道，PCM=%lu字节，总帧=%llu",
+        static_cast<unsigned long>(decoder->sample_rate_hz),
+        static_cast<unsigned>(decoder->bits_per_sample),
+        static_cast<unsigned>(decoder->channels),
+        static_cast<unsigned long>(decoder->data_size_bytes),
+        static_cast<unsigned long long>(decoder->total_frames));
+    return ESP_OK;
+}
+
+esp_err_t wav_decoder_read_pcm32(
+    WavDecoder *decoder,
+    int32_t *out_interleaved_stereo,
+    size_t max_frames,
+    size_t *out_frames)
+{
+    if (out_frames != nullptr) {
+        *out_frames = 0;
+    }
+    if (decoder == nullptr || decoder->file == nullptr ||
+        out_interleaved_stereo == nullptr || out_frames == nullptr || max_frames == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (decoder->data_remaining_bytes == 0) {
+        return ESP_OK;
+    }
+
+    size_t frames_to_read = max_frames;
+    if (frames_to_read > WAV_READ_FRAMES_MAX) {
+        frames_to_read = WAV_READ_FRAMES_MAX;
+    }
+
+    const size_t remaining_frames = decoder->data_remaining_bytes / decoder->block_align;
+    if (frames_to_read > remaining_frames) {
+        frames_to_read = remaining_frames;
+    }
+
+    uint8_t raw[WAV_READ_FRAMES_MAX * 4] = {};
+    const size_t bytes_to_read = frames_to_read * decoder->block_align;
+    const size_t bytes_read = fread(raw, 1, bytes_to_read, decoder->file);
+
+    if (bytes_read == 0) {
+        if (ferror(decoder->file)) {
+            ESP_LOGE(TAG, "读取 WAV PCM 数据失败");
+            return ESP_FAIL;
+        }
+        ESP_LOGE(TAG, "WAV PCM 提前结束：声明剩余=%lu字节",
+            static_cast<unsigned long>(decoder->data_remaining_bytes));
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    if ((bytes_read % decoder->block_align) != 0) {
+        ESP_LOGE(TAG, "WAV PCM 读取到非完整帧：%u字节", static_cast<unsigned>(bytes_read));
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    const size_t frames_read = bytes_read / decoder->block_align;
+    for (size_t i = 0; i < frames_read; ++i) {
+        const uint8_t *frame = raw + i * 4;
+        const int16_t left = static_cast<int16_t>(wav_read_le16(frame));
+        const int16_t right = static_cast<int16_t>(wav_read_le16(frame + 2));
+        out_interleaved_stereo[i * 2] = static_cast<int32_t>(left) * 65536;
+        out_interleaved_stereo[i * 2 + 1] = static_cast<int32_t>(right) * 65536;
+    }
+
+    decoder->data_remaining_bytes -= static_cast<uint32_t>(bytes_read);
+    decoder->frames_read += frames_read;
+    *out_frames = frames_read;
+    return ESP_OK;
+}
+
+void wav_decoder_close(WavDecoder *decoder)
+{
+    if (decoder == nullptr) {
+        return;
+    }
+    if (decoder->file != nullptr) {
+        fclose(decoder->file);
+    }
+    *decoder = WavDecoder{};
+}
+
+bool wav_decoder_is_open(const WavDecoder *decoder)
+{
+    return decoder != nullptr && decoder->file != nullptr;
+}
+
+bool wav_decoder_is_eof(const WavDecoder *decoder)
+{
+    return decoder != nullptr && decoder->file != nullptr && decoder->data_remaining_bytes == 0;
+}

@@ -10,6 +10,7 @@
 #include "i2c_bus.h"
 #include "cst820.h"
 #include "qmi8658.h"
+#include "audio_service.h"
 #include "sdcard.h"
 #include "display.h"
 #include "media_library.h"
@@ -114,7 +115,7 @@ void boot_state_update()
         {
             ESP_LOGI(
                 TAG,
-                "步骤 1/8：检查 PSRAM"
+                "步骤 1/9：检查 PSRAM"
             );
 
 
@@ -164,7 +165,7 @@ void boot_state_update()
         {
             ESP_LOGI(
                 TAG,
-                "步骤 2/8：初始化 I2C"
+                "步骤 2/9：初始化 I2C"
             );
 
 
@@ -203,7 +204,7 @@ void boot_state_update()
         {
             ESP_LOGI(
                 TAG,
-                "步骤 3/8：初始化触摸"
+                "步骤 3/9：初始化触摸"
             );
 
 
@@ -239,7 +240,7 @@ void boot_state_update()
         {
             ESP_LOGI(
                 TAG,
-                "步骤 4/8：初始化 IMU"
+                "步骤 4/9：初始化 IMU"
             );
 
 
@@ -261,21 +262,40 @@ void boot_state_update()
 
 
             g_state =
-                BootState::InitSDCard;
+                BootState::InitAudioService;
 
             break;
         }
 
+        // ====================================================
+        // 5. AudioTask + CS43131
+        // ====================================================
+
+        case BootState::InitAudioService:
+        {
+            ESP_LOGI(TAG, "步骤 5/9：启动正式 AudioTask");
+
+            esp_err_t ret = audio_service_start();
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "AudioTask 启动失败：%s", esp_err_to_name(ret));
+                g_state = BootState::Error;
+                break;
+            }
+
+            ESP_LOGI(TAG, "正式播放器音频服务已就绪；开机不再执行测试音");
+            g_state = BootState::InitSDCard;
+            break;
+        }
 
         // ====================================================
-        // 5. TF 卡
+        // 6. TF 卡
         // ====================================================
 
         case BootState::InitSDCard:
         {
             ESP_LOGI(
                 TAG,
-                "步骤 5/8：初始化 TF 卡"
+                "步骤 6/9：初始化 TF 卡"
             );
 
 
@@ -307,14 +327,14 @@ void boot_state_update()
         }
 
         // ====================================================
-        // 6. 音乐库
+        // 7. 音乐库
         // ====================================================
 
         case BootState::ScanMediaLibrary:
         {
             ESP_LOGI(
                 TAG,
-                "步骤 6/8：扫描音乐库"
+                "步骤 7/9：扫描音乐库"
             );
 
             if (
@@ -345,14 +365,14 @@ void boot_state_update()
         }
 
         // ====================================================
-        // 7. CO5300 AMOLED
+        // 8. CO5300 AMOLED
         // ====================================================
 
         case BootState::InitDisplay:
         {
             ESP_LOGI(
                 TAG,
-                "步骤 7/8：初始化 AMOLED"
+                "步骤 8/9：初始化 AMOLED"
             );
 
 
@@ -381,14 +401,14 @@ void boot_state_update()
 
 
         // ====================================================
-        // 8. LVGL 用户界面
+        // 9. LVGL 用户界面
         // ====================================================
 
         case BootState::InitUI:
         {
             ESP_LOGI(
                 TAG,
-                "步骤 8/8：初始化 LVGL 用户界面"
+                "步骤 9/9：初始化 LVGL 用户界面"
             );
 
             if (ui_manager_init() != ESP_OK) {
@@ -413,7 +433,7 @@ void boot_state_update()
 
             ESP_LOGI(
                 TAG,
-                "FakePod 基础硬件、音乐库与界面启动完成"
+                "FakePod 基础硬件、AudioTask、音乐库与界面启动完成"
             );
 
             ESP_LOGI(
