@@ -263,7 +263,7 @@ static esp_err_t mp3_fill_input(Mp3Decoder *decoder, bool *out_read)
     if (out_read != nullptr) {
         *out_read = false;
     }
-    if (decoder == nullptr || decoder->file == nullptr || decoder->input_buffer == nullptr) {
+    if (decoder == nullptr || decoder->source == nullptr || decoder->input_buffer == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -278,7 +278,7 @@ static esp_err_t mp3_fill_input(Mp3Decoder *decoder, bool *out_read)
         return ESP_OK;
     }
 
-    // 当前窗口仍有足够压缩数据时直接交给 parser，减少 AudioTask 进入同步 SD fread 的频率。
+    // 当前窗口仍有足够压缩数据时直接交给 parser，减少 AudioTask 进入同步 Source read 的频率。
     if (remaining >= MP3_INPUT_REFILL_LOW_WATER_BYTES) {
         return ESP_OK;
     }
@@ -301,11 +301,12 @@ static esp_err_t mp3_fill_input(Mp3Decoder *decoder, bool *out_read)
 #if APP_DIAG_MP3_PERFORMANCE
     const int64_t read_begin_us = esp_timer_get_time();
 #endif
-    const size_t read_bytes = fread(
+    size_t read_bytes = 0;
+    const esp_err_t source_ret = audio_source_read(
+        decoder->source,
         decoder->input_buffer + decoder->input_size,
-        1,
         free_bytes,
-        decoder->file
+        &read_bytes
     );
 #if APP_DIAG_MP3_PERFORMANCE
     const uint32_t read_us = static_cast<uint32_t>(esp_timer_get_time() - read_begin_us);
@@ -330,14 +331,13 @@ static esp_err_t mp3_fill_input(Mp3Decoder *decoder, bool *out_read)
     }
     decoder->input_size += read_bytes;
 
-    if (read_bytes < free_bytes) {
-        if (ferror(decoder->file)) {
-            ESP_LOGE(TAG, "读取 MP3 压缩数据失败");
-            return ESP_FAIL;
-        }
-        if (feof(decoder->file)) {
-            decoder->input_chunk_eos = true;
-        }
+    if (source_ret != ESP_OK) {
+        ESP_LOGE(TAG, "读取 MP3 压缩数据失败：source=%s ret=%s",
+            audio_source_name(decoder->source), esp_err_to_name(source_ret));
+        return source_ret;
+    }
+    if (read_bytes < free_bytes && audio_source_eof(decoder->source)) {
+        decoder->input_chunk_eos = true;
     }
 
     if (decoder->input_size == 0 && decoder->input_chunk_eos) {
@@ -591,9 +591,9 @@ esp_err_t mp3_decoder_register_backend()
     return ESP_OK;
 }
 
-esp_err_t mp3_decoder_open(Mp3Decoder *decoder, const char *path, AudioDecodeWorkspace *workspace)
+esp_err_t mp3_decoder_open(Mp3Decoder *decoder, AudioSource *source, AudioDecodeWorkspace *workspace)
 {
-    if (decoder == nullptr || path == nullptr || path[0] == '\0') {
+    if (decoder == nullptr || !audio_source_is_open(source)) {
         return ESP_ERR_INVALID_ARG;
     }
     mp3_decoder_close(decoder);
@@ -603,21 +603,26 @@ esp_err_t mp3_decoder_open(Mp3Decoder *decoder, const char *path, AudioDecodeWor
         return ret;
     }
 
-    decoder->file = fopen(path, "rb");
-    if (decoder->file == nullptr) {
-        ESP_LOGE(TAG, "打开 MP3 失败：%s", path);
-        return ESP_ERR_NOT_FOUND;
-    }
-    if (fseek(decoder->file, 0, SEEK_END) != 0) {
+    decoder->source = source;
+    if (!audio_source_has_capability(source, AUDIO_SOURCE_CAP_READ) ||
+        !audio_source_has_capability(source, AUDIO_SOURCE_CAP_SEEK) ||
+        !audio_source_has_capability(source, AUDIO_SOURCE_CAP_SIZE)) {
         mp3_decoder_close(decoder);
-        return ESP_FAIL;
+        return ESP_ERR_NOT_SUPPORTED;
     }
-    const long file_size = ftell(decoder->file);
-    if (file_size <= 0 || fseek(decoder->file, 0, SEEK_SET) != 0) {
+
+    uint64_t file_size = 0;
+    ret = audio_source_size(source, &file_size);
+    if (ret != ESP_OK || file_size == 0) {
         mp3_decoder_close(decoder);
-        return ESP_ERR_INVALID_SIZE;
+        return ret != ESP_OK ? ret : ESP_ERR_INVALID_SIZE;
     }
-    decoder->file_size_bytes = static_cast<uint64_t>(file_size);
+    ret = audio_source_seek(source, 0, AudioSourceSeekOrigin::Begin);
+    if (ret != ESP_OK) {
+        mp3_decoder_close(decoder);
+        return ret;
+    }
+    decoder->file_size_bytes = file_size;
 
     decoder->workspace = workspace;
     if (workspace != nullptr) {
@@ -767,10 +772,8 @@ void mp3_decoder_close(Mp3Decoder *decoder)
     if (decoder->simple_handle != nullptr) {
         esp_audio_simple_dec_close(static_cast<esp_audio_simple_dec_handle_t>(decoder->simple_handle));
     }
-    if (decoder->file != nullptr) {
-        fclose(decoder->file);
-    }
-    // 使用共享 workspace 时缓冲归 AudioTask 生命周期所有，切歌只关闭 codec/FILE，不释放 PSRAM。
+    // Source 生命周期由 PcmDecoder 所有；这里仅关闭 Codec，切歌时底层 Source 最后统一关闭。
+    // 使用共享 workspace 时缓冲归 AudioTask 生命周期所有，切歌只关闭 codec，不释放 PSRAM。
     if (decoder->workspace == nullptr) {
         mp3_free_buffer(decoder->input_buffer);
         mp3_free_buffer(decoder->decoded_buffer);
@@ -788,7 +791,7 @@ void mp3_decoder_close(Mp3Decoder *decoder)
 
 bool mp3_decoder_is_open(const Mp3Decoder *decoder)
 {
-    return decoder != nullptr && decoder->file != nullptr && decoder->simple_handle != nullptr;
+    return decoder != nullptr && audio_source_is_open(decoder->source) && decoder->simple_handle != nullptr;
 }
 
 bool mp3_decoder_is_eof(const Mp3Decoder *decoder)

@@ -21,6 +21,8 @@ idf_component_register(
 
         "audio/audio_service.cpp"
         "audio/audio_decode_workspace.cpp"
+        "audio/sources/audio_source.cpp"
+        "audio/sources/sd_file_audio_source.cpp"
         "audio/decoders/pcm_decoder.cpp"
         "audio/decoders/wav_decoder.cpp"
         "audio/decoders/flac_decoder.cpp"
@@ -68,6 +70,7 @@ idf_component_register(
 
         "audio"
         "audio/decoders"
+        "audio/sources"
 
         "media/library"
 

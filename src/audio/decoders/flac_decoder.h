@@ -2,19 +2,19 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 #include "esp_err.h"
 #include "audio_diag_config.h"
 #include "../audio_decode_workspace.h"
+#include "../sources/audio_source.h"
 
 // FLAC 解码器只负责“压缩数据 -> PCM”，不拥有 I2S、DAC 或播放状态。
 // 当前已进入 44.1~192kHz 受控实机验证；高采样率是否长期保留由实时预算和缓存水位决定。
 struct FlacDecoder
 {
-    FILE *file = nullptr;
+    AudioSource *source = nullptr;
     AudioDecodeWorkspace *workspace = nullptr;
     void *simple_handle = nullptr;
-    // 压缩流预取层只拥有 SD 读取和 PSRAM 环形缓冲，不拥有 FLAC 解码器状态。
+    // 压缩流预取层只拥有 Source 读取和 PSRAM 环形缓冲，不拥有 FLAC 解码器状态。
     void *prefetch_context = nullptr;
 
     uint8_t *input_buffer = nullptr;
@@ -143,9 +143,9 @@ bool flac_decoder_get_perf_snapshot(FlacPerfSnapshot *out_snapshot);
 // AudioTask 启动时调用一次，只注册 FLAC 后端，不注册无关编解码器。
 esp_err_t flac_decoder_register_backend();
 
-// 打开 FLAC 并读取 STREAMINFO。支持标准 fLaC，也兼容前置 ID3v2 标签。
+// 从统一 AudioSource 打开 FLAC 并读取 STREAMINFO。支持标准 fLaC，也兼容前置 ID3v2 标签。
 // 当前 PCM sink 支持：44.1/48/88.2/96/176.4/192kHz、单/双声道、16/24/32bit。
-esp_err_t flac_decoder_open(FlacDecoder *decoder, const char *path, AudioDecodeWorkspace *workspace = nullptr);
+esp_err_t flac_decoder_open(FlacDecoder *decoder, AudioSource *source, AudioDecodeWorkspace *workspace = nullptr);
 
 // 按需流式解码并统一转换成 32bit I2S 立体声容器。
 // 单声道会复制到左右声道；16/24bit 会左对齐到 32bit。

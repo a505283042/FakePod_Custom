@@ -7,6 +7,8 @@
 #include "mp3_decoder.h"
 #include "wav_decoder.h"
 #include "../audio_decode_workspace.h"
+#include "../sources/audio_source.h"
+#include "../sources/sd_file_audio_source.h"
 
 enum class PcmDecoderType : uint8_t
 {
@@ -28,6 +30,10 @@ struct PcmDecoderInfo
 // AudioTask -> I2S -> CS43131 的播放链路不因源格式复制。
 struct PcmDecoder
 {
+    // Source 生命周期归统一 PCM Decoder 所有；各 codec 只借用 AudioSource*。
+    AudioSource source = {};
+    SdFileAudioSource sd_file_source = {};
+
     PcmDecoderType type = PcmDecoderType::None;
     PcmDecoderInfo info = {};
     WavDecoder wav = {};

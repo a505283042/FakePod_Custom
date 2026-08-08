@@ -30,10 +30,15 @@ esp_err_t pcm_decoder_open(
     }
     pcm_decoder_close(decoder);
 
-    esp_err_t ret = ESP_ERR_NOT_SUPPORTED;
+    // Stage 10.9 第一版只有本地 SD Source。Codec 不再 fopen(path)，只消费统一 AudioSource。
+    esp_err_t ret = sd_file_audio_source_open(&decoder->source, &decoder->sd_file_source, path);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
     switch (type) {
         case PcmDecoderType::Wav:
-            ret = wav_decoder_open(&decoder->wav, path);
+            ret = wav_decoder_open(&decoder->wav, &decoder->source);
             if (ret == ESP_OK) {
                 decoder->info.sample_rate_hz = decoder->wav.sample_rate_hz;
                 decoder->info.channels = decoder->wav.channels;
@@ -42,7 +47,7 @@ esp_err_t pcm_decoder_open(
             }
             break;
         case PcmDecoderType::Flac:
-            ret = flac_decoder_open(&decoder->flac, path, workspace);
+            ret = flac_decoder_open(&decoder->flac, &decoder->source, workspace);
             if (ret == ESP_OK) {
                 decoder->info.sample_rate_hz = decoder->flac.sample_rate_hz;
                 decoder->info.channels = decoder->flac.channels;
@@ -51,7 +56,7 @@ esp_err_t pcm_decoder_open(
             }
             break;
         case PcmDecoderType::Mp3:
-            ret = mp3_decoder_open(&decoder->mp3, path, workspace);
+            ret = mp3_decoder_open(&decoder->mp3, &decoder->source, workspace);
             if (ret == ESP_OK) {
                 decoder->info.sample_rate_hz = decoder->mp3.sample_rate_hz;
                 decoder->info.channels = decoder->mp3.channels;
@@ -60,6 +65,7 @@ esp_err_t pcm_decoder_open(
             }
             break;
         default:
+            audio_source_close(&decoder->source);
             return ESP_ERR_NOT_SUPPORTED;
     }
 
@@ -113,6 +119,20 @@ void pcm_decoder_close(PcmDecoder *decoder)
     if (mp3_decoder_is_open(&decoder->mp3)) {
         mp3_decoder_close(&decoder->mp3);
     }
+
+    // FLAC close 会先停止 Core1 PrefetchTask；确认所有 Codec 都不再访问 Source 后，最后关闭底层文件。
+    if (audio_source_is_open(&decoder->source)) {
+        const AudioSourceStats *stats = audio_source_stats(&decoder->source);
+        ESP_LOGI(TAG,
+            "SOURCE_TRACE: CLOSE type=%s reads=%lu bytes=%llu seeks=%lu tells=%lu",
+            audio_source_name(&decoder->source),
+            static_cast<unsigned long>(stats != nullptr ? stats->read_calls : 0U),
+            static_cast<unsigned long long>(stats != nullptr ? stats->bytes_read : 0ULL),
+            static_cast<unsigned long>(stats != nullptr ? stats->seek_calls : 0U),
+            static_cast<unsigned long>(stats != nullptr ? stats->tell_calls : 0U));
+        audio_source_close(&decoder->source);
+    }
+    decoder->sd_file_source = {};
     decoder->type = PcmDecoderType::None;
     decoder->info = {};
 }

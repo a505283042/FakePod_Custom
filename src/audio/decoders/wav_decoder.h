@@ -2,14 +2,14 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 #include "esp_err.h"
+#include "../sources/audio_source.h"
 
 // Stage 9.2 第一版只接入最常见的未压缩 PCM WAV：
 // 16bit、双声道、44.1kHz 或 48kHz。
 struct WavDecoder
 {
-    FILE *file = nullptr;
+    AudioSource *source = nullptr;
     uint32_t sample_rate_hz = 0;
     uint16_t channels = 0;
     uint16_t bits_per_sample = 0;
@@ -21,9 +21,9 @@ struct WavDecoder
     uint64_t frames_read = 0;
 };
 
-// 打开并解析 RIFF/WAVE、fmt 和 data chunk。
+// 从统一 AudioSource 打开并解析 RIFF/WAVE、fmt 和 data chunk。
 // 不支持压缩 WAV、单声道、24/32bit PCM 或 WAVE_FORMAT_EXTENSIBLE。
-esp_err_t wav_decoder_open(WavDecoder *decoder, const char *path);
+esp_err_t wav_decoder_open(WavDecoder *decoder, AudioSource *source);
 
 // 将 16bit little-endian 立体声 PCM 转为 32bit I2S 容器。
 // 每个 16bit 样本左移到 32bit 高 16 位，保持原始幅度关系。

@@ -77,7 +77,7 @@ static FlacPrefetchProfile flac_prefetch_profile_for_rate(uint32_t sample_rate_h
 
 struct FlacPrefetchContext
 {
-    FILE *file = nullptr;
+    AudioSource *source = nullptr;
     StreamBufferHandle_t stream = nullptr;
     StaticStreamBuffer_t stream_storage = {};
     StaticSemaphore_t done_storage = {};
@@ -346,7 +346,7 @@ static void flac_prefetch_task(void *arg)
     FlacPrefetchContext *context = static_cast<FlacPrefetchContext *>(arg);
     if (
         context == nullptr ||
-        context->file == nullptr ||
+        context->source == nullptr ||
         context->stream == nullptr ||
         context->read_buffer == nullptr
     ) {
@@ -404,11 +404,12 @@ static void flac_prefetch_task(void *arg)
 #if APP_DIAG_FLAC_PERFORMANCE
         const int64_t read_begin_us = esp_timer_get_time();
 #endif
-        const size_t bytes_read = fread(
+        size_t bytes_read = 0;
+        const esp_err_t source_ret = audio_source_read(
+            context->source,
             context->read_buffer,
-            1,
             context->read_chunk_bytes,
-            context->file
+            &bytes_read
         );
 #if APP_DIAG_FLAC_PERFORMANCE
         const uint32_t read_us = static_cast<uint32_t>(esp_timer_get_time() - read_begin_us);
@@ -428,12 +429,20 @@ static void flac_prefetch_task(void *arg)
             }
         }
 
+        if (source_ret != ESP_OK) {
+            if (!context->stop_requested) {
+                context->io_error = true;
+                ESP_LOGE(TAG, "FLAC 预取任务读取 Source 失败：source=%s ret=%s",
+                    audio_source_name(context->source), esp_err_to_name(source_ret));
+            }
+            break;
+        }
         if (bytes_read < context->read_chunk_bytes) {
-            if (feof(context->file)) {
+            if (audio_source_eof(context->source)) {
                 context->eof = true;
             } else if (!context->stop_requested) {
                 context->io_error = true;
-                ESP_LOGE(TAG, "FLAC 预取任务读取文件失败");
+                ESP_LOGE(TAG, "FLAC 预取任务发生非 EOF 短读");
             }
             break;
         }
@@ -478,7 +487,7 @@ static void flac_prefetch_destroy(FlacDecoder *decoder)
 
 static esp_err_t flac_prefetch_start(FlacDecoder *decoder)
 {
-    if (decoder == nullptr || decoder->file == nullptr) {
+    if (decoder == nullptr || decoder->source == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -490,7 +499,7 @@ static esp_err_t flac_prefetch_start(FlacDecoder *decoder)
     }
 
     const FlacPrefetchProfile profile = flac_prefetch_profile_for_rate(decoder->sample_rate_hz);
-    context->file = decoder->file;
+    context->source = decoder->source;
     context->ring_bytes = profile.ring_bytes;
     context->read_chunk_bytes = profile.read_chunk_bytes;
     context->start_target_bytes = profile.start_target_bytes;
@@ -625,17 +634,22 @@ static uint32_t flac_read_synchsafe_u28(const uint8_t *p)
            static_cast<uint32_t>(p[3] & 0x7FU);
 }
 
-static esp_err_t flac_seek_to_stream_marker(FILE *file, uint64_t *out_offset)
+static esp_err_t flac_seek_to_stream_marker(AudioSource *source, uint64_t *out_offset)
 {
-    if (file == nullptr || out_offset == nullptr) {
+    if (!audio_source_is_open(source) || out_offset == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
 
     uint8_t first10[10] = {};
-    if (fseek(file, 0, SEEK_SET) != 0) {
-        return ESP_FAIL;
+    esp_err_t ret = audio_source_seek(source, 0, AudioSourceSeekOrigin::Begin);
+    if (ret != ESP_OK) {
+        return ret;
     }
-    const size_t first_read = fread(first10, 1, sizeof(first10), file);
+    size_t first_read = 0;
+    ret = audio_source_read(source, first10, sizeof(first10), &first_read);
+    if (ret != ESP_OK) {
+        return ret;
+    }
     if (first_read < 4) {
         return ESP_ERR_INVALID_SIZE;
     }
@@ -657,14 +671,20 @@ static esp_err_t flac_seek_to_stream_marker(FILE *file, uint64_t *out_offset)
             static_cast<unsigned long long>(offset));
     }
 
-    if (offset > static_cast<uint64_t>(LONG_MAX) || fseek(file, static_cast<long>(offset), SEEK_SET) != 0) {
+    if (offset > static_cast<uint64_t>(INT64_MAX)) {
         return ESP_ERR_INVALID_SIZE;
+    }
+    ret = audio_source_seek(source, static_cast<int64_t>(offset), AudioSourceSeekOrigin::Begin);
+    if (ret != ESP_OK) {
+        return ret;
     }
 
     uint8_t marker[4] = {};
-    if (fread(marker, 1, sizeof(marker), file) != sizeof(marker) || memcmp(marker, "fLaC", 4) != 0) {
+    size_t marker_read = 0;
+    ret = audio_source_read(source, marker, sizeof(marker), &marker_read);
+    if (ret != ESP_OK || marker_read != sizeof(marker) || memcmp(marker, "fLaC", 4) != 0) {
         ESP_LOGE(TAG, "未找到标准 fLaC 文件头");
-        return ESP_ERR_INVALID_RESPONSE;
+        return ret != ESP_OK ? ret : ESP_ERR_INVALID_RESPONSE;
     }
 
     *out_offset = offset;
@@ -673,18 +693,20 @@ static esp_err_t flac_seek_to_stream_marker(FILE *file, uint64_t *out_offset)
 
 static esp_err_t flac_parse_streaminfo(FlacDecoder *decoder)
 {
-    if (decoder == nullptr || decoder->file == nullptr) {
+    if (decoder == nullptr || decoder->source == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    esp_err_t ret = flac_seek_to_stream_marker(decoder->file, &decoder->flac_offset_bytes);
+    esp_err_t ret = flac_seek_to_stream_marker(decoder->source, &decoder->flac_offset_bytes);
     if (ret != ESP_OK) {
         return ret;
     }
 
     uint8_t block_header[4] = {};
-    if (fread(block_header, 1, sizeof(block_header), decoder->file) != sizeof(block_header)) {
-        return ESP_ERR_INVALID_SIZE;
+    size_t block_header_read = 0;
+    ret = audio_source_read(decoder->source, block_header, sizeof(block_header), &block_header_read);
+    if (ret != ESP_OK || block_header_read != sizeof(block_header)) {
+        return ret != ESP_OK ? ret : ESP_ERR_INVALID_SIZE;
     }
 
     const uint8_t block_type = block_header[0] & 0x7FU;
@@ -700,8 +722,10 @@ static esp_err_t flac_parse_streaminfo(FlacDecoder *decoder)
     }
 
     uint8_t info[34] = {};
-    if (fread(info, 1, sizeof(info), decoder->file) != sizeof(info)) {
-        return ESP_ERR_INVALID_SIZE;
+    size_t info_read = 0;
+    ret = audio_source_read(decoder->source, info, sizeof(info), &info_read);
+    if (ret != ESP_OK || info_read != sizeof(info)) {
+        return ret != ESP_OK ? ret : ESP_ERR_INVALID_SIZE;
     }
 
     decoder->max_block_size = static_cast<uint16_t>(
@@ -1264,9 +1288,9 @@ esp_err_t flac_decoder_register_backend()
     return ESP_OK;
 }
 
-esp_err_t flac_decoder_open(FlacDecoder *decoder, const char *path, AudioDecodeWorkspace *workspace)
+esp_err_t flac_decoder_open(FlacDecoder *decoder, AudioSource *source, AudioDecodeWorkspace *workspace)
 {
-    if (decoder == nullptr || path == nullptr || path[0] == '\0') {
+    if (decoder == nullptr || !audio_source_is_open(source)) {
         return ESP_ERR_INVALID_ARG;
     }
     flac_decoder_close(decoder);
@@ -1276,22 +1300,22 @@ esp_err_t flac_decoder_open(FlacDecoder *decoder, const char *path, AudioDecodeW
         return ret;
     }
 
-    decoder->file = fopen(path, "rb");
-    if (decoder->file == nullptr) {
-        ESP_LOGE(TAG, "打开 FLAC 失败：%s", path);
-        return ESP_ERR_NOT_FOUND;
+    decoder->source = source;
+    if (!audio_source_has_capability(source, AUDIO_SOURCE_CAP_READ) ||
+        !audio_source_has_capability(source, AUDIO_SOURCE_CAP_SEEK) ||
+        !audio_source_has_capability(source, AUDIO_SOURCE_CAP_SIZE) ||
+        !audio_source_has_capability(source, AUDIO_SOURCE_CAP_EOF)) {
+        flac_decoder_close(decoder);
+        return ESP_ERR_NOT_SUPPORTED;
     }
 
-    if (fseek(decoder->file, 0, SEEK_END) != 0) {
+    uint64_t file_size = 0;
+    ret = audio_source_size(source, &file_size);
+    if (ret != ESP_OK || file_size == 0) {
         flac_decoder_close(decoder);
-        return ESP_FAIL;
+        return ret != ESP_OK ? ret : ESP_ERR_INVALID_SIZE;
     }
-    const long file_size = ftell(decoder->file);
-    if (file_size <= 0) {
-        flac_decoder_close(decoder);
-        return ESP_ERR_INVALID_SIZE;
-    }
-    decoder->file_size_bytes = static_cast<uint64_t>(file_size);
+    decoder->file_size_bytes = file_size;
 
     ret = flac_parse_streaminfo(decoder);
     if (ret != ESP_OK) {
@@ -1355,12 +1379,18 @@ esp_err_t flac_decoder_open(FlacDecoder *decoder, const char *path, AudioDecodeW
             static_cast<unsigned>(decoder->input_capacity));
     }
 
-    if (
-        decoder->flac_offset_bytes > static_cast<uint64_t>(LONG_MAX) ||
-        fseek(decoder->file, static_cast<long>(decoder->flac_offset_bytes), SEEK_SET) != 0
-    ) {
+    if (decoder->flac_offset_bytes > static_cast<uint64_t>(INT64_MAX)) {
         flac_decoder_close(decoder);
         return ESP_ERR_INVALID_SIZE;
+    }
+    ret = audio_source_seek(
+        decoder->source,
+        static_cast<int64_t>(decoder->flac_offset_bytes),
+        AudioSourceSeekOrigin::Begin
+    );
+    if (ret != ESP_OK) {
+        flac_decoder_close(decoder);
+        return ret;
     }
 
     ret = flac_prefetch_start(decoder);
@@ -1500,16 +1530,13 @@ void flac_decoder_close(FlacDecoder *decoder)
         return;
     }
 
-    // FILE 在正式播放期间只由预取任务读取；关闭解码器前先停止预取任务，避免清理阶段继续访问 SD。
+    // Source 在正式播放期间只由预取任务读取；关闭解码器前先停止预取任务，避免清理阶段继续访问底层 I/O。
     flac_prefetch_destroy(decoder);
     if (decoder->simple_handle != nullptr) {
         esp_audio_simple_dec_close(static_cast<esp_audio_simple_dec_handle_t>(decoder->simple_handle));
         decoder->simple_handle = nullptr;
     }
-    if (decoder->file != nullptr) {
-        fclose(decoder->file);
-        decoder->file = nullptr;
-    }
+    // Source 生命周期由 PcmDecoder 所有；确认预取任务已退出后，本 Codec 不再访问底层 Source。
     // decoder input/PCM 若来自 AudioTask 共享 workspace，切歌时保留供下一 codec 复用。
     if (decoder->workspace == nullptr) {
         flac_free_buffer(decoder->input_buffer);
@@ -1528,7 +1555,7 @@ void flac_decoder_close(FlacDecoder *decoder)
 
 bool flac_decoder_is_open(const FlacDecoder *decoder)
 {
-    return decoder != nullptr && decoder->file != nullptr && decoder->simple_handle != nullptr;
+    return decoder != nullptr && audio_source_is_open(decoder->source) && decoder->simple_handle != nullptr;
 }
 
 bool flac_decoder_is_eof(const FlacDecoder *decoder)
