@@ -2,3 +2,4 @@ dependencies:
   espressif/esp_lcd_co5300: "2.0.3"
   espressif/esp_lvgl_port: "2.6.2"
   lvgl/lvgl: "9.2.2"
+  espressif/esp_audio_codec: "2.6.0"

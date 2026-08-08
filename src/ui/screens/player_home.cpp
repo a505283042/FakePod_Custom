@@ -72,18 +72,34 @@ static void player_home_refresh_track(const AudioStateSnapshot *audio_snapshot)
             audio_snapshot->state == AudioPlaybackState::Error &&
             audio_snapshot->last_error == ESP_ERR_NOT_SUPPORTED
         ) {
-            snprintf(suffix, sizeof(suffix), "  · 解码器待接入");
+            const MediaFormat format = player_state_get_format();
+            if (format == MediaFormat::WAV || format == MediaFormat::FLAC) {
+                snprintf(suffix, sizeof(suffix), "  · 参数暂不支持");
+            } else {
+                snprintf(suffix, sizeof(suffix), "  · 解码器待接入");
+            }
         } else if (audio_snapshot->state == AudioPlaybackState::Playing) {
             if (audio_snapshot->sample_rate_hz == 44100) {
-                snprintf(suffix, sizeof(suffix), "  · 播放中 · 44.1k/16bit");
+                snprintf(suffix, sizeof(suffix), "  · 播放中 · 44.1k/%ubit",
+                    static_cast<unsigned>(audio_snapshot->bits_per_sample));
             } else if (audio_snapshot->sample_rate_hz > 0) {
-                snprintf(suffix, sizeof(suffix), "  · 播放中 · %luk/16bit",
-                    static_cast<unsigned long>(audio_snapshot->sample_rate_hz / 1000));
+                snprintf(suffix, sizeof(suffix), "  · 播放中 · %luk/%ubit",
+                    static_cast<unsigned long>(audio_snapshot->sample_rate_hz / 1000),
+                    static_cast<unsigned>(audio_snapshot->bits_per_sample));
             } else {
                 snprintf(suffix, sizeof(suffix), "  · 播放中");
             }
         } else if (audio_snapshot->state == AudioPlaybackState::Paused) {
-            snprintf(suffix, sizeof(suffix), "  · 已暂停");
+            if (audio_snapshot->sample_rate_hz == 44100) {
+                snprintf(suffix, sizeof(suffix), "  · 已暂停 · 44.1k/%ubit",
+                    static_cast<unsigned>(audio_snapshot->bits_per_sample));
+            } else if (audio_snapshot->sample_rate_hz > 0) {
+                snprintf(suffix, sizeof(suffix), "  · 已暂停 · %luk/%ubit",
+                    static_cast<unsigned long>(audio_snapshot->sample_rate_hz / 1000),
+                    static_cast<unsigned>(audio_snapshot->bits_per_sample));
+            } else {
+                snprintf(suffix, sizeof(suffix), "  · 已暂停");
+            }
         } else if (audio_snapshot->state == AudioPlaybackState::Finished) {
             snprintf(suffix, sizeof(suffix), "  · 播放结束");
         }
@@ -251,7 +267,7 @@ void player_home_create(lv_obj_t *screen)
     g_last_audio_state_revision = snapshot.state_revision;
     lv_timer_create(player_home_audio_timer_cb, 100, nullptr);
 
-    ESP_LOGI(TAG, "Stage 9.2 播放器首页已接入 WAV PCM 播放与进度快照，当前歌曲=%u/%u",
+    ESP_LOGI(TAG, "Stage 9.3 播放器首页已接入 WAV/FLAC 统一 PCM Core 与进度快照，当前歌曲=%u/%u",
         static_cast<unsigned>(media_library_get_count() > 0 ? player_state_get_index() + 1 : 0),
         static_cast<unsigned>(media_library_get_count()));
 }

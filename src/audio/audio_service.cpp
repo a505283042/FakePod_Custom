@@ -10,25 +10,56 @@
 #include "esp_log.h"
 #include "cs43131.h"
 #include "i2s_output.h"
-#include "wav_decoder.h"
+#include "pcm_decoder.h"
 
 static const char *TAG = "音频服务";
 
-static constexpr uint32_t AUDIO_TASK_STACK_BYTES = 8192;
+#define AUDIO_POP_TRACE_LOG(...) \
+    ESP_LOGI(TAG, "POP_TRACE: " __VA_ARGS__)
+
+// 仅在控制路径关键节点采样，不进入 PCM 热循环。
+// 用于判断 AudioTask 栈是否可以后续从 24KB 安全下调，以及播放链路是否侵蚀内部 RAM。
+static void audio_task_log_ram(const char *stage)
+{
+    const size_t internal_free =
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t internal_min =
+        heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t internal_largest =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t dma_free =
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    const size_t psram_free =
+        heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const UBaseType_t stack_hwm = uxTaskGetStackHighWaterMark(nullptr);
+    ESP_LOGI(TAG, "RAM_TRACE: %s internal=%u min=%u largest=%u dma=%u psram=%u stack_hwm=%u",
+        stage ? stage : "unknown",
+        static_cast<unsigned>(internal_free),
+        static_cast<unsigned>(internal_min),
+        static_cast<unsigned>(internal_largest),
+        static_cast<unsigned>(dma_free),
+        static_cast<unsigned>(psram_free),
+        static_cast<unsigned>(stack_hwm));
+}
+
+static constexpr uint32_t AUDIO_TASK_STACK_BYTES = 20480;
 static constexpr UBaseType_t AUDIO_TASK_PRIORITY = 5;
 static constexpr BaseType_t AUDIO_TASK_CORE = 0;
 static constexpr UBaseType_t AUDIO_COMMAND_QUEUE_LENGTH = 8;
 static constexpr size_t AUDIO_INLINE_PATH_SIZE = 384;
 static constexpr size_t AUDIO_MAX_PATH_SIZE = 4096;
 static constexpr size_t AUDIO_STREAM_FRAMES = 256;
+static constexpr uint32_t AUDIO_PCM_FADE_IN_MS = 30;
+static constexpr uint8_t AUDIO_PCM_UNMUTE_PRIME_BLOCKS = 4;
 static constexpr uint32_t AUDIO_I2S_WRITE_TIMEOUT_MS = 100;
 static constexpr uint32_t AUDIO_PCM_MUTE_SETTLE_MS = 150;
 static constexpr TickType_t AUDIO_QUEUE_SEND_TIMEOUT = pdMS_TO_TICKS(50);
 static constexpr TickType_t AUDIO_SYNC_WAIT_TIMEOUT = pdMS_TO_TICKS(1500);
 static constexpr TickType_t AUDIO_START_WAIT_TIMEOUT = pdMS_TO_TICKS(1500);
 
-// Stage 9.2 第一版输出保持 Stage 8.3 已实机验证过的安全低音量：
+// Stage 9.3 继续保持 Stage 8.3 已实机验证过的安全低音量：
 // CS43131 0.5Vrms 满量程 + PCM -40dB。后续再独立做用户音量系统。
+// AudioTask 当前保持 20KB；后续只依据实测 stack high-water mark 继续回收内部 RAM。
 
 
 enum class AudioCommandType : uint8_t
@@ -79,9 +110,16 @@ static uint16_t g_task_bits_per_sample = 0;
 static uint64_t g_task_position_frames = 0;
 static uint64_t g_task_total_frames = 0;
 static uint64_t g_last_progress_publish_frame = 0;
+static bool g_ram_trace_first_pcm_done = false;
+static bool g_ram_trace_steady_5s_done = false;
+static bool g_pcm_unmute_pending = false;
+static uint32_t g_pcm_fade_in_total_frames = 0;
+static uint32_t g_pcm_fade_in_done_frames = 0;
+static bool g_pcm_fade_in_logged_done = true;
 
 // 正式播放资源也只属于 AudioTask。
-static WavDecoder g_wav = {};
+// WAV/FLAC 都通过统一 PcmDecoder 产出 32bit stereo PCM，I2S/DAC 不关心源格式。
+static PcmDecoder g_decoder = {};
 static bool g_pipeline_clock_prepared = false;
 static bool g_pipeline_i2s_started = false;
 static bool g_pipeline_asp_enabled = false;
@@ -282,9 +320,107 @@ static void audio_task_remember_first_error(esp_err_t candidate, esp_err_t *firs
     }
 }
 
+static void audio_task_reset_pcm_fade_in()
+{
+    g_pcm_fade_in_total_frames = 0;
+    g_pcm_fade_in_done_frames = 0;
+    g_pcm_fade_in_logged_done = true;
+}
+
+static void audio_task_begin_pcm_fade_in(const char *reason)
+{
+    const uint32_t sample_rate =
+        g_task_sample_rate_hz > 0 ? g_task_sample_rate_hz : 48000U;
+    g_pcm_fade_in_total_frames = static_cast<uint32_t>(
+        (static_cast<uint64_t>(sample_rate) * AUDIO_PCM_FADE_IN_MS + 999ULL) / 1000ULL
+    );
+    if (g_pcm_fade_in_total_frames == 0) {
+        g_pcm_fade_in_total_frames = 1;
+    }
+    g_pcm_fade_in_done_frames = 0;
+    g_pcm_fade_in_logged_done = false;
+    AUDIO_POP_TRACE_LOG(
+        "PCM_FADE_IN_BEGIN reason=%s duration=%lums frames=%lu",
+        reason != nullptr ? reason : "unknown",
+        static_cast<unsigned long>(AUDIO_PCM_FADE_IN_MS),
+        static_cast<unsigned long>(g_pcm_fade_in_total_frames));
+}
+
+static void audio_task_apply_pcm_fade_in(int32_t *pcm, size_t frames)
+{
+    if (
+        pcm == nullptr ||
+        frames == 0 ||
+        g_pcm_fade_in_total_frames == 0 ||
+        g_pcm_fade_in_done_frames >= g_pcm_fade_in_total_frames
+    ) {
+        return;
+    }
+
+    for (size_t frame = 0; frame < frames; ++frame) {
+        if (g_pcm_fade_in_done_frames >= g_pcm_fade_in_total_frames) {
+            break;
+        }
+
+        const uint32_t gain_q15 = static_cast<uint32_t>(
+            (static_cast<uint64_t>(g_pcm_fade_in_done_frames) * 32768ULL) /
+            g_pcm_fade_in_total_frames
+        );
+        pcm[frame * 2] = static_cast<int32_t>(
+            (static_cast<int64_t>(pcm[frame * 2]) * gain_q15) >> 15);
+        pcm[frame * 2 + 1] = static_cast<int32_t>(
+            (static_cast<int64_t>(pcm[frame * 2 + 1]) * gain_q15) >> 15);
+        ++g_pcm_fade_in_done_frames;
+    }
+
+    if (
+        !g_pcm_fade_in_logged_done &&
+        g_pcm_fade_in_done_frames >= g_pcm_fade_in_total_frames
+    ) {
+        g_pcm_fade_in_logged_done = true;
+        AUDIO_POP_TRACE_LOG("PCM_FADE_IN_DONE");
+    }
+}
+
+static esp_err_t audio_task_unmute_when_pcm_ready()
+{
+    if (!g_pcm_unmute_pending) {
+        return ESP_OK;
+    }
+
+    // 首次 FLAC process 可能耗时较长，期间 DMA 中原有静音已经播放完。
+    // 真正解除静音前重新送一小段全零 PCM，让 BCLK/LRCK 和 ASP 先恢复稳定。
+    for (uint8_t i = 0; i < AUDIO_PCM_UNMUTE_PRIME_BLOCKS; ++i) {
+        esp_err_t ret =
+            i2s_output_stream_write_silence(AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+    }
+
+    esp_err_t ret = cs43131_set_pcm_mute(false);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    g_pcm_unmute_pending = false;
+    AUDIO_POP_TRACE_LOG(
+        "PCM_UNMUTE_ON_READY_PCM prime_blocks=%u",
+        static_cast<unsigned>(AUDIO_PCM_UNMUTE_PRIME_BLOCKS));
+    return ESP_OK;
+}
+
 static esp_err_t audio_task_shutdown_pipeline()
 {
     esp_err_t first_error = ESP_OK;
+
+    audio_task_log_ram("shutdown_begin");
+    AUDIO_POP_TRACE_LOG(
+        "SHUTDOWN_BEGIN rate=%lu hp=%u asp=%u i2s=%u",
+        static_cast<unsigned long>(g_task_sample_rate_hz),
+        static_cast<unsigned>(g_pipeline_headphone_enabled),
+        static_cast<unsigned>(g_pipeline_asp_enabled),
+        static_cast<unsigned>(g_pipeline_i2s_started));
 
     // 先触发 PCM 软斜坡静音，并在整个静音收敛窗口持续发送全零 PCM。
     // CS43131 的 PCM_SZC=soft-ramp 模式不是“写寄存器后立即静音”；官方多个切换序列
@@ -330,42 +466,63 @@ static esp_err_t audio_task_shutdown_pipeline()
         g_pipeline_i2s_started = false;
     }
 
-    if (wav_decoder_is_open(&g_wav)) {
-        wav_decoder_close(&g_wav);
+    if (pcm_decoder_is_open(&g_decoder)) {
+        pcm_decoder_close(&g_decoder);
     }
 
+    g_pcm_unmute_pending = false;
+    audio_task_reset_pcm_fade_in();
+
+    AUDIO_POP_TRACE_LOG("SHUTDOWN_END ret=%s", esp_err_to_name(first_error));
+    audio_task_log_ram("shutdown_end");
     return first_error;
 }
 
-static esp_err_t audio_task_start_wav_pipeline(const char *path)
+static esp_err_t audio_task_start_pcm_pipeline(PcmDecoderType decoder_type, const char *path)
 {
-    esp_err_t ret = wav_decoder_open(&g_wav, path);
+    audio_task_log_ram("before_decoder_open");
+    esp_err_t ret = pcm_decoder_open(&g_decoder, decoder_type, path);
     if (ret != ESP_OK) {
+        audio_task_log_ram("decoder_open_failed");
         return ret;
     }
+    audio_task_log_ram("after_decoder_open");
 
-    g_task_sample_rate_hz = g_wav.sample_rate_hz;
-    g_task_channels = g_wav.channels;
-    g_task_bits_per_sample = g_wav.bits_per_sample;
+    g_task_sample_rate_hz = g_decoder.info.sample_rate_hz;
+    g_task_channels = g_decoder.info.channels;
+    g_task_bits_per_sample = g_decoder.info.bits_per_sample;
     g_task_position_frames = 0;
-    g_task_total_frames = g_wav.total_frames;
+    g_task_total_frames = g_decoder.info.total_frames;
     g_last_progress_publish_frame = 0;
+    g_ram_trace_first_pcm_done = false;
+    g_ram_trace_steady_5s_done = false;
     audio_task_publish_snapshot();
+
+    AUDIO_POP_TRACE_LOG(
+        "START_BEGIN format=%s rate=%lu bits=%u channels=%u",
+        pcm_decoder_type_name(decoder_type),
+        static_cast<unsigned long>(g_task_sample_rate_hz),
+        static_cast<unsigned>(g_task_bits_per_sample),
+        static_cast<unsigned>(g_task_channels));
 
     // 从这一刻开始即使 CS43131 准备过程中途失败，也必须执行 finish 清理。
     g_pipeline_clock_prepared = true;
-    ret = cs43131_prepare_pcm_playback_32bit(g_wav.sample_rate_hz);
+    ret = cs43131_prepare_pcm_playback_32bit(g_task_sample_rate_hz);
     if (ret != ESP_OK) {
         audio_task_shutdown_pipeline();
         return ret;
     }
 
-    ret = i2s_output_stream_start_32bit(g_wav.sample_rate_hz);
+    ret = i2s_output_stream_start_32bit(g_task_sample_rate_hz);
     if (ret != ESP_OK) {
         audio_task_shutdown_pipeline();
         return ret;
     }
     g_pipeline_i2s_started = true;
+    AUDIO_POP_TRACE_LOG(
+        "I2S_START rate=%lu bclk=%lu",
+        static_cast<unsigned long>(g_task_sample_rate_hz),
+        static_cast<unsigned long>(g_task_sample_rate_hz * 64UL));
 
     // 先给 I2S DMA 填入全零 PCM，再开启 CS43131 ASP，避免 ASP 上电瞬间面对不稳定时钟。
     ret = i2s_output_stream_write_silence(AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
@@ -411,7 +568,8 @@ static esp_err_t audio_task_start_wav_pipeline(const char *path)
         audio_task_shutdown_pipeline();
         return ret;
     }
-    ESP_LOGI(TAG, "WAV起播前 ASP 稳定状态：0x%02X", asp_status);
+    ESP_LOGI(TAG, "%s起播前 ASP 稳定状态：0x%02X", pcm_decoder_type_name(decoder_type), asp_status);
+    AUDIO_POP_TRACE_LOG("ASP_STABLE status=0x%02X", asp_status);
     if ((asp_status & 0xF8U) != 0) {
         ESP_LOGE(TAG, "ASP 时序异常，拒绝开启耳放：INT_STATUS2=0x%02X", asp_status);
         audio_task_shutdown_pipeline();
@@ -425,6 +583,7 @@ static esp_err_t audio_task_start_wav_pipeline(const char *path)
         audio_task_shutdown_pipeline();
         return ret;
     }
+    AUDIO_POP_TRACE_LOG("HP_ENABLE");
 
     // 耳放 pop-free 上电后继续送约 20ms 静音，再解除 PCM 手动静音。
     for (int i = 0; i < 4; ++i) {
@@ -435,16 +594,18 @@ static esp_err_t audio_task_start_wav_pipeline(const char *path)
         }
     }
 
-    ret = cs43131_set_pcm_mute(false);
-    if (ret != ESP_OK) {
-        audio_task_shutdown_pipeline();
-        return ret;
-    }
+    // 耳放保持手动静音，等第一块真实 PCM 已经解码完成后再解除。
+    // 这样即使 FLAC 首次 process 发生秒级延迟，也不会出现“先开声、后等数据”的窗口。
+    audio_task_begin_pcm_fade_in("start");
+    g_pcm_unmute_pending = true;
+    AUDIO_POP_TRACE_LOG("PCM_UNMUTE_ARMED reason=start");
+    audio_task_log_ram("pipeline_playing");
 
-    const uint64_t duration_ms = g_task_sample_rate_hz > 0
+    const uint64_t duration_ms = g_task_sample_rate_hz > 0 && g_task_total_frames > 0
         ? (g_task_total_frames * 1000ULL) / g_task_sample_rate_hz
         : 0;
-    ESP_LOGI(TAG, "WAV正式播放链路已开启：%luHz / %ubit / %u声道，时长约=%llums，PCM音量=-40dB",
+    ESP_LOGI(TAG, "PCM硬件链路已开启：格式=%s %luHz / %ubit / %u声道，时长约=%llums，PCM音量=-20dB，等待首PCM帧解除静音",
+        pcm_decoder_type_name(decoder_type),
         static_cast<unsigned long>(g_task_sample_rate_hz),
         static_cast<unsigned>(g_task_bits_per_sample),
         static_cast<unsigned>(g_task_channels),
@@ -454,7 +615,8 @@ static esp_err_t audio_task_start_wav_pipeline(const char *path)
 
 static void audio_task_fail_stream(esp_err_t error, const char *stage)
 {
-    ESP_LOGE(TAG, "WAV播放失败：阶段=%s，错误=%s",
+    ESP_LOGE(TAG, "%s播放失败：阶段=%s，错误=%s",
+        media_library_format_name(g_task_format),
         stage != nullptr ? stage : "未知",
         esp_err_to_name(error));
     esp_err_t cleanup_error = audio_task_shutdown_pipeline();
@@ -466,10 +628,16 @@ static void audio_task_fail_stream(esp_err_t error, const char *stage)
 
 static void audio_task_finish_stream()
 {
-    g_task_position_frames = g_task_total_frames;
+    if (g_task_total_frames > 0) {
+        g_task_position_frames = g_task_total_frames;
+    } else {
+        // FLAC STREAMINFO 允许 total_samples=0（未知），这种文件以实际解码帧数收尾。
+        g_task_total_frames = g_task_position_frames;
+    }
     audio_task_publish_snapshot();
 
-    ESP_LOGI(TAG, "WAV PCM 数据播放完成：帧=%llu/%llu",
+    ESP_LOGI(TAG, "%s PCM 数据播放完成：帧=%llu/%llu",
+        media_library_format_name(g_task_format),
         static_cast<unsigned long long>(g_task_position_frames),
         static_cast<unsigned long long>(g_task_total_frames));
 
@@ -482,7 +650,8 @@ static void audio_task_finish_stream()
             AUDIO_I2S_WRITE_TIMEOUT_MS
         );
         if (drain_ret != ESP_OK) {
-            ESP_LOGE(TAG, "WAV 尾部静音排空失败：%s", esp_err_to_name(drain_ret));
+            ESP_LOGE(TAG, "%s 尾部静音排空失败：%s",
+                media_library_format_name(g_task_format), esp_err_to_name(drain_ret));
             audio_task_shutdown_pipeline();
             audio_task_set_state(AudioPlaybackState::Error, drain_ret);
             return;
@@ -498,15 +667,15 @@ static void audio_task_finish_stream()
     audio_task_set_state(AudioPlaybackState::Finished, ESP_OK);
 }
 
-static void audio_task_service_wav_playback()
+static void audio_task_service_pcm_playback()
 {
-    if (g_task_state != AudioPlaybackState::Playing || !wav_decoder_is_open(&g_wav)) {
+    if (g_task_state != AudioPlaybackState::Playing || !pcm_decoder_is_open(&g_decoder)) {
         return;
     }
 
     size_t frames = 0;
-    esp_err_t ret = wav_decoder_read_pcm32(
-        &g_wav,
+    esp_err_t ret = pcm_decoder_read_pcm32(
+        &g_decoder,
         g_pcm_block,
         AUDIO_STREAM_FRAMES,
         &frames
@@ -517,11 +686,21 @@ static void audio_task_service_wav_playback()
     }
 
     if (frames == 0) {
-        if (wav_decoder_is_eof(&g_wav)) {
+        if (pcm_decoder_is_eof(&g_decoder)) {
             audio_task_finish_stream();
         } else {
             audio_task_fail_stream(ESP_FAIL, "PCM无进度");
         }
+        return;
+    }
+
+    audio_task_apply_pcm_fade_in(g_pcm_block, frames);
+
+    // 第一块真实 PCM 已经在 g_pcm_block 中准备好；先恢复稳定的零 PCM 时钟，
+    // 再解除 CS43131 手动静音，随后发送从 0 开始淡入的真实 PCM。
+    ret = audio_task_unmute_when_pcm_ready();
+    if (ret != ESP_OK) {
+        audio_task_fail_stream(ret, "首PCM解除静音");
         return;
     }
 
@@ -531,7 +710,23 @@ static void audio_task_service_wav_playback()
         return;
     }
 
-    g_task_position_frames = g_wav.frames_read;
+    g_task_position_frames = pcm_decoder_position_frames(&g_decoder);
+
+    // FLAC/simple-decoder 可能在真正 process 首帧时才完成内部工作区的延迟分配。
+    // 这里只采样一次首个 PCM 块和一次 5 秒稳定态，避免 RAM 诊断日志进入实时热循环。
+    if (!g_ram_trace_first_pcm_done) {
+        g_ram_trace_first_pcm_done = true;
+        audio_task_log_ram("first_pcm");
+    }
+    if (
+        !g_ram_trace_steady_5s_done &&
+        g_task_sample_rate_hz > 0 &&
+        g_task_position_frames >= static_cast<uint64_t>(g_task_sample_rate_hz) * 5ULL
+    ) {
+        g_ram_trace_steady_5s_done = true;
+        audio_task_log_ram("steady_5s");
+    }
+
     const uint64_t publish_interval = g_task_sample_rate_hz >= 4
         ? g_task_sample_rate_hz / 4U
         : 1;
@@ -587,15 +782,20 @@ static void audio_task_handle_play(AudioRequest *request)
         return;
     }
 
-    if (request->format != MediaFormat::WAV) {
-        ESP_LOGW(TAG, "Stage 9.2 当前仅接入 WAV PCM；%s 解码器尚未接入",
+    PcmDecoderType decoder_type = PcmDecoderType::None;
+    if (request->format == MediaFormat::WAV) {
+        decoder_type = PcmDecoderType::Wav;
+    } else if (request->format == MediaFormat::FLAC) {
+        decoder_type = PcmDecoderType::Flac;
+    } else {
+        ESP_LOGW(TAG, "Stage 9.3 当前统一PCM Core 已接入 WAV/FLAC；%s 解码器尚未接入",
             media_library_format_name(request->format));
         audio_task_set_state(AudioPlaybackState::Error, ESP_ERR_NOT_SUPPORTED);
         audio_request_complete(request, false, ESP_ERR_NOT_SUPPORTED);
         return;
     }
 
-    esp_err_t ret = audio_task_start_wav_pipeline(path);
+    esp_err_t ret = audio_task_start_pcm_pipeline(decoder_type, path);
     if (ret != ESP_OK) {
         audio_task_set_state(AudioPlaybackState::Error, ret);
         audio_request_complete(request, false, ret);
@@ -640,12 +840,17 @@ static void audio_task_handle_pause(AudioRequest *request)
         return;
     }
 
+    AUDIO_POP_TRACE_LOG("PAUSE_MUTE_BEGIN frame=%llu",
+        static_cast<unsigned long long>(g_task_position_frames));
     esp_err_t ret = cs43131_set_pcm_mute(true);
     if (ret != ESP_OK) {
         audio_task_fail_stream(ret, "暂停静音");
         audio_request_complete(request, false, ret);
         return;
     }
+    AUDIO_POP_TRACE_LOG("PAUSE_MUTE_DONE");
+    g_pcm_unmute_pending = false;
+    audio_task_reset_pcm_fade_in();
 
     audio_task_set_state(AudioPlaybackState::Paused, ESP_OK);
     ESP_LOGI(TAG, "播放已暂停：帧=%llu/%llu，I2S继续发送静音保持时钟",
@@ -665,15 +870,19 @@ static void audio_task_handle_resume(AudioRequest *request)
         return;
     }
 
+    AUDIO_POP_TRACE_LOG("RESUME_ZERO_PRIME_BEGIN");
     esp_err_t ret = i2s_output_stream_write_silence(AUDIO_STREAM_FRAMES * 2, AUDIO_I2S_WRITE_TIMEOUT_MS);
     if (ret == ESP_OK) {
-        ret = cs43131_set_pcm_mute(false);
+        AUDIO_POP_TRACE_LOG("RESUME_ZERO_PRIME_DONE");
     }
     if (ret != ESP_OK) {
         audio_task_fail_stream(ret, "恢复播放");
         audio_request_complete(request, false, ret);
         return;
     }
+    audio_task_begin_pcm_fade_in("resume");
+    g_pcm_unmute_pending = true;
+    AUDIO_POP_TRACE_LOG("RESUME_UNMUTE_ARMED");
 
     audio_task_set_state(AudioPlaybackState::Playing, ESP_OK);
     ESP_LOGI(TAG, "播放已恢复：从帧=%llu继续",
@@ -702,24 +911,46 @@ static void audio_task_process_request(AudioRequest *request)
 static void audio_task_main(void *arg)
 {
     (void)arg;
+    const BaseType_t current_core = xPortGetCoreID();
     ESP_LOGI(TAG, "AudioTask 已启动：核心=%d，优先级=%u，栈=%u字节",
-        xPortGetCoreID(),
+        static_cast<int>(current_core),
         static_cast<unsigned>(uxTaskPriorityGet(nullptr)),
         static_cast<unsigned>(AUDIO_TASK_STACK_BYTES));
 
-    g_start_result = cs43131_init();
+    // 高采样率播放依赖双核流水线：AudioTask 固定 Core 0，SD/FLAC 预取固定 Core 1。
+    // 如果运行环境没有遵守绑核约束，宁可拒绝初始化，也不让音频实时任务和阻塞 I/O 混在同一核心。
+    if (current_core != AUDIO_TASK_CORE) {
+        g_start_result = ESP_ERR_INVALID_STATE;
+        g_task_ready = false;
+        g_task_state = AudioPlaybackState::Error;
+        g_task_last_error = g_start_result;
+        audio_task_publish_snapshot();
+        ESP_LOGE(TAG, "AudioTask 核心绑定异常：当前=%d，期望=%d",
+            static_cast<int>(current_core),
+            static_cast<int>(AUDIO_TASK_CORE));
+        if (g_start_done != nullptr) {
+            xSemaphoreGive(g_start_done);
+        }
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    g_start_result = pcm_decoder_register_backends();
+    if (g_start_result == ESP_OK) {
+        g_start_result = cs43131_init();
+    }
     if (g_start_result == ESP_OK) {
         g_task_ready = true;
         g_task_state = AudioPlaybackState::Ready;
         g_task_last_error = ESP_OK;
         audio_task_publish_snapshot();
-        ESP_LOGI(TAG, "AudioTask 已取得运行期音频硬件所有权；DAC 当前保持安全掉电状态");
+        ESP_LOGI(TAG, "AudioTask 已取得运行期音频硬件所有权；统一 PCM Core 已就绪，DAC 当前保持安全掉电状态");
     } else {
         g_task_ready = false;
         g_task_state = AudioPlaybackState::Error;
         g_task_last_error = g_start_result;
         audio_task_publish_snapshot();
-        ESP_LOGE(TAG, "AudioTask 初始化 CS43131 失败：%s", esp_err_to_name(g_start_result));
+        ESP_LOGE(TAG, "AudioTask 初始化播放器后端失败：%s", esp_err_to_name(g_start_result));
     }
 
     if (g_start_done != nullptr) {
@@ -745,7 +976,7 @@ static void audio_task_main(void *arg)
         }
 
         if (g_task_state == AudioPlaybackState::Playing) {
-            audio_task_service_wav_playback();
+            audio_task_service_pcm_playback();
         } else if (g_task_state == AudioPlaybackState::Paused) {
             audio_task_service_pause_silence();
         }

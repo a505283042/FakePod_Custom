@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "board_pins.h"
 #include "i2c_bus.h"
+#include "../../audio/audio_rate_profile.h"
 
 static const char *TAG = "DAC";
 static i2c_master_dev_handle_t g_device = nullptr;
@@ -52,7 +53,7 @@ static constexpr uint32_t REG_PCM_PATH_CONTROL_2 = 0x090004;
 static constexpr uint32_t REG_CLASS_H_CONTROL = 0x0B0000;
 static constexpr uint32_t REG_POP_FREE_POWER_UP_1 = 0x010010;
 
-static constexpr uint8_t PCM_TEST_VOLUME_MINUS_40_DB = 0x50;
+static constexpr uint8_t PCM_TEST_VOLUME_MINUS_20_DB = 0x28;
 static constexpr uint8_t PCM_PATH_SOFT_RAMP_MUTED = 0xEF;
 static constexpr uint8_t PCM_PATH_SOFT_RAMP_UNMUTED = 0xEC;
 static constexpr int HP_PDN_DONE_WAIT_MS = 100;
@@ -214,8 +215,9 @@ esp_err_t cs43131_prepare_pcm_playback_32bit(uint32_t sample_rate_hz)
     if (!g_ready || g_device == nullptr) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (sample_rate_hz != 44100 && sample_rate_hz != 48000) {
-        ESP_LOGE(TAG, "当前 PCM 播放仅支持 44.1kHz / 48kHz：收到=%luHz",
+    AudioRateProfile rate_profile = {};
+    if (!audio_rate_profile_get(sample_rate_hz, &rate_profile)) {
+        ESP_LOGE(TAG, "CS43131 PCM 采样率不在 FakePod Rate Profile：收到=%luHz",
             static_cast<unsigned long>(sample_rate_hz));
         return ESP_ERR_NOT_SUPPORTED;
     }
@@ -318,10 +320,10 @@ esp_err_t cs43131_prepare_pcm_playback_32bit(uint32_t sample_rate_hz)
         uint8_t value;
     };
 
-    // 44.1kHz 与 48kHz 都使用板载 24.576MHz XTAL 作为内部 MCLK。
+    // 44.1~192kHz Rate Profile 都使用板载 24.576MHz XTAL 作为内部 MCLK。
     // 数据手册明确说明除 384kHz Master Mode 外，其余采样率可使用 22.5792 或 24.576MHz MCLK_INT。
     // CS43131 保持 Slave，BCLK/LRCK 由 ESP32-S3 产生。
-    const uint8_t sample_rate_reg = sample_rate_hz == 44100 ? 0x01 : 0x02;
+    const uint8_t sample_rate_reg = rate_profile.cs43131_asp_sprate;
     const RegValue config[] = {
         {REG_ASP_SAMPLE_RATE, sample_rate_reg},
         {REG_ASP_SAMPLE_BITS, 0x04},
@@ -350,8 +352,9 @@ esp_err_t cs43131_prepare_pcm_playback_32bit(uint32_t sample_rate_hz)
         }
     }
 
-    ESP_LOGI(TAG, "CS43131 ASP 参数配置完成：采样率=%luHz，当前仍保持 PDN_ASP=1、PDN_HP=1",
-        static_cast<unsigned long>(sample_rate_hz));
+    ESP_LOGI(TAG, "CS43131 ASP 参数配置完成：采样率=%luHz，ASP_SPRATE=0x%02X，当前仍保持 PDN_ASP=1、PDN_HP=1",
+        static_cast<unsigned long>(sample_rate_hz),
+        static_cast<unsigned>(sample_rate_reg));
     return ESP_OK;
 }
 
@@ -399,7 +402,7 @@ esp_err_t cs43131_prepare_headphone_playback_low_volume()
         return ESP_ERR_INVALID_STATE;
     }
 
-    ESP_LOGI(TAG, "正在配置低音量 PCM 耳放输出：0.5Vrms满量程，PCM数字音量=-40dB");
+    ESP_LOGI(TAG, "正在配置低音量 PCM 耳放输出：0.5Vrms满量程，PCM数字音量=-20dB");
 
     struct RegValue {
         uint32_t reg;
@@ -410,8 +413,8 @@ esp_err_t cs43131_prepare_headphone_playback_low_volume()
     // 0x80000 的 OUT_FS=00 对应 0.5Vrms，避免第一次模拟输出使用默认 1.73Vrms。
     static constexpr RegValue config[] = {
         {REG_PCM_FILTER_OPTION, 0x02},
-        {REG_PCM_VOLUME_B, PCM_TEST_VOLUME_MINUS_40_DB},
-        {REG_PCM_VOLUME_A, PCM_TEST_VOLUME_MINUS_40_DB},
+        {REG_PCM_VOLUME_B, PCM_TEST_VOLUME_MINUS_20_DB},
+        {REG_PCM_VOLUME_A, PCM_TEST_VOLUME_MINUS_20_DB},
         {REG_PCM_PATH_CONTROL_1, PCM_PATH_SOFT_RAMP_MUTED},
         {REG_PCM_PATH_CONTROL_2, 0x00},
         {REG_CLASS_H_CONTROL, 0x1E},

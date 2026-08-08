@@ -8,6 +8,7 @@
 #include "driver/i2s_std.h"
 #include "esp_log.h"
 #include "board_pins.h"
+#include "../../audio/audio_rate_profile.h"
 
 static const char *TAG = "I2S";
 static i2s_chan_handle_t g_tx = NULL;
@@ -20,7 +21,10 @@ static bool g_started = false;
 static uint32_t g_sample_rate_hz = 0;
 
 #define I2S_FRAMES_PER_BLOCK 256
-#define I2S_DMA_DESC_NUM 4
+// DMA 描述符数量由统一 Rate Profile 按采样率选择。48kHz 保持已经实机验证的 8 块；
+// 88.2/96kHz 首轮验证使用 12 块，96kHz 下约 32ms，仅在高采样率播放时增加约 8KB 内部 DMA RAM。
+// 176.4/192kHz 当前处于受控实机验证，临时使用更长 DMA runway；
+// 最终仍以 FLAC refill 实测预算为依据回收内部 DMA RAM，不把堆 DMA 当作 Hi-Res 最终方案。
 #define I2S_DMA_FRAME_NUM I2S_FRAMES_PER_BLOCK
 #define I2S_WRITE_TIMEOUT_MS 100
 #define I2S_MAX_ZERO_PROGRESS_TIMEOUTS 3
@@ -55,7 +59,8 @@ static esp_err_t i2s_output_create_channel(uint32_t sample_rate_hz)
     if (g_started) {
         return g_sample_rate_hz == sample_rate_hz ? ESP_OK : ESP_ERR_INVALID_STATE;
     }
-    if (sample_rate_hz != 44100 && sample_rate_hz != 48000) {
+    AudioRateProfile rate_profile = {0};
+    if (!audio_rate_profile_get(sample_rate_hz, &rate_profile)) {
         return ESP_ERR_NOT_SUPPORTED;
     }
 
@@ -65,7 +70,7 @@ static esp_err_t i2s_output_create_channel(uint32_t sample_rate_hz)
         FAKEPOD_I2S_BCLK, FAKEPOD_I2S_LRCK, FAKEPOD_I2S_DOUT);
 
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = I2S_DMA_DESC_NUM;
+    chan_cfg.dma_desc_num = rate_profile.i2s_dma_desc_num;
     chan_cfg.dma_frame_num = I2S_DMA_FRAME_NUM;
 
     esp_err_t ret = i2s_new_channel(&chan_cfg, &g_tx, NULL);
@@ -117,10 +122,15 @@ static esp_err_t i2s_output_create_channel(uint32_t sample_rate_hz)
     ESP_LOGI(TAG, "I2S TX 初始化成功：BCLK=%luHz，LRCK=%luHz",
         (unsigned long)bclk_hz,
         (unsigned long)sample_rate_hz);
-    ESP_LOGI(TAG, "DMA配置：%d个描述符 × %d帧，单缓冲=%u字节",
-        I2S_DMA_DESC_NUM,
+    const uint32_t dma_runway_us = (uint32_t)(
+        ((uint64_t)rate_profile.i2s_dma_desc_num * I2S_DMA_FRAME_NUM * 1000000ULL) / sample_rate_hz
+    );
+    ESP_LOGI(TAG, "DMA配置：%d个描述符 × %d帧，单缓冲=%u字节，总缓冲约=%lu.%03lums",
+        rate_profile.i2s_dma_desc_num,
         I2S_DMA_FRAME_NUM,
-        (unsigned)sizeof(g_silence));
+        (unsigned)sizeof(g_silence),
+        (unsigned long)(dma_runway_us / 1000U),
+        (unsigned long)(dma_runway_us % 1000U));
     return ESP_OK;
 }
 

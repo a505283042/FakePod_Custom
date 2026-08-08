@@ -1,0 +1,1438 @@
+#include "flac_decoder.h"
+
+#include <limits.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/stream_buffer.h"
+#include "freertos/task.h"
+#include "esp_audio_simple_dec.h"
+#include "esp_audio_types.h"
+#include "esp_flac_dec.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "../audio_rate_profile.h"
+
+static const char *TAG = "FLAC";
+
+// Simple Decoder 每次最多取 32KB 连续压缩数据，输入工作区与 PCM 输出区都放在 PSRAM。
+// SD 读取不再由 AudioTask 同步执行，而是由独立低优先级预取任务填充 PSRAM 环形缓冲。
+// 预取缓存按采样率扩展，未来开放 96/192kHz 时优先增加 PSRAM 吞吐余量，不堆内部 DMA RAM。
+static constexpr size_t FLAC_INPUT_BUFFER_BYTES = 32768;
+// 在 Simple Decoder parser 模式下，尽量让下一完整 FLAC 压缩帧连续落在同一个输入窗口中。
+// STREAMINFO 的 max_frame_size 再留少量保护字节，避免窗口边界导致一次 PCM refill 需要两轮 process。
+static constexpr size_t FLAC_INPUT_FRAME_GUARD_BYTES = 64;
+static constexpr size_t FLAC_PREFETCH_RING_48K_BYTES = 128 * 1024;
+static constexpr size_t FLAC_PREFETCH_RING_96K_BYTES = 192 * 1024;
+static constexpr size_t FLAC_PREFETCH_RING_192K_BYTES = 256 * 1024;
+static constexpr size_t FLAC_PREFETCH_READ_48K_BYTES = 8192;
+static constexpr size_t FLAC_PREFETCH_READ_96K_BYTES = 16384;
+static constexpr size_t FLAC_PREFETCH_READ_192K_BYTES = 32768;
+static constexpr size_t FLAC_PREFETCH_START_48K_BYTES = 64 * 1024;
+static constexpr size_t FLAC_PREFETCH_START_96K_BYTES = 96 * 1024;
+static constexpr size_t FLAC_PREFETCH_START_192K_BYTES = 128 * 1024;
+static constexpr uint32_t FLAC_PREFETCH_TASK_STACK_BYTES = 4096;
+static constexpr UBaseType_t FLAC_PREFETCH_TASK_PRIORITY = 4;
+static constexpr BaseType_t FLAC_PREFETCH_TASK_CORE = 1;
+static constexpr TickType_t FLAC_PREFETCH_SEND_WAIT = pdMS_TO_TICKS(20);
+static constexpr TickType_t FLAC_PREFETCH_RECEIVE_WAIT = pdMS_TO_TICKS(20);
+static constexpr TickType_t FLAC_PREFETCH_START_WAIT = pdMS_TO_TICKS(750);
+static constexpr TickType_t FLAC_PREFETCH_STOP_WAIT = pdMS_TO_TICKS(1000);
+static constexpr size_t FLAC_MIN_DECODED_BUFFER_BYTES = 16384;
+static constexpr size_t FLAC_MAX_DECODED_BUFFER_BYTES = 1024 * 1024;
+
+struct FlacPrefetchProfile
+{
+    size_t ring_bytes = FLAC_PREFETCH_RING_48K_BYTES;
+    size_t read_chunk_bytes = FLAC_PREFETCH_READ_48K_BYTES;
+    size_t start_target_bytes = FLAC_PREFETCH_START_48K_BYTES;
+};
+
+static FlacPrefetchProfile flac_prefetch_profile_for_rate(uint32_t sample_rate_hz)
+{
+    if (sample_rate_hz > 96000U) {
+        return {
+            FLAC_PREFETCH_RING_192K_BYTES,
+            FLAC_PREFETCH_READ_192K_BYTES,
+            FLAC_PREFETCH_START_192K_BYTES
+        };
+    }
+    if (sample_rate_hz > 48000U) {
+        return {
+            FLAC_PREFETCH_RING_96K_BYTES,
+            FLAC_PREFETCH_READ_96K_BYTES,
+            FLAC_PREFETCH_START_96K_BYTES
+        };
+    }
+    return {};
+}
+
+struct FlacPrefetchContext
+{
+    FILE *file = nullptr;
+    StreamBufferHandle_t stream = nullptr;
+    StaticStreamBuffer_t stream_storage = {};
+    StaticSemaphore_t done_storage = {};
+    SemaphoreHandle_t done = nullptr;
+    TaskHandle_t task = nullptr;
+    uint8_t *ring_storage = nullptr;
+    uint8_t *read_buffer = nullptr;
+    size_t ring_bytes = 0;
+    size_t read_chunk_bytes = 0;
+    size_t start_target_bytes = 0;
+    volatile BaseType_t core_id = -1;
+    volatile bool stop_requested = false;
+    volatile bool eof = false;
+    volatile bool io_error = false;
+    volatile UBaseType_t stack_hwm = 0;
+    uint64_t perf_read_total_us = 0;
+    uint32_t perf_read_calls = 0;
+    uint32_t perf_read_max_us = 0;
+    uint32_t perf_read_over_10ms = 0;
+};
+
+static bool g_flac_backend_registered = false;
+static portMUX_TYPE g_flac_prefetch_metrics_mux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE g_flac_perf_snapshot_mux = portMUX_INITIALIZER_UNLOCKED;
+static FlacPerfSnapshot g_flac_perf_snapshot = {};
+
+// 只累计耗时并每 5 秒发布一次轻量快照；真正日志由 loopTask 输出，
+// 避免 ESP_LOGI 的格式化和串口输出进入 AudioTask 实时路径。
+static constexpr uint32_t FLAC_PERF_REPORT_INTERVAL_US = 5000000U;
+static constexpr uint32_t FLAC_SLOW_READ_US = 10000U;
+static constexpr uint32_t FLAC_SLOW_DECODE_US = 20000U;
+static constexpr uint32_t FLAC_CRITICAL_DECODE_US = 40000U;
+// refill 阈值改为与固定 DMA 数量解耦：20ms 对 192kHz/4096 帧已经接近整块播放预算，
+// 30ms 则可提前暴露 96kHz 及更高采样率下的实时风险。
+static constexpr uint32_t FLAC_SLOW_REFILL_US = 20000U;
+static constexpr uint32_t FLAC_CRITICAL_REFILL_US = 30000U;
+
+static FlacPrefetchContext *flac_prefetch_context(FlacDecoder *decoder)
+{
+    return decoder != nullptr
+        ? static_cast<FlacPrefetchContext *>(decoder->prefetch_context)
+        : nullptr;
+}
+
+static void flac_perf_reset_runtime(FlacDecoder *decoder)
+{
+    if (decoder == nullptr) {
+        return;
+    }
+
+    FlacPrefetchContext *context = flac_prefetch_context(decoder);
+    if (context != nullptr) {
+        portENTER_CRITICAL(&g_flac_prefetch_metrics_mux);
+        context->perf_read_total_us = 0;
+        context->perf_read_calls = 0;
+        context->perf_read_max_us = 0;
+        context->perf_read_over_10ms = 0;
+        portEXIT_CRITICAL(&g_flac_prefetch_metrics_mux);
+    }
+
+    decoder->perf_decode_total_us = 0;
+    decoder->perf_refill_total_us = 0;
+    decoder->perf_last_report_us = 0;
+    decoder->perf_decode_calls = 0;
+    decoder->perf_refill_calls = 0;
+    decoder->perf_decode_max_us = 0;
+    decoder->perf_refill_max_us = 0;
+    decoder->perf_decode_over_20ms = 0;
+    decoder->perf_decode_over_40ms = 0;
+    decoder->perf_refill_over_20ms = 0;
+    decoder->perf_refill_over_30ms = 0;
+    decoder->perf_refill_over_block_budget = 0;
+    decoder->perf_refill_worst_over_budget_us = 0;
+    decoder->perf_refill_process_total = 0;
+    decoder->perf_refill_process_max = 0;
+    decoder->perf_refill_multi_process = 0;
+    decoder->perf_refill_input_fill_max = 0;
+    decoder->perf_refill_multi_fill = 0;
+    decoder->perf_input_compact_calls = 0;
+    decoder->perf_input_compact_bytes = 0;
+    decoder->perf_input_topup_bytes = 0;
+    decoder->perf_input_topup_calls = 0;
+    decoder->perf_input_topup_max_bytes = 0;
+    decoder->perf_prefetch_wait_total_us = 0;
+    decoder->perf_prefetch_wait_calls = 0;
+    decoder->perf_prefetch_wait_max_us = 0;
+    decoder->perf_prefetch_wait_over_2ms = 0;
+    decoder->perf_prefetch_starve_count = 0;
+    const FlacPrefetchContext *prefetch = flac_prefetch_context(decoder);
+    decoder->perf_prefetch_min_buffered_bytes = prefetch != nullptr && prefetch->stream != nullptr
+        ? xStreamBufferBytesAvailable(prefetch->stream)
+        : 0;
+}
+
+static void flac_perf_maybe_publish(FlacDecoder *decoder, uint64_t now_us)
+{
+    if (decoder == nullptr) {
+        return;
+    }
+
+    if (decoder->perf_last_report_us == 0) {
+        decoder->perf_last_report_us = now_us;
+        return;
+    }
+    if (now_us - decoder->perf_last_report_us < FLAC_PERF_REPORT_INTERVAL_US) {
+        return;
+    }
+
+    uint64_t read_total_us = 0;
+    uint32_t read_calls = 0;
+    uint32_t read_max_us = 0;
+    uint32_t read_over_10ms = 0;
+    const FlacPrefetchContext *context = flac_prefetch_context(decoder);
+    if (context != nullptr) {
+        portENTER_CRITICAL(&g_flac_prefetch_metrics_mux);
+        read_total_us = context->perf_read_total_us;
+        read_calls = context->perf_read_calls;
+        read_max_us = context->perf_read_max_us;
+        read_over_10ms = context->perf_read_over_10ms;
+        portEXIT_CRITICAL(&g_flac_prefetch_metrics_mux);
+    }
+
+    FlacPerfSnapshot snapshot = {};
+    snapshot.active = true;
+    snapshot.sample_rate_hz = decoder->sample_rate_hz;
+    snapshot.prefetch_core_id = context != nullptr ? static_cast<int32_t>(context->core_id) : -1;
+    snapshot.read_avg_us = read_calls > 0
+        ? static_cast<uint32_t>(read_total_us / read_calls)
+        : 0;
+    snapshot.read_max_us = read_max_us;
+    snapshot.read_over_10ms = read_over_10ms;
+    snapshot.read_calls = read_calls;
+
+    snapshot.ring_buffered_bytes = context != nullptr && context->stream != nullptr
+        ? static_cast<uint32_t>(xStreamBufferBytesAvailable(context->stream))
+        : 0;
+    snapshot.ring_capacity_bytes = context != nullptr
+        ? static_cast<uint32_t>(context->ring_bytes)
+        : 0;
+    snapshot.ring_min_buffered_bytes =
+        static_cast<uint32_t>(decoder->perf_prefetch_min_buffered_bytes);
+    snapshot.prefetch_copy_avg_us = decoder->perf_prefetch_wait_calls > 0
+        ? static_cast<uint32_t>(
+            decoder->perf_prefetch_wait_total_us / decoder->perf_prefetch_wait_calls
+        )
+        : 0;
+    snapshot.prefetch_copy_max_us = decoder->perf_prefetch_wait_max_us;
+    snapshot.prefetch_copy_over_2ms = decoder->perf_prefetch_wait_over_2ms;
+    snapshot.prefetch_starve_count = decoder->perf_prefetch_starve_count;
+    snapshot.prefetch_stack_hwm = context != nullptr
+        ? static_cast<uint32_t>(context->stack_hwm)
+        : 0;
+
+    snapshot.decode_avg_us = decoder->perf_decode_calls > 0
+        ? static_cast<uint32_t>(decoder->perf_decode_total_us / decoder->perf_decode_calls)
+        : 0;
+    snapshot.decode_max_us = decoder->perf_decode_max_us;
+    snapshot.decode_over_20ms = decoder->perf_decode_over_20ms;
+    snapshot.decode_over_40ms = decoder->perf_decode_over_40ms;
+    snapshot.decode_calls = decoder->perf_decode_calls;
+
+    snapshot.refill_avg_us = decoder->perf_refill_calls > 0
+        ? static_cast<uint32_t>(decoder->perf_refill_total_us / decoder->perf_refill_calls)
+        : 0;
+    snapshot.refill_max_us = decoder->perf_refill_max_us;
+    snapshot.refill_over_20ms = decoder->perf_refill_over_20ms;
+    snapshot.refill_over_30ms = decoder->perf_refill_over_30ms;
+    snapshot.refill_over_block_budget = decoder->perf_refill_over_block_budget;
+    snapshot.refill_worst_over_budget_us = decoder->perf_refill_worst_over_budget_us;
+    snapshot.refill_calls = decoder->perf_refill_calls;
+    snapshot.process_per_refill_x100 = decoder->perf_refill_calls > 0
+        ? static_cast<uint32_t>(
+            (decoder->perf_refill_process_total * 100ULL + decoder->perf_refill_calls / 2U) /
+            decoder->perf_refill_calls
+        )
+        : 0;
+    snapshot.process_per_refill_max = decoder->perf_refill_process_max;
+    snapshot.multi_process_refills = decoder->perf_refill_multi_process;
+    snapshot.input_fills_per_refill_max = decoder->perf_refill_input_fill_max;
+    snapshot.multi_fill_refills = decoder->perf_refill_multi_fill;
+    snapshot.input_compact_calls = decoder->perf_input_compact_calls;
+    snapshot.input_compact_total_bytes = static_cast<uint32_t>(
+        decoder->perf_input_compact_bytes > UINT32_MAX
+            ? UINT32_MAX
+            : decoder->perf_input_compact_bytes
+    );
+    snapshot.input_topup_avg_bytes = decoder->perf_input_topup_calls > 0
+        ? static_cast<uint32_t>(decoder->perf_input_topup_bytes / decoder->perf_input_topup_calls)
+        : 0;
+    snapshot.input_topup_max_bytes = decoder->perf_input_topup_max_bytes;
+
+    snapshot.block_budget_us =
+        decoder->sample_rate_hz > 0 && decoder->max_block_size > 0
+        ? static_cast<uint32_t>(
+            (static_cast<uint64_t>(decoder->max_block_size) * 1000000ULL) /
+            decoder->sample_rate_hz
+        )
+        : 0;
+    snapshot.refill_avg_load_percent = snapshot.block_budget_us > 0
+        ? static_cast<uint32_t>(
+            (static_cast<uint64_t>(snapshot.refill_avg_us) * 100ULL + snapshot.block_budget_us / 2U) /
+            snapshot.block_budget_us
+        )
+        : 0;
+    snapshot.refill_peak_load_percent = snapshot.block_budget_us > 0
+        ? static_cast<uint32_t>(
+            (static_cast<uint64_t>(snapshot.refill_max_us) * 100ULL + snapshot.block_budget_us / 2U) /
+            snapshot.block_budget_us
+        )
+        : 0;
+    snapshot.refill_peak_margin_us = snapshot.block_budget_us > 0
+        ? static_cast<int32_t>(snapshot.block_budget_us) - static_cast<int32_t>(snapshot.refill_max_us)
+        : 0;
+
+    portENTER_CRITICAL(&g_flac_perf_snapshot_mux);
+    snapshot.sequence = g_flac_perf_snapshot.sequence + 1U;
+    g_flac_perf_snapshot = snapshot;
+    portEXIT_CRITICAL(&g_flac_perf_snapshot_mux);
+
+    decoder->perf_last_report_us = now_us;
+}
+
+bool flac_decoder_get_perf_snapshot(FlacPerfSnapshot *out_snapshot)
+{
+    if (out_snapshot == nullptr) {
+        return false;
+    }
+
+    portENTER_CRITICAL(&g_flac_perf_snapshot_mux);
+    *out_snapshot = g_flac_perf_snapshot;
+    portEXIT_CRITICAL(&g_flac_perf_snapshot_mux);
+    return out_snapshot->sequence != 0;
+}
+
+static uint8_t *flac_alloc_buffer(size_t size);
+static void flac_free_buffer(void *buffer);
+
+static void flac_prefetch_record_read(FlacPrefetchContext *context, uint32_t read_us)
+{
+    if (context == nullptr) {
+        return;
+    }
+
+    portENTER_CRITICAL(&g_flac_prefetch_metrics_mux);
+    context->perf_read_total_us += read_us;
+    ++context->perf_read_calls;
+    if (read_us > context->perf_read_max_us) {
+        context->perf_read_max_us = read_us;
+    }
+    if (read_us >= FLAC_SLOW_READ_US) {
+        ++context->perf_read_over_10ms;
+    }
+    portEXIT_CRITICAL(&g_flac_prefetch_metrics_mux);
+}
+
+static void flac_prefetch_task(void *arg)
+{
+    FlacPrefetchContext *context = static_cast<FlacPrefetchContext *>(arg);
+    if (
+        context == nullptr ||
+        context->file == nullptr ||
+        context->stream == nullptr ||
+        context->read_buffer == nullptr
+    ) {
+        if (context != nullptr) {
+            context->io_error = true;
+            context->stack_hwm = uxTaskGetStackHighWaterMark(nullptr);
+            if (context->done != nullptr) {
+                xSemaphoreGive(context->done);
+            }
+        }
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    context->core_id = xPortGetCoreID();
+    if (context->core_id != FLAC_PREFETCH_TASK_CORE) {
+        context->io_error = true;
+        context->stack_hwm = uxTaskGetStackHighWaterMark(nullptr);
+        ESP_LOGE(TAG, "FLAC预取任务核心绑定异常：当前=%d，期望=%d",
+            static_cast<int>(context->core_id),
+            static_cast<int>(FLAC_PREFETCH_TASK_CORE));
+        if (context->done != nullptr) {
+            xSemaphoreGive(context->done);
+        }
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    ESP_LOGI(TAG, "FLAC预取任务已启动：核心=%d，优先级=%u，栈=%uB，SD块=%uB",
+        static_cast<int>(context->core_id),
+        static_cast<unsigned>(uxTaskPriorityGet(nullptr)),
+        static_cast<unsigned>(FLAC_PREFETCH_TASK_STACK_BYTES),
+        static_cast<unsigned>(context->read_chunk_bytes));
+
+    uint32_t stack_sample_counter = 0;
+    while (!context->stop_requested) {
+        if ((stack_sample_counter++ & 0x3FU) == 0U) {
+            context->stack_hwm = uxTaskGetStackHighWaterMark(nullptr);
+        }
+
+        const size_t free_bytes = xStreamBufferSpacesAvailable(context->stream);
+        if (free_bytes < context->read_chunk_bytes) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+
+        const int64_t read_begin_us = esp_timer_get_time();
+        const size_t bytes_read = fread(
+            context->read_buffer,
+            1,
+            context->read_chunk_bytes,
+            context->file
+        );
+        const uint32_t read_us = static_cast<uint32_t>(esp_timer_get_time() - read_begin_us);
+        flac_prefetch_record_read(context, read_us);
+
+        if (bytes_read > 0) {
+            size_t sent = 0;
+            while (sent < bytes_read && !context->stop_requested) {
+                const size_t chunk = xStreamBufferSend(
+                    context->stream,
+                    context->read_buffer + sent,
+                    bytes_read - sent,
+                    FLAC_PREFETCH_SEND_WAIT
+                );
+                sent += chunk;
+            }
+        }
+
+        if (bytes_read < context->read_chunk_bytes) {
+            if (feof(context->file)) {
+                context->eof = true;
+            } else if (!context->stop_requested) {
+                context->io_error = true;
+                ESP_LOGE(TAG, "FLAC 预取任务读取文件失败");
+            }
+            break;
+        }
+    }
+
+    context->stack_hwm = uxTaskGetStackHighWaterMark(nullptr);
+    if (context->done != nullptr) {
+        xSemaphoreGive(context->done);
+    }
+    vTaskDelete(nullptr);
+}
+
+static void flac_prefetch_destroy(FlacDecoder *decoder)
+{
+    FlacPrefetchContext *context = flac_prefetch_context(decoder);
+    if (context == nullptr) {
+        return;
+    }
+
+    context->stop_requested = true;
+    if (context->task != nullptr && context->done != nullptr) {
+        if (xSemaphoreTake(context->done, FLAC_PREFETCH_STOP_WAIT) != pdTRUE) {
+            ESP_LOGE(TAG, "等待 FLAC 预取任务退出超时，强制结束任务");
+            vTaskDelete(context->task);
+        }
+        context->task = nullptr;
+    }
+
+    if (context->stream != nullptr) {
+        vStreamBufferDelete(context->stream);
+        context->stream = nullptr;
+    }
+    flac_free_buffer(context->ring_storage);
+    flac_free_buffer(context->read_buffer);
+    context->ring_storage = nullptr;
+    context->read_buffer = nullptr;
+    decoder->prefetch_context = nullptr;
+    heap_caps_free(context);
+}
+
+static esp_err_t flac_prefetch_start(FlacDecoder *decoder)
+{
+    if (decoder == nullptr || decoder->file == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    FlacPrefetchContext *context = static_cast<FlacPrefetchContext *>(
+        heap_caps_calloc(1, sizeof(FlacPrefetchContext), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+    );
+    if (context == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    const FlacPrefetchProfile profile = flac_prefetch_profile_for_rate(decoder->sample_rate_hz);
+    context->file = decoder->file;
+    context->ring_bytes = profile.ring_bytes;
+    context->read_chunk_bytes = profile.read_chunk_bytes;
+    context->start_target_bytes = profile.start_target_bytes;
+    context->ring_storage = flac_alloc_buffer(context->ring_bytes + 1U);
+    context->read_buffer = flac_alloc_buffer(context->read_chunk_bytes);
+    if (context->ring_storage == nullptr || context->read_buffer == nullptr) {
+        decoder->prefetch_context = context;
+        flac_prefetch_destroy(decoder);
+        return ESP_ERR_NO_MEM;
+    }
+
+    context->stream = xStreamBufferCreateStatic(
+        context->ring_bytes + 1U,
+        1,
+        context->ring_storage,
+        &context->stream_storage
+    );
+    context->done = xSemaphoreCreateBinaryStatic(&context->done_storage);
+    if (context->stream == nullptr || context->done == nullptr) {
+        decoder->prefetch_context = context;
+        flac_prefetch_destroy(decoder);
+        return ESP_ERR_NO_MEM;
+    }
+
+    decoder->prefetch_context = context;
+    const BaseType_t task_ret = xTaskCreatePinnedToCore(
+        flac_prefetch_task,
+        "FlacPrefetch",
+        FLAC_PREFETCH_TASK_STACK_BYTES,
+        context,
+        FLAC_PREFETCH_TASK_PRIORITY,
+        &context->task,
+        FLAC_PREFETCH_TASK_CORE
+    );
+    if (task_ret != pdPASS) {
+        ESP_LOGE(TAG, "创建 FLAC 预取任务失败");
+        flac_prefetch_destroy(decoder);
+        return ESP_ERR_NO_MEM;
+    }
+
+    const uint64_t remaining_bytes = decoder->file_size_bytes > decoder->flac_offset_bytes
+        ? decoder->file_size_bytes - decoder->flac_offset_bytes
+        : 0;
+    size_t target = context->start_target_bytes;
+    if (remaining_bytes < target) {
+        target = static_cast<size_t>(remaining_bytes);
+    }
+    const size_t minimum = remaining_bytes < FLAC_INPUT_BUFFER_BYTES
+        ? static_cast<size_t>(remaining_bytes)
+        : FLAC_INPUT_BUFFER_BYTES;
+
+    const TickType_t start_tick = xTaskGetTickCount();
+    while (
+        xStreamBufferBytesAvailable(context->stream) < target &&
+        !context->eof &&
+        !context->io_error &&
+        xTaskGetTickCount() - start_tick < FLAC_PREFETCH_START_WAIT
+    ) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    const size_t primed = xStreamBufferBytesAvailable(context->stream);
+    if (context->io_error || primed < minimum) {
+        const bool io_error = context->io_error;
+        ESP_LOGE(TAG, "FLAC 预取启动失败：已缓存=%uB，最低需要=%uB",
+            static_cast<unsigned>(primed),
+            static_cast<unsigned>(minimum));
+        flac_prefetch_destroy(decoder);
+        return io_error ? ESP_FAIL : ESP_ERR_TIMEOUT;
+    }
+
+    ESP_LOGI(TAG,
+        "FLAC压缩流预取已就绪：%luHz，核心=%d，PSRAM环形=%uKB，SD块=%uB，起播缓存=%uB，任务栈=%uB",
+        static_cast<unsigned long>(decoder->sample_rate_hz),
+        static_cast<int>(context->core_id),
+        static_cast<unsigned>(context->ring_bytes / 1024U),
+        static_cast<unsigned>(context->read_chunk_bytes),
+        static_cast<unsigned>(primed),
+        static_cast<unsigned>(FLAC_PREFETCH_TASK_STACK_BYTES));
+    return ESP_OK;
+}
+
+static esp_err_t flac_audio_error_to_esp(esp_audio_err_t error)
+{
+    switch (error) {
+        case ESP_AUDIO_ERR_OK:
+        case ESP_AUDIO_ERR_ALREADY_EXIST:
+            return ESP_OK;
+        case ESP_AUDIO_ERR_MEM_LACK:
+            return ESP_ERR_NO_MEM;
+        case ESP_AUDIO_ERR_INVALID_PARAMETER:
+            return ESP_ERR_INVALID_ARG;
+        case ESP_AUDIO_ERR_NOT_SUPPORT:
+            return ESP_ERR_NOT_SUPPORTED;
+        case ESP_AUDIO_ERR_DATA_LACK:
+            return ESP_ERR_INVALID_SIZE;
+        case ESP_AUDIO_ERR_HEADER_PARSE:
+            return ESP_ERR_INVALID_RESPONSE;
+        case ESP_AUDIO_ERR_NOT_FOUND:
+            return ESP_ERR_NOT_FOUND;
+        default:
+            return ESP_FAIL;
+    }
+}
+
+static uint8_t *flac_alloc_buffer(size_t size)
+{
+    // FLAC 流式输入/PCM 解码缓冲属于可放外部 RAM 的大块工作区。
+    // 不允许 PSRAM 分配失败后悄悄吃掉内部 RAM；失败时由上层明确返回 ESP_ERR_NO_MEM。
+    uint8_t *buffer = static_cast<uint8_t *>(
+        heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+    );
+    if (buffer == nullptr) {
+        ESP_LOGE(TAG, "FLAC PSRAM 工作缓冲分配失败：%u字节，禁止回落内部RAM",
+            static_cast<unsigned>(size));
+    }
+    return buffer;
+}
+
+static void flac_free_buffer(void *buffer)
+{
+    if (buffer != nullptr) {
+        heap_caps_free(buffer);
+    }
+}
+
+static uint32_t flac_read_synchsafe_u28(const uint8_t *p)
+{
+    return (static_cast<uint32_t>(p[0] & 0x7FU) << 21) |
+           (static_cast<uint32_t>(p[1] & 0x7FU) << 14) |
+           (static_cast<uint32_t>(p[2] & 0x7FU) << 7) |
+           static_cast<uint32_t>(p[3] & 0x7FU);
+}
+
+static esp_err_t flac_seek_to_stream_marker(FILE *file, uint64_t *out_offset)
+{
+    if (file == nullptr || out_offset == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t first10[10] = {};
+    if (fseek(file, 0, SEEK_SET) != 0) {
+        return ESP_FAIL;
+    }
+    const size_t first_read = fread(first10, 1, sizeof(first10), file);
+    if (first_read < 4) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    uint64_t offset = 0;
+    if (memcmp(first10, "ID3", 3) == 0) {
+        if (first_read < sizeof(first10)) {
+            ESP_LOGE(TAG, "ID3v2 文件头不完整");
+            return ESP_ERR_INVALID_SIZE;
+        }
+        if ((first10[6] | first10[7] | first10[8] | first10[9]) & 0x80U) {
+            ESP_LOGE(TAG, "ID3v2 标签长度不是 synchsafe 编码");
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        const uint32_t tag_size = flac_read_synchsafe_u28(&first10[6]);
+        const bool has_footer = (first10[5] & 0x10U) != 0;
+        offset = 10ULL + tag_size + (has_footer ? 10ULL : 0ULL);
+        ESP_LOGI(TAG, "检测到前置 ID3v2 标签：跳过=%llu字节",
+            static_cast<unsigned long long>(offset));
+    }
+
+    if (offset > static_cast<uint64_t>(LONG_MAX) || fseek(file, static_cast<long>(offset), SEEK_SET) != 0) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    uint8_t marker[4] = {};
+    if (fread(marker, 1, sizeof(marker), file) != sizeof(marker) || memcmp(marker, "fLaC", 4) != 0) {
+        ESP_LOGE(TAG, "未找到标准 fLaC 文件头");
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    *out_offset = offset;
+    return ESP_OK;
+}
+
+static esp_err_t flac_parse_streaminfo(FlacDecoder *decoder)
+{
+    if (decoder == nullptr || decoder->file == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t ret = flac_seek_to_stream_marker(decoder->file, &decoder->flac_offset_bytes);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    uint8_t block_header[4] = {};
+    if (fread(block_header, 1, sizeof(block_header), decoder->file) != sizeof(block_header)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    const uint8_t block_type = block_header[0] & 0x7FU;
+    const uint32_t block_length =
+        (static_cast<uint32_t>(block_header[1]) << 16) |
+        (static_cast<uint32_t>(block_header[2]) << 8) |
+        static_cast<uint32_t>(block_header[3]);
+    if (block_type != 0 || block_length != 34) {
+        ESP_LOGE(TAG, "FLAC 首个元数据块不是标准 STREAMINFO：类型=%u 长度=%lu",
+            static_cast<unsigned>(block_type),
+            static_cast<unsigned long>(block_length));
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    uint8_t info[34] = {};
+    if (fread(info, 1, sizeof(info), decoder->file) != sizeof(info)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    decoder->max_block_size = static_cast<uint16_t>(
+        (static_cast<uint16_t>(info[2]) << 8) | info[3]
+    );
+    decoder->min_frame_size =
+        (static_cast<uint32_t>(info[4]) << 16) |
+        (static_cast<uint32_t>(info[5]) << 8) |
+        static_cast<uint32_t>(info[6]);
+    decoder->max_frame_size =
+        (static_cast<uint32_t>(info[7]) << 16) |
+        (static_cast<uint32_t>(info[8]) << 8) |
+        static_cast<uint32_t>(info[9]);
+    decoder->sample_rate_hz =
+        (static_cast<uint32_t>(info[10]) << 12) |
+        (static_cast<uint32_t>(info[11]) << 4) |
+        (static_cast<uint32_t>(info[12]) >> 4);
+    decoder->channels = static_cast<uint16_t>(((info[12] >> 1) & 0x07U) + 1U);
+    decoder->bits_per_sample = static_cast<uint16_t>(
+        (((static_cast<uint16_t>(info[12]) & 0x01U) << 4) | (info[13] >> 4)) + 1U
+    );
+    decoder->total_frames =
+        (static_cast<uint64_t>(info[13] & 0x0FU) << 32) |
+        (static_cast<uint64_t>(info[14]) << 24) |
+        (static_cast<uint64_t>(info[15]) << 16) |
+        (static_cast<uint64_t>(info[16]) << 8) |
+        static_cast<uint64_t>(info[17]);
+
+    if (decoder->max_block_size == 0 || decoder->sample_rate_hz == 0 || decoder->channels == 0) {
+        ESP_LOGE(TAG, "STREAMINFO 参数无效：block=%u rate=%lu channels=%u",
+            static_cast<unsigned>(decoder->max_block_size),
+            static_cast<unsigned long>(decoder->sample_rate_hz),
+            static_cast<unsigned>(decoder->channels));
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    ESP_LOGI(TAG, "STREAMINFO：%luHz / %ubit / %u声道，总帧=%llu，最大块=%u，压缩帧=%lu~%luB",
+        static_cast<unsigned long>(decoder->sample_rate_hz),
+        static_cast<unsigned>(decoder->bits_per_sample),
+        static_cast<unsigned>(decoder->channels),
+        static_cast<unsigned long long>(decoder->total_frames),
+        static_cast<unsigned>(decoder->max_block_size),
+        static_cast<unsigned long>(decoder->min_frame_size),
+        static_cast<unsigned long>(decoder->max_frame_size));
+    return ESP_OK;
+}
+
+static esp_err_t flac_validate_sink_format(const FlacDecoder *decoder)
+{
+    if (decoder == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!audio_rate_profile_flac_enabled(decoder->sample_rate_hz)) {
+        ESP_LOGW(TAG, "当前 PCM 硬件档位不支持 FLAC=%luHz/%ubit/%u声道",
+            static_cast<unsigned long>(decoder->sample_rate_hz),
+            static_cast<unsigned>(decoder->bits_per_sample),
+            static_cast<unsigned>(decoder->channels));
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (decoder->channels != 1 && decoder->channels != 2) {
+        ESP_LOGW(TAG, "当前 PCM sink 仅支持单/双声道 FLAC：实际=%u声道",
+            static_cast<unsigned>(decoder->channels));
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (
+        decoder->bits_per_sample != 16 &&
+        decoder->bits_per_sample != 24 &&
+        decoder->bits_per_sample != 32
+    ) {
+        ESP_LOGW(TAG, "当前 FLAC PCM 位深仅支持 16/24/32bit：实际=%ubit",
+            static_cast<unsigned>(decoder->bits_per_sample));
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t flac_resize_decoded_buffer(FlacDecoder *decoder, size_t requested)
+{
+    if (decoder == nullptr || requested == 0 || requested > FLAC_MAX_DECODED_BUFFER_BYTES) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (decoder->decoded_capacity >= requested) {
+        return ESP_OK;
+    }
+
+    uint8_t *new_buffer = flac_alloc_buffer(requested);
+    if (new_buffer == nullptr) {
+        ESP_LOGE(TAG, "FLAC PCM 输出缓冲分配失败：%u字节", static_cast<unsigned>(requested));
+        return ESP_ERR_NO_MEM;
+    }
+    flac_free_buffer(decoder->decoded_buffer);
+    decoder->decoded_buffer = new_buffer;
+    decoder->decoded_capacity = requested;
+    decoder->decoded_offset = 0;
+    decoder->decoded_size = 0;
+    ESP_LOGI(TAG, "FLAC PCM 输出缓冲调整为 %u 字节", static_cast<unsigned>(requested));
+    return ESP_OK;
+}
+
+static esp_err_t flac_verify_runtime_info(FlacDecoder *decoder)
+{
+    if (decoder == nullptr || decoder->simple_handle == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (decoder->runtime_info_verified) {
+        return ESP_OK;
+    }
+
+    esp_audio_simple_dec_info_t info = {};
+    const esp_audio_err_t codec_ret = esp_audio_simple_dec_get_info(
+        static_cast<esp_audio_simple_dec_handle_t>(decoder->simple_handle),
+        &info
+    );
+    if (codec_ret != ESP_AUDIO_ERR_OK) {
+        return flac_audio_error_to_esp(codec_ret);
+    }
+
+    ESP_LOGI(TAG, "乐鑫 FLAC 解码输出：%luHz / %ubit / %u声道，bitrate=%lu",
+        static_cast<unsigned long>(info.sample_rate),
+        static_cast<unsigned>(info.bits_per_sample),
+        static_cast<unsigned>(info.channel),
+        static_cast<unsigned long>(info.bitrate));
+
+    if (
+        info.sample_rate != decoder->sample_rate_hz ||
+        info.channel != decoder->channels ||
+        info.bits_per_sample != decoder->bits_per_sample
+    ) {
+        ESP_LOGE(TAG, "FLAC STREAMINFO 与解码器输出参数不一致，拒绝继续播放");
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    decoder->runtime_info_verified = true;
+    return ESP_OK;
+}
+
+static TickType_t flac_prefetch_receive_wait(const FlacDecoder *decoder)
+{
+    // 等待上限按单个 FLAC 块播放预算的约 1/4 缩放：
+    // 48k/4096帧约20ms，96k约10ms，192k约5ms，避免高采样率下等待本身吃光实时预算。
+    if (decoder == nullptr || decoder->sample_rate_hz == 0 || decoder->max_block_size == 0) {
+        return FLAC_PREFETCH_RECEIVE_WAIT;
+    }
+
+    const uint64_t block_budget_us =
+        (static_cast<uint64_t>(decoder->max_block_size) * 1000000ULL) / decoder->sample_rate_hz;
+    uint32_t wait_ms = static_cast<uint32_t>(block_budget_us / 4000ULL);
+    if (wait_ms == 0) {
+        wait_ms = 1;
+    }
+    const uint32_t max_wait_ms = static_cast<uint32_t>(pdTICKS_TO_MS(FLAC_PREFETCH_RECEIVE_WAIT));
+    if (wait_ms > max_wait_ms) {
+        wait_ms = max_wait_ms;
+    }
+    return pdMS_TO_TICKS(wait_ms);
+}
+
+static size_t flac_input_window_target(const FlacDecoder *decoder)
+{
+    if (decoder == nullptr || decoder->input_capacity == 0) {
+        return 0;
+    }
+
+    // STREAMINFO 的最大压缩帧为 0 时表示文件未提供可靠上限，直接保持完整 32KB 窗口。
+    if (decoder->max_frame_size == 0 || decoder->max_frame_size >= decoder->input_capacity) {
+        return decoder->input_capacity;
+    }
+
+    size_t target = static_cast<size_t>(decoder->max_frame_size);
+    if (target > decoder->input_capacity - FLAC_INPUT_FRAME_GUARD_BYTES) {
+        return decoder->input_capacity;
+    }
+    target += FLAC_INPUT_FRAME_GUARD_BYTES;
+    return target;
+}
+
+static esp_err_t flac_prepare_input_window(FlacDecoder *decoder, bool *out_received)
+{
+    if (out_received != nullptr) {
+        *out_received = false;
+    }
+    if (decoder == nullptr || decoder->input_buffer == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t remaining = decoder->input_offset < decoder->input_size
+        ? decoder->input_size - decoder->input_offset
+        : 0;
+
+    if (decoder->input_chunk_eos) {
+        if (remaining == 0) {
+            decoder->eof = true;
+        }
+        return ESP_OK;
+    }
+
+    FlacPrefetchContext *context = flac_prefetch_context(decoder);
+    if (context == nullptr || context->stream == nullptr) {
+        ESP_LOGE(TAG, "FLAC 压缩流预取上下文不存在");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const size_t target = flac_input_window_target(decoder);
+
+    // 已经有足够连续输入时直接交给 parser，不做无意义 memmove，也不从 ring 复制新数据。
+    // 只有当前尾部不足以覆盖 max_frame_size + guard 时才补窗。
+    if (remaining >= target) {
+        decoder->input_chunk_eos =
+            context->eof && xStreamBufferBytesAvailable(context->stream) == 0;
+        return ESP_OK;
+    }
+
+    // 优先直接追加到当前输入缓冲尾部。只有尾部空间不足以补到目标窗口时，
+    // 才把未消费数据压到缓冲头，减少 192kHz 热路径中的 PSRAM 搬运量。
+    const size_t initial_needed = target - remaining;
+    size_t tail_capacity = decoder->input_size < decoder->input_capacity
+        ? decoder->input_capacity - decoder->input_size
+        : 0;
+    if (tail_capacity < initial_needed && remaining > 0 && decoder->input_offset > 0) {
+        memmove(
+            decoder->input_buffer,
+            decoder->input_buffer + decoder->input_offset,
+            remaining
+        );
+        ++decoder->perf_input_compact_calls;
+        decoder->perf_input_compact_bytes += remaining;
+        decoder->input_offset = 0;
+        decoder->input_size = remaining;
+    } else if (remaining == 0) {
+        decoder->input_offset = 0;
+        decoder->input_size = 0;
+    }
+
+    while ((decoder->input_size - decoder->input_offset) < target) {
+        const size_t buffered_before = xStreamBufferBytesAvailable(context->stream);
+        if (
+            decoder->perf_prefetch_wait_calls == 0 ||
+            buffered_before < decoder->perf_prefetch_min_buffered_bytes
+        ) {
+            decoder->perf_prefetch_min_buffered_bytes = buffered_before;
+        }
+
+        // 已经保留有可用压缩数据时，补窗只是优化，不为等待更多数据阻塞 AudioTask。
+        // 只有输入完全耗尽时才允许按当前 FLAC 块预算等待预取任务。
+        const size_t available_now = decoder->input_size - decoder->input_offset;
+        const bool must_wait = available_now == 0 && !context->eof;
+        if (must_wait && buffered_before == 0) {
+            ++decoder->perf_prefetch_starve_count;
+        }
+        const TickType_t receive_wait = must_wait
+            ? flac_prefetch_receive_wait(decoder)
+            : 0;
+
+        const size_t available_before_receive = decoder->input_size - decoder->input_offset;
+        const size_t needed = target > available_before_receive
+            ? target - available_before_receive
+            : 0;
+        const size_t tail_free = decoder->input_capacity - decoder->input_size;
+        const size_t receive_capacity = needed < tail_free ? needed : tail_free;
+        if (receive_capacity == 0) {
+            ESP_LOGE(TAG, "FLAC 输入窗口无法继续补充：available=%u target=%u tail=%u",
+                static_cast<unsigned>(available_before_receive),
+                static_cast<unsigned>(target),
+                static_cast<unsigned>(tail_free));
+            return ESP_ERR_INVALID_SIZE;
+        }
+
+        const int64_t wait_begin_us = esp_timer_get_time();
+        const size_t received = xStreamBufferReceive(
+            context->stream,
+            decoder->input_buffer + decoder->input_size,
+            receive_capacity,
+            receive_wait
+        );
+        const uint32_t wait_us = static_cast<uint32_t>(esp_timer_get_time() - wait_begin_us);
+        decoder->perf_prefetch_wait_total_us += wait_us;
+        ++decoder->perf_prefetch_wait_calls;
+        if (wait_us > decoder->perf_prefetch_wait_max_us) {
+            decoder->perf_prefetch_wait_max_us = wait_us;
+        }
+        if (wait_us >= 2000U) {
+            ++decoder->perf_prefetch_wait_over_2ms;
+        }
+
+        if (received > 0) {
+            decoder->input_size += received;
+            decoder->perf_input_topup_bytes += received;
+            ++decoder->perf_input_topup_calls;
+            if (received > decoder->perf_input_topup_max_bytes) {
+                decoder->perf_input_topup_max_bytes = static_cast<uint32_t>(received);
+            }
+            if (out_received != nullptr) {
+                *out_received = true;
+            }
+            continue;
+        }
+
+        if (context->io_error) {
+            ESP_LOGE(TAG, "FLAC 预取层报告 SD 读取失败");
+            return ESP_FAIL;
+        }
+        if (context->eof) {
+            decoder->input_chunk_eos = true;
+            break;
+        }
+        if (must_wait) {
+            ESP_LOGE(TAG, "FLAC 预取环形缓冲等待超时：%ums",
+                static_cast<unsigned>(pdTICKS_TO_MS(receive_wait)));
+            return ESP_ERR_TIMEOUT;
+        }
+
+        // 有未消费尾部时，即使当前 ring 瞬间没有新数据也继续交给 parser，
+        // 不让“窗口补满”优化反过来成为新的实时阻塞点。
+        break;
+    }
+
+    decoder->input_chunk_eos =
+        context->eof && xStreamBufferBytesAvailable(context->stream) == 0;
+    if (decoder->input_size == 0 && decoder->input_chunk_eos) {
+        decoder->eof = true;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t flac_decode_next_output(FlacDecoder *decoder)
+{
+    if (decoder == nullptr || decoder->simple_handle == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const int64_t refill_begin_us = esp_timer_get_time();
+    decoder->decoded_offset = 0;
+    decoder->decoded_size = 0;
+    uint32_t refill_process_calls = 0;
+    uint32_t refill_input_fills = 0;
+
+    while (!decoder->eof) {
+        bool input_received = false;
+        esp_err_t ret = flac_prepare_input_window(decoder, &input_received);
+        if (input_received && ret == ESP_OK) {
+            ++refill_input_fills;
+        }
+        if (ret != ESP_OK || decoder->eof) {
+            return ret;
+        }
+
+        esp_audio_simple_dec_raw_t raw = {};
+        raw.buffer = decoder->input_buffer + decoder->input_offset;
+        raw.len = static_cast<uint32_t>(decoder->input_size - decoder->input_offset);
+        raw.eos = decoder->input_chunk_eos;
+
+        esp_audio_simple_dec_out_t out = {};
+        out.buffer = decoder->decoded_buffer;
+        out.len = static_cast<uint32_t>(decoder->decoded_capacity);
+
+        const int64_t decode_begin_us = esp_timer_get_time();
+        ++refill_process_calls;
+        esp_audio_err_t codec_ret = esp_audio_simple_dec_process(
+            static_cast<esp_audio_simple_dec_handle_t>(decoder->simple_handle),
+            &raw,
+            &out
+        );
+        const uint32_t decode_us = static_cast<uint32_t>(esp_timer_get_time() - decode_begin_us);
+        decoder->perf_decode_total_us += decode_us;
+        ++decoder->perf_decode_calls;
+        if (decode_us > decoder->perf_decode_max_us) {
+            decoder->perf_decode_max_us = decode_us;
+        }
+        if (decode_us >= FLAC_SLOW_DECODE_US) {
+            ++decoder->perf_decode_over_20ms;
+        }
+        if (decode_us >= FLAC_CRITICAL_DECODE_US) {
+            ++decoder->perf_decode_over_40ms;
+        }
+        if (codec_ret == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
+            if (out.needed_size == 0 || out.needed_size > FLAC_MAX_DECODED_BUFFER_BYTES) {
+                ESP_LOGE(TAG, "FLAC 解码器请求异常输出缓冲：%lu字节",
+                    static_cast<unsigned long>(out.needed_size));
+                return ESP_ERR_INVALID_SIZE;
+            }
+            ret = flac_resize_decoded_buffer(decoder, out.needed_size);
+            if (ret != ESP_OK) {
+                return ret;
+            }
+            continue;
+        }
+        if (codec_ret != ESP_AUDIO_ERR_OK) {
+            ESP_LOGE(TAG, "乐鑫 FLAC 解码失败：codec_ret=%d", static_cast<int>(codec_ret));
+            return flac_audio_error_to_esp(codec_ret);
+        }
+        if (raw.consumed > raw.len) {
+            ESP_LOGE(TAG, "FLAC 解码器报告非法 consumed=%lu/%lu",
+                static_cast<unsigned long>(raw.consumed),
+                static_cast<unsigned long>(raw.len));
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+
+        decoder->input_offset += raw.consumed;
+        if (out.decoded_size > 0) {
+            ret = flac_verify_runtime_info(decoder);
+            if (ret != ESP_OK) {
+                return ret;
+            }
+            decoder->decoded_size = out.decoded_size;
+            decoder->decoded_offset = 0;
+
+            const uint32_t refill_us = static_cast<uint32_t>(
+                esp_timer_get_time() - refill_begin_us
+            );
+            decoder->perf_refill_total_us += refill_us;
+            ++decoder->perf_refill_calls;
+            if (refill_us > decoder->perf_refill_max_us) {
+                decoder->perf_refill_max_us = refill_us;
+            }
+            if (refill_us >= FLAC_SLOW_REFILL_US) {
+                ++decoder->perf_refill_over_20ms;
+            }
+            if (refill_us >= FLAC_CRITICAL_REFILL_US) {
+                ++decoder->perf_refill_over_30ms;
+            }
+
+            // 高采样率判断不能只看固定 20/30ms 阈值。直接按当前 STREAMINFO
+            // 的最大块帧数计算真实播放预算，统计 refill 是否已经追不上消费速度。
+            if (decoder->sample_rate_hz > 0 && decoder->max_block_size > 0) {
+                const uint32_t block_budget_us = static_cast<uint32_t>(
+                    (static_cast<uint64_t>(decoder->max_block_size) * 1000000ULL) /
+                    decoder->sample_rate_hz
+                );
+                if (block_budget_us > 0 && refill_us >= block_budget_us) {
+                    ++decoder->perf_refill_over_block_budget;
+                    const uint32_t over_budget_us = refill_us - block_budget_us;
+                    if (over_budget_us > decoder->perf_refill_worst_over_budget_us) {
+                        decoder->perf_refill_worst_over_budget_us = over_budget_us;
+                    }
+                }
+            }
+
+            decoder->perf_refill_process_total += refill_process_calls;
+            if (refill_process_calls > decoder->perf_refill_process_max) {
+                decoder->perf_refill_process_max = refill_process_calls;
+            }
+            if (refill_process_calls > 1U) {
+                ++decoder->perf_refill_multi_process;
+            }
+            if (refill_input_fills > decoder->perf_refill_input_fill_max) {
+                decoder->perf_refill_input_fill_max = refill_input_fills;
+            }
+            if (refill_input_fills > 1U) {
+                ++decoder->perf_refill_multi_fill;
+            }
+
+            // refill 计时到这里已经结束；性能快照发布放在计时之后，
+            // 避免诊断逻辑污染真实解码峰值。
+            flac_perf_maybe_publish(decoder, static_cast<uint64_t>(esp_timer_get_time()));
+            return ESP_OK;
+        }
+
+        if (raw.consumed == 0) {
+            if (raw.eos) {
+                decoder->eof = true;
+                return ESP_OK;
+            }
+            ESP_LOGE(TAG, "FLAC 解码无输入消耗也无 PCM 输出，拒绝死循环");
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        if (decoder->input_offset >= decoder->input_size && decoder->input_chunk_eos) {
+            decoder->eof = true;
+            return ESP_OK;
+        }
+    }
+
+    return ESP_OK;
+}
+
+static int32_t flac_read_sample_as_i2s32(const uint8_t *p, uint16_t bits_per_sample)
+{
+    if (bits_per_sample == 16) {
+        const uint32_t raw = static_cast<uint32_t>(p[0]) |
+            (static_cast<uint32_t>(p[1]) << 8);
+        const uint32_t sign_extended = (raw & 0x8000U) != 0 ? (raw | 0xFFFF0000U) : raw;
+        return static_cast<int32_t>(sign_extended << 16);
+    }
+    if (bits_per_sample == 24) {
+        const uint32_t raw = static_cast<uint32_t>(p[0]) |
+            (static_cast<uint32_t>(p[1]) << 8) |
+            (static_cast<uint32_t>(p[2]) << 16);
+        const uint32_t sign_extended = (raw & 0x800000U) != 0 ? (raw | 0xFF000000U) : raw;
+        return static_cast<int32_t>(sign_extended << 8);
+    }
+
+    const uint32_t raw = static_cast<uint32_t>(p[0]) |
+        (static_cast<uint32_t>(p[1]) << 8) |
+        (static_cast<uint32_t>(p[2]) << 16) |
+        (static_cast<uint32_t>(p[3]) << 24);
+    return static_cast<int32_t>(raw);
+}
+
+esp_err_t flac_decoder_register_backend()
+{
+    if (g_flac_backend_registered) {
+        return ESP_OK;
+    }
+
+    const esp_audio_err_t ret = esp_flac_dec_register();
+    if (ret != ESP_AUDIO_ERR_OK && ret != ESP_AUDIO_ERR_ALREADY_EXIST) {
+        ESP_LOGE(TAG, "注册乐鑫 FLAC 解码器失败：codec_ret=%d", static_cast<int>(ret));
+        return flac_audio_error_to_esp(ret);
+    }
+
+    g_flac_backend_registered = true;
+    ESP_LOGI(TAG, "乐鑫 FLAC 解码后端注册成功");
+    return ESP_OK;
+}
+
+esp_err_t flac_decoder_open(FlacDecoder *decoder, const char *path)
+{
+    if (decoder == nullptr || path == nullptr || path[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    flac_decoder_close(decoder);
+
+    esp_err_t ret = flac_decoder_register_backend();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    decoder->file = fopen(path, "rb");
+    if (decoder->file == nullptr) {
+        ESP_LOGE(TAG, "打开 FLAC 失败：%s", path);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    if (fseek(decoder->file, 0, SEEK_END) != 0) {
+        flac_decoder_close(decoder);
+        return ESP_FAIL;
+    }
+    const long file_size = ftell(decoder->file);
+    if (file_size <= 0) {
+        flac_decoder_close(decoder);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    decoder->file_size_bytes = static_cast<uint64_t>(file_size);
+
+    ret = flac_parse_streaminfo(decoder);
+    if (ret != ESP_OK) {
+        flac_decoder_close(decoder);
+        return ret;
+    }
+    ret = flac_validate_sink_format(decoder);
+    if (ret != ESP_OK) {
+        flac_decoder_close(decoder);
+        return ret;
+    }
+    if (decoder->sample_rate_hz > 96000U) {
+        ESP_LOGW(TAG, "高采样率 FLAC 实机验证：%luHz / %ubit / %u声道；请重点观察 refill预算、DMA余量和内部RAM",
+            static_cast<unsigned long>(decoder->sample_rate_hz),
+            static_cast<unsigned>(decoder->bits_per_sample),
+            static_cast<unsigned>(decoder->channels));
+    }
+
+    const size_t sample_bytes = decoder->bits_per_sample / 8U;
+    size_t decoded_capacity = static_cast<size_t>(decoder->max_block_size) * decoder->channels * sample_bytes;
+    if (decoded_capacity < FLAC_MIN_DECODED_BUFFER_BYTES) {
+        decoded_capacity = FLAC_MIN_DECODED_BUFFER_BYTES;
+    }
+    if (decoded_capacity > FLAC_MAX_DECODED_BUFFER_BYTES) {
+        ESP_LOGE(TAG, "FLAC STREAMINFO 要求过大的 PCM 缓冲：%u字节",
+            static_cast<unsigned>(decoded_capacity));
+        flac_decoder_close(decoder);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    decoder->input_buffer = flac_alloc_buffer(FLAC_INPUT_BUFFER_BYTES);
+    decoder->decoded_buffer = flac_alloc_buffer(decoded_capacity);
+    if (decoder->input_buffer == nullptr || decoder->decoded_buffer == nullptr) {
+        ESP_LOGE(TAG, "FLAC 流缓冲分配失败：输入=%u 输出=%u",
+            static_cast<unsigned>(FLAC_INPUT_BUFFER_BYTES),
+            static_cast<unsigned>(decoded_capacity));
+        flac_decoder_close(decoder);
+        return ESP_ERR_NO_MEM;
+    }
+    decoder->input_capacity = FLAC_INPUT_BUFFER_BYTES;
+    decoder->decoded_capacity = decoded_capacity;
+    if (decoder->max_frame_size > decoder->input_capacity) {
+        ESP_LOGW(TAG,
+            "FLAC 最大压缩帧=%luB 超过当前输入缓冲=%uB，单帧可能跨多次读取；高采样率优化时需要重点观察 refill 负载",
+            static_cast<unsigned long>(decoder->max_frame_size),
+            static_cast<unsigned>(decoder->input_capacity));
+    }
+
+    if (
+        decoder->flac_offset_bytes > static_cast<uint64_t>(LONG_MAX) ||
+        fseek(decoder->file, static_cast<long>(decoder->flac_offset_bytes), SEEK_SET) != 0
+    ) {
+        flac_decoder_close(decoder);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    ret = flac_prefetch_start(decoder);
+    if (ret != ESP_OK) {
+        flac_decoder_close(decoder);
+        return ret;
+    }
+
+    esp_audio_simple_dec_cfg_t cfg = {};
+    cfg.dec_type = ESP_AUDIO_SIMPLE_DEC_TYPE_FLAC;
+    cfg.dec_cfg = nullptr;
+    cfg.cfg_size = 0;
+    cfg.use_frame_dec = false;
+
+    esp_audio_simple_dec_handle_t handle = nullptr;
+    const esp_audio_err_t codec_ret = esp_audio_simple_dec_open(&cfg, &handle);
+    if (codec_ret != ESP_AUDIO_ERR_OK || handle == nullptr) {
+        ESP_LOGE(TAG, "打开乐鑫 FLAC Simple Decoder 失败：codec_ret=%d", static_cast<int>(codec_ret));
+        flac_decoder_close(decoder);
+        return flac_audio_error_to_esp(codec_ret);
+    }
+    decoder->simple_handle = handle;
+
+    // 在触碰 I2S/DAC 之前先解出第一块 PCM：既验证 Simple Decoder 真正可用，
+    // 又让正式起播后的第一批数据已经在 PSRAM 中，避免首帧解码造成时钟欠料。
+    ret = flac_decode_next_output(decoder);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "FLAC 首块 PCM 预解码失败：%s", esp_err_to_name(ret));
+        flac_decoder_close(decoder);
+        return ret;
+    }
+    if (decoder->decoded_size == 0) {
+        ESP_LOGE(TAG, "FLAC 首块 PCM 为空，拒绝启动播放链路");
+        flac_decoder_close(decoder);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    const size_t source_frame_bytes = sample_bytes * decoder->channels;
+    if (source_frame_bytes == 0 || decoder->decoded_size % source_frame_bytes != 0) {
+        ESP_LOGE(TAG, "FLAC 首块 PCM 长度与 %ubit/%u声道不整除：%u字节",
+            static_cast<unsigned>(decoder->bits_per_sample),
+            static_cast<unsigned>(decoder->channels),
+            static_cast<unsigned>(decoder->decoded_size));
+        flac_decoder_close(decoder);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    // 首块 PCM 是在 I2S 启动前预解码的，不会造成播放期 DMA 欠料。
+    // 运行期统计从正式播放开始重新计数，避免把首块预热耗时误判成 underrun 根因。
+    flac_perf_reset_runtime(decoder);
+
+    const FlacPrefetchContext *ready_prefetch = flac_prefetch_context(decoder);
+    ESP_LOGI(TAG, "FLAC流式解码已就绪：解码输入=%uB，预取环形=%uKB，PCM缓冲=%uB，首块PCM=%uB，优先使用PSRAM",
+        static_cast<unsigned>(decoder->input_capacity),
+        static_cast<unsigned>(ready_prefetch != nullptr ? ready_prefetch->ring_bytes / 1024U : 0U),
+        static_cast<unsigned>(decoder->decoded_capacity),
+        static_cast<unsigned>(decoder->decoded_size));
+    return ESP_OK;
+}
+
+esp_err_t flac_decoder_read_pcm32(
+    FlacDecoder *decoder,
+    int32_t *out_interleaved_stereo,
+    size_t max_frames,
+    size_t *out_frames)
+{
+    if (out_frames != nullptr) {
+        *out_frames = 0;
+    }
+    if (
+        decoder == nullptr ||
+        out_interleaved_stereo == nullptr ||
+        out_frames == nullptr ||
+        max_frames == 0 ||
+        !flac_decoder_is_open(decoder)
+    ) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const size_t sample_bytes = decoder->bits_per_sample / 8U;
+    const size_t source_frame_bytes = sample_bytes * decoder->channels;
+    size_t produced = 0;
+
+    while (produced < max_frames) {
+        if (decoder->decoded_offset >= decoder->decoded_size) {
+            esp_err_t ret = flac_decode_next_output(decoder);
+            if (ret != ESP_OK) {
+                return ret;
+            }
+            if (decoder->decoded_offset >= decoder->decoded_size) {
+                break;
+            }
+            if (decoder->decoded_size % source_frame_bytes != 0) {
+                ESP_LOGE(TAG, "FLAC PCM 输出长度与 %ubit/%u声道不整除：%u字节",
+                    static_cast<unsigned>(decoder->bits_per_sample),
+                    static_cast<unsigned>(decoder->channels),
+                    static_cast<unsigned>(decoder->decoded_size));
+                return ESP_ERR_INVALID_SIZE;
+            }
+        }
+
+        const size_t available_frames =
+            (decoder->decoded_size - decoder->decoded_offset) / source_frame_bytes;
+        const size_t copy_frames = (max_frames - produced) < available_frames
+            ? (max_frames - produced)
+            : available_frames;
+
+        const uint8_t *src = decoder->decoded_buffer + decoder->decoded_offset;
+        for (size_t i = 0; i < copy_frames; ++i) {
+            const int32_t left = flac_read_sample_as_i2s32(src, decoder->bits_per_sample);
+            int32_t right = left;
+            if (decoder->channels == 2) {
+                right = flac_read_sample_as_i2s32(src + sample_bytes, decoder->bits_per_sample);
+            }
+            out_interleaved_stereo[(produced + i) * 2] = left;
+            out_interleaved_stereo[(produced + i) * 2 + 1] = right;
+            src += source_frame_bytes;
+        }
+
+        const size_t consumed_bytes = copy_frames * source_frame_bytes;
+        decoder->decoded_offset += consumed_bytes;
+        decoder->frames_read += copy_frames;
+        produced += copy_frames;
+    }
+
+    *out_frames = produced;
+    return ESP_OK;
+}
+
+void flac_decoder_close(FlacDecoder *decoder)
+{
+    if (decoder == nullptr) {
+        return;
+    }
+
+    // FILE 在正式播放期间只由预取任务读取；关闭解码器前先停止预取任务，避免清理阶段继续访问 SD。
+    flac_prefetch_destroy(decoder);
+    if (decoder->simple_handle != nullptr) {
+        esp_audio_simple_dec_close(static_cast<esp_audio_simple_dec_handle_t>(decoder->simple_handle));
+        decoder->simple_handle = nullptr;
+    }
+    if (decoder->file != nullptr) {
+        fclose(decoder->file);
+        decoder->file = nullptr;
+    }
+    flac_free_buffer(decoder->input_buffer);
+    flac_free_buffer(decoder->decoded_buffer);
+
+    portENTER_CRITICAL(&g_flac_perf_snapshot_mux);
+    g_flac_perf_snapshot.active = false;
+    ++g_flac_perf_snapshot.sequence;
+    portEXIT_CRITICAL(&g_flac_perf_snapshot_mux);
+
+    *decoder = {};
+}
+
+bool flac_decoder_is_open(const FlacDecoder *decoder)
+{
+    return decoder != nullptr && decoder->file != nullptr && decoder->simple_handle != nullptr;
+}
+
+bool flac_decoder_is_eof(const FlacDecoder *decoder)
+{
+    return decoder != nullptr && decoder->eof && decoder->decoded_offset >= decoder->decoded_size;
+}

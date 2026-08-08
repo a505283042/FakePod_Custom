@@ -20,7 +20,9 @@ idf_component_register(
         "drivers/audio/i2s_output.c"
 
         "audio/audio_service.cpp"
+        "audio/decoders/pcm_decoder.cpp"
         "audio/decoders/wav_decoder.cpp"
+        "audio/decoders/flac_decoder.cpp"
 
         "media/library/media_library.cpp"
 
