@@ -19,7 +19,11 @@ esp_err_t pcm_decoder_register_backends()
     return ESP_OK;
 }
 
-esp_err_t pcm_decoder_open(PcmDecoder *decoder, PcmDecoderType type, const char *path)
+esp_err_t pcm_decoder_open(
+    PcmDecoder *decoder,
+    PcmDecoderType type,
+    const char *path,
+    AudioDecodeWorkspace *workspace)
 {
     if (decoder == nullptr || path == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -38,7 +42,7 @@ esp_err_t pcm_decoder_open(PcmDecoder *decoder, PcmDecoderType type, const char 
             }
             break;
         case PcmDecoderType::Flac:
-            ret = flac_decoder_open(&decoder->flac, path);
+            ret = flac_decoder_open(&decoder->flac, path, workspace);
             if (ret == ESP_OK) {
                 decoder->info.sample_rate_hz = decoder->flac.sample_rate_hz;
                 decoder->info.channels = decoder->flac.channels;
@@ -47,7 +51,7 @@ esp_err_t pcm_decoder_open(PcmDecoder *decoder, PcmDecoderType type, const char 
             }
             break;
         case PcmDecoderType::Mp3:
-            ret = mp3_decoder_open(&decoder->mp3, path);
+            ret = mp3_decoder_open(&decoder->mp3, path, workspace);
             if (ret == ESP_OK) {
                 decoder->info.sample_rate_hz = decoder->mp3.sample_rate_hz;
                 decoder->info.channels = decoder->mp3.channels;

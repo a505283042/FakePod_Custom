@@ -466,6 +466,25 @@ esp_err_t cs43131_prepare_headphone_playback_low_volume()
     return ESP_OK;
 }
 
+esp_err_t cs43131_set_pcm_volume_attenuation(uint8_t half_db_steps)
+{
+    if (!g_ready || g_device == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t ret = cs43131_write_reg(REG_PCM_VOLUME_B, half_db_steps);
+    if (ret == ESP_OK) {
+        ret = cs43131_write_reg(REG_PCM_VOLUME_A, half_db_steps);
+    }
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "PCM数字音量：衰减=%u.%udB，寄存器=0x%02X",
+            static_cast<unsigned>(half_db_steps / 2U),
+            static_cast<unsigned>((half_db_steps & 1U) ? 5U : 0U),
+            half_db_steps);
+    }
+    return ret;
+}
+
 esp_err_t cs43131_set_pcm_mute(bool mute)
 {
     if (!g_ready || g_device == nullptr) {

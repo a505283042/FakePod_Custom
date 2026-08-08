@@ -5,12 +5,14 @@
 #include <stdio.h>
 #include "esp_err.h"
 #include "audio_diag_config.h"
+#include "../audio_decode_workspace.h"
 
 // MP3 解码器只负责“压缩数据 -> PCM”，不拥有 I2S、DAC 或播放状态。
 // 当前先开放常见本地 MP3：44.1/48kHz、单/双声道，输出统一转换为 32bit 立体声容器。
 struct Mp3Decoder
 {
     FILE *file = nullptr;
+    AudioDecodeWorkspace *workspace = nullptr;
     void *simple_handle = nullptr;
 
     uint8_t *input_buffer = nullptr;
@@ -130,7 +132,7 @@ bool mp3_decoder_get_perf_snapshot(Mp3PerfSnapshot *out_snapshot);
 esp_err_t mp3_decoder_register_backend();
 
 // 打开本地 MP3 并预解码第一块 PCM，以便在启动 I2S/DAC 前确认真实输出格式。
-esp_err_t mp3_decoder_open(Mp3Decoder *decoder, const char *path);
+esp_err_t mp3_decoder_open(Mp3Decoder *decoder, const char *path, AudioDecodeWorkspace *workspace = nullptr);
 
 // 流式解码并统一转换为 32bit I2S 立体声容器；单声道自动复制到左右声道。
 esp_err_t mp3_decoder_read_pcm32(

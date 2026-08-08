@@ -438,7 +438,7 @@ static lv_obj_t *library_view_create_row(uint32_t slot, LibraryRowBinding *bindi
         }
 
         // 点歌曲即进入对应 Playback List Context 并开始播放。播放失败仍保留已选歌曲，回首页显示真实状态。
-        if (!player_control_toggle_play_pause()) {
+        if (!player_control_play_current()) {
             ESP_LOGW(TAG, "曲库选歌后播放请求未能入队");
         }
         player_home_refresh();

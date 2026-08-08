@@ -788,17 +788,29 @@ static esp_err_t flac_resize_decoded_buffer(FlacDecoder *decoder, size_t request
         return ESP_OK;
     }
 
-    uint8_t *new_buffer = flac_alloc_buffer(requested);
-    if (new_buffer == nullptr) {
-        ESP_LOGE(TAG, "FLAC PCM 输出缓冲分配失败：%u字节", static_cast<unsigned>(requested));
-        return ESP_ERR_NO_MEM;
+    uint8_t *new_buffer = nullptr;
+    esp_err_t reserve_ret = ESP_OK;
+    if (decoder->workspace != nullptr) {
+        reserve_ret = audio_decode_workspace_reserve_decoded(
+            decoder->workspace, requested, &new_buffer);
+    } else {
+        new_buffer = flac_alloc_buffer(requested);
+        reserve_ret = new_buffer != nullptr ? ESP_OK : ESP_ERR_NO_MEM;
     }
-    flac_free_buffer(decoder->decoded_buffer);
+    if (reserve_ret != ESP_OK || new_buffer == nullptr) {
+        ESP_LOGE(TAG, "FLAC PCM 输出缓冲分配失败：%u字节", static_cast<unsigned>(requested));
+        return reserve_ret != ESP_OK ? reserve_ret : ESP_ERR_NO_MEM;
+    }
+    if (decoder->workspace == nullptr) {
+        flac_free_buffer(decoder->decoded_buffer);
+    }
     decoder->decoded_buffer = new_buffer;
     decoder->decoded_capacity = requested;
     decoder->decoded_offset = 0;
     decoder->decoded_size = 0;
-    ESP_LOGI(TAG, "FLAC PCM 输出缓冲调整为 %u 字节", static_cast<unsigned>(requested));
+    ESP_LOGI(TAG, "FLAC PCM 输出缓冲调整为 %u 字节（shared=%u）",
+        static_cast<unsigned>(requested),
+        static_cast<unsigned>(decoder->workspace != nullptr));
     return ESP_OK;
 }
 
@@ -1252,7 +1264,7 @@ esp_err_t flac_decoder_register_backend()
     return ESP_OK;
 }
 
-esp_err_t flac_decoder_open(FlacDecoder *decoder, const char *path)
+esp_err_t flac_decoder_open(FlacDecoder *decoder, const char *path, AudioDecodeWorkspace *workspace)
 {
     if (decoder == nullptr || path == nullptr || path[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
@@ -1310,15 +1322,30 @@ esp_err_t flac_decoder_open(FlacDecoder *decoder, const char *path)
         return ESP_ERR_INVALID_SIZE;
     }
 
-    decoder->input_buffer = flac_alloc_buffer(FLAC_INPUT_BUFFER_BYTES);
-    decoder->decoded_buffer = flac_alloc_buffer(decoded_capacity);
-    if (decoder->input_buffer == nullptr || decoder->decoded_buffer == nullptr) {
-        ESP_LOGE(TAG, "FLAC 流缓冲分配失败：输入=%u 输出=%u",
-            static_cast<unsigned>(FLAC_INPUT_BUFFER_BYTES),
-            static_cast<unsigned>(decoded_capacity));
-        flac_decoder_close(decoder);
-        return ESP_ERR_NO_MEM;
+    decoder->workspace = workspace;
+    if (workspace != nullptr) {
+        ret = audio_decode_workspace_reserve_input(
+            workspace, FLAC_INPUT_BUFFER_BYTES, &decoder->input_buffer);
+        if (ret == ESP_OK) {
+            ret = audio_decode_workspace_reserve_decoded(
+                workspace, decoded_capacity, &decoder->decoded_buffer);
+        }
+    } else {
+        decoder->input_buffer = flac_alloc_buffer(FLAC_INPUT_BUFFER_BYTES);
+        decoder->decoded_buffer = flac_alloc_buffer(decoded_capacity);
+        ret = decoder->input_buffer != nullptr && decoder->decoded_buffer != nullptr
+            ? ESP_OK
+            : ESP_ERR_NO_MEM;
     }
+    if (ret != ESP_OK || decoder->input_buffer == nullptr || decoder->decoded_buffer == nullptr) {
+        ESP_LOGE(TAG, "FLAC 流缓冲分配失败：输入=%u 输出=%u shared=%u",
+            static_cast<unsigned>(FLAC_INPUT_BUFFER_BYTES),
+            static_cast<unsigned>(decoded_capacity),
+            static_cast<unsigned>(workspace != nullptr));
+        flac_decoder_close(decoder);
+        return ret != ESP_OK ? ret : ESP_ERR_NO_MEM;
+    }
+    // codec 可见窗口仍保持原参数，workspace 只复用底层 PSRAM，不改变 refill 调优结果。
     decoder->input_capacity = FLAC_INPUT_BUFFER_BYTES;
     decoder->decoded_capacity = decoded_capacity;
     if (decoder->max_frame_size > decoder->input_capacity) {
@@ -1483,8 +1510,11 @@ void flac_decoder_close(FlacDecoder *decoder)
         fclose(decoder->file);
         decoder->file = nullptr;
     }
-    flac_free_buffer(decoder->input_buffer);
-    flac_free_buffer(decoder->decoded_buffer);
+    // decoder input/PCM 若来自 AudioTask 共享 workspace，切歌时保留供下一 codec 复用。
+    if (decoder->workspace == nullptr) {
+        flac_free_buffer(decoder->input_buffer);
+        flac_free_buffer(decoder->decoded_buffer);
+    }
 
 #if APP_DIAG_FLAC_PERFORMANCE
     portENTER_CRITICAL(&g_flac_perf_snapshot_mux);

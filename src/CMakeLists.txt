@@ -20,6 +20,7 @@ idf_component_register(
         "drivers/audio/i2s_output.c"
 
         "audio/audio_service.cpp"
+        "audio/audio_decode_workspace.cpp"
         "audio/decoders/pcm_decoder.cpp"
         "audio/decoders/wav_decoder.cpp"
         "audio/decoders/flac_decoder.cpp"
@@ -35,6 +36,7 @@ idf_component_register(
 
         "player/player_playlist.cpp"
         "player/player_state.cpp"
+        "player/player_transport.cpp"
         "player/player_control.cpp"
 
         "ui/ui_manager.cpp"

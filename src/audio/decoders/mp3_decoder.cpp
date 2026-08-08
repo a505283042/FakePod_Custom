@@ -230,17 +230,31 @@ static esp_err_t mp3_resize_decoded_buffer(Mp3Decoder *decoder, size_t requested
         return ESP_OK;
     }
 
-    uint8_t *new_buffer = mp3_alloc_buffer(requested);
-    if (new_buffer == nullptr) {
-        ESP_LOGE(TAG, "MP3 PCM 输出缓冲分配失败：%u字节", static_cast<unsigned>(requested));
-        return ESP_ERR_NO_MEM;
+    uint8_t *new_buffer = nullptr;
+    esp_err_t reserve_ret = ESP_OK;
+    if (decoder->workspace != nullptr) {
+        reserve_ret = audio_decode_workspace_reserve_decoded(
+            decoder->workspace, requested, &new_buffer);
+    } else {
+        new_buffer = mp3_alloc_buffer(requested);
+        reserve_ret = new_buffer != nullptr ? ESP_OK : ESP_ERR_NO_MEM;
     }
-    mp3_free_buffer(decoder->decoded_buffer);
+    if (reserve_ret != ESP_OK || new_buffer == nullptr) {
+        ESP_LOGE(TAG, "MP3 PCM 输出缓冲分配失败：%u字节", static_cast<unsigned>(requested));
+        return reserve_ret != ESP_OK ? reserve_ret : ESP_ERR_NO_MEM;
+    }
+    if (decoder->workspace == nullptr) {
+        mp3_free_buffer(decoder->decoded_buffer);
+    }
     decoder->decoded_buffer = new_buffer;
+    // 即使共享 workspace 的实际容量更大，也保持 codec 可见窗口为 requested，
+    // 避免切换格式后无意改变经过实机验证的 decoder refill 行为。
     decoder->decoded_capacity = requested;
     decoder->decoded_offset = 0;
     decoder->decoded_size = 0;
-    ESP_LOGI(TAG, "MP3 PCM 输出缓冲调整为 %u 字节", static_cast<unsigned>(requested));
+    ESP_LOGI(TAG, "MP3 PCM 输出缓冲调整为 %u 字节（shared=%u）",
+        static_cast<unsigned>(requested),
+        static_cast<unsigned>(decoder->workspace != nullptr));
     return ESP_OK;
 }
 
@@ -577,7 +591,7 @@ esp_err_t mp3_decoder_register_backend()
     return ESP_OK;
 }
 
-esp_err_t mp3_decoder_open(Mp3Decoder *decoder, const char *path)
+esp_err_t mp3_decoder_open(Mp3Decoder *decoder, const char *path, AudioDecodeWorkspace *workspace)
 {
     if (decoder == nullptr || path == nullptr || path[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
@@ -605,15 +619,30 @@ esp_err_t mp3_decoder_open(Mp3Decoder *decoder, const char *path)
     }
     decoder->file_size_bytes = static_cast<uint64_t>(file_size);
 
-    decoder->input_buffer = mp3_alloc_buffer(MP3_INPUT_BUFFER_BYTES);
-    decoder->decoded_buffer = mp3_alloc_buffer(MP3_DECODED_BUFFER_BYTES);
-    if (decoder->input_buffer == nullptr || decoder->decoded_buffer == nullptr) {
-        ESP_LOGE(TAG, "MP3 流缓冲分配失败：输入=%u 输出=%u",
-            static_cast<unsigned>(MP3_INPUT_BUFFER_BYTES),
-            static_cast<unsigned>(MP3_DECODED_BUFFER_BYTES));
-        mp3_decoder_close(decoder);
-        return ESP_ERR_NO_MEM;
+    decoder->workspace = workspace;
+    if (workspace != nullptr) {
+        ret = audio_decode_workspace_reserve_input(
+            workspace, MP3_INPUT_BUFFER_BYTES, &decoder->input_buffer);
+        if (ret == ESP_OK) {
+            ret = audio_decode_workspace_reserve_decoded(
+                workspace, MP3_DECODED_BUFFER_BYTES, &decoder->decoded_buffer);
+        }
+    } else {
+        decoder->input_buffer = mp3_alloc_buffer(MP3_INPUT_BUFFER_BYTES);
+        decoder->decoded_buffer = mp3_alloc_buffer(MP3_DECODED_BUFFER_BYTES);
+        ret = decoder->input_buffer != nullptr && decoder->decoded_buffer != nullptr
+            ? ESP_OK
+            : ESP_ERR_NO_MEM;
     }
+    if (ret != ESP_OK || decoder->input_buffer == nullptr || decoder->decoded_buffer == nullptr) {
+        ESP_LOGE(TAG, "MP3 流缓冲分配失败：输入=%u 输出=%u shared=%u",
+            static_cast<unsigned>(MP3_INPUT_BUFFER_BYTES),
+            static_cast<unsigned>(MP3_DECODED_BUFFER_BYTES),
+            static_cast<unsigned>(workspace != nullptr));
+        mp3_decoder_close(decoder);
+        return ret != ESP_OK ? ret : ESP_ERR_NO_MEM;
+    }
+    // 保持 Stage 9.5 实机验证的逻辑窗口大小，不因 workspace 曾被 FLAC 扩大而变成 32KB fread。
     decoder->input_capacity = MP3_INPUT_BUFFER_BYTES;
     decoder->decoded_capacity = MP3_DECODED_BUFFER_BYTES;
 
@@ -741,8 +770,11 @@ void mp3_decoder_close(Mp3Decoder *decoder)
     if (decoder->file != nullptr) {
         fclose(decoder->file);
     }
-    mp3_free_buffer(decoder->input_buffer);
-    mp3_free_buffer(decoder->decoded_buffer);
+    // 使用共享 workspace 时缓冲归 AudioTask 生命周期所有，切歌只关闭 codec/FILE，不释放 PSRAM。
+    if (decoder->workspace == nullptr) {
+        mp3_free_buffer(decoder->input_buffer);
+        mp3_free_buffer(decoder->decoded_buffer);
+    }
 
 #if APP_DIAG_MP3_PERFORMANCE
     portENTER_CRITICAL(&g_mp3_perf_snapshot_mux);

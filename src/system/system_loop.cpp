@@ -7,6 +7,7 @@
 #include "esp_log.h"
 
 #include "boot_state.h"
+#include "player_control.h"
 #include "audio_diag_config.h"
 #if APP_DIAG_FLAC_PERFORMANCE
 #include "flac_decoder.h"
@@ -45,6 +46,11 @@ void system_loop_update()
 
         return;
     }
+
+
+    // Player transport 只观察 AudioTask POD Snapshot；自然 EOF 的续播决策在 loopTask 执行，
+    // AudioTask 本身不依赖 Player/Catalog，也不会直接选择下一首。
+    player_control_update();
 
 
     // ========================================================

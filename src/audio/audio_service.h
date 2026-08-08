@@ -28,5 +28,10 @@ bool audio_service_stop(bool wait = true);
 bool audio_service_pause(bool wait = true);
 bool audio_service_resume(bool wait = true);
 
+// 用户音量/静音同样只能通过 AudioTask 命令队列改变。
+// percent 范围 0~100；默认 80 保持 Stage 9.x 已实机验证的 -20dB 起始音量。
+bool audio_service_set_volume(uint8_t percent, bool wait = false);
+bool audio_service_set_mute(bool mute, bool wait = false);
+
 // 当前播放世代。播放新曲或停止时递增，用于后续取消过期异步操作。
 uint32_t audio_service_playback_revision();

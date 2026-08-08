@@ -15,6 +15,7 @@
 #include "display.h"
 #include "media_library.h"
 #include "player_state.h"
+#include "player_control.h"
 #include "ui_manager.h"
 
 
@@ -354,6 +355,11 @@ void boot_state_update()
 
             if (player_state_init() != ESP_OK) {
                 ESP_LOGE(TAG, "播放器选择状态初始化失败");
+                g_state = BootState::Error;
+                break;
+            }
+            if (player_control_init() != ESP_OK) {
+                ESP_LOGE(TAG, "播放器控制初始化失败");
                 g_state = BootState::Error;
                 break;
             }

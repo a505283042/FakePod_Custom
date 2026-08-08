@@ -15,6 +15,8 @@ static lv_obj_t *g_title = nullptr;
 static lv_obj_t *g_track_info = nullptr;
 static lv_obj_t *g_play_symbol = nullptr;
 static lv_obj_t *g_progress = nullptr;
+static lv_obj_t *g_loop_label = nullptr;
+static lv_obj_t *g_volume_label = nullptr;
 static uint32_t g_last_audio_state_revision = UINT32_MAX;
 
 static lv_obj_t *player_home_create_label(
@@ -44,6 +46,33 @@ static lv_obj_t *player_home_create_round_button(lv_obj_t *parent, int32_t size,
     lv_obj_t *label = player_home_create_label(
         button, symbol, lv_color_hex(0xFFFFFF), lv_font_default());
     lv_obj_center(label);
+    return button;
+}
+
+static lv_obj_t *player_home_create_top_button(
+    lv_obj_t *parent,
+    int32_t x,
+    int32_t width,
+    const char *text,
+    lv_obj_t **out_label)
+{
+    lv_obj_t *button = lv_button_create(parent);
+    ui_common_lock_object(button);
+    lv_obj_set_pos(button, x, 12);
+    lv_obj_set_size(button, width, 36);
+    lv_obj_set_style_radius(button, 12, 0);
+    lv_obj_set_style_bg_color(button, lv_color_hex(0x1B2029), 0);
+    lv_obj_set_style_bg_opa(button, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(button, 0, 0);
+    lv_obj_set_style_shadow_width(button, 0, 0);
+    lv_obj_set_style_pad_all(button, 0, 0);
+
+    lv_obj_t *label = player_home_create_label(
+        button, text, lv_color_hex(0xE9ECF1), font_manager_get_ui_font());
+    lv_obj_center(label);
+    if (out_label != nullptr) {
+        *out_label = label;
+    }
     return button;
 }
 
@@ -117,6 +146,21 @@ static void player_home_refresh_track(const AudioStateSnapshot *audio_snapshot)
         suffix);
 }
 
+static void player_home_refresh_transport_controls(const AudioStateSnapshot *snapshot)
+{
+    if (g_loop_label != nullptr) {
+        lv_label_set_text(g_loop_label,
+            player_transport_loop_mode_name(player_control_get_loop_mode()));
+    }
+    if (g_volume_label != nullptr && snapshot != nullptr) {
+        if (snapshot->user_muted) {
+            lv_label_set_text(g_volume_label, "静音");
+        } else {
+            lv_label_set_text_fmt(g_volume_label, "%u", static_cast<unsigned>(snapshot->volume_percent));
+        }
+    }
+}
+
 static void player_home_apply_audio_snapshot(const AudioStateSnapshot &snapshot)
 {
     if (g_play_symbol != nullptr) {
@@ -140,6 +184,7 @@ static void player_home_apply_audio_snapshot(const AudioStateSnapshot &snapshot)
     }
 
     player_home_refresh_track(&snapshot);
+    player_home_refresh_transport_controls(&snapshot);
 }
 
 static void player_home_audio_timer_cb(lv_timer_t *timer)
@@ -190,6 +235,38 @@ static void player_home_play_cb(lv_event_t *event)
     }
 }
 
+static void player_home_loop_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+        return;
+    }
+    player_control_cycle_loop_mode();
+    AudioStateSnapshot snapshot = {};
+    audio_service_get_snapshot(&snapshot);
+    player_home_refresh_transport_controls(&snapshot);
+}
+
+static void player_home_volume_down_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED && !player_control_volume_down()) {
+        ESP_LOGW(TAG, "降低音量请求未能入队");
+    }
+}
+
+static void player_home_volume_up_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED && !player_control_volume_up()) {
+        ESP_LOGW(TAG, "提高音量请求未能入队");
+    }
+}
+
+static void player_home_mute_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED && !player_control_toggle_mute()) {
+        ESP_LOGW(TAG, "静音切换请求未能入队");
+    }
+}
+
 static void player_home_library_cb(lv_event_t *event)
 {
     if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
@@ -218,28 +295,21 @@ void player_home_create(lv_obj_t *screen)
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x0E1117), 0);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
 
-    lv_obj_t *brand = player_home_create_label(
-        screen, "FakePod", lv_color_hex(0xF4F5F7), lv_font_default());
-    lv_obj_align(brand, LV_ALIGN_TOP_LEFT, 30, 26);
+    // 顶部控制条：循环模式 / 曲库 / 音量。音量数字本身可点击静音。
+    lv_obj_t *loop = player_home_create_top_button(screen, 12, 104, "顺序", &g_loop_label);
+    lv_obj_add_event_cb(loop, player_home_loop_cb, LV_EVENT_CLICKED, nullptr);
 
-    lv_obj_t *sd = player_home_create_label(
-        screen, LV_SYMBOL_SD_CARD, lv_color_hex(0xAAB2BF), lv_font_default());
-    lv_obj_align(sd, LV_ALIGN_TOP_RIGHT, -32, 26);
-
-    lv_obj_t *library = lv_button_create(screen);
-    ui_common_lock_object(library);
-    lv_obj_set_size(library, 76, 36);
-    lv_obj_align(library, LV_ALIGN_TOP_MID, 0, 12);
-    lv_obj_set_style_radius(library, 12, 0);
-    lv_obj_set_style_bg_color(library, lv_color_hex(0x1B2029), 0);
-    lv_obj_set_style_bg_opa(library, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(library, 0, 0);
-    lv_obj_set_style_shadow_width(library, 0, 0);
-    lv_obj_set_style_pad_all(library, 0, 0);
-    lv_obj_t *library_label = player_home_create_label(
-        library, "曲库", lv_color_hex(0xE9ECF1), font_manager_get_ui_font());
-    lv_obj_center(library_label);
+    lv_obj_t *library = player_home_create_top_button(screen, 192, 76, "曲库", nullptr);
     lv_obj_add_event_cb(library, player_home_library_cb, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *volume_down = player_home_create_top_button(screen, 302, 38, "-", nullptr);
+    lv_obj_add_event_cb(volume_down, player_home_volume_down_cb, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *volume = player_home_create_top_button(screen, 344, 58, "80", &g_volume_label);
+    lv_obj_add_event_cb(volume, player_home_mute_cb, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *volume_up = player_home_create_top_button(screen, 406, 38, "+", nullptr);
+    lv_obj_add_event_cb(volume_up, player_home_volume_up_cb, LV_EVENT_CLICKED, nullptr);
 
     lv_obj_t *cover = lv_obj_create(screen);
     ui_common_lock_object(cover);
@@ -307,9 +377,12 @@ void player_home_create(lv_obj_t *screen)
     if (!player_state_copy_list_label(list_label, sizeof(list_label))) {
         snprintf(list_label, sizeof(list_label), "未知列表");
     }
-    ESP_LOGI(TAG, "Stage 10.6 播放器首页已接入曲库列表上下文：列表=%s 位置=%u/%u 全局track=%u",
+    ESP_LOGI(TAG, "Stage 10.7 播放器首页已接入 Transport：列表=%s 位置=%u/%u 全局track=%u loop=%s volume=%u%% mute=%u",
         list_label,
         static_cast<unsigned>(player_state_get_list_count() > 0 ? player_state_get_list_position() + 1 : 0),
         static_cast<unsigned>(player_state_get_list_count()),
-        static_cast<unsigned>(media_library_get_count() > 0 ? player_state_get_index() : 0));
+        static_cast<unsigned>(media_library_get_count() > 0 ? player_state_get_index() : 0),
+        player_transport_loop_mode_name(player_control_get_loop_mode()),
+        static_cast<unsigned>(snapshot.volume_percent),
+        static_cast<unsigned>(snapshot.user_muted));
 }

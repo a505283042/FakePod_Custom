@@ -6,6 +6,7 @@
 #include "flac_decoder.h"
 #include "mp3_decoder.h"
 #include "wav_decoder.h"
+#include "../audio_decode_workspace.h"
 
 enum class PcmDecoderType : uint8_t
 {
@@ -35,7 +36,12 @@ struct PcmDecoder
 };
 
 esp_err_t pcm_decoder_register_backends();
-esp_err_t pcm_decoder_open(PcmDecoder *decoder, PcmDecoderType type, const char *path);
+esp_err_t pcm_decoder_open(
+    PcmDecoder *decoder,
+    PcmDecoderType type,
+    const char *path,
+    AudioDecodeWorkspace *workspace = nullptr
+);
 esp_err_t pcm_decoder_read_pcm32(
     PcmDecoder *decoder,
     int32_t *out_interleaved_stereo,

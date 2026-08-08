@@ -21,9 +21,13 @@ esp_err_t cs43131_enable_asp_input();
 // 读取 ASP 中断状态 2，用于检查 LRCK early/late/no-LRCK 等错误。
 esp_err_t cs43131_read_asp_status(uint8_t *status);
 
-// 配置 PCM 路径、0.5Vrms 满量程和 -40dB 数字音量，
+// 配置 PCM 路径、0.5Vrms 满量程和默认 -20dB 数字音量，
 // 按数据手册 pop-free 序列开启耳放；返回时 PCM 仍保持静音。
 esp_err_t cs43131_prepare_headphone_playback_low_volume();
+
+// 设置左右声道 PCM 数字衰减，单位为 0.5dB steps：0=0dB，40=-20dB。
+// 调用者负责确保该值处于芯片允许范围；运行期仅 AudioTask 调用。
+esp_err_t cs43131_set_pcm_volume_attenuation(uint8_t half_db_steps);
 
 // PCM 软斜坡静音/解除静音。
 esp_err_t cs43131_set_pcm_mute(bool mute);
