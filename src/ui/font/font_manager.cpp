@@ -31,7 +31,7 @@ static const char *TAG = "字体";
 // byte 1  bitmap width
 // byte 2  bitmap height
 // byte 3  x offset，int8
-// byte 4  字形顶部在行框中的 Y
+// byte 4  字形底部到整行底部的距离（bottom bearing）
 // byte 5  保留，目前文件中为 0
 // byte 6  开始为 2bpp 位图
 //
@@ -91,7 +91,8 @@ static uint32_t font_manager_lookup_glyph_offset(uint32_t unicode)
     }
 
     const uint32_t glyph_offset = font_manager_read_le32(g_context.data + table_offset);
-    if (glyph_offset == 0 || static_cast<size_t>(glyph_offset) + GLYPH_HEADER_SIZE > g_context.size) {
+    if (glyph_offset == 0 || glyph_offset == g_context.missing_glyph_offset ||
+        static_cast<size_t>(glyph_offset) + GLYPH_HEADER_SIZE > g_context.size) {
         return 0;
     }
 
@@ -115,9 +116,8 @@ static bool font_manager_get_glyph_dsc_cb(
 
     const uint32_t glyph_offset = font_manager_lookup_glyph_offset(unicode_letter);
     if (glyph_offset == 0) {
-        // 当前字体没有该字符时交给 LVGL fallback。
-        // 这样 FontAwesome 图标和英文可继续使用默认字体，
-        // 不会被原厂字体的缺字占位符截获。
+        // 正文不使用 LVGL fallback；返回 false 让 LVGL 按“本字体缺字”处理。
+        // Symbol 图标仍由页面显式选择 lv_font_default()。
         return false;
     }
 
@@ -126,13 +126,16 @@ static bool font_manager_get_glyph_dsc_cb(
     const uint8_t box_width = glyph[1];
     const uint8_t box_height = glyph[2];
     const int8_t offset_x = static_cast<int8_t>(glyph[3]);
-    const uint8_t top_y = glyph[4];
+    // 字体记录 byte[4] 是“字形底部到行底的距离”(bottom bearing)，
+    // 不是从行顶开始的 top_y。对齐 LVGL 时应转换成相对基线的 ofs_y。
+    // 例如本字体：A/a 的 bottom bearing=8，g=2；因此 g 会自然下伸 6px。
+    const uint8_t bottom_bearing = glyph[4];
 
     dsc_out->adv_w = is_tab ? static_cast<uint16_t>(advance_width) * 2 : advance_width;
     dsc_out->box_w = box_width;
     dsc_out->box_h = box_height;
     dsc_out->ofs_x = offset_x;
-    dsc_out->ofs_y = g_context.baseline_y - static_cast<int32_t>(top_y) - static_cast<int32_t>(box_height);
+    dsc_out->ofs_y = static_cast<int32_t>(bottom_bearing) - g_context.base_line;
     dsc_out->format = LV_FONT_GLYPH_FORMAT_A2;
     dsc_out->is_placeholder = false;
     dsc_out->gid.index = glyph_offset;
@@ -191,59 +194,91 @@ static const void *font_manager_get_glyph_bitmap_cb(
     return draw_buf;
 }
 
+
+
+
+
 static esp_err_t font_manager_analyze_metrics()
 {
-    uint16_t bottom_histogram[256] = {};
     uint32_t valid_glyphs = 0;
-    uint32_t max_bottom = 0;
+    uint32_t max_vertical_extent = 0;
 
     const uint32_t table_count = g_context.upper_inclusive - g_context.lower_exclusive;
     for (uint32_t index = 0; index < table_count; ++index) {
         const size_t table_offset = FONT_HEADER_SIZE + static_cast<size_t>(index) * sizeof(uint32_t);
         const uint32_t glyph_offset = font_manager_read_le32(g_context.data + table_offset);
-        if (glyph_offset == 0 || static_cast<size_t>(glyph_offset) + GLYPH_HEADER_SIZE > g_context.size) {
+        if (glyph_offset == 0 ||
+            glyph_offset == g_context.missing_glyph_offset ||
+            static_cast<size_t>(glyph_offset) + GLYPH_HEADER_SIZE > g_context.size) {
             continue;
         }
 
         const uint8_t *glyph = g_context.data + glyph_offset;
-        const uint32_t bottom = static_cast<uint32_t>(glyph[4]) + glyph[2];
-        if (bottom >= 256) {
-            continue;
-        }
-
-        bottom_histogram[bottom]++;
-        if (bottom > max_bottom) {
-            max_bottom = bottom;
+        // byte[4] 是 bottom bearing，因此 bearing + box_h 是该字形从行底向上的总占用。
+        const uint32_t vertical_extent = static_cast<uint32_t>(glyph[4]) + glyph[2];
+        if (vertical_extent > max_vertical_extent) {
+            max_vertical_extent = vertical_extent;
         }
         valid_glyphs++;
     }
 
-    if (valid_glyphs == 0 || max_bottom == 0) {
+    if (valid_glyphs == 0 || max_vertical_extent == 0) {
         ESP_LOGE(TAG, "字体中没有有效字形");
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    uint32_t baseline_y = 0;
-    uint16_t baseline_votes = 0;
-    for (uint32_t y = 0; y <= max_bottom; ++y) {
-        if (bottom_histogram[y] > baseline_votes) {
-            baseline_votes = bottom_histogram[y];
-            baseline_y = y;
+    // 用明确落在拉丁基线上的大写字母和数字推断 base_line。
+    // 不对全字体做众数统计，因为大量 CJK 字形会把基线误判成汉字的 bottom bearing。
+    static constexpr uint32_t BASELINE_ANCHORS[] = {
+        'A', 'H', 'M', 'N', 'X',
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'
+    };
+    uint16_t baseline_histogram[256] = {};
+    uint16_t anchor_count = 0;
+    for (uint32_t unicode : BASELINE_ANCHORS) {
+        const uint32_t glyph_offset = font_manager_lookup_glyph_offset(unicode);
+        if (glyph_offset == 0 ||
+            static_cast<size_t>(glyph_offset) + GLYPH_HEADER_SIZE > g_context.size) {
+            continue;
         }
+        const uint8_t bottom_bearing = g_context.data[glyph_offset + 4];
+        baseline_histogram[bottom_bearing]++;
+        anchor_count++;
     }
 
-    if (baseline_y > max_bottom) {
+    if (anchor_count == 0) {
+        ESP_LOGE(TAG, "无法从 ASCII 锚点推断字体基线");
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    g_context.line_height = static_cast<int32_t>(max_bottom);
-    g_context.baseline_y = static_cast<int32_t>(baseline_y);
-    g_context.base_line = static_cast<int32_t>(max_bottom - baseline_y);
+    uint32_t base_line = 0;
+    uint16_t baseline_votes = 0;
+    for (uint32_t y = 0; y < 256; ++y) {
+        if (baseline_histogram[y] > baseline_votes) {
+            baseline_votes = baseline_histogram[y];
+            base_line = y;
+        }
+    }
 
-    ESP_LOGI(TAG, "字体度量分析：有效字形=%lu，行高=%ld，基线=%ld",
+    if (base_line >= max_vertical_extent) {
+        ESP_LOGE(TAG, "字体基线异常：base_line=%lu line_height=%lu",
+            static_cast<unsigned long>(base_line),
+            static_cast<unsigned long>(max_vertical_extent));
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    g_context.line_height = static_cast<int32_t>(max_vertical_extent);
+    g_context.base_line = static_cast<int32_t>(base_line);
+    g_context.baseline_y = g_context.line_height - g_context.base_line;
+
+    ESP_LOGI(TAG,
+        "字体度量分析：有效字形=%lu，行高=%ld，base_line=%ld，baseline_y=%ld，ASCII锚点=%u票/%u",
         static_cast<unsigned long>(valid_glyphs),
         static_cast<long>(g_context.line_height),
-        static_cast<long>(g_context.base_line));
+        static_cast<long>(g_context.base_line),
+        static_cast<long>(g_context.baseline_y),
+        static_cast<unsigned>(baseline_votes),
+        static_cast<unsigned>(anchor_count));
 
     return ESP_OK;
 }
@@ -379,7 +414,9 @@ esp_err_t font_manager_init()
     g_ui_font.underline_position = -2;
     g_ui_font.underline_thickness = 1;
     g_ui_font.dsc = &g_context;
-    g_ui_font.fallback = lv_font_default();
+    // 所有正文/菜单只使用原厂中文字体；Symbol 图标由页面显式使用 lv_font_default()。
+    // 不再让正文缺字时偷偷切换成 LVGL 西文字体。
+    g_ui_font.fallback = nullptr;
     g_ui_font.user_data = nullptr;
 
     g_ready = true;

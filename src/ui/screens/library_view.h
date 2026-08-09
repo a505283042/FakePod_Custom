@@ -1,8 +1,16 @@
 #pragma once
 
+#include <stdint.h>
+
 #include "lvgl.h"
 
-// Stage 10.6：创建曲库覆盖层。默认隐藏，由播放器首页“曲库”入口打开。
+// P1.3.5.4：460x460 方屏曲库覆盖层。
+// 顶层左右滑切歌曲/歌手/专辑/年代；列表由 CST820 原始坐标直驱，抬手后追加轻量惯性并显示右侧位置条。
+// 搜索页复用同一虚拟列表；底部 2x5 键盘按字母组连续输入，多位 query 匹配运行时 initials SearchKey。
 void library_view_create(lv_obj_t *screen);
 void library_view_open();
 bool library_view_is_visible();
+
+// 由 ui_manager 的 CST820 原始指针路径旁路观察：
+// 普通曲库负责横向分类 + 纵向直驱列表；搜索模式只允许结果区纵向滚动，键盘区域交给 LVGL Button。
+void library_view_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick_ms);

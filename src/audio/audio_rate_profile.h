@@ -12,10 +12,9 @@ typedef struct
 } AudioRateProfile;
 
 // 统一维护 FakePod PCM 硬件采样率档位，避免 DAC、I2S 和解码器各自散落判断。
-// 176.4/192kHz 已通过首轮实时验证；192kHz 在 24 个描述符下长期 over_budget=0，
-// Stage 9.4.14 的 20 个描述符已通过约 4 分钟 192kHz 长时间验证：starve=0、over_budget=0，
-// Stage 9.4.15 再小步回收为 18 个描述符，192kHz 仍保留约 24ms DMA runway；
-// 本轮只回收内部 DMA RAM，不改变解码、预取和 DAC 参数。
+// PCM 硬件仍保留 192kHz 档位，供未来其它格式/专项测试使用。
+// P1.3.5.4.2 起，192kHz FLAC 因与 460x460 UI 同时运行时实时余量不足而正式禁用；
+// 44.1/48/88.2/96/176.4kHz FLAC 保持现有路径。稳定播放优先于极限规格。
 static inline bool audio_rate_profile_get(uint32_t sample_rate_hz, AudioRateProfile *out_profile)
 {
     // 显式初始化全部字段，避免 C++ 编译器把 {0} 视为仅初始化首字段并产生告警。
@@ -59,7 +58,9 @@ static inline bool audio_rate_profile_get(uint32_t sample_rate_hz, AudioRateProf
             profile.sample_rate_hz = 192000U;
             profile.cs43131_asp_sprate = 0x06U;
             profile.i2s_dma_desc_num = 18U;
-            profile.flac_stage_enabled = true;
+            // P1.3.5.4.2：正式关闭 192kHz FLAC。硬件档位仍保留，
+            // 但 FLAC decoder 的统一能力门禁会在打开 pipeline 前拒绝该采样率。
+            profile.flac_stage_enabled = false;
             break;
         default:
             return false;

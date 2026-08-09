@@ -63,7 +63,7 @@ static lv_obj_t *artwork_ui_create_label(
     ui_common_lock_object(label);
     lv_label_set_text(label, text);
     lv_obj_set_style_text_color(label, color, 0);
-    lv_obj_set_style_text_font(label, font != nullptr ? font : lv_font_default(), 0);
+    lv_obj_set_style_text_font(label, font != nullptr ? font : font_manager_get_ui_font(), 0);
     return label;
 }
 

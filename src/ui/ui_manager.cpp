@@ -10,6 +10,7 @@
 #include "cst820.h"
 #include "display.h"
 #include "font/font_manager.h"
+#include "gesture/gesture_router.h"
 #include "screens/player_home.h"
 #include "screens/library_view.h"
 
@@ -18,6 +19,8 @@ static lv_display_t *g_display = nullptr;
 static lv_indev_t *g_touch = nullptr;
 static bool g_ready = false;
 static esp_lv_decoder_handle_t g_image_decoder = nullptr;
+static int16_t g_touch_last_x = 0;
+static int16_t g_touch_last_y = 0;
 
 // CO5300 对局部刷新窗口有偶数对齐要求：
 // 起始 X/Y 必须为偶数，刷新宽度和高度也必须为偶数。
@@ -76,10 +79,30 @@ static void ui_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
         data->state = LV_INDEV_STATE_PRESSED;
         data->point.x = ui_clamp_coord(point.x, FAKEPOD_LCD_WIDTH - 1);
         data->point.y = ui_clamp_coord(point.y, FAKEPOD_LCD_HEIGHT - 1);
+        g_touch_last_x = data->point.x;
+        g_touch_last_y = data->point.y;
+        if (!library_view_is_visible()) {
+            gesture_router_feed_pointer(
+                true, g_touch_last_x, g_touch_last_y, static_cast<uint32_t>(lv_tick_get()));
+        } else {
+            gesture_router_reset();
+            library_view_feed_pointer(
+                true, g_touch_last_x, g_touch_last_y, static_cast<uint32_t>(lv_tick_get()));
+        }
         return;
     }
 
     data->state = LV_INDEV_STATE_RELEASED;
+    data->point.x = g_touch_last_x;
+    data->point.y = g_touch_last_y;
+    if (!library_view_is_visible()) {
+        gesture_router_feed_pointer(
+            false, g_touch_last_x, g_touch_last_y, static_cast<uint32_t>(lv_tick_get()));
+    } else {
+        gesture_router_reset();
+        library_view_feed_pointer(
+            false, g_touch_last_x, g_touch_last_y, static_cast<uint32_t>(lv_tick_get()));
+    }
 }
 
 esp_err_t ui_manager_init()
@@ -135,6 +158,7 @@ esp_err_t ui_manager_init()
     ESP_LOGI(TAG, "已启用 CO5300 局部刷新偶数对齐");
 
     ESP_LOGI(TAG, "正在注册 CST820 触摸输入");
+    gesture_router_reset();
     if (!lvgl_port_lock(0)) {
         ESP_LOGE(TAG, "获取 LVGL 锁失败");
         return ESP_FAIL;
@@ -150,7 +174,9 @@ esp_err_t ui_manager_init()
     lv_indev_set_type(g_touch, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(g_touch, ui_touch_read_cb);
     lv_indev_set_display(g_touch, g_display);
-    lv_indev_set_scroll_limit(g_touch, 255);
+    // P1.3.4.2：所有页面都不依赖 LVGL 原生滚动手势；曲库由 CST820 原始坐标直驱虚拟列表。
+    // 这里保留 8px 仅用于 LVGL 自身的 click/drag 判定，真正滚动不再受它影响。
+    lv_indev_set_scroll_limit(g_touch, 8);
     lv_indev_add_event_cb(g_touch, ui_touch_block_scroll_cb, LV_EVENT_SCROLL_BEGIN, nullptr);
     lv_indev_add_event_cb(g_touch, ui_touch_block_scroll_cb, LV_EVENT_SCROLL, nullptr);
 

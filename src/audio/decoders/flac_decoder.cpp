@@ -1108,10 +1108,17 @@ static esp_err_t flac_validate_sink_format(const FlacDecoder *decoder)
     }
 
     if (!audio_rate_profile_flac_enabled(decoder->sample_rate_hz)) {
-        ESP_LOGW(TAG, "当前 PCM 硬件档位不支持 FLAC=%luHz/%ubit/%u声道",
-            static_cast<unsigned long>(decoder->sample_rate_hz),
-            static_cast<unsigned>(decoder->bits_per_sample),
-            static_cast<unsigned>(decoder->channels));
+        if (decoder->sample_rate_hz == 192000U) {
+            ESP_LOGW(TAG,
+                "192kHz FLAC 已按稳定性策略禁用：%ubit/%u声道；176.4kHz 及以下 FLAC 仍支持",
+                static_cast<unsigned>(decoder->bits_per_sample),
+                static_cast<unsigned>(decoder->channels));
+        } else {
+            ESP_LOGW(TAG, "当前 PCM 硬件档位不支持 FLAC=%luHz/%ubit/%u声道",
+                static_cast<unsigned long>(decoder->sample_rate_hz),
+                static_cast<unsigned>(decoder->bits_per_sample),
+                static_cast<unsigned>(decoder->channels));
+        }
         return ESP_ERR_NOT_SUPPORTED;
     }
     if (decoder->channels != 1 && decoder->channels != 2) {
