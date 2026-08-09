@@ -14,7 +14,9 @@
 #include "media_catalog_v2.h"
 #include "app_diag_config.h"
 
+#if APP_DIAG_LIBRARY_ARTWORK
 static const char *TAG = "封面索引";
+#endif
 static constexpr size_t IMAGE_HEADER_SCAN_BYTES = 16U * 1024U;
 static constexpr size_t ID3_APIC_PREFIX_SCAN_BYTES = 64U * 1024U;
 

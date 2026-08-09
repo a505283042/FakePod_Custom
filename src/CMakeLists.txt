@@ -48,6 +48,8 @@ idf_component_register(
         "ui/ui_manager.cpp"
         "ui/ui_common.cpp"
         "ui/font/font_manager.cpp"
+        "ui/artwork/cover_surface_cache.cpp"
+        "ui/artwork/now_playing_artwork.cpp"
         "ui/screens/player_home.cpp"
         "ui/screens/library_view.cpp"
 
@@ -83,6 +85,7 @@ idf_component_register(
         "player"
 
         "ui"
+        "ui/artwork"
 
     REQUIRES
         esp_driver_i2c
@@ -91,6 +94,9 @@ idf_component_register(
         esp_driver_sdmmc
         esp_driver_spi
         esp_lcd
+        esp_lv_decoder
+        esp_new_jpeg
+        libpng
         esp_psram
         esp_timer
         fatfs

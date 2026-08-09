@@ -38,6 +38,10 @@ static constexpr size_t FLAC_PREFETCH_START_192K_BYTES = 64 * 1024;
 static constexpr uint32_t FLAC_PREFETCH_TASK_STACK_BYTES = 4096;
 static constexpr UBaseType_t FLAC_PREFETCH_TASK_PRIORITY = 4;
 static constexpr BaseType_t FLAC_PREFETCH_TASK_CORE = 1;
+// P1.2.15: cooperative waits must be expressed in RTOS ticks, not sub-tick milliseconds.
+// On a 100Hz FreeRTOS tick, pdMS_TO_TICKS(1) becomes 0 and does not truly block the task.
+static constexpr TickType_t FLAC_PREFETCH_COOPERATIVE_BLOCK_TICKS = 1;
+static constexpr uint32_t FLAC_PREFETCH_COOPERATIVE_READ_BATCH = 4;
 static constexpr TickType_t FLAC_PREFETCH_SEND_WAIT = pdMS_TO_TICKS(20);
 static constexpr TickType_t FLAC_PREFETCH_RECEIVE_WAIT = pdMS_TO_TICKS(20);
 // 首块 PCM 预解码发生在 I2S 启动前，不受实时播放预算约束。
@@ -121,6 +125,8 @@ struct FlacPrefetchContext
     size_t ring_bytes = 0;
     size_t read_chunk_bytes = 0;
     size_t start_target_bytes = 0;
+    uint32_t sample_rate_hz = 0;
+    bool storage_competes = false;
     volatile BaseType_t core_id = -1;
     volatile bool stop_requested = false;
     volatile bool eof = false;
@@ -135,6 +141,38 @@ struct FlacPrefetchContext
 };
 
 static bool g_flac_backend_registered = false;
+
+// P1.2.8：后台封面 I/O 只需要知道“当前 FLAC ring 是否有足够安全余量”。
+// 用独立 POD 快照避免 Artwork/System 直接碰 FlacPrefetchContext 生命周期。
+static portMUX_TYPE g_flac_storage_window_mux = portMUX_INITIALIZER_UNLOCKED;
+static FlacStorageWindowSnapshot g_flac_storage_window = {};
+
+static void flac_storage_window_publish(const FlacPrefetchContext *context)
+{
+    FlacStorageWindowSnapshot snapshot = {};
+    if (context != nullptr && context->stream != nullptr) {
+        snapshot.active = true;
+        snapshot.storage_competes = context->storage_competes;
+        snapshot.sample_rate_hz = context->sample_rate_hz;
+        snapshot.buffered_bytes = static_cast<uint32_t>(xStreamBufferBytesAvailable(context->stream));
+        snapshot.capacity_bytes = static_cast<uint32_t>(context->ring_bytes);
+    }
+
+    portENTER_CRITICAL(&g_flac_storage_window_mux);
+    g_flac_storage_window = snapshot;
+    portEXIT_CRITICAL(&g_flac_storage_window_mux);
+}
+
+bool flac_decoder_get_storage_window(FlacStorageWindowSnapshot *out_snapshot)
+{
+    if (out_snapshot == nullptr) {
+        return false;
+    }
+    portENTER_CRITICAL(&g_flac_storage_window_mux);
+    *out_snapshot = g_flac_storage_window;
+    portEXIT_CRITICAL(&g_flac_storage_window_mux);
+    return true;
+}
 
 #if APP_DIAG_FLAC_PERFORMANCE
 static portMUX_TYPE g_flac_prefetch_metrics_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -423,6 +461,7 @@ static void flac_prefetch_task(void *arg)
 #if APP_DIAG_FLAC_PERFORMANCE
     uint32_t stack_sample_counter = 0;
 #endif
+    uint32_t cooperative_read_count = 0;
     while (!context->stop_requested) {
 #if APP_DIAG_FLAC_PERFORMANCE
         if ((stack_sample_counter++ & 0x3FU) == 0U) {
@@ -441,15 +480,17 @@ static void flac_prefetch_task(void *arg)
                 FLAC_PREFETCH_SEND_WAIT
             );
             context->prefix_offset += sent;
+            flac_storage_window_publish(context);
             if (sent == 0) {
-                vTaskDelay(pdMS_TO_TICKS(1));
+                vTaskDelay(FLAC_PREFETCH_COOPERATIVE_BLOCK_TICKS);
             }
             continue;
         }
 
         const size_t free_bytes = xStreamBufferSpacesAvailable(context->stream);
         if (free_bytes < context->read_chunk_bytes) {
-            vTaskDelay(pdMS_TO_TICKS(1));
+            flac_storage_window_publish(context);
+            vTaskDelay(FLAC_PREFETCH_COOPERATIVE_BLOCK_TICKS);
             continue;
         }
 
@@ -478,6 +519,14 @@ static void flac_prefetch_task(void *arg)
                     FLAC_PREFETCH_SEND_WAIT
                 );
                 sent += chunk;
+            }
+            flac_storage_window_publish(context);
+
+            // Give Core1 a real idle window periodically without sleeping after every SD read.
+            // 48/96/192k profiles therefore move 32/64/128KB respectively before one tick block.
+            if (++cooperative_read_count >= FLAC_PREFETCH_COOPERATIVE_READ_BATCH) {
+                cooperative_read_count = 0;
+                vTaskDelay(FLAC_PREFETCH_COOPERATIVE_BLOCK_TICKS);
             }
         }
 
@@ -534,6 +583,7 @@ static void flac_prefetch_destroy(FlacDecoder *decoder)
     context->ring_storage = nullptr;
     context->read_buffer = nullptr;
     decoder->prefetch_context = nullptr;
+    flac_storage_window_publish(nullptr);
     heap_caps_free(context);
 }
 
@@ -555,6 +605,8 @@ static esp_err_t flac_prefetch_start(FlacDecoder *decoder)
     context->ring_bytes = profile.ring_bytes;
     context->read_chunk_bytes = profile.read_chunk_bytes;
     context->start_target_bytes = profile.start_target_bytes;
+    context->sample_rate_hz = decoder->sample_rate_hz;
+    context->storage_competes = strcmp(audio_source_name(decoder->source), "SD_FILE") == 0;
     if (decoder->prefetch_prefix_size > sizeof(context->prefix)) {
         decoder->prefetch_context = context;
         flac_prefetch_destroy(decoder);
@@ -586,6 +638,7 @@ static esp_err_t flac_prefetch_start(FlacDecoder *decoder)
     }
 
     decoder->prefetch_context = context;
+    flac_storage_window_publish(context);
     const BaseType_t task_ret = xTaskCreatePinnedToCore(
         flac_prefetch_task,
         "FlacPrefetch",
@@ -620,10 +673,11 @@ static esp_err_t flac_prefetch_start(FlacDecoder *decoder)
         !context->io_error &&
         xTaskGetTickCount() - start_tick < FLAC_PREFETCH_START_WAIT
     ) {
-        vTaskDelay(pdMS_TO_TICKS(1));
+        vTaskDelay(FLAC_PREFETCH_COOPERATIVE_BLOCK_TICKS);
     }
 
     const size_t primed = xStreamBufferBytesAvailable(context->stream);
+    flac_storage_window_publish(context);
     if (context->io_error || primed < minimum) {
         const bool io_error = context->io_error;
         ESP_LOGE(TAG, "FLAC 预取启动失败：已缓存=%uB，最低需要=%uB",
@@ -1309,6 +1363,7 @@ static esp_err_t flac_prepare_input_window(FlacDecoder *decoder, bool *out_recei
             receive_capacity,
             receive_wait
         );
+        flac_storage_window_publish(context);
 #if APP_DIAG_FLAC_PERFORMANCE
         const uint32_t wait_us = static_cast<uint32_t>(esp_timer_get_time() - wait_begin_us);
         decoder->perf_prefetch_wait_total_us += wait_us;
@@ -1716,6 +1771,12 @@ esp_err_t flac_decoder_register_backend()
 
     g_flac_backend_registered = true;
     ESP_LOGI(TAG, "乐鑫 FLAC 解码后端注册成功");
+    ESP_LOGI(TAG,
+        "P1.2.15 Cooperative Tick：RTOS=%uHz tick=%ums pdMS_TO_TICKS(1)=%u，每%u个SD块主动阻塞1tick",
+        static_cast<unsigned>(configTICK_RATE_HZ),
+        static_cast<unsigned>(portTICK_PERIOD_MS),
+        static_cast<unsigned>(pdMS_TO_TICKS(1)),
+        static_cast<unsigned>(FLAC_PREFETCH_COOPERATIVE_READ_BATCH));
     return ESP_OK;
 }
 

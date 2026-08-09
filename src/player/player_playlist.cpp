@@ -351,6 +351,72 @@ bool player_playlist_get_track_index(size_t *out_track_index)
     return true;
 }
 
+bool player_playlist_get_track_index_at_position(size_t position, size_t *out_track_index)
+{
+    if (out_track_index == nullptr || !playlist_catalog_generation_valid()) {
+        return false;
+    }
+    if (position > UINT32_MAX) {
+        return false;
+    }
+
+    const uint32_t pos = static_cast<uint32_t>(position);
+    uint32_t track_index = UINT32_MAX;
+
+    switch (g_context.type) {
+        case PlayerListType::AllTracks:
+            if (pos >= media_library_get_count()) return false;
+            track_index = pos;
+            break;
+
+        case PlayerListType::Artist:
+        {
+            MediaArtistGroupViewV2 view = {};
+            if (!media_groups_v2_get_artist(g_context.group_index, &view) ||
+                view.generation != g_context.catalog_generation ||
+                view.artist_id != g_context.group_id ||
+                pos >= view.track_count || view.track_indices == nullptr) {
+                return false;
+            }
+            track_index = view.track_indices[pos];
+            break;
+        }
+
+        case PlayerListType::Album:
+        {
+            MediaAlbumGroupViewV2 view = {};
+            if (!media_groups_v2_get_album(g_context.group_index, &view) ||
+                view.generation != g_context.catalog_generation ||
+                view.album_id != g_context.group_id ||
+                pos >= view.track_count || view.track_indices == nullptr) {
+                return false;
+            }
+            track_index = view.track_indices[pos];
+            break;
+        }
+
+        case PlayerListType::Decade:
+        {
+            MediaDecadeGroupViewV2 view = {};
+            if (!media_groups_v2_get_decade(g_context.group_index, &view) ||
+                view.generation != g_context.catalog_generation ||
+                view.decade_start != g_context.decade_start ||
+                view.unknown != g_context.decade_unknown ||
+                pos >= view.track_count || view.track_indices == nullptr) {
+                return false;
+            }
+            track_index = view.track_indices[pos];
+            break;
+        }
+    }
+
+    if (track_index >= media_library_get_count()) {
+        return false;
+    }
+    *out_track_index = static_cast<size_t>(track_index);
+    return true;
+}
+
 static bool playlist_move(int direction)
 {
     PlayerListSnapshot snapshot = {};

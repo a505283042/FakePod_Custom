@@ -44,6 +44,10 @@ bool player_playlist_get_snapshot(PlayerListSnapshot *out_snapshot);
 // 获取当前全局 Track index。
 bool player_playlist_get_track_index(size_t *out_track_index);
 
+// 解析当前列表中任意位置对应的全局 Track index，不修改当前播放位置。
+// 用于资源预热等只读场景；position 是列表内位置。
+bool player_playlist_get_track_index_at_position(size_t position, size_t *out_track_index);
+
 // 在当前列表中首尾循环移动。
 bool player_playlist_previous();
 bool player_playlist_next();

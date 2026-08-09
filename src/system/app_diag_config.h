@@ -56,6 +56,10 @@
 #define APP_DIAG_ARTWORK_LOADER 0
 #endif
 
+#ifndef APP_DIAG_ARTWORK_UI
+#define APP_DIAG_ARTWORK_UI 0
+#endif
+
 #ifndef APP_DIAG_SYSTEM_HEARTBEAT
 #define APP_DIAG_SYSTEM_HEARTBEAT 0
 #endif

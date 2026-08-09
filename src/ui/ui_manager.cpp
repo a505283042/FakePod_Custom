@@ -4,6 +4,7 @@
 
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
+#include "esp_lv_decoder.h"
 #include "lvgl.h"
 #include "board_pins.h"
 #include "cst820.h"
@@ -16,6 +17,7 @@ static const char *TAG = "界面";
 static lv_display_t *g_display = nullptr;
 static lv_indev_t *g_touch = nullptr;
 static bool g_ready = false;
+static esp_lv_decoder_handle_t g_image_decoder = nullptr;
 
 // CO5300 对局部刷新窗口有偶数对齐要求：
 // 起始 X/Y 必须为偶数，刷新宽度和高度也必须为偶数。
@@ -95,7 +97,7 @@ esp_err_t ui_manager_init()
     lvgl_port_cfg_t lvgl_cfg = {};
     lvgl_cfg.task_priority = 4;
     lvgl_cfg.task_stack = 6144;
-    lvgl_cfg.task_affinity = -1;
+    lvgl_cfg.task_affinity = 1;
     lvgl_cfg.task_max_sleep_ms = 100;
     lvgl_cfg.timer_period_ms = 5;
 
@@ -104,6 +106,8 @@ esp_err_t ui_manager_init()
         ESP_LOGE(TAG, "LVGL Port 初始化失败：%s", esp_err_to_name(ret));
         return ret;
     }
+    ESP_LOGI(TAG, "LVGL任务配置：core=1 priority=%u stack=%uB",
+        static_cast<unsigned>(lvgl_cfg.task_priority), static_cast<unsigned>(lvgl_cfg.task_stack));
 
     ESP_LOGI(TAG, "正在注册 CO5300 显示设备");
     lvgl_port_display_cfg_t disp_cfg = {};
@@ -149,6 +153,19 @@ esp_err_t ui_manager_init()
     lv_indev_set_scroll_limit(g_touch, 255);
     lv_indev_add_event_cb(g_touch, ui_touch_block_scroll_cb, LV_EVENT_SCROLL_BEGIN, nullptr);
     lv_indev_add_event_cb(g_touch, ui_touch_block_scroll_cb, LV_EVENT_SCROLL, nullptr);
+
+    // Stage 12.2：注册 Espressif LVGL JPEG/PNG 内存解码器。
+    // ArtworkLoader 已把压缩图放入 PSRAM，LVGL 只消费内存变量，不再访问 SD。
+    const esp_err_t decoder_ret = esp_lv_decoder_init(&g_image_decoder);
+    if (decoder_ret != ESP_OK) {
+        ESP_LOGW(TAG, "JPEG/PNG 图片解码器初始化失败，首页将使用默认封面：%s", esp_err_to_name(decoder_ret));
+        g_image_decoder = nullptr;
+    } else {
+        // P1.2 正常播放器封面已由 CoverSurfaceTask 预处理成 RGB565，不再依赖 LVGL decoded cache。
+        // 这里只给 progressive JPEG 等兼容回退和后续普通图片控件保留小缓存，避免与两张 460x460
+        // cover surface 同时长期占用数 MB PSRAM。
+        lv_image_cache_resize(512U * 1024U, true);
+    }
 
     const esp_err_t font_ret = font_manager_init();
     if (font_ret != ESP_OK) {

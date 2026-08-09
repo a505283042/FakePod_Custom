@@ -2353,6 +2353,12 @@ CONFIG_AUDIO_ENCODER_G722_SUPPORT=y
 # end of Audio Codec Configuration
 
 #
+# ESP LV Decoder
+#
+# CONFIG_ESP_LV_DECODER_PJPG_HW_ALPHA_BLEND is not set
+# end of ESP LV Decoder
+
+#
 # ESP LVGL PORT
 #
 # end of ESP LVGL PORT

@@ -1,0 +1,376 @@
+diff --git a/src/assets/artwork_loader.cpp b/src/assets/artwork_loader.cpp
+index f6391b6..1e431d7 100644
+--- a/src/assets/artwork_loader.cpp
++++ b/src/assets/artwork_loader.cpp
+@@ -16,7 +16,6 @@
+ 
+ #include "app_diag_config.h"
+ #include "flac_decoder.h"
+-#include "media_artwork.h"
+ #include "media_catalog_v2.h"
+ #include "media_library.h"
+ #include "storage_io.h"
+@@ -43,12 +42,8 @@ static constexpr size_t ARTWORK_CACHE_BUDGET_BYTES = 2U * 1024U * 1024U;
+ static constexpr size_t ARTWORK_MAX_COMPRESSED_BYTES = 2U * 1024U * 1024U;
+ // P1.2.9：SD 锁竞争是正常背压，不再映射成 ESP_ERR_TIMEOUT。
+ // 每次只尝试一个非常短的锁窗口；失败就阻塞后再试，让 FlacPrefetch 永远优先。
+-// Try-lock is intentionally non-blocking. Backoff/pause use real RTOS ticks: on a 100Hz
+-// ESP-IDF scheduler pdMS_TO_TICKS(2/5) is 0, which previously turned the retry path into
+-// a busy-yield loop and could starve IDLE1 long enough to trip the task watchdog.
+-static constexpr TickType_t ARTWORK_SD_LOCK_TRY = 0;
+-static constexpr TickType_t ARTWORK_SD_RETRY_DELAY = 1;
+-static constexpr TickType_t ARTWORK_FLAC_PAUSE_DELAY = 1;
++static constexpr TickType_t ARTWORK_SD_LOCK_TRY = pdMS_TO_TICKS(2);
++static constexpr TickType_t ARTWORK_SD_RETRY_DELAY = pdMS_TO_TICKS(3);
+ static constexpr TickType_t ARTWORK_PROGRESS_LOG_INTERVAL = pdMS_TO_TICKS(1000);
+ static constexpr uint32_t ARTWORK_FLAC_PAUSE_PERCENT = 65U;
+ static constexpr uint32_t ARTWORK_FLAC_MID_PERCENT = 80U;
+@@ -61,10 +56,7 @@ struct ArtworkLoadRequest
+     uint32_t track_index = UINT32_MAX;
+     ArtworkRefV2 ref = {};
+     char *source_path = nullptr;
+-    uint64_t source_file_size = 0U;
+-    MediaFormat track_format = MediaFormat::Unknown;
+     bool has_artwork = false;
+-    bool runtime_reprobed = false;
+ };
+ 
+ struct ArtworkCacheEntry
+@@ -255,9 +247,7 @@ static bool artwork_lock_next_slice(
+                     static_cast<unsigned long>(ring_percent),
+                     static_cast<unsigned long>(ARTWORK_FLAC_PAUSE_PERCENT));
+             }
+-            // Ring below the safe watermark is not an I/O error. Sleep long enough to
+-            // guarantee an Idle1 scheduling window instead of polling every few milliseconds.
+-            vTaskDelay(ARTWORK_FLAC_PAUSE_DELAY);
++            vTaskDelay(ARTWORK_SD_RETRY_DELAY);
+             continue;
+         }
+         if (storage_sd_lock(ARTWORK_SD_LOCK_TRY)) {
+@@ -293,72 +283,6 @@ private:
+     bool locked_ = false;
+ };
+ 
+-// P1.2.12：Catalog 没有 ArtworkRef 时做一次运行期自愈探测。
+-// 这不是第二套图片加载器：这里只重新获取 locator（offset/size/format），找到后仍走下方
+-// 2/4/8KB 增量读取与同一压缩缓存。探测也受 FLAC 安全窗口约束，不在音频低水位时抢 TF。
+-static esp_err_t artwork_runtime_reprobe_locator(ArtworkLoadRequest *request)
+-{
+-    if (request == nullptr || request->source_path == nullptr || request->source_path[0] == '\0' ||
+-        request->source_file_size == 0U ||
+-        (request->track_format != MediaFormat::MP3 && request->track_format != MediaFormat::FLAC)) {
+-        return ESP_ERR_NOT_FOUND;
+-    }
+-
+-    size_t ignored_chunk = 0U;
+-    FlacStorageWindowSnapshot window = {};
+-    ArtworkSdSliceGuard sd_lock(request, &ignored_chunk, &window);
+-    if (!sd_lock.locked()) {
+-        return ESP_ERR_INVALID_STATE;
+-    }
+-
+-    MediaArtworkBuildV2 probe = {};
+-    // media_artwork_scan_file_v2() 内部也使用递归 SD mutex；当前任务已持有同一把递归锁，
+-    // 因此不会再次等待。directory fallback 传 nullptr，只自愈内嵌 APIC/PICTURE。
+-    const esp_err_t probe_ret = media_artwork_scan_file_v2(
+-        request->source_path, request->track_format, request->source_file_size, nullptr, &probe
+-    );
+-    if (probe_ret != ESP_OK) {
+-        media_artwork_build_release_v2(&probe);
+-        return probe_ret;
+-    }
+-
+-    if (probe.source != MediaArtworkSourceV2::Mp3Apic &&
+-        probe.source != MediaArtworkSourceV2::FlacPicture) {
+-        media_artwork_build_release_v2(&probe);
+-        return ESP_ERR_NOT_FOUND;
+-    }
+-    if (probe.data_size == 0U || probe.data_size > ARTWORK_MAX_COMPRESSED_BYTES) {
+-        media_artwork_build_release_v2(&probe);
+-        return ESP_ERR_INVALID_SIZE;
+-    }
+-
+-    request->ref = {};
+-    request->ref.data_offset = probe.data_offset;
+-    request->ref.data_size = probe.data_size;
+-    request->ref.source_modified_time = probe.source_modified_time;
+-    request->ref.flags = probe.flags;
+-    request->ref.width = probe.width;
+-    request->ref.height = probe.height;
+-    request->ref.source = probe.source;
+-    request->ref.format = probe.format;
+-    request->ref.picture_type = probe.picture_type;
+-    request->has_artwork = true;
+-    request->runtime_reprobed = true;
+-
+-    ESP_LOGI(TAG,
+-        "运行期封面自愈成功：track=%lu source=%u offset=%llu size=%lu format=%u %ux%u",
+-        static_cast<unsigned long>(request->track_index),
+-        static_cast<unsigned>(request->ref.source),
+-        static_cast<unsigned long long>(request->ref.data_offset),
+-        static_cast<unsigned long>(request->ref.data_size),
+-        static_cast<unsigned>(request->ref.format),
+-        static_cast<unsigned>(request->ref.width),
+-        static_cast<unsigned>(request->ref.height));
+-
+-    media_artwork_build_release_v2(&probe);
+-    return ESP_OK;
+-}
+-
+ static void cache_release_entry_locked(ArtworkCacheEntry *entry)
+ {
+     if (entry == nullptr || !entry->valid || entry->pin_count != 0U) {
+@@ -712,7 +636,7 @@ static __attribute__((noinline)) esp_err_t artwork_read_blob(
+ 
+         if (loaded < request->ref.data_size) {
+             // 每个 slice 后必定阻塞一 tick，把 Core1/SD 窗口主动还给 FlacPrefetch/LVGL。
+-            vTaskDelay(1);
++            vTaskDelay(pdMS_TO_TICKS(1));
+         }
+     }
+ 
+@@ -764,8 +688,13 @@ static void artwork_task_main(void *)
+             static_cast<unsigned>(request->ref.source),
+             static_cast<unsigned long>(request->ref.data_size));
+ 
+-        // 先查压缩缓存。即使 Catalog 仍是 NoArtwork，只要本次运行曾经自愈成功并缓存过，
+-        // 后续再次播放也必须直接命中，而不能因为 catalog artwork_ref_id=INVALID 提前 NoArtwork。
++        if (!request->has_artwork) {
++            artwork_publish_state(ArtworkLoadState::NoArtwork, request, ESP_ERR_NOT_FOUND, false, 0U,
++                MediaArtworkFormatV2::Unknown, 0U, 0U);
++            artwork_request_release(request);
++            continue;
++        }
++
+         MediaArtworkFormatV2 cached_format = MediaArtworkFormatV2::Unknown;
+         uint16_t cached_width = 0U;
+         uint16_t cached_height = 0U;
+@@ -782,29 +711,6 @@ static void artwork_task_main(void *)
+             continue;
+         }
+ 
+-        if (!request->has_artwork) {
+-            const esp_err_t reprobe_ret = artwork_runtime_reprobe_locator(request);
+-            if (!artwork_request_is_latest(request)) {
+-                artwork_count_superseded();
+-                artwork_request_release(request);
+-                continue;
+-            }
+-            if (reprobe_ret != ESP_OK || !request->has_artwork) {
+-                if (reprobe_ret == ESP_ERR_NOT_FOUND) {
+-                    ESP_LOGI(TAG, "运行期复探未发现内嵌封面：track=%lu path=%s",
+-                        static_cast<unsigned long>(request->track_index),
+-                        request->source_path != nullptr ? request->source_path : "");
+-                } else {
+-                    ESP_LOGW(TAG, "运行期封面复探失败：track=%lu result=%s",
+-                        static_cast<unsigned long>(request->track_index), esp_err_to_name(reprobe_ret));
+-                }
+-                artwork_publish_state(ArtworkLoadState::NoArtwork, request, reprobe_ret, false, 0U,
+-                    MediaArtworkFormatV2::Unknown, 0U, 0U);
+-                artwork_request_release(request);
+-                continue;
+-            }
+-        }
+-
+         artwork_publish_state(ArtworkLoadState::Loading, request, ESP_OK, false, request->ref.data_size,
+             request->ref.format, request->ref.width, request->ref.height);
+ 
+@@ -901,13 +807,12 @@ esp_err_t artwork_loader_start()
+         return ESP_ERR_NO_MEM;
+     }
+ 
+-    ESP_LOGI(TAG, "ArtworkTask 已启动：核心=%ld，优先级=%u，栈=%uB，增量切片=2/4/8KB，压缩缓存=%u槽/%uKB，RTOS=%uHz",
++    ESP_LOGI(TAG, "ArtworkTask 已启动：核心=%ld，优先级=%u，栈=%uB，增量切片=2/4/8KB，压缩缓存=%u槽/%uKB",
+         static_cast<long>(ARTWORK_TASK_CORE),
+         static_cast<unsigned>(ARTWORK_TASK_PRIORITY),
+         static_cast<unsigned>(ARTWORK_TASK_STACK_BYTES),
+         static_cast<unsigned>(ARTWORK_CACHE_SLOT_COUNT),
+-        static_cast<unsigned>(ARTWORK_CACHE_BUDGET_BYTES / 1024U),
+-        static_cast<unsigned>(configTICK_RATE_HZ));
++        static_cast<unsigned>(ARTWORK_CACHE_BUDGET_BYTES / 1024U));
+     return ESP_OK;
+ }
+ 
+@@ -932,25 +837,15 @@ bool artwork_loader_request_track(uint32_t track_index, uint32_t *out_request_id
+     request->request_id = artwork_next_request_id();
+     request->track_index = track_index;
+ 
+-    // Catalog 指针只在这里短期使用；入队前把 locator、媒体格式、文件大小和 source path 全部复制出来。
+-    // 即使 Catalog 没有 ArtworkRef，也保留音频文件 path/format/size，供 ArtworkTask 运行期自愈复探。
++    // Catalog 指针只在这里短期使用；入队前把 locator 和 source path 全部复制出来。
+     const uint32_t generation_before = media_catalog_v2_generation();
+-    MediaTrackViewV2 track_view = {};
+-    if (!media_catalog_v2_get_track_view(track_index, &track_view) ||
+-        track_view.row == nullptr || track_view.path == nullptr) {
+-        artwork_request_release(request);
+-        return false;
+-    }
+-    request->catalog_generation = track_view.generation;
+-    request->track_format = track_view.row->format;
+-    request->source_file_size = track_view.row->file_size_bytes;
+-
+     MediaArtworkViewV2 view = {};
+     if (media_library_get_artwork_view(track_index, &view) && view.ref != nullptr) {
++        request->catalog_generation = view.generation;
+         request->ref = *view.ref;
+         const char *source_path = request->ref.source == MediaArtworkSourceV2::ExternalFile
+             ? view.external_path
+-            : track_view.path;
++            : media_library_get_path(track_index);
+         request->source_path = artwork_psram_strdup(source_path);
+         if (request->source_path == nullptr) {
+             artwork_request_release(request);
+@@ -958,11 +853,7 @@ bool artwork_loader_request_track(uint32_t track_index, uint32_t *out_request_id
+         }
+         request->has_artwork = true;
+     } else {
+-        request->source_path = artwork_psram_strdup(track_view.path);
+-        if (request->source_path == nullptr) {
+-            artwork_request_release(request);
+-            return false;
+-        }
++        request->catalog_generation = generation_before;
+         request->has_artwork = false;
+     }
+ 
+diff --git a/src/audio/decoders/flac_decoder.cpp b/src/audio/decoders/flac_decoder.cpp
+index 932087d..9252ebc 100644
+--- a/src/audio/decoders/flac_decoder.cpp
++++ b/src/audio/decoders/flac_decoder.cpp
+@@ -39,11 +39,6 @@ static constexpr uint32_t FLAC_PREFETCH_TASK_STACK_BYTES = 4096;
+ static constexpr UBaseType_t FLAC_PREFETCH_TASK_PRIORITY = 4;
+ static constexpr BaseType_t FLAC_PREFETCH_TASK_CORE = 1;
+ static constexpr TickType_t FLAC_PREFETCH_SEND_WAIT = pdMS_TO_TICKS(20);
+-// P1.2.14: use a literal RTOS tick, not pdMS_TO_TICKS(1). With the ESP-IDF default
+-// 100Hz scheduler, 1ms converts to 0 ticks and degenerates into a yield, which can keep
+-// IDLE1 permanently starved when Prefetch/Artwork/LVGL remain ready. One real tick is
+-// still tiny relative to the audio represented by each 8/16/32KB compressed read.
+-static constexpr TickType_t FLAC_PREFETCH_COOPERATIVE_DELAY = 1;
+ static constexpr TickType_t FLAC_PREFETCH_RECEIVE_WAIT = pdMS_TO_TICKS(20);
+ // 首块 PCM 预解码发生在 I2S 启动前，不受实时播放预算约束。
+ // 允许等待完整一次较慢的 SD 读取，避免较大的 Vorbis Comment/PICTURE 元数据
+@@ -482,7 +477,7 @@ static void flac_prefetch_task(void *arg)
+             context->prefix_offset += sent;
+             flac_storage_window_publish(context);
+             if (sent == 0) {
+-                vTaskDelay(FLAC_PREFETCH_COOPERATIVE_DELAY);
++                vTaskDelay(pdMS_TO_TICKS(1));
+             }
+             continue;
+         }
+@@ -490,7 +485,7 @@ static void flac_prefetch_task(void *arg)
+         const size_t free_bytes = xStreamBufferSpacesAvailable(context->stream);
+         if (free_bytes < context->read_chunk_bytes) {
+             flac_storage_window_publish(context);
+-            vTaskDelay(FLAC_PREFETCH_COOPERATIVE_DELAY);
++            vTaskDelay(pdMS_TO_TICKS(1));
+             continue;
+         }
+ 
+@@ -521,7 +516,6 @@ static void flac_prefetch_task(void *arg)
+                 sent += chunk;
+             }
+             flac_storage_window_publish(context);
+-            vTaskDelay(FLAC_PREFETCH_COOPERATIVE_DELAY);
+         }
+ 
+         if (source_ret != ESP_OK) {
+@@ -667,7 +661,7 @@ static esp_err_t flac_prefetch_start(FlacDecoder *decoder)
+         !context->io_error &&
+         xTaskGetTickCount() - start_tick < FLAC_PREFETCH_START_WAIT
+     ) {
+-        vTaskDelay(FLAC_PREFETCH_COOPERATIVE_DELAY);
++        vTaskDelay(pdMS_TO_TICKS(1));
+     }
+ 
+     const size_t primed = xStreamBufferBytesAvailable(context->stream);
+diff --git a/src/media/library/media_artwork.cpp b/src/media/library/media_artwork.cpp
+index 50b5900..af54fb6 100644
+--- a/src/media/library/media_artwork.cpp
++++ b/src/media/library/media_artwork.cpp
+@@ -452,7 +452,7 @@ static bool parse_apic_payload_locator(
+     return true;
+ }
+ 
+-static esp_err_t scan_id3_embedded(FILE *file, uint64_t file_size, MediaArtworkBuildV2 *selected)
++static esp_err_t scan_mp3_embedded(FILE *file, uint64_t file_size, MediaArtworkBuildV2 *selected)
+ {
+     if (file == nullptr || selected == nullptr || !seek_u64(file, 0U)) {
+         return ESP_ERR_INVALID_ARG;
+@@ -669,28 +669,12 @@ esp_err_t media_artwork_scan_file_v2(
+             return ESP_FAIL;
+         }
+         const esp_err_t embedded_ret = format == MediaFormat::MP3
+-            ? scan_id3_embedded(file, file_size, out_artwork)
+-            : ESP_OK;
+-
+-        // P1.2.13: Some FLAC files carry a leading ID3v2 tag with APIC/PIC artwork.
+-        // Parse that tag before the native FLAC PICTURE blocks. scan_flac_embedded()
+-        // already understands how to skip the leading ID3 tag to find the fLaC marker.
+-        esp_err_t flac_ret = ESP_OK;
+-        if (format == MediaFormat::FLAC && embedded_ret != ESP_ERR_NO_MEM) {
+-            const esp_err_t id3_ret = scan_id3_embedded(file, file_size, out_artwork);
+-            if (id3_ret == ESP_ERR_NO_MEM) {
+-                flac_ret = id3_ret;
+-            } else if (out_artwork->source == MediaArtworkSourceV2::None) {
+-                flac_ret = scan_flac_embedded(file, file_size, out_artwork);
+-            }
+-        }
++            ? scan_mp3_embedded(file, file_size, out_artwork)
++            : scan_flac_embedded(file, file_size, out_artwork);
+         fclose(file);
+         if (embedded_ret == ESP_ERR_NO_MEM) {
+             return embedded_ret;
+         }
+-        if (format == MediaFormat::FLAC && flac_ret == ESP_ERR_NO_MEM) {
+-            return flac_ret;
+-        }
+         // 单个损坏 APIC/PICTURE 不阻断 fallback；真正图片 locator 仍需 magic 校验才会进入结果。
+         if (out_artwork->source != MediaArtworkSourceV2::None) {
+ #if APP_DIAG_LIBRARY_ARTWORK
+@@ -785,14 +769,7 @@ esp_err_t media_artwork_clone_from_catalog_v2(
+     }
+ 
+     if (!have_current_external) {
+-        // P1.2.11：旧 Catalog 的 None 不能永久视为“已确认无封面”。
+-        // artwork 解析器后续可能增强（例如补充某些 FLAC PICTURE/APIC 兼容），
+-        // 因此仅对旧结果为 None 的少量 Track 在启动增量扫描时重新探测。
+-        // 这里用 ESP_ERR_NOT_FOUND 告诉上层“不要复用旧 locator，请重扫当前文件”。
+-        if (old_ref == nullptr) {
+-            return ESP_ERR_NOT_FOUND;
+-        }
+-        *out_unchanged = false;
++        *out_unchanged = old_ref == nullptr;
+         return ESP_OK;
+     }
+ 
+diff --git a/src/media/library/media_library.cpp b/src/media/library/media_library.cpp
+index 6cbb4d4..c70877f 100644
+--- a/src/media/library/media_library.cpp
++++ b/src/media/library/media_library.cpp
+@@ -567,11 +567,6 @@ static esp_err_t media_library_scan_with_scratch(MediaLibraryScanScratch *scratc
+                                             artwork_refreshed_count++;
+                                         }
+                                     } else {
+-                                        if (artwork_clone_ret == ESP_ERR_NOT_FOUND) {
+-                                            ESP_LOGI(TAG,
+-                                                "旧 Catalog 标记无封面，按当前解析器重新探测：%s",
+-                                                full_path);
+-                                        }
+                                         media_artwork_build_release_v2(artwork_build);
+                                         heap_caps_free(artwork_build);
+                                         artwork_build = nullptr;
+diff --git a/src/ui/ui_manager.cpp b/src/ui/ui_manager.cpp
+index e06a379..8154218 100644
+--- a/src/ui/ui_manager.cpp
++++ b/src/ui/ui_manager.cpp
+@@ -97,9 +97,6 @@ esp_err_t ui_manager_init()
+     lvgl_port_cfg_t lvgl_cfg = {};
+     lvgl_cfg.task_priority = 4;
+     lvgl_cfg.task_stack = 6144;
+-    // P1.2.13: restore strict domain separation. AudioTask + FlacPrefetch stay on Core0;
+-    // LVGL + Artwork + CoverSurface stay on Core1. This keeps UI/resource work out of the
+-    // real-time audio domain and removes FlacPrefetch from the Core1 idle budget.
+     lvgl_cfg.task_affinity = 1;
+     lvgl_cfg.task_max_sleep_ms = 100;
+     lvgl_cfg.timer_period_ms = 5;

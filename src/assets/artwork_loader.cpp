@@ -15,6 +15,7 @@
 #include "esp_log.h"
 
 #include "app_diag_config.h"
+#include "flac_decoder.h"
 #include "media_catalog_v2.h"
 #include "media_library.h"
 #include "storage_io.h"
@@ -30,11 +31,23 @@ static const char *TAG = "封面加载";
 static constexpr uint32_t ARTWORK_TASK_STACK_BYTES = 4096U;
 static constexpr UBaseType_t ARTWORK_TASK_PRIORITY = 2U;
 static constexpr BaseType_t ARTWORK_TASK_CORE = 1;
-static constexpr size_t ARTWORK_READ_CHUNK_BYTES = 8U * 1024U;
-static constexpr size_t ARTWORK_CACHE_SLOT_COUNT = 2U;
+// P1.2.9：压缩封面不再要求一次连续读完。ArtworkTask 只在 FLAC ring 有余量时
+// 抢一个很短的 SD 窗口，每次读 2/4/8KB，随后立即释放锁；水位不足或拿不到锁时
+// 只是暂停当前 Job，loaded offset 保留在 PSRAM buffer 中，下一轮继续，不从头重读。
+static constexpr size_t ARTWORK_READ_CHUNK_MIN_BYTES = 2U * 1024U;
+static constexpr size_t ARTWORK_READ_CHUNK_MID_BYTES = 4U * 1024U;
+static constexpr size_t ARTWORK_READ_CHUNK_MAX_BYTES = 8U * 1024U;
+static constexpr size_t ARTWORK_CACHE_SLOT_COUNT = 16U;
 static constexpr size_t ARTWORK_CACHE_BUDGET_BYTES = 2U * 1024U * 1024U;
 static constexpr size_t ARTWORK_MAX_COMPRESSED_BYTES = 2U * 1024U * 1024U;
-static constexpr TickType_t ARTWORK_SD_LOCK_TIMEOUT = pdMS_TO_TICKS(250);
+// P1.2.9：SD 锁竞争是正常背压，不再映射成 ESP_ERR_TIMEOUT。
+// 每次只尝试一个非常短的锁窗口；失败就阻塞后再试，让 FlacPrefetch 永远优先。
+static constexpr TickType_t ARTWORK_SD_LOCK_TRY = pdMS_TO_TICKS(2);
+static constexpr TickType_t ARTWORK_SD_RETRY_DELAY = pdMS_TO_TICKS(3);
+static constexpr TickType_t ARTWORK_PROGRESS_LOG_INTERVAL = pdMS_TO_TICKS(1000);
+static constexpr uint32_t ARTWORK_FLAC_PAUSE_PERCENT = 65U;
+static constexpr uint32_t ARTWORK_FLAC_MID_PERCENT = 80U;
+static constexpr uint32_t ARTWORK_FLAC_FAST_PERCENT = 90U;
 
 struct ArtworkLoadRequest
 {
@@ -172,6 +185,104 @@ static bool artwork_request_is_latest(const ArtworkLoadRequest *request)
     return request->catalog_generation == media_catalog_v2_generation();
 }
 
+static bool artwork_flac_slice_plan(size_t *out_chunk, FlacStorageWindowSnapshot *out_window = nullptr)
+{
+    if (out_chunk == nullptr) {
+        return false;
+    }
+    *out_chunk = ARTWORK_READ_CHUNK_MAX_BYTES;
+
+    FlacStorageWindowSnapshot window = {};
+    if (!flac_decoder_get_storage_window(&window) || !window.active ||
+        !window.storage_competes || window.capacity_bytes == 0U) {
+        if (out_window != nullptr) *out_window = window;
+        return true;
+    }
+
+    const uint64_t percent = static_cast<uint64_t>(window.buffered_bytes) * 100ULL /
+        static_cast<uint64_t>(window.capacity_bytes);
+    if (out_window != nullptr) *out_window = window;
+
+    if (percent < ARTWORK_FLAC_PAUSE_PERCENT) {
+        *out_chunk = 0U;
+        return false;
+    }
+    if (percent < ARTWORK_FLAC_MID_PERCENT) {
+        *out_chunk = ARTWORK_READ_CHUNK_MIN_BYTES;
+    } else if (percent < ARTWORK_FLAC_FAST_PERCENT) {
+        *out_chunk = ARTWORK_READ_CHUNK_MID_BYTES;
+    } else {
+        *out_chunk = ARTWORK_READ_CHUNK_MAX_BYTES;
+    }
+    return true;
+}
+
+// 等待一个真正安全的小 I/O 窗口。没有窗口不是错误：Job 保留 loaded offset，
+// 只要请求仍是 latest，就持续在后台等待；切歌后 latest-wins 会立即取消旧 Job。
+static bool artwork_lock_next_slice(
+    const ArtworkLoadRequest *request,
+    size_t *out_chunk,
+    FlacStorageWindowSnapshot *out_window = nullptr
+)
+{
+    if (out_chunk == nullptr) {
+        return false;
+    }
+    TickType_t last_wait_log = 0;
+    while (artwork_request_is_latest(request)) {
+        size_t planned = 0U;
+        FlacStorageWindowSnapshot window = {};
+        if (!artwork_flac_slice_plan(&planned, &window) || planned == 0U) {
+            if (out_window != nullptr) *out_window = window;
+            const TickType_t now = xTaskGetTickCount();
+            if (last_wait_log == 0 || now - last_wait_log >= ARTWORK_PROGRESS_LOG_INTERVAL) {
+                last_wait_log = now;
+                const uint32_t ring_percent = window.capacity_bytes == 0U ? 0U :
+                    static_cast<uint32_t>(static_cast<uint64_t>(window.buffered_bytes) * 100ULL /
+                                          static_cast<uint64_t>(window.capacity_bytes));
+                ESP_LOGI(TAG, "封面增量等待：track=%lu ring=%lu/%luB (%lu%%)，低于%lu%%暂停读TF",
+                    request != nullptr ? static_cast<unsigned long>(request->track_index) : 0UL,
+                    static_cast<unsigned long>(window.buffered_bytes),
+                    static_cast<unsigned long>(window.capacity_bytes),
+                    static_cast<unsigned long>(ring_percent),
+                    static_cast<unsigned long>(ARTWORK_FLAC_PAUSE_PERCENT));
+            }
+            vTaskDelay(ARTWORK_SD_RETRY_DELAY);
+            continue;
+        }
+        if (storage_sd_lock(ARTWORK_SD_LOCK_TRY)) {
+            *out_chunk = planned;
+            if (out_window != nullptr) *out_window = window;
+            return true;
+        }
+        vTaskDelay(ARTWORK_SD_RETRY_DELAY);
+    }
+    return false;
+}
+
+class ArtworkSdSliceGuard
+{
+public:
+    ArtworkSdSliceGuard(const ArtworkLoadRequest *request, size_t *out_chunk,
+                        FlacStorageWindowSnapshot *out_window = nullptr)
+        : locked_(artwork_lock_next_slice(request, out_chunk, out_window))
+    {
+    }
+
+    ~ArtworkSdSliceGuard()
+    {
+        if (locked_) storage_sd_unlock();
+    }
+
+    ArtworkSdSliceGuard(const ArtworkSdSliceGuard &) = delete;
+    ArtworkSdSliceGuard &operator=(const ArtworkSdSliceGuard &) = delete;
+
+    bool locked() const { return locked_; }
+
+private:
+    bool locked_ = false;
+};
+
 static void cache_release_entry_locked(ArtworkCacheEntry *entry)
 {
     if (entry == nullptr || !entry->valid || entry->pin_count != 0U) {
@@ -216,6 +327,23 @@ static int cache_find_lru_evictable_locked(int exclude_index = -1)
             return static_cast<int>(i);
         }
         if (entry.pin_count == 0U && (selected < 0 || entry.lru_stamp < oldest)) {
+            selected = static_cast<int>(i);
+            oldest = entry.lru_stamp;
+        }
+    }
+    return selected;
+}
+
+static int cache_find_lru_valid_evictable_locked(int exclude_index = -1)
+{
+    int selected = -1;
+    uint32_t oldest = UINT32_MAX;
+    for (size_t i = 0; i < ARTWORK_CACHE_SLOT_COUNT; ++i) {
+        if (static_cast<int>(i) == exclude_index) {
+            continue;
+        }
+        const ArtworkCacheEntry &entry = g_cache[i];
+        if (entry.valid && entry.pin_count == 0U && (selected < 0 || entry.lru_stamp < oldest)) {
             selected = static_cast<int>(i);
             oldest = entry.lru_stamp;
         }
@@ -289,10 +417,11 @@ static bool cache_insert(
         cache_release_entry_locked(&g_cache[slot]);
     }
 
-    // 在 2MB 总预算内保留最近两张压缩图。若另一槽未固定且预算不足，先按 LRU 淘汰。
+    // 最多 16 个元数据槽，但严格受 2MB 总预算约束。预算不足时只淘汰真实有效的 LRU，
+    // 因此已经成功读取过的较小压缩封面可以跨多首歌曲长期复用。
     while (cache_total_bytes_locked() + size > ARTWORK_CACHE_BUDGET_BYTES) {
-        const int victim = cache_find_lru_evictable_locked(slot);
-        if (victim < 0 || victim == slot || !g_cache[victim].valid) {
+        const int victim = cache_find_lru_valid_evictable_locked(slot);
+        if (victim < 0 || victim == slot) {
             break;
         }
         cache_release_entry_locked(&g_cache[victim]);
@@ -368,9 +497,10 @@ static esp_err_t artwork_validate_source(const ArtworkLoadRequest *request)
     }
     struct stat info = {};
     {
-        StorageSdLockGuard sd_lock(ARTWORK_SD_LOCK_TIMEOUT);
+        size_t ignored_chunk = 0U;
+        ArtworkSdSliceGuard sd_lock(request, &ignored_chunk);
         if (!sd_lock.locked()) {
-            return ESP_ERR_TIMEOUT;
+            return ESP_ERR_INVALID_STATE;
         }
         if (stat(request->source_path, &info) != 0 || info.st_size < 0) {
             return ESP_ERR_NOT_FOUND;
@@ -386,6 +516,18 @@ static esp_err_t artwork_validate_source(const ArtworkLoadRequest *request)
         return ESP_ERR_INVALID_STATE;
     }
     return ESP_OK;
+}
+
+static void artwork_close_file_cooperatively(FILE *file)
+{
+    if (file == nullptr) {
+        return;
+    }
+    while (!storage_sd_lock(ARTWORK_SD_LOCK_TRY)) {
+        vTaskDelay(ARTWORK_SD_RETRY_DELAY);
+    }
+    fclose(file);
+    storage_sd_unlock();
 }
 
 static __attribute__((noinline)) esp_err_t artwork_read_blob(
@@ -413,80 +555,92 @@ static __attribute__((noinline)) esp_err_t artwork_read_blob(
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    FILE *file = nullptr;
-    {
-        // 只在 fopen + seek 的短临界区持锁。文件句柄可以跨临界区存在，
-        // 但每一次真正 FATFS/SDMMC 操作仍必须重新进入同一把全局递归锁。
-        StorageSdLockGuard sd_lock(ARTWORK_SD_LOCK_TIMEOUT);
-        if (!sd_lock.locked()) {
-            return ESP_ERR_TIMEOUT;
-        }
-        file = fopen(request->source_path, "rb");
-        if (file == nullptr) {
-            return ESP_ERR_NOT_FOUND;
-        }
-        if (fseek(file, static_cast<long>(request->ref.data_offset), SEEK_SET) != 0) {
-            fclose(file);
-            return ESP_FAIL;
-        }
-    }
-
     uint8_t *data = static_cast<uint8_t *>(
         heap_caps_malloc(request->ref.data_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
     );
     if (data == nullptr) {
-        StorageSdLockGuard sd_lock;
-        if (sd_lock.locked()) {
-            fclose(file);
-        }
         return ESP_ERR_NO_MEM;
     }
 
+    FILE *file = nullptr;
+    {
+        size_t ignored_chunk = 0U;
+        ArtworkSdSliceGuard sd_lock(request, &ignored_chunk);
+        if (!sd_lock.locked()) {
+            heap_caps_free(data);
+            return ESP_ERR_INVALID_STATE;
+        }
+        file = fopen(request->source_path, "rb");
+        if (file == nullptr) {
+            heap_caps_free(data);
+            return ESP_ERR_NOT_FOUND;
+        }
+        if (fseek(file, static_cast<long>(request->ref.data_offset), SEEK_SET) != 0) {
+            fclose(file);
+            heap_caps_free(data);
+            return ESP_FAIL;
+        }
+    }
+
     size_t loaded = 0U;
-    esp_err_t result = ESP_OK;
+    TickType_t last_progress_log = xTaskGetTickCount();
+    uint8_t last_progress_bucket = 0U;
+
+    // 真正的“间隙读取”：FILE/offset 保持，但 SD mutex 绝不跨 slice 持有。
+    // 每次 ring 安全时只 fread 2/4/8KB，立即释放锁；水位不足时 loaded 保持原值暂停。
     while (loaded < request->ref.data_size) {
         if (!artwork_request_is_latest(request)) {
-            result = ESP_ERR_INVALID_STATE;
-            break;
+            artwork_close_file_cooperatively(file);
+            heap_caps_free(data);
+            return ESP_ERR_INVALID_STATE;
         }
-        const size_t remaining = static_cast<size_t>(request->ref.data_size) - loaded;
-        const size_t chunk = remaining < ARTWORK_READ_CHUNK_BYTES ? remaining : ARTWORK_READ_CHUNK_BYTES;
 
-        // 每个 8KB 块独立持锁：封面和 AudioSource 永远不会并行打 SD 总线，
-        // 同时避免低优先级 ArtworkTask 一次锁住整张几百 KB 的图片。
+        size_t planned_chunk = 0U;
+        FlacStorageWindowSnapshot window = {};
         {
-            StorageSdLockGuard sd_lock(ARTWORK_SD_LOCK_TIMEOUT);
+            ArtworkSdSliceGuard sd_lock(request, &planned_chunk, &window);
             if (!sd_lock.locked()) {
-                result = ESP_ERR_TIMEOUT;
-                break;
+                artwork_close_file_cooperatively(file);
+                heap_caps_free(data);
+                return ESP_ERR_INVALID_STATE;
             }
+
+            const size_t remaining = static_cast<size_t>(request->ref.data_size) - loaded;
+            const size_t chunk = remaining < planned_chunk ? remaining : planned_chunk;
             const size_t got = fread(data + loaded, 1, chunk, file);
             if (got != chunk) {
-                result = ESP_FAIL;
-                break;
+                artwork_close_file_cooperatively(file);
+                heap_caps_free(data);
+                return ESP_FAIL;
             }
             loaded += got;
         }
 
+        const uint8_t progress_bucket = static_cast<uint8_t>(
+            (static_cast<uint64_t>(loaded) * 4ULL) / static_cast<uint64_t>(request->ref.data_size));
+        const TickType_t now = xTaskGetTickCount();
+        if (progress_bucket > last_progress_bucket ||
+            now - last_progress_log >= ARTWORK_PROGRESS_LOG_INTERVAL) {
+            last_progress_bucket = progress_bucket;
+            last_progress_log = now;
+            const uint32_t ring_percent = window.capacity_bytes == 0U ? 100U :
+                static_cast<uint32_t>(static_cast<uint64_t>(window.buffered_bytes) * 100ULL /
+                                      static_cast<uint64_t>(window.capacity_bytes));
+            ESP_LOGI(TAG, "封面增量读取：track=%lu loaded=%u/%luB chunk=%uB ring=%lu%%",
+                static_cast<unsigned long>(request->track_index),
+                static_cast<unsigned>(loaded),
+                static_cast<unsigned long>(request->ref.data_size),
+                static_cast<unsigned>(planned_chunk),
+                static_cast<unsigned long>(ring_percent));
+        }
+
         if (loaded < request->ref.data_size) {
-            // 释放全局 SD 锁后再让出 CPU；Audio/扫描/其他资产任务可以先获得总线。
-            taskYIELD();
+            // 每个 slice 后必定阻塞一 tick，把 Core1/SD 窗口主动还给 FlacPrefetch/LVGL。
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
     }
 
-    {
-        StorageSdLockGuard sd_lock;
-        if (sd_lock.locked()) {
-            fclose(file);
-        } else if (result == ESP_OK) {
-            result = ESP_ERR_TIMEOUT;
-        }
-    }
-
-    if (result != ESP_OK) {
-        heap_caps_free(data);
-        return result;
-    }
+    artwork_close_file_cooperatively(file);
 
     size_t logical_size = loaded;
     if ((request->ref.flags & MEDIA_ARTWORK_REF_NEEDS_ID3_UNSYNC_V2) != 0U) {
@@ -653,11 +807,11 @@ esp_err_t artwork_loader_start()
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "ArtworkTask 已启动：核心=%ld，优先级=%u，栈=%uB，SD互斥分块=%uB，压缩缓存预算=%uKB",
+    ESP_LOGI(TAG, "ArtworkTask 已启动：核心=%ld，优先级=%u，栈=%uB，增量切片=2/4/8KB，压缩缓存=%u槽/%uKB",
         static_cast<long>(ARTWORK_TASK_CORE),
         static_cast<unsigned>(ARTWORK_TASK_PRIORITY),
         static_cast<unsigned>(ARTWORK_TASK_STACK_BYTES),
-        static_cast<unsigned>(ARTWORK_READ_CHUNK_BYTES),
+        static_cast<unsigned>(ARTWORK_CACHE_SLOT_COUNT),
         static_cast<unsigned>(ARTWORK_CACHE_BUDGET_BYTES / 1024U));
     return ESP_OK;
 }

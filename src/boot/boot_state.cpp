@@ -12,6 +12,7 @@
 #include "qmi8658.h"
 #include "audio_service.h"
 #include "artwork_loader.h"
+#include "cover_surface_cache.h"
 #include "sdcard.h"
 #include "display.h"
 #include "media_library.h"
@@ -369,6 +370,14 @@ void boot_state_update()
             const esp_err_t artwork_ret = artwork_loader_start();
             if (artwork_ret != ESP_OK) {
                 ESP_LOGW(TAG, "异步封面加载服务启动失败，继续无封面运行：%s", esp_err_to_name(artwork_ret));
+            } else {
+                // P1.2.5：低优先级封面预处理只消费 ArtworkLoader 的 PSRAM 压缩缓存，
+                // 不访问 SD；只生成一张 normal 460x460 RGB565 surface。Overlay 压暗由 LVGL alpha 完成。
+                const esp_err_t surface_ret = cover_surface_cache_start();
+                if (surface_ret != ESP_OK) {
+                    ESP_LOGW(TAG, "封面最终表面服务启动失败，将使用 LVGL decoder 回退：%s",
+                        esp_err_to_name(surface_ret));
+                }
             }
 
             g_state =

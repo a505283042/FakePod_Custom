@@ -49,16 +49,6 @@ static char *metadata_strdup(const char *text)
     return text != nullptr ? metadata_strdup_n(text, strlen(text)) : nullptr;
 }
 
-static void replace_string(char **target, char *value)
-{
-    if (target == nullptr) {
-        heap_caps_free(value);
-        return;
-    }
-    heap_caps_free(*target);
-    *target = value;
-}
-
 static void trim_ascii_in_place(char *text)
 {
     if (text == nullptr) {

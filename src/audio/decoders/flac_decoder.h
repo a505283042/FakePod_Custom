@@ -153,6 +153,20 @@ bool flac_decoder_get_perf_snapshot(FlacPerfSnapshot *out_snapshot);
 
 #endif
 
+// P1.2.8：给低优先级后台 SD I/O 一个只读的 FLAC 预取水位窗口。
+// 该快照只反映压缩 ring 的当前水位，不暴露 decoder/context 指针，跨任务读取安全。
+struct FlacStorageWindowSnapshot
+{
+    bool active = false;
+    bool storage_competes = false;
+    uint32_t sample_rate_hz = 0;
+    uint32_t buffered_bytes = 0;
+    uint32_t capacity_bytes = 0;
+};
+
+// 只读获取最近一次预取/消费更新后的 ring 水位。无活动 FLAC 时 active=false。
+bool flac_decoder_get_storage_window(FlacStorageWindowSnapshot *out_snapshot);
+
 // AudioTask 启动时调用一次，只注册 FLAC 后端，不注册无关编解码器。
 esp_err_t flac_decoder_register_backend();
 
