@@ -136,7 +136,7 @@ static void system_artwork_schedule_retry(bool current, uint32_t track_index)
     g_artwork_prewarm_stage = current
         ? ArtworkPrewarmStage::RetryCurrentCompressed
         : ArtworkPrewarmStage::RetryNextCompressed;
-    ESP_LOGW(TAG, "%s封面读取遇到存储繁忙：track=%lu，第%u次退避%lums后重试",
+    ESP_LOGW(TAG, "%s封面请求暂未完成：track=%lu，第%u次退避%lums后重试",
         current ? "当前曲" : "下一曲预热",
         static_cast<unsigned long>(track_index),
         static_cast<unsigned>(count),
@@ -195,6 +195,8 @@ static void system_artwork_begin_context(uint32_t generation, uint32_t current_t
     } else if (system_artwork_compressed_cached(current_track)) {
         if (cover_surface_cache_request_track(current_track, nullptr)) {
             g_artwork_prewarm_stage = ArtworkPrewarmStage::WaitCurrentSurface;
+        } else {
+            system_artwork_schedule_retry(true, current_track);
         }
     } else {
         ArtworkLoaderSnapshot loader = {};
@@ -205,6 +207,8 @@ static void system_artwork_begin_context(uint32_t generation, uint32_t current_t
         } else if (same_inflight && loader.state == ArtworkLoadState::Ready) {
             if (cover_surface_cache_request_track(current_track, nullptr)) {
                 g_artwork_prewarm_stage = ArtworkPrewarmStage::WaitCurrentSurface;
+            } else {
+                system_artwork_schedule_retry(true, current_track);
             }
         } else if (same_inflight &&
                    (loader.state == ArtworkLoadState::NoArtwork || loader.state == ArtworkLoadState::Failed)) {
@@ -214,6 +218,8 @@ static void system_artwork_begin_context(uint32_t generation, uint32_t current_t
             g_artwork_retry_due_tick = 0;
         } else if (artwork_loader_request_track(current_track, nullptr)) {
             g_artwork_prewarm_stage = ArtworkPrewarmStage::WaitCurrentCompressed;
+        } else {
+            system_artwork_schedule_retry(true, current_track);
         }
     }
 
@@ -254,12 +260,16 @@ static void system_artwork_prewarm_update()
             if (system_artwork_compressed_cached(current_track)) {
                 if (cover_surface_cache_request_track(current_track, nullptr)) {
                     g_artwork_prewarm_stage = ArtworkPrewarmStage::WaitCurrentSurface;
+                } else {
+                    system_artwork_schedule_retry(true, current_track);
                 }
                 break;
             }
             ArtworkLoaderSnapshot snapshot = {};
             if (!artwork_loader_get_snapshot(&snapshot) ||
                 snapshot.catalog_generation != generation || snapshot.track_index != current_track) {
+                // 请求刚入队时 snapshot 可能仍是上一条，先等待任务发布 Loading/Ready。
+                // 真正的提交失败已在 Request/Retry 分支转入退避，不在这里误判。
                 break;
             }
             if (snapshot.state == ArtworkLoadState::Failed && snapshot.result == ESP_ERR_TIMEOUT) {
@@ -279,6 +289,8 @@ static void system_artwork_prewarm_update()
             if (system_artwork_compressed_cached(current_track)) {
                 if (cover_surface_cache_request_track(current_track, nullptr)) {
                     g_artwork_prewarm_stage = ArtworkPrewarmStage::WaitCurrentSurface;
+                } else {
+                    system_artwork_schedule_retry(true, current_track);
                 }
             } else if (!system_artwork_storage_window_open(true, current_track)) {
                 break;
@@ -286,15 +298,23 @@ static void system_artwork_prewarm_update()
                 ESP_LOGI(TAG, "重试当前曲封面：track=%lu",
                     static_cast<unsigned long>(current_track));
                 g_artwork_prewarm_stage = ArtworkPrewarmStage::WaitCurrentCompressed;
+            } else {
+                system_artwork_schedule_retry(true, current_track);
             }
             break;
         }
 
         case ArtworkPrewarmStage::WaitCurrentSurface:
         {
+            if (system_cover_surface_cached(current_track)) {
+                g_artwork_prewarm_stage = ArtworkPrewarmStage::RequestNextCompressed;
+                break;
+            }
             CoverSurfaceSnapshot snapshot = {};
             if (!cover_surface_cache_get_snapshot(&snapshot) ||
                 snapshot.catalog_generation != generation || snapshot.track_index != current_track) {
+                // Surface 请求刚提交时 snapshot 可能仍属于上一首；缓存命中检查已在上方，
+                // 这里等待任务发布当前曲状态，避免把正常异步切换误判为丢请求。
                 break;
             }
             if (snapshot.state == CoverSurfaceState::Ready || snapshot.state == CoverSurfaceState::Failed) {
@@ -408,7 +428,19 @@ static void system_artwork_prewarm_update()
                 ESP_LOGI(TAG, "下一曲最终封面预热完成：track=%lu prepare=%lums",
                     static_cast<unsigned long>(g_artwork_next_track),
                     static_cast<unsigned long>(snapshot.prepare_ms));
-                g_artwork_prewarm_stage = ArtworkPrewarmStage::Complete;
+
+                // P1.5R.1.2.2：两槽 cache 的语义必须是 current + next。
+                // 如果由于旧 UI lease / 异常淘汰导致当前曲 Surface 已不在 cache，
+                // 不能把预热状态直接标成 Complete；立即重新建立当前曲资源编排。
+                if (!system_cover_surface_cached(current_track)) {
+                    ESP_LOGW(TAG,
+                        "下一曲预热后发现当前曲Surface缺失：current=%lu next=%lu，重新建立当前曲",
+                        static_cast<unsigned long>(current_track),
+                        static_cast<unsigned long>(g_artwork_next_track));
+                    system_artwork_begin_context(generation, current_track);
+                } else {
+                    g_artwork_prewarm_stage = ArtworkPrewarmStage::Complete;
+                }
             } else if (snapshot.state == CoverSurfaceState::Failed) {
                 g_artwork_prewarm_stage = ArtworkPrewarmStage::Complete;
             }
@@ -416,6 +448,11 @@ static void system_artwork_prewarm_update()
         }
 
         case ArtworkPrewarmStage::Idle:
+            // 防御性自恢复：当前 context 不应长期停在 Idle。若早期提交瞬态失败，
+            // 重新建立当前曲编排；失败分支会进入 RetryCurrentCompressed 而不是空转。
+            system_artwork_begin_context(generation, current_track);
+            break;
+
         case ArtworkPrewarmStage::Complete:
         default:
             break;

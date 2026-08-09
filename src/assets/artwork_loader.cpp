@@ -40,10 +40,12 @@ static constexpr size_t ARTWORK_READ_CHUNK_MAX_BYTES = 8U * 1024U;
 static constexpr size_t ARTWORK_CACHE_SLOT_COUNT = 16U;
 static constexpr size_t ARTWORK_CACHE_BUDGET_BYTES = 2U * 1024U * 1024U;
 static constexpr size_t ARTWORK_MAX_COMPRESSED_BYTES = 2U * 1024U * 1024U;
-// P1.2.9：SD 锁竞争是正常背压，不再映射成 ESP_ERR_TIMEOUT。
-// 每次只尝试一个非常短的锁窗口；失败就阻塞后再试，让 FlacPrefetch 永远优先。
-static constexpr TickType_t ARTWORK_SD_LOCK_TRY = pdMS_TO_TICKS(2);
-static constexpr TickType_t ARTWORK_SD_RETRY_DELAY = pdMS_TO_TICKS(3);
+// P1.5R.1：SD 锁竞争属于正常背压。锁尝试明确使用 0 tick（非阻塞），
+// 失败后明确阻塞 1 个 RTOS tick。禁止再用 pdMS_TO_TICKS(1/2/3)，因为
+// 在 100Hz tick 下这些值会变成 0，导致 ArtworkTask 看似 delay、实际仍 Ready。
+static constexpr TickType_t ARTWORK_SD_LOCK_TRY = 0;
+static constexpr TickType_t ARTWORK_SD_RETRY_DELAY = 1;
+static constexpr TickType_t ARTWORK_POST_SLICE_DELAY = 1;
 static constexpr TickType_t ARTWORK_PROGRESS_LOG_INTERVAL = pdMS_TO_TICKS(1000);
 static constexpr uint32_t ARTWORK_FLAC_PAUSE_PERCENT = 65U;
 static constexpr uint32_t ARTWORK_FLAC_MID_PERCENT = 80U;
@@ -636,7 +638,7 @@ static __attribute__((noinline)) esp_err_t artwork_read_blob(
 
         if (loaded < request->ref.data_size) {
             // 每个 slice 后必定阻塞一 tick，把 Core1/SD 窗口主动还给 FlacPrefetch/LVGL。
-            vTaskDelay(pdMS_TO_TICKS(1));
+            vTaskDelay(ARTWORK_POST_SLICE_DELAY);
         }
     }
 
@@ -813,6 +815,8 @@ esp_err_t artwork_loader_start()
         static_cast<unsigned>(ARTWORK_TASK_STACK_BYTES),
         static_cast<unsigned>(ARTWORK_CACHE_SLOT_COUNT),
         static_cast<unsigned>(ARTWORK_CACHE_BUDGET_BYTES / 1024U));
+    ESP_LOGI(TAG, "P1.5R.1 Tick Hygiene：SD锁=non-blocking，竞争重试=1tick，slice后让步=1tick，RTOS=%uHz",
+        static_cast<unsigned>(configTICK_RATE_HZ));
     return ESP_OK;
 }
 

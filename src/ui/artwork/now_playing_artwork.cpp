@@ -52,6 +52,7 @@ static bool g_has_compressed_source = false;
 static uint32_t g_context_generation = 0U;
 static uint32_t g_context_track = UINT32_MAX;
 static uint32_t g_last_loader_state_revision = UINT32_MAX;
+static bool g_active = true;
 
 static lv_obj_t *artwork_ui_create_label(
     lv_obj_t *parent,
@@ -414,12 +415,36 @@ esp_err_t now_playing_artwork_create(lv_obj_t *parent, int32_t size_px, lv_obj_t
 
 void now_playing_artwork_refresh_context()
 {
+    if (!g_active) return;
     artwork_ui_sync_context(false);
+}
+
+void now_playing_artwork_set_active(bool active)
+{
+    if (g_active == active) return;
+    g_active = active;
+
+    if (!g_active) {
+        // 页面被完整覆盖后，LVGL 不会再绘制这张图。立即释放 UI lease，
+        // 让两槽 cache 可以稳定保存 current + next，而不是 hidden-old + next。
+        artwork_ui_release_all_sources();
+        if (g_placeholder_icon != nullptr) lv_obj_add_flag(g_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
+        if (g_status != nullptr) lv_obj_add_flag(g_status, LV_OBJ_FLAG_HIDDEN);
+        ARTWORK_UI_TRACE("SUSPEND release leases context_track=%lu",
+            static_cast<unsigned long>(g_context_track));
+        return;
+    }
+
+    // 恢复时强制重新读取 Player context。即便切歌期间 UI timer 一直暂停，
+    // 也能直接 acquire 已预热好的当前曲 Surface；未命中则显示正确占位状态。
+    artwork_ui_sync_context(true);
+    ARTWORK_UI_TRACE("RESUME rebind context_track=%lu",
+        static_cast<unsigned long>(g_context_track));
 }
 
 void now_playing_artwork_update()
 {
-    if (g_container == nullptr) return;
+    if (g_container == nullptr || !g_active) return;
 
     artwork_ui_sync_context(false);
     if (g_context_track == UINT32_MAX) return;

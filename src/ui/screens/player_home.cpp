@@ -8,10 +8,13 @@
 #include "board_pins.h"
 #include "font/font_manager.h"
 #include "gesture/gesture_router.h"
+#include "input/touch_input.h"
 #include "media_library.h"
 #include "player_control.h"
 #include "player_state.h"
 #include "library_view.h"
+#include "lyrics/lyrics_view.h"
+#include "spectrum/spectrum_view.h"
 #include "ui_common.h"
 
 static const char *TAG = "首页";
@@ -25,8 +28,16 @@ static constexpr uint32_t kOverlayTimeoutMs = 5000U;
 // 仍只在 Overlay 显示期间启用，隐藏后立即回到原始全屏封面。
 static constexpr lv_opa_t kOverlayDimOpacity = 150U;
 static constexpr uint32_t kGestureHintTimeoutMs = 900U;
+// P1.5R.1.2：用户正在触摸或刚松手时，周期性状态/封面刷新主动让路。
+static constexpr uint32_t kInteractionYieldMs = 120U;
 // 约 220px 的纵向位移覆盖 0~100%。上滑增加，下滑降低；12px 起手阈值由 GestureRouter 负责。
 static constexpr int32_t kOverlayVolumeFullScalePx = 220;
+// P1.4.3.1：只有中央安全区的轻点可以打开 Overlay。
+// 顶部留给曲库下拉，底部留给 Launcher，左右边缘留给页面横滑。
+static constexpr int16_t kOverlayTapSafeLeftPx = 36;
+static constexpr int16_t kOverlayTapSafeTopPx = 60;
+static constexpr int16_t kOverlayTapSafeRightPx = 423;
+static constexpr int16_t kOverlayTapSafeBottomPx = 404;
 
 static lv_obj_t *g_overlay = nullptr;
 static lv_obj_t *g_overlay_backdrop = nullptr;
@@ -38,6 +49,9 @@ static bool g_overlay_dim_path_valid = false;
 static lv_obj_t *g_gesture_hint = nullptr;
 static lv_obj_t *g_gesture_hint_label = nullptr;
 static lv_timer_t *g_gesture_hint_timer = nullptr;
+static lv_timer_t *g_audio_timer = nullptr;
+static lv_timer_t *g_artwork_timer = nullptr;
+static bool g_background_timers_running = true;
 
 static lv_obj_t *g_title = nullptr;
 static lv_obj_t *g_track_info = nullptr;
@@ -335,10 +349,98 @@ static bool player_home_volume_gesture_update()
     return true;
 }
 
+static void player_home_update_background_timer_qos()
+{
+    // 主页被歌词/频谱/曲库完整覆盖时，不让主页自己的 100ms Audio/Artwork timer
+    // 继续在 LVGL P3 后台醒来。Gesture timer 保持运行，负责统一页面导航与恢复。
+    const bool should_run =
+        !library_view_is_visible() &&
+        !lyrics_view_is_visible() &&
+        !spectrum_view_is_visible();
+    if (should_run == g_background_timers_running) {
+        return;
+    }
+
+    g_background_timers_running = should_run;
+
+    // P1.5R.1.2.2：主页被完整覆盖时必须释放 Artwork UI lease。
+    // CoverSurface cache 只有两槽，隐藏主页继续 pin 旧曲会迫使下一曲预热淘汰“当前曲”。
+    // 恢复主页时 set_active(true) 会按当前 Player context 重新绑定 cache。
+    now_playing_artwork_set_active(should_run);
+
+    lv_timer_t *timers[] = {g_audio_timer, g_artwork_timer};
+    for (lv_timer_t *background_timer : timers) {
+        if (background_timer == nullptr) {
+            continue;
+        }
+        if (should_run) {
+            lv_timer_reset(background_timer);
+            lv_timer_resume(background_timer);
+        } else {
+            lv_timer_pause(background_timer);
+        }
+    }
+    ESP_LOGI(TAG, "P1.5R.1.2 主页后台timer：%s", should_run ? "恢复" : "暂停");
+}
+
 static void player_home_gesture_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
+    player_home_update_background_timer_qos();
     if (library_view_is_visible()) {
+        return;
+    }
+
+    // P1.4.3：歌词页与首页继续共用唯一 GestureRouter 消费点。
+    // 歌词 Overlay 显示时，纵向手势优先调音量；其余页面级手势全部锁定。
+    if (lyrics_view_is_visible()) {
+        if (lyrics_view_process_overlay_interaction()) {
+            return;
+        }
+        UiGestureAction lyrics_action = UiGestureAction::None;
+        if (!gesture_router_take_action(&lyrics_action)) {
+            return;
+        }
+        if (lyrics_view_overlay_is_visible()) {
+            ESP_LOGI(TAG, "歌词Overlay 已锁定页面手势：忽略 %s", gesture_router_action_name(lyrics_action));
+            return;
+        }
+        ESP_LOGI(TAG, "P1.4.3.2 歌词页手势命中：%s", gesture_router_action_name(lyrics_action));
+        switch (lyrics_action) {
+            case UiGestureAction::SwipeLeft:
+                lyrics_view_close();
+                player_home_refresh();
+                break;
+            case UiGestureAction::PullDownFromTop:
+                // P1.4.3.2：歌词页不再下拉进入曲库。曲库入口只保留在封面主页，
+                // 避免“歌词 -> 曲库 -> 返回主页”破坏当前页面上下文。
+                ESP_LOGI(TAG, "歌词页顶部下拉已禁用：请返回封面主页后进入曲库");
+                break;
+            default:
+                break;
+        }
+        return;
+    }
+
+    // P1.5.1：频谱页复用同一个 GestureRouter，但第一版只验证横向返回和持续刷新负载。
+    // 与歌词页一致，曲库入口仍只保留在封面主页；频谱页不开放顶部下拉。
+    if (spectrum_view_is_visible()) {
+        UiGestureAction spectrum_action = UiGestureAction::None;
+        if (!gesture_router_take_action(&spectrum_action)) {
+            return;
+        }
+        ESP_LOGI(TAG, "P1.5R.1.2 频谱页手势命中：%s", gesture_router_action_name(spectrum_action));
+        switch (spectrum_action) {
+            case UiGestureAction::SwipeRight:
+                spectrum_view_close();
+                player_home_refresh();
+                break;
+            case UiGestureAction::PullDownFromTop:
+                ESP_LOGI(TAG, "频谱页顶部下拉已禁用：请返回封面主页后进入曲库");
+                break;
+            default:
+                break;
+        }
         return;
     }
 
@@ -370,11 +472,11 @@ static void player_home_gesture_timer_cb(lv_timer_t *timer)
             break;
         case UiGestureAction::SwipeLeft:
             player_home_overlay_hide();
-            player_home_show_gesture_hint("频谱页 · P1.5");
+            spectrum_view_open();
             break;
         case UiGestureAction::SwipeRight:
             player_home_overlay_hide();
-            player_home_show_gesture_hint("歌词页 · P1.4");
+            lyrics_view_open();
             break;
         case UiGestureAction::PullUpFromBottom:
             player_home_overlay_hide();
@@ -387,9 +489,17 @@ static void player_home_gesture_timer_cb(lv_timer_t *timer)
 
 static void player_home_screen_tap_cb(lv_event_t *event)
 {
-    if (lv_event_get_code(event) == LV_EVENT_CLICKED && !player_home_click_suppressed()) {
-        player_home_overlay_show();
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED || player_home_click_suppressed()) {
+        return;
     }
+    if (!gesture_router_press_started_in_rect(
+            kOverlayTapSafeLeftPx,
+            kOverlayTapSafeTopPx,
+            kOverlayTapSafeRightPx,
+            kOverlayTapSafeBottomPx)) {
+        return;
+    }
+    player_home_overlay_show();
 }
 
 static void player_home_overlay_backdrop_tap_cb(lv_event_t *event)
@@ -750,6 +860,9 @@ static void player_home_apply_audio_snapshot(const AudioStateSnapshot &snapshot)
 static void player_home_artwork_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
+    if (ui_touch_input_recent_activity(kInteractionYieldMs)) {
+        return;
+    }
     now_playing_artwork_update();
     // 如果 Overlay 打开期间后台 surface 刚好准备完成，保持 alpha 黑层，不再切换第二张 Surface。
     if (g_overlay_visible) {
@@ -760,6 +873,9 @@ static void player_home_artwork_timer_cb(lv_timer_t *timer)
 static void player_home_audio_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
+    if (ui_touch_input_recent_activity(kInteractionYieldMs)) {
+        return;
+    }
     AudioStateSnapshot snapshot = {};
     if (!audio_service_get_snapshot(&snapshot)) {
         return;
@@ -842,8 +958,17 @@ void player_home_refresh()
     if (!audio_service_get_snapshot(&snapshot)) {
         return;
     }
+
+    // P1.5R.1.2.1：从歌词/频谱/曲库返回主页时，不能只切换 Artwork context 后
+    // 等待下一次 100ms timer。主页此刻已经可见，立即恢复后台 timer，并主动消费一次
+    // 当前曲 Surface/Loader 状态，避免切歌期间 timer 被暂停后长期停在“准备封面...”。
+    player_home_update_background_timer_qos();
     player_home_apply_audio_snapshot(snapshot);
     now_playing_artwork_refresh_context();
+    now_playing_artwork_update();
+    if (g_overlay_visible) {
+        player_home_overlay_apply_dim_path();
+    }
     g_last_audio_state_revision = snapshot.state_revision;
 }
 
@@ -862,6 +987,9 @@ void player_home_create(lv_obj_t *screen)
     g_gesture_hint = nullptr;
     g_gesture_hint_label = nullptr;
     g_gesture_hint_timer = nullptr;
+    g_audio_timer = nullptr;
+    g_artwork_timer = nullptr;
+    g_background_timers_running = true;
     gesture_router_reset();
 
     ui_common_lock_object(screen);
@@ -1034,8 +1162,8 @@ void player_home_create(lv_obj_t *screen)
     player_home_apply_audio_snapshot(snapshot);
     g_last_audio_state_revision = snapshot.state_revision;
 
-    lv_timer_create(player_home_audio_timer_cb, 100, nullptr);
-    lv_timer_create(player_home_artwork_timer_cb, 100, nullptr);
+    g_audio_timer = lv_timer_create(player_home_audio_timer_cb, 100, nullptr);
+    g_artwork_timer = lv_timer_create(player_home_artwork_timer_cb, 100, nullptr);
     lv_timer_create(player_home_gesture_timer_cb, 20, nullptr);
     g_overlay_timer = lv_timer_create(player_home_overlay_timeout_cb, kOverlayTimeoutMs, nullptr);
     g_gesture_hint_timer = lv_timer_create(
@@ -1055,7 +1183,7 @@ void player_home_create(lv_obj_t *screen)
         snprintf(list_label, sizeof(list_label), "未知列表");
     }
     ESP_LOGI(TAG,
-        "UI Reset P1.2.5 已启用：全屏 RGB565 单 Surface + Overlay alpha + 5s 自动隐藏；列表=%s 位置=%u/%u track=%u loop=%s volume=%u%% mute=%u",
+        "P1.5R.1.2.2 已启用：主页隐藏释放Artwork lease，恢复时重新绑定当前曲；两槽Surface cache保持current+next；列表=%s 位置=%u/%u track=%u loop=%s volume=%u%% mute=%u",
         list_label,
         static_cast<unsigned>(player_state_get_list_count() > 0 ? player_state_get_list_position() + 1 : 0),
         static_cast<unsigned>(player_state_get_list_count()),

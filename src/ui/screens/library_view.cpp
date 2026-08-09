@@ -73,6 +73,8 @@ static constexpr int32_t LIBRARY_SCROLLBAR_W = 4;
 static constexpr int32_t LIBRARY_SCROLLBAR_MARGIN_RIGHT = 5;
 static constexpr int32_t LIBRARY_SCROLLBAR_MARGIN_Y = 6;
 static constexpr int32_t LIBRARY_SCROLLBAR_MIN_THUMB_H = 28;
+// P1.5R.1.2：列表直驱期间位置条只需约20Hz，避免每个触摸采样都多改一个LVGL对象。
+static constexpr uint32_t LIBRARY_SCROLLBAR_TOUCH_UPDATE_MS = 48U;
 
 // 四个顶层浏览分类与 PlayerListType 对齐，但 UI 浏览状态仍与播放上下文分离。
 enum class LibraryBrowseMode : uint8_t
@@ -190,6 +192,9 @@ struct LibraryScrollbarState
     int32_t travel = 0;
     int32_t max_scroll = 0;
     bool visible = false;
+    uint32_t last_touch_update_tick_ms = 0U;
+    int32_t last_thumb_y = 0;
+    bool thumb_y_valid = false;
 };
 
 struct LibrarySearchKeyEntry
@@ -849,6 +854,9 @@ static void library_view_scrollbar_set_visible(bool visible)
     if (g_scrollbar.track == nullptr || g_scrollbar.thumb == nullptr) {
         return;
     }
+    if (g_scrollbar.visible == visible) {
+        return;
+    }
     g_scrollbar.visible = visible;
     if (visible) {
         lv_obj_remove_flag(g_scrollbar.track, LV_OBJ_FLAG_HIDDEN);
@@ -856,6 +864,8 @@ static void library_view_scrollbar_set_visible(bool visible)
     } else {
         lv_obj_add_flag(g_scrollbar.track, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(g_scrollbar.thumb, LV_OBJ_FLAG_HIDDEN);
+        g_scrollbar.last_touch_update_tick_ms = 0U;
+        g_scrollbar.thumb_y_valid = false;
     }
 }
 
@@ -865,10 +875,31 @@ static void library_view_scrollbar_update_position()
         g_scrollbar.max_scroll <= 0 || g_scrollbar.travel < 0) {
         return;
     }
+
+    // 列表本体必须逐触摸采样跟手；右侧位置条只是辅助视觉。
+    // 手指按住期间把 thumb 更新限到约20Hz，释放后立即补一次最终位置。
+    if (g_gesture.pressed) {
+        const uint32_t now = static_cast<uint32_t>(lv_tick_get());
+        if (g_scrollbar.last_touch_update_tick_ms != 0U &&
+            static_cast<uint32_t>(now - g_scrollbar.last_touch_update_tick_ms) <
+                LIBRARY_SCROLLBAR_TOUCH_UPDATE_MS) {
+            return;
+        }
+        g_scrollbar.last_touch_update_tick_ms = now;
+    } else {
+        g_scrollbar.last_touch_update_tick_ms = 0U;
+    }
+
     const int32_t thumb_offset = static_cast<int32_t>(
         (static_cast<int64_t>(g_scrollbar.travel) * static_cast<int64_t>(g_manual_scroll_y)) /
         static_cast<int64_t>(g_scrollbar.max_scroll));
-    lv_obj_set_y(g_scrollbar.thumb, g_scrollbar.track_y + thumb_offset);
+    const int32_t thumb_y = g_scrollbar.track_y + thumb_offset;
+    if (g_scrollbar.thumb_y_valid && g_scrollbar.last_thumb_y == thumb_y) {
+        return;
+    }
+    lv_obj_set_y(g_scrollbar.thumb, thumb_y);
+    g_scrollbar.last_thumb_y = thumb_y;
+    g_scrollbar.thumb_y_valid = true;
 }
 
 static void library_view_scrollbar_rebuild_geometry()
@@ -908,6 +939,8 @@ static void library_view_scrollbar_rebuild_geometry()
     g_scrollbar.thumb_h = thumb_h;
     g_scrollbar.travel = track_h - thumb_h;
     g_scrollbar.max_scroll = max_scroll;
+    g_scrollbar.last_touch_update_tick_ms = 0U;
+    g_scrollbar.thumb_y_valid = false;
 
     lv_obj_set_pos(g_scrollbar.track, x, y);
     lv_obj_set_size(g_scrollbar.track, LIBRARY_SCROLLBAR_W, track_h);
@@ -1884,9 +1917,9 @@ void library_view_create(lv_obj_t *screen)
     lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
     library_view_render(false);
 
-    ESP_LOGI(TAG, "Build=P1.3.5.4.5 OverlayVerticalVolume");
+    ESP_LOGI(TAG, "Build=P1.5R.1.2.2 ArtworkLeaseLifecycle");
     ESP_LOGI(TAG,
-        "P1.3.5.4.5 方屏曲库：Direct Touch保持；全部FLAC禁用惯性；仅192kHz FLAC禁用，176.4kHz保留；Overlay半透明黑层保持；Overlay任意位置纵向拖动预览音量并松手提交，横滑继续锁定；FLAC仅暂停态允许Seek；右侧%dpx位置条保持",
+        "P1.5R.1.2.2：Artwork Lease Lifecycle已启用；主页隐藏释放旧Surface lease，恢复时重绑当前曲；两槽cache保持current+next；P1.5R.1.2 Interaction QoS保持；右侧%dpx位置条保持",
         static_cast<int>(LIBRARY_SCROLLBAR_W));
 }
 
@@ -2114,6 +2147,9 @@ void library_view_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick
     g_gesture.scroll_velocity_px_s = 0;
     g_gesture.last_sample_tick_ms = 0U;
     g_gesture.last_motion_tick_ms = 0U;
+
+    // Direct Touch 已结束：辅助位置条立即追到最终位置，不把节流残留到抬手后。
+    library_view_scrollbar_update_position();
 
     if (start_inertia) {
         library_view_inertia_start(release_velocity, tick_ms);

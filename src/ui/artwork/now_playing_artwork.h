@@ -12,6 +12,11 @@ esp_err_t now_playing_artwork_create(lv_obj_t *parent, int32_t size_px, lv_obj_t
 void now_playing_artwork_update();
 void now_playing_artwork_refresh_context();
 
+// P1.5R.1.2.2：主页被歌词/频谱/曲库完整覆盖时释放 UI 持有的封面 lease，
+// 避免两槽 Surface cache 被“隐藏的旧封面 + 下一曲”占满，从而淘汰当前曲。
+// 再次激活时会强制按当前 Player context 重新 acquire/cache bind。
+void now_playing_artwork_set_active(bool active);
+
 // Overlay 明暗兼容接口。P1.2.5 不再保存 dimmed surface，因此返回 false，
 // 调用方使用固定 alpha 黑层；由于底图已是最终 RGB565，不会重新解码/缩放。
 bool now_playing_artwork_set_dimmed(bool dimmed);

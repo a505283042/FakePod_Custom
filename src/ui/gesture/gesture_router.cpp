@@ -24,6 +24,7 @@ enum class GestureAxis : uint8_t
 struct GestureState
 {
     bool pressed = false;
+    bool press_origin_valid = false;
     bool control_capture = false;
     bool suppress_click = false;
     bool vertical_adjust_enabled = false;
@@ -146,6 +147,7 @@ void gesture_router_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t ti
     if (pressed) {
         if (!g_state.pressed) {
             g_state.pressed = true;
+            g_state.press_origin_valid = true;
             g_state.suppress_click = false;
             g_state.start_x = x;
             g_state.start_y = y;
@@ -258,6 +260,16 @@ void gesture_router_ack_vertical_adjust_release(uint32_t sequence)
 bool gesture_router_should_suppress_click()
 {
     return g_state.suppress_click;
+}
+
+bool gesture_router_press_started_in_rect(
+    int16_t left, int16_t top, int16_t right, int16_t bottom)
+{
+    if (!g_state.press_origin_valid || left > right || top > bottom) {
+        return false;
+    }
+    return g_state.start_x >= left && g_state.start_x <= right &&
+        g_state.start_y >= top && g_state.start_y <= bottom;
 }
 
 bool gesture_router_take_action(UiGestureAction *out_action)

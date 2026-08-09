@@ -41,6 +41,12 @@ void gesture_router_ack_vertical_adjust_release(uint32_t sequence);
 // 用这个标记丢弃该次 click，避免“滑一下顺便点了一次”。新一轮按下会自动清除。
 bool gesture_router_should_suppress_click();
 
+// 返回最近一轮触摸按下时的原始坐标是否位于给定闭区间内。
+// RELEASE 后仍保留该起点，供 LVGL 随后产生的 CLICKED 回调判断“触摸从哪里开始”。
+// 这样顶部/底部/左右边缘可以永久留给页面手势，而不会因为抬手落到中央被误判成 Overlay Tap。
+bool gesture_router_press_started_in_rect(
+    int16_t left, int16_t top, int16_t right, int16_t bottom);
+
 // latest-wins 单槽动作。调用方应在 LVGL task/timer 上下文消费。
 bool gesture_router_take_action(UiGestureAction *out_action);
 

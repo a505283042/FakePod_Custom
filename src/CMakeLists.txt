@@ -47,10 +47,14 @@ idf_component_register(
 
         "ui/ui_manager.cpp"
         "ui/ui_common.cpp"
+        "ui/input/touch_input.cpp"
         "ui/gesture/gesture_router.cpp"
         "ui/font/font_manager.cpp"
         "ui/search/pinyin_initial.cpp"
         "ui/search/search_key_builder.cpp"
+        "ui/lyrics/lyrics_service.cpp"
+        "ui/lyrics/lyrics_view.cpp"
+        "ui/spectrum/spectrum_view.cpp"
         "ui/widgets/quick_index_keyboard.cpp"
         "ui/artwork/cover_surface_cache.cpp"
         "ui/artwork/now_playing_artwork.cpp"
@@ -90,6 +94,9 @@ idf_component_register(
 
         "ui"
         "ui/artwork"
+        "ui/input"
+        "ui/lyrics"
+        "ui/spectrum"
 
     REQUIRES
         esp_driver_i2c
