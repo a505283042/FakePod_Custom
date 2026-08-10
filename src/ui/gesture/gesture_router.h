@@ -41,6 +41,11 @@ void gesture_router_ack_vertical_adjust_release(uint32_t sequence);
 // 用这个标记丢弃该次 click，避免“滑一下顺便点了一次”。新一轮按下会自动清除。
 bool gesture_router_should_suppress_click();
 
+// P1.5.3.2R.11：严格区分“点击”和“短距离滑动”。
+// max_move_px 表示从按下起点开始，整个触摸生命周期允许的最大横/纵偏移；
+// 即使手指最后又回到起点，只要中途移动超过阈值，也不会被当成 Tap。
+bool gesture_router_press_was_tap(int16_t max_move_px);
+
 // 返回最近一轮触摸按下时的原始坐标是否位于给定闭区间内。
 // RELEASE 后仍保留该起点，供 LVGL 随后产生的 CLICKED 回调判断“触摸从哪里开始”。
 // 这样顶部/底部/左右边缘可以永久留给页面手势，而不会因为抬手落到中央被误判成 Overlay Tap。

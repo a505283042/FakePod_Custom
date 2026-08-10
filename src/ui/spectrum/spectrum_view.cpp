@@ -24,12 +24,12 @@ constexpr uint8_t SPECTRUM_VISUAL_BAR_COUNT = 24U; // P1.5.2R.4：绘制层插�
 constexpr int16_t SPECTRUM_BAR_W = 9;
 constexpr int16_t SPECTRUM_BAR_GAP = 5;
 constexpr int16_t SPECTRUM_AREA_LEFT = 50;
-constexpr int16_t SPECTRUM_AREA_TOP = 112;
+constexpr int16_t SPECTRUM_AREA_TOP = 126;
 constexpr int16_t SPECTRUM_AREA_W = 360;
-constexpr int16_t SPECTRUM_AREA_H = 258;
+constexpr int16_t SPECTRUM_AREA_H = 230;
 constexpr int16_t SPECTRUM_BASELINE_GAP = 2;
 constexpr int16_t SPECTRUM_MIN_H = 2;
-constexpr int16_t SPECTRUM_MAX_H = (SPECTRUM_AREA_H / 2) - 3; // P1.5.3.3：横向主体最大高度约+18%，基线绝对位置保持不变。
+constexpr int16_t SPECTRUM_MAX_H = (SPECTRUM_AREA_H / 2) - 8;
 constexpr uint8_t SPECTRUM_REFLECTION_PERCENT = 55U; // P1.5.2R.4.1：下半只做短倒影。
 constexpr int16_t SPECTRUM_PEAK_DOT_W = 5;
 constexpr int16_t SPECTRUM_PEAK_DOT_H = 3;
@@ -47,12 +47,14 @@ constexpr uint32_t SPECTRUM_LYRIC_POLL_FRAMES = 2U; // 50ms频谱timer下约100m
 constexpr int32_t SPECTRUM_LYRIC_TEXT_MAX_W = SPECTRUM_LYRIC_W - 8;
 constexpr size_t SPECTRUM_LYRIC_FORMATTED_BYTES = LYRICS_VIEW_TEXT_BYTES + 8U;
 
-// P1.5.3.3：Neon Ridge 竖向 stems 加密到每个采样点一根，并同步放大两种频谱的纵向动态范围。
-// 仍保留已验证横向频谱作为 Tap 对照样式；圆环方案继续彻底移除。
+// P1.5.3.2R.6：SegmentedColumns 调整为第一/默认样式，HorizontalMirror 第二，NeonRidge 第三。
+// SegmentedColumns 仍只消费现有16-band FFT Snapshot：每列由多个小矩形堆叠，
+// 下方绘制更暗的短倒影；每列最少保留1格，Peak落点改为与主柱同宽的窄矩形。
 enum class SpectrumStyle : uint8_t
 {
-    NeonRidge = 0,
+    SegmentedColumns = 0,
     HorizontalMirror,
+    NeonRidge,
     Count,
 };
 
@@ -65,17 +67,34 @@ constexpr int16_t SPECTRUM_RIDGE_W = 388;
 constexpr int16_t SPECTRUM_RIDGE_H = 190;
 constexpr int16_t SPECTRUM_RIDGE_BASELINE_Y = 154;
 constexpr int16_t SPECTRUM_RIDGE_MIN_H = 6;
-constexpr int16_t SPECTRUM_RIDGE_MAX_H = 142; // P1.5.3.3：相对P1.5.3.2约+20%。
+constexpr int16_t SPECTRUM_RIDGE_MAX_H = 118;
 constexpr int16_t SPECTRUM_RIDGE_TRAIL_OFFSET_Y = 7;
 constexpr uint8_t SPECTRUM_RIDGE_TRAIL_PERCENT = 28U;
 constexpr int16_t SPECTRUM_RIDGE_MAIN_W = 3;
 constexpr int16_t SPECTRUM_RIDGE_TRAIL_W = 3;
 constexpr int16_t SPECTRUM_RIDGE_PEAK_DOT = 3;
-// P1.5.3.3：40个山脊采样点全部绘制细竖线，从基线连到主山脊。
-// 数量翻倍后将亮度降到40%，保持“山脊为主体、竖线为骨架”的层级。
-constexpr uint8_t SPECTRUM_RIDGE_STEM_STEP = 1U;
-constexpr uint8_t SPECTRUM_RIDGE_STEM_PERCENT = 40U;
+// P1.5.3.2：每隔一个山脊采样点绘制一根细竖线，从基线连到主山脊。
+// 竖线只做辅助结构，颜色压暗，避免重新变成密集传统均衡器。
+constexpr uint8_t SPECTRUM_RIDGE_STEM_STEP = 2U;
+constexpr uint8_t SPECTRUM_RIDGE_STEM_PERCENT = 46U;
 constexpr int16_t SPECTRUM_RIDGE_STEM_W = 1;
+
+// P1.5.3.2R.6 SegmentedColumns：18列分段小矩形，继续使用同一个单对象自绘区域。
+// 主柱与倒影每列都至少保留1格；Peak Hold 改成与主柱同宽、仅3px高的窄落点。
+// 18列从现有24点视觉频谱等距取样，既覆盖完整频段，也控制每帧小矩形数量。
+constexpr uint8_t SPECTRUM_SEGMENTED_COLUMN_COUNT = 18U;
+constexpr int16_t SPECTRUM_SEGMENTED_BAR_W = 11;
+constexpr int16_t SPECTRUM_SEGMENTED_BAR_GAP = 8;
+constexpr int16_t SPECTRUM_SEGMENTED_BASELINE_Y = SPECTRUM_AREA_H / 2;
+constexpr int16_t SPECTRUM_SEGMENTED_BASELINE_GAP = 3;
+constexpr int16_t SPECTRUM_SEGMENTED_SEGMENT_H = 5;
+constexpr int16_t SPECTRUM_SEGMENTED_SEGMENT_GAP = 3;
+constexpr int16_t SPECTRUM_SEGMENTED_SEGMENT_STEP =
+    SPECTRUM_SEGMENTED_SEGMENT_H + SPECTRUM_SEGMENTED_SEGMENT_GAP;
+constexpr int16_t SPECTRUM_SEGMENTED_MAX_H = 96;
+constexpr uint8_t SPECTRUM_SEGMENTED_REFLECTION_PERCENT = 46U;
+constexpr int16_t SPECTRUM_SEGMENTED_PEAK_H = 3;
+constexpr int16_t SPECTRUM_SEGMENTED_PEAK_GAP = 6;
 
 // P1.5.2R.4：参考目标机视觉，颜色只随横向位置变化。
 // 使用固定24色色阶避免每帧做颜色插值：洋红 -> 紫 -> 蓝 -> 青。
@@ -112,7 +131,7 @@ uint32_t g_last_lyrics_line = UINT32_MAX;
 uint16_t g_bar_height[SPECTRUM_BAR_COUNT] = {};
 uint16_t g_bar_target[SPECTRUM_BAR_COUNT] = {};
 uint16_t g_peak_height[SPECTRUM_VISUAL_BAR_COUNT] = {};
-SpectrumStyle g_style = SpectrumStyle::NeonRidge;
+SpectrumStyle g_style = SpectrumStyle::SegmentedColumns;
 
 static void spectrum_format_time(uint64_t ms, char *out, size_t out_size)
 {
@@ -184,6 +203,8 @@ static uint32_t spectrum_current_track(const AudioStateSnapshot &audio)
 static const char *spectrum_style_name(SpectrumStyle style)
 {
     switch (style) {
+        case SpectrumStyle::SegmentedColumns:
+            return "SegmentedColumns";
         case SpectrumStyle::HorizontalMirror:
             return "HorizontalMirror";
         case SpectrumStyle::NeonRidge:
@@ -199,7 +220,7 @@ static void spectrum_apply_style_layout()
         return;
     }
 
-    // 两种样式都保留歌曲名 / 歌手 / 当前歌词 / 时间，避免切换样式时页面信息结构跳变。
+    // 三种样式都保留歌曲名 / 歌手 / 当前歌词 / 时间。歌词规则保持不变：短句单行，超长才均衡拆成两行。
     lv_obj_set_size(g_title, 392, 34);
     lv_obj_align(g_title, LV_ALIGN_TOP_MID, 0, 24);
     lv_obj_set_style_text_color(g_title, lv_color_hex(0xFFFFFF), 0);
@@ -814,7 +835,7 @@ static void spectrum_draw_neon_ridge(lv_layer_t *layer, lv_obj_t *obj)
     baseline.p2.y = baseline_y;
     lv_draw_line(layer, &baseline);
 
-    // P1.5.3.3：40个采样点全部画细竖向 stems，从基线连到实时山脊高度。
+    // P1.5.3.2：先画约20根细竖向 stems，从基线连到实时山脊高度。
     // 它们与主山脊使用同一横向渐变，但固定压暗，既补足“频谱”结构感，
     // 又不重新创建独立LVGL bar对象。
     lv_draw_line_dsc_t stem = {};
@@ -888,6 +909,149 @@ static void spectrum_draw_neon_ridge(lv_layer_t *layer, lv_obj_t *obj)
     }
 }
 
+static uint8_t spectrum_segmented_visual_index(uint8_t column_index)
+{
+    if (column_index >= SPECTRUM_SEGMENTED_COLUMN_COUNT) {
+        return 0U;
+    }
+    return static_cast<uint8_t>(
+        (static_cast<uint32_t>(column_index) *
+            static_cast<uint32_t>(SPECTRUM_VISUAL_BAR_COUNT - 1U) +
+            static_cast<uint32_t>((SPECTRUM_SEGMENTED_COLUMN_COUNT - 1U) / 2U)) /
+        static_cast<uint32_t>(SPECTRUM_SEGMENTED_COLUMN_COUNT - 1U));
+}
+
+static int16_t spectrum_segmented_scale_height(uint16_t source_height)
+{
+    constexpr int32_t source_span = SPECTRUM_MAX_H - SPECTRUM_MIN_H;
+    if (source_span <= 0 || source_height <= SPECTRUM_MIN_H) {
+        return 0;
+    }
+
+    int32_t source = source_height;
+    if (source > SPECTRUM_MAX_H) {
+        source = SPECTRUM_MAX_H;
+    }
+    return static_cast<int16_t>(
+        ((source - SPECTRUM_MIN_H) * SPECTRUM_SEGMENTED_MAX_H + source_span / 2) /
+        source_span);
+}
+
+static int16_t spectrum_segmented_height_px(uint8_t column_index)
+{
+    const uint8_t visual_index = spectrum_segmented_visual_index(column_index);
+    return spectrum_segmented_scale_height(spectrum_visual_height(visual_index));
+}
+
+static int16_t spectrum_segmented_peak_height_px(uint8_t column_index)
+{
+    const uint8_t visual_index = spectrum_segmented_visual_index(column_index);
+    return spectrum_segmented_scale_height(g_peak_height[visual_index]);
+}
+
+static void spectrum_draw_segmented_columns(lv_layer_t *layer, lv_obj_t *obj)
+{
+    if (layer == nullptr || obj == nullptr) {
+        return;
+    }
+
+    lv_area_t coords = {};
+    lv_obj_get_coords(obj, &coords);
+    constexpr int32_t bars_total_w =
+        SPECTRUM_SEGMENTED_COLUMN_COUNT * SPECTRUM_SEGMENTED_BAR_W +
+        (SPECTRUM_SEGMENTED_COLUMN_COUNT - 1) * SPECTRUM_SEGMENTED_BAR_GAP;
+    const int32_t bars_left = coords.x1 + (SPECTRUM_AREA_W - bars_total_w) / 2;
+    const int32_t baseline_y = coords.y1 + SPECTRUM_SEGMENTED_BASELINE_Y;
+
+    // 极暗1px基线只提供上下分界，主视觉仍由离散小矩形构成。
+    lv_draw_rect_dsc_t baseline = {};
+    lv_draw_rect_dsc_init(&baseline);
+    baseline.bg_color = lv_color_hex(0x202431);
+    baseline.bg_opa = LV_OPA_COVER;
+    baseline.radius = 0;
+    baseline.border_width = 0;
+    lv_area_t baseline_area = {
+        bars_left - 4, baseline_y, bars_left + bars_total_w + 3, baseline_y
+    };
+    lv_draw_rect(layer, &baseline, &baseline_area);
+
+    lv_draw_rect_dsc_t segment = {};
+    lv_draw_rect_dsc_init(&segment);
+    segment.bg_opa = LV_OPA_COVER;
+    segment.radius = 1;
+    segment.border_width = 0;
+
+    lv_draw_rect_dsc_t peak = {};
+    lv_draw_rect_dsc_init(&peak);
+    peak.bg_opa = LV_OPA_COVER;
+    peak.radius = 0;
+    peak.border_width = 0;
+
+    for (uint8_t i = 0U; i < SPECTRUM_SEGMENTED_COLUMN_COUNT; ++i) {
+        const uint8_t visual_index = spectrum_segmented_visual_index(i);
+        const int32_t height = spectrum_segmented_height_px(i);
+        const int32_t x1 = bars_left +
+            static_cast<int32_t>(i) * (SPECTRUM_SEGMENTED_BAR_W + SPECTRUM_SEGMENTED_BAR_GAP);
+        const int32_t x2 = x1 + SPECTRUM_SEGMENTED_BAR_W - 1;
+        int32_t main_segments =
+            (height + SPECTRUM_SEGMENTED_SEGMENT_STEP - 1) / SPECTRUM_SEGMENTED_SEGMENT_STEP;
+        if (main_segments < 1) {
+            main_segments = 1;
+        }
+
+        // 主频谱：一列由多个互不相连的小矩形向上堆叠。
+        segment.bg_color = lv_color_hex(SPECTRUM_GRADIENT[visual_index]);
+        for (int32_t s = 0; s < main_segments; ++s) {
+            const int32_t bottom = baseline_y - SPECTRUM_SEGMENTED_BASELINE_GAP - 1 -
+                s * SPECTRUM_SEGMENTED_SEGMENT_STEP;
+            lv_area_t a = {
+                x1,
+                bottom - SPECTRUM_SEGMENTED_SEGMENT_H + 1,
+                x2,
+                bottom,
+            };
+            lv_draw_rect(layer, &segment, &a);
+        }
+
+        // 倒影：同列同色系但明显压暗，并且高度只保留主柱约46%。
+        const int32_t reflection_h =
+            (height * static_cast<int32_t>(SPECTRUM_SEGMENTED_REFLECTION_PERCENT) + 50) / 100;
+        int32_t reflection_segments =
+            (reflection_h + SPECTRUM_SEGMENTED_SEGMENT_STEP - 1) /
+            SPECTRUM_SEGMENTED_SEGMENT_STEP;
+        if (reflection_segments < 1) {
+            reflection_segments = 1;
+        }
+        segment.bg_color = lv_color_hex(SPECTRUM_REFLECTION_GRADIENT[visual_index]);
+        for (int32_t s = 0; s < reflection_segments; ++s) {
+            const int32_t top = baseline_y + SPECTRUM_SEGMENTED_BASELINE_GAP + 1 +
+                s * SPECTRUM_SEGMENTED_SEGMENT_STEP;
+            lv_area_t a = {
+                x1,
+                top,
+                x2,
+                top + SPECTRUM_SEGMENTED_SEGMENT_H - 1,
+            };
+            lv_draw_rect(layer, &segment, &a);
+        }
+
+        // 窄落点：复用原有 Peak Hold，宽度与主柱一致，高度仅3px；无新峰值时按现有3px/帧独立下落。
+        const int32_t peak_h = spectrum_segmented_peak_height_px(i);
+        if (peak_h > 0) {
+            const int32_t peak_y = baseline_y - SPECTRUM_SEGMENTED_BASELINE_GAP -
+                peak_h - SPECTRUM_SEGMENTED_PEAK_GAP;
+            peak.bg_color = lv_color_hex(SPECTRUM_GRADIENT[visual_index]);
+            lv_area_t a = {
+                x1,
+                peak_y - SPECTRUM_SEGMENTED_PEAK_H + 1,
+                x2,
+                peak_y,
+            };
+            lv_draw_rect(layer, &peak, &a);
+        }
+    }
+}
+
 static void spectrum_widget_draw_cb(lv_event_t *event)
 {
     if (event == nullptr || lv_event_get_code(event) != LV_EVENT_DRAW_MAIN) {
@@ -902,8 +1066,10 @@ static void spectrum_widget_draw_cb(lv_event_t *event)
 
     if (g_style == SpectrumStyle::NeonRidge) {
         spectrum_draw_neon_ridge(layer, obj);
-    } else {
+    } else if (g_style == SpectrumStyle::HorizontalMirror) {
         spectrum_draw_horizontal(layer, obj);
+    } else {
+        spectrum_draw_segmented_columns(layer, obj);
     }
 }
 
@@ -954,7 +1120,7 @@ static void spectrum_update_bars()
         }
     }
 
-    // 16 个真实 FFT frequency band 仍共享一个自绘对象；主柱/Peak/倒影一次绘完。
+    // 16 个真实 FFT frequency band 仍共享一个自绘对象；当前样式一次绘完。
     if (changed && g_spectrum_widget != nullptr) {
         lv_obj_invalidate(g_spectrum_widget);
     }
@@ -975,7 +1141,7 @@ static void spectrum_root_click_cb(lv_event_t *event)
     g_style = static_cast<SpectrumStyle>(next);
     spectrum_apply_style_layout();
 
-    ESP_LOGI(TAG, "P1.5.3.3 Tap切换频谱样式：style=%u %s",
+    ESP_LOGI(TAG, "P1.5.3.2R.6 Tap切换频谱样式：style=%u %s",
         static_cast<unsigned>(g_style), spectrum_style_name(g_style));
 }
 
@@ -1094,7 +1260,7 @@ void spectrum_view_create(lv_obj_t *screen)
     }
 
     ESP_LOGI(TAG,
-        "P1.5.3.3 频谱样式：NeonRidge=40根低亮stems+约20%%高度；Horizontal=约18%%高度；Tap切换；歌名/歌手/两行歌词/时间坐标保持；刷新=%ums",
+        "P1.5.3.2R.6 频谱样式：默认SegmentedColumns=18列分段小矩形（每列至少1格+暗倒影+同宽3px窄Peak落点），HorizontalMirror第二，NeonRidge第三；歌词仍为短句单行/超长两行；Tap三态循环；刷新=%ums",
         static_cast<unsigned>(SPECTRUM_FRAME_MS));
 }
 
@@ -1141,7 +1307,7 @@ void spectrum_view_open()
         lv_timer_resume(g_timer);
     }
     audio_service_set_spectrum_enabled(true);
-    ESP_LOGI(TAG, "打开频谱页：P1.5.3.1 当前样式=%u %s；Tap切换样式；右滑返回主页",
+    ESP_LOGI(TAG, "打开频谱页：P1.5.3.2R.6 当前样式=%u %s；默认SegmentedColumns；Tap三态切换；右滑返回主页",
         static_cast<unsigned>(g_style), spectrum_style_name(g_style));
 }
 

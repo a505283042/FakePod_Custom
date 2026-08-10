@@ -2,12 +2,14 @@
 
 #include <stdint.h>
 
-// 播放模式只影响“自然 EOF”后的动作；手动上一/下一曲始终尊重用户操作。
+// 播放模式。顺序/列表循环/单曲循环沿用既有 EOF 语义；随机模式同时接管
+// 自然 EOF 与手动下一曲，并在当前 Playlist Context 内随机选择。
 enum class PlayerLoopMode : uint8_t
 {
     Sequential = 0,   // 顺序播放：列表末尾自然停止
     ListRepeat = 1,   // 列表循环：末尾回到第一首
     SingleRepeat = 2, // 单曲循环：自然 EOF 重播当前首
+    Shuffle = 3,      // 随机播放：当前列表内随机，避免立即重复当前首
 };
 
 // 高频轻量更新：观察 AudioTask Snapshot 的 Finished 边沿并执行自动续播。
@@ -18,7 +20,8 @@ void player_transport_update();
 bool player_transport_play_current(const char *reason = nullptr);
 
 // 手动 transport。上一曲在当前歌曲已播放超过 3 秒时重播当前首；否则切上一首。
-// 下一曲始终切到当前 Playlist Context 的下一首。手动操作在列表首尾循环。
+// 随机模式下：下一曲随机选择，上一曲优先返回本次随机会话的实际历史；
+// 非随机模式继续按当前 Playlist Context 首尾循环。
 bool player_transport_previous();
 bool player_transport_next();
 

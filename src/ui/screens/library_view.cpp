@@ -1917,9 +1917,9 @@ void library_view_create(lv_obj_t *screen)
     lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
     library_view_render(false);
 
-    ESP_LOGI(TAG, "Build=P1.5.3.3 SpectrumScaleDensityPolish");
+    ESP_LOGI(TAG, "Build=P1.5.3.2R.13 VolumeCurveRedistributed");
     ESP_LOGI(TAG,
-        "P1.5.3.3：Neon Ridge竖向stems加密到40根且亮度降至40%%，山脊高度约+20%%；横向频谱高度约+18%%，Peak/55%%倒影同步；其它位置与FFT/手势/歌词/Adaptive Prefetch保持；右侧%dpx位置条保持",
+        "P1.5.3.2R.6：18列分段小矩形调整为默认第一样式（每列至少1格+暗倒影+同宽3px窄Peak落点），HorizontalMirror第二，Neon Ridge第三；歌词仍短句单行/超长两行；FFT/手势/Adaptive Prefetch保持；右侧%dpx位置条保持",
         static_cast<int>(LIBRARY_SCROLLBAR_W));
 }
 

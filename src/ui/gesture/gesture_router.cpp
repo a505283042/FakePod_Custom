@@ -35,6 +35,8 @@ struct GestureState
     int16_t start_y = 0;
     int16_t last_x = 0;
     int16_t last_y = 0;
+    int16_t max_abs_dx = 0;
+    int16_t max_abs_dy = 0;
     uint32_t start_tick_ms = 0U;
     GestureAxis axis = GestureAxis::None;
     UiGestureAction pending = UiGestureAction::None;
@@ -153,6 +155,8 @@ void gesture_router_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t ti
             g_state.start_y = y;
             g_state.last_x = x;
             g_state.last_y = y;
+            g_state.max_abs_dx = 0;
+            g_state.max_abs_dy = 0;
             g_state.start_tick_ms = tick_ms;
             g_state.axis = GestureAxis::None;
             g_state.vertical_adjust_active = false;
@@ -168,6 +172,10 @@ void gesture_router_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t ti
         g_state.last_y = y;
         const int32_t dx = static_cast<int32_t>(g_state.last_x) - g_state.start_x;
         const int32_t dy = static_cast<int32_t>(g_state.last_y) - g_state.start_y;
+        const int16_t ax = static_cast<int16_t>(gesture_abs(dx));
+        const int16_t ay = static_cast<int16_t>(gesture_abs(dy));
+        if (ax > g_state.max_abs_dx) g_state.max_abs_dx = ax;
+        if (ay > g_state.max_abs_dy) g_state.max_abs_dy = ay;
         if (gesture_try_activate_vertical_adjust(dx, dy)) {
             g_state.suppress_click = true;
             return;
@@ -186,6 +194,10 @@ void gesture_router_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t ti
     g_state.last_y = y;
     const int32_t dx = static_cast<int32_t>(g_state.last_x) - g_state.start_x;
     const int32_t dy = static_cast<int32_t>(g_state.last_y) - g_state.start_y;
+    const int16_t ax = static_cast<int16_t>(gesture_abs(dx));
+    const int16_t ay = static_cast<int16_t>(gesture_abs(dy));
+    if (ax > g_state.max_abs_dx) g_state.max_abs_dx = ax;
+    if (ay > g_state.max_abs_dy) g_state.max_abs_dy = ay;
 
     // 极快的滑动可能只有 PRESSED + RELEASED 两个采样，因此 RELEASE 时也必须再判一次。
     if (gesture_try_activate_vertical_adjust(dx, dy)) {
@@ -260,6 +272,15 @@ void gesture_router_ack_vertical_adjust_release(uint32_t sequence)
 bool gesture_router_should_suppress_click()
 {
     return g_state.suppress_click;
+}
+
+bool gesture_router_press_was_tap(int16_t max_move_px)
+{
+    if (!g_state.press_origin_valid || max_move_px < 0) {
+        return false;
+    }
+    return g_state.max_abs_dx <= max_move_px &&
+        g_state.max_abs_dy <= max_move_px;
 }
 
 bool gesture_router_press_started_in_rect(

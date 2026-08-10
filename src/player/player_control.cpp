@@ -114,12 +114,22 @@ PlayerLoopMode player_control_get_loop_mode()
 
 PlayerLoopMode player_control_cycle_loop_mode()
 {
-    return player_transport_cycle_loop_mode();
+    if (!player_control_lock(pdMS_TO_TICKS(100))) {
+        return player_transport_get_loop_mode();
+    }
+    const PlayerLoopMode next = player_transport_cycle_loop_mode();
+    player_control_unlock();
+    return next;
 }
 
 bool player_control_set_loop_mode(PlayerLoopMode mode)
 {
-    return player_transport_set_loop_mode(mode);
+    if (!player_control_lock(pdMS_TO_TICKS(100))) {
+        return false;
+    }
+    const bool ok = player_transport_set_loop_mode(mode);
+    player_control_unlock();
+    return ok;
 }
 
 bool player_control_set_volume(uint8_t percent)

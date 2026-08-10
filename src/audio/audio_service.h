@@ -47,7 +47,7 @@ bool audio_service_seek_track(
 );
 
 // 用户音量/静音同样只能通过 AudioTask 命令队列改变。
-// percent 范围 0~100；默认 80 保持 Stage 9.x 已实机验证的 -20dB 起始音量。
+// percent 范围 0~100；R.13 默认 50%≈-18dB，保持接近旧版 80%=-20dB 的启动实际响度。
 bool audio_service_set_volume(uint8_t percent, bool wait = false);
 bool audio_service_set_mute(bool mute, bool wait = false);
 

@@ -48,6 +48,10 @@ bool player_playlist_get_track_index(size_t *out_track_index);
 // 用于资源预热等只读场景；position 是列表内位置。
 bool player_playlist_get_track_index_at_position(size_t position, size_t *out_track_index);
 
+// 在不改变当前 Playlist Context 身份的前提下直接选择列表内 position。
+// 供随机播放等 transport 策略使用；会先验证目标位置真实可解析。
+bool player_playlist_select_position(size_t position);
+
 // 在当前列表中首尾循环移动。
 bool player_playlist_previous();
 bool player_playlist_next();

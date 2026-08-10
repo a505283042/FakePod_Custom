@@ -134,6 +134,11 @@ bool player_state_select_decade_group(size_t group_index, size_t position)
     return player_state_select(player_playlist_bind_decade(group_index, position), "切换年代列表");
 }
 
+bool player_state_select_position(size_t position)
+{
+    return player_state_select(player_playlist_select_position(position), "直接选择列表位置");
+}
+
 bool player_state_previous()
 {
     if (!g_ready || !player_playlist_previous()) {

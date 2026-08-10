@@ -55,7 +55,7 @@ struct AudioStateSnapshot
     uint32_t decode_workspace_pcm_bytes = 0;
 
     // 用户音量由 AudioTask 持有并发布；0~100 与 DAC 实际寄存器映射解耦。
-    uint8_t volume_percent = 80;
+    uint8_t volume_percent = 50;
     bool user_muted = false;
 };
 

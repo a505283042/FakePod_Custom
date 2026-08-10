@@ -23,12 +23,13 @@ bool player_control_toggle_play_pause();
 bool player_control_previous();
 bool player_control_next();
 
-// 循环策略只影响自然 EOF；手动上一/下一曲始终尊重用户操作。
+// 播放模式：顺序/列表循环/单曲循环沿用 EOF 策略；随机模式同时接管
+// 自然 EOF 和手动下一曲，并在当前 Playlist Context 内随机。
 PlayerLoopMode player_control_get_loop_mode();
 PlayerLoopMode player_control_cycle_loop_mode();
 bool player_control_set_loop_mode(PlayerLoopMode mode);
 
-// 用户音量：0~100，默认 80（对应当前已验证的 -20dB 数字衰减）。
+// 用户音量：0~100，R.13 默认 50（约 -18dB）；30%=-26dB，100%=0dB。
 // 静音状态独立于暂停；所有实际 DAC 寄存器操作仍由 AudioTask 执行。
 bool player_control_set_volume(uint8_t percent);
 bool player_control_volume_up(uint8_t step = 5U);

@@ -74,7 +74,8 @@ static constexpr TickType_t AUDIO_SYNC_WAIT_TIMEOUT = pdMS_TO_TICKS(1500);
 static constexpr TickType_t AUDIO_START_WAIT_TIMEOUT = pdMS_TO_TICKS(1500);
 
 // 用户音量继续保持此前实机验证的安全模拟基线：CS43131 0.5Vrms 满量程。
-// 默认逻辑音量 80% 映射为 PCM -20dB；运行期音量只能由 AudioTask 写 DAC。
+// P1.5.3.2R.13 重新分配逻辑音量曲线后，默认逻辑音量改为 50%（约 -18dB），
+// 保持接近旧版 80%=-20dB 的启动实际响度；运行期音量仍只能由 AudioTask 写 DAC。
 // 192kHz 长时间实测显示 AudioTask 峰值栈使用约 5.3KB；先保守收敛到 12KB，仍保留超过一倍的观测余量。
 
 
@@ -98,7 +99,7 @@ struct AudioRequest
     MediaFormat format = MediaFormat::Unknown;
     bool has_technical_info = false;
     MediaTechnicalInfo technical_info = {};
-    uint8_t volume_percent = 80;
+    uint8_t volume_percent = 50;
     bool mute = false;
     uint32_t expected_playback_revision = 0;
     uint64_t seek_target_ms = 0;
@@ -155,7 +156,7 @@ static bool g_pcm_unmute_pending = false;
 static uint32_t g_pcm_fade_in_total_frames = 0;
 static uint32_t g_pcm_fade_in_done_frames = 0;
 static bool g_pcm_fade_in_logged_done = true;
-static uint8_t g_task_volume_percent = 80U;
+static uint8_t g_task_volume_percent = 50U;
 static bool g_task_user_muted = false;
 
 // 正式播放资源也只属于 AudioTask。
@@ -511,19 +512,63 @@ static void audio_task_apply_pcm_fade_in(int32_t *pcm, size_t frames)
     }
 }
 
+static constexpr uint8_t audio_volume_interp_half_db_steps(
+    uint8_t percent,
+    uint8_t p0,
+    uint8_t steps0,
+    uint8_t p1,
+    uint8_t steps1)
+{
+    const uint16_t span = static_cast<uint16_t>(p1 - p0);
+    if (span == 0U || percent <= p0) {
+        return steps0;
+    }
+    if (percent >= p1) {
+        return steps1;
+    }
+
+    const uint16_t offset = static_cast<uint16_t>(percent - p0);
+    const uint16_t delta = static_cast<uint16_t>(steps0 - steps1);
+    return static_cast<uint8_t>(
+        steps0 - ((offset * delta + span / 2U) / span));
+}
+
 static constexpr uint8_t audio_volume_percent_to_half_db_steps(uint8_t percent)
 {
     if (percent > 100U) {
         percent = 100U;
     }
-    // 0~100 映射到 -100dB~0dB，0.5dB/step。默认 80 => 40 steps => -20dB，
-    // 与 Stage 9.x 已实机验证音量完全一致；100 仍受 0.5Vrms 模拟满量程限制。
-    return static_cast<uint8_t>((100U - percent) * 2U);
+
+    // P1.5.3.2R.13：重新分配整个 0~100% 听感区间。
+    // 用户确认 -26dB 应落在约 30%；30% 以上不再把主要响度挤在最后 20%，
+    // 而是按约 3~4dB / 10% 的节奏平滑走到 100%=0dB。低音量区同时继续抬升。
+    //   0%=-100dB（近似静音，真正静音仍由独立 mute 控制）
+    //   1%=-54dB, 5%=-48dB, 10%=-42dB, 20%=-33dB, 30%=-26dB
+    //   40%=-22dB, 50%=-18dB, 60%=-14dB, 70%=-10dB
+    //   80%=-7dB, 90%=-4dB, 100%=0dB
+    if (percent == 0U) return 200U;
+    if (percent <= 1U) return 108U;
+    if (percent <= 5U) return audio_volume_interp_half_db_steps(percent, 1U, 108U, 5U, 96U);
+    if (percent <= 10U) return audio_volume_interp_half_db_steps(percent, 5U, 96U, 10U, 84U);
+    if (percent <= 20U) return audio_volume_interp_half_db_steps(percent, 10U, 84U, 20U, 66U);
+    if (percent <= 30U) return audio_volume_interp_half_db_steps(percent, 20U, 66U, 30U, 52U);
+    if (percent <= 40U) return audio_volume_interp_half_db_steps(percent, 30U, 52U, 40U, 44U);
+    if (percent <= 50U) return audio_volume_interp_half_db_steps(percent, 40U, 44U, 50U, 36U);
+    if (percent <= 60U) return audio_volume_interp_half_db_steps(percent, 50U, 36U, 60U, 28U);
+    if (percent <= 70U) return audio_volume_interp_half_db_steps(percent, 60U, 28U, 70U, 20U);
+    if (percent <= 80U) return audio_volume_interp_half_db_steps(percent, 70U, 20U, 80U, 14U);
+    if (percent <= 90U) return audio_volume_interp_half_db_steps(percent, 80U, 14U, 90U, 8U);
+    return audio_volume_interp_half_db_steps(percent, 90U, 8U, 100U, 0U);
 }
 
-static_assert(audio_volume_percent_to_half_db_steps(100U) == 0x00U, "100% 应对应 0dB");
-static_assert(audio_volume_percent_to_half_db_steps(80U) == 0x28U, "80% 必须保持历史 -20dB 基线");
-static_assert(audio_volume_percent_to_half_db_steps(0U) == 0xC8U, "0% 应对应 -100dB 数字衰减");
+static_assert(audio_volume_percent_to_half_db_steps(100U) == 0U, "100% 应保持 0dB 满幅");
+static_assert(audio_volume_percent_to_half_db_steps(90U) == 8U, "90% 应对应 -4dB");
+static_assert(audio_volume_percent_to_half_db_steps(80U) == 14U, "80% 应对应 -7dB");
+static_assert(audio_volume_percent_to_half_db_steps(70U) == 20U, "70% 应对应 -10dB");
+static_assert(audio_volume_percent_to_half_db_steps(50U) == 36U, "50% 应对应 -18dB");
+static_assert(audio_volume_percent_to_half_db_steps(30U) == 52U, "30% 应对应 -26dB");
+static_assert(audio_volume_percent_to_half_db_steps(20U) == 66U, "20% 应对应 -33dB");
+static_assert(audio_volume_percent_to_half_db_steps(0U) == 200U, "0% 应对应 -100dB 数字衰减");
 
 static esp_err_t audio_task_apply_user_volume()
 {

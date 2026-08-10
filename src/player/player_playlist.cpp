@@ -417,6 +417,18 @@ bool player_playlist_get_track_index_at_position(size_t position, size_t *out_tr
     return true;
 }
 
+bool player_playlist_select_position(size_t position)
+{
+    size_t track_index = 0U;
+    if (!player_playlist_get_track_index_at_position(position, &track_index) || position > UINT32_MAX) {
+        return false;
+    }
+
+    g_context.position = static_cast<uint32_t>(position);
+    playlist_log_selection("直接选择位置");
+    return true;
+}
+
 static bool playlist_move(int direction)
 {
     PlayerListSnapshot snapshot = {};

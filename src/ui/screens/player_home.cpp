@@ -10,6 +10,7 @@
 #include "gesture/gesture_router.h"
 #include "input/touch_input.h"
 #include "media_library.h"
+#include "media/library/media_catalog_v2.h"
 #include "player_control.h"
 #include "player_state.h"
 #include "library_view.h"
@@ -24,10 +25,9 @@ static const char *TAG = "首页";
 // AudioTask / Player Transport 仍沿用既有实现。
 static constexpr int32_t kProgressScale = 10000;
 static constexpr uint32_t kOverlayTimeoutMs = 5000U;
-// P1.3.5.4.5：保持全屏半透明黑层；Overlay 任意位置纵向拖动改为音量预览，松手只提交一次。
-// 仍只在 Overlay 显示期间启用，隐藏后立即回到原始全屏封面。
+// P1.5.3.2R.7：Overlay 默认只处理点击；纵向音量手势不再随 Overlay 自动启用。
+// 用户必须先点击 Overlay 底部的音量图标，才进入纵向音量调节；再次点击或 Overlay 隐藏时退出。
 static constexpr lv_opa_t kOverlayDimOpacity = 150U;
-static constexpr uint32_t kGestureHintTimeoutMs = 900U;
 // P1.5R.1.2：用户正在触摸或刚松手时，周期性状态/封面刷新主动让路。
 static constexpr uint32_t kInteractionYieldMs = 120U;
 // 约 220px 的纵向位移覆盖 0~100%。上滑增加，下滑降低；12px 起手阈值由 GestureRouter 负责。
@@ -38,6 +38,35 @@ static constexpr int16_t kOverlayTapSafeLeftPx = 36;
 static constexpr int16_t kOverlayTapSafeTopPx = 60;
 static constexpr int16_t kOverlayTapSafeRightPx = 423;
 static constexpr int16_t kOverlayTapSafeBottomPx = 404;
+// R.11：Overlay 只能由真正轻点进入。超过 12px 的任意方向移动都视为滑动/拖动，
+// 即使没有达到 72px 页面手势触发阈值，也绝不补成 Overlay 点击。
+static constexpr int16_t kOverlayTapMaxMovePx = 12;
+
+// P1.5.3.2R.14：上滑 Launcher 改为真正的圆环菜单。第一版只先落 7 个图标点位，
+// 不接功能页面；默认高亮“音乐”，点击其他图标仅改变选中态。选中项使用粉红色。
+static constexpr uint32_t kLauncherAccentRgb = 0xFF4FA3;
+static constexpr uint32_t kLauncherBackdropRgb = 0x000000;
+static constexpr lv_opa_t kLauncherBackdropOpa = 150;
+static constexpr uint8_t kLauncherItemCount = 7U;
+
+// 手工布局的 7 个圆环点位：上中最突出，两侧沿弧线分布。
+// 第一版只验证 Launcher 视觉/手感，后续再给各项接页面能力。
+struct LauncherMenuItemDef {
+    const char *icon_text;
+    const char *caption;
+    int16_t center_x;
+    int16_t center_y;
+};
+
+static constexpr LauncherMenuItemDef kLauncherItems[kLauncherItemCount] = {
+    {"M",   "音乐",     230, 208},
+    {"NSF", "NSF播放",  152, 240},
+    {"MIC", "拾音频谱", 108, 315},
+    {"MJ",  "MJPG播放", 308, 240},
+    {"PIC", "图片播放", 352, 315},
+    {"TXT", "电子书",   176, 390},
+    {"SET", "设置",     284, 390},
+};
 
 // P1.5.2R.4.2：播放页页面级手势统一用白名单过滤。
 // TouchInput / GestureRouter 仍识别所有动作；页面层只执行当前上下文允许的动作。
@@ -46,6 +75,7 @@ enum class PlaybackGestureScope : uint8_t
 {
     Home = 0,
     HomeOverlay,
+    HomeLauncher,
     Lyrics,
     LyricsOverlay,
     Spectrum,
@@ -66,6 +96,7 @@ static bool player_home_page_allows_gesture(
         case PlaybackGestureScope::Spectrum:
             return action == UiGestureAction::SwipeRight;
         case PlaybackGestureScope::HomeOverlay:
+        case PlaybackGestureScope::HomeLauncher:
         case PlaybackGestureScope::LyricsOverlay:
         default:
             return false;
@@ -79,22 +110,33 @@ static bool g_overlay_visible = false;
 static bool g_overlay_fast_dim = false;
 static bool g_overlay_dim_path_valid = false;
 
-static lv_obj_t *g_gesture_hint = nullptr;
-static lv_obj_t *g_gesture_hint_label = nullptr;
-static lv_timer_t *g_gesture_hint_timer = nullptr;
+static lv_obj_t *g_launcher = nullptr;
+static lv_obj_t *g_launcher_backdrop = nullptr;
+static lv_obj_t *g_launcher_arc = nullptr;
+static lv_obj_t *g_launcher_buttons[kLauncherItemCount] = {};
+static lv_obj_t *g_launcher_captions[kLauncherItemCount] = {};
+static bool g_launcher_visible = false;
+static uint8_t g_launcher_selected_index = 0U;
+
 static lv_timer_t *g_audio_timer = nullptr;
 static lv_timer_t *g_artwork_timer = nullptr;
 static bool g_background_timers_running = true;
 
 static lv_obj_t *g_title = nullptr;
+static lv_obj_t *g_artist = nullptr;
 static lv_obj_t *g_track_info = nullptr;
+static lv_obj_t *g_prev_button = nullptr;
+static lv_obj_t *g_play_button = nullptr;
+static lv_obj_t *g_next_button = nullptr;
 static lv_obj_t *g_play_symbol = nullptr;
+static bool g_play_icon_pause = false;
 static lv_obj_t *g_progress = nullptr;
 static lv_obj_t *g_current_time = nullptr;
 static lv_obj_t *g_total_time = nullptr;
-static lv_obj_t *g_loop_label = nullptr;
+static lv_obj_t *g_loop_button = nullptr;
 static lv_obj_t *g_volume_label = nullptr;
 static lv_obj_t *g_volume_slider = nullptr;
+static lv_obj_t *g_volume_mode_button = nullptr;
 
 // Stage 11.2：进度条使用 0~10000 的归一化范围，避免把超长音频毫秒数直接塞进 LVGL int32_t range。
 // 拖动期间只做 UI 本地预览；松手时才向 Player 提交一次 Seek。
@@ -108,14 +150,16 @@ static uint32_t g_progress_seek_base_revision = 0;
 static uint32_t g_progress_seek_started_tick = 0;
 
 static bool g_volume_dragging = false;
+static bool g_volume_adjust_armed = false;
 static uint8_t g_volume_drag_start_percent = 0U;
 static uint8_t g_volume_preview_percent = 0U;
 static uint32_t g_volume_drag_sequence = 0U;
 static uint32_t g_last_audio_state_revision = UINT32_MAX;
 
-// Overlay 纵向音量手势定义在进度同步函数之前，先声明这两个内部 helper。
+// Overlay / Launcher 内部 helper 先行声明，供后续多个回调交叉调用。
 static void player_home_cancel_progress_interaction();
 static void player_home_progress_sync(const AudioStateSnapshot &snapshot);
+static void player_home_overlay_hide();
 
 static void player_home_control_capture_cb(lv_event_t *event)
 {
@@ -169,6 +213,230 @@ static lv_obj_t *player_home_create_round_button(lv_obj_t *parent, int32_t size,
     return button;
 }
 
+// P1.5.3.2R.10：上一曲/播放/下一曲继续使用 R.9 的大触摸按钮，
+// 但不再依赖默认 Symbol 字体的小尺寸 glyph；按钮内部改为更大的轻量线框图标。
+// 播放按钮仍保留隐藏 label 作为既有状态载体，自绘图标由 g_play_icon_pause 同步刷新。
+static void player_home_transport_icon_draw_cb(lv_event_t *event)
+{
+    if (event == nullptr || lv_event_get_code(event) != LV_EVENT_DRAW_MAIN) {
+        return;
+    }
+
+    lv_layer_t *layer = lv_event_get_layer(event);
+    lv_obj_t *obj = lv_event_get_current_target_obj(event);
+    if (layer == nullptr || obj == nullptr) {
+        return;
+    }
+
+    lv_area_t coords = {};
+    lv_obj_get_coords(obj, &coords);
+    const int32_t cx = (coords.x1 + coords.x2) / 2;
+    const int32_t cy = (coords.y1 + coords.y2) / 2;
+    const bool is_play_button = obj == g_play_button;
+
+    lv_draw_line_dsc_t line = {};
+    lv_draw_line_dsc_init(&line);
+    line.color = lv_color_hex(is_play_button ? 0x111111 : 0xFFFFFF);
+    line.width = is_play_button ? 5 : 4;
+    line.opa = LV_OPA_COVER;
+    line.round_start = 1U;
+    line.round_end = 1U;
+
+    auto draw = [&](int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
+        line.p1.x = x0; line.p1.y = y0;
+        line.p2.x = x1; line.p2.y = y1;
+        lv_draw_line(layer, &line);
+    };
+
+    if (obj == g_prev_button) {
+        // 34x30 左右的大号 Previous：竖线 + 双折返箭头。
+        draw(cx - 17, cy - 15, cx - 17, cy + 15);
+        draw(cx + 12, cy - 14, cx - 3, cy);
+        draw(cx - 3, cy, cx + 12, cy + 14);
+        draw(cx - 1, cy - 14, cx - 16, cy);
+        draw(cx - 16, cy, cx - 1, cy + 14);
+        return;
+    }
+
+    if (obj == g_next_button) {
+        // Previous 的镜像，保持三颗按钮内部图标视觉重量一致。
+        draw(cx + 17, cy - 15, cx + 17, cy + 15);
+        draw(cx - 12, cy - 14, cx + 3, cy);
+        draw(cx + 3, cy, cx - 12, cy + 14);
+        draw(cx + 1, cy - 14, cx + 16, cy);
+        draw(cx + 16, cy, cx + 1, cy + 14);
+        return;
+    }
+
+    if (obj == g_play_button) {
+        if (g_play_icon_pause) {
+            // 约 24x34 的大号 Pause。
+            draw(cx - 9, cy - 17, cx - 9, cy + 17);
+            draw(cx + 9, cy - 17, cx + 9, cy + 17);
+        } else {
+            // 约 31x36 的大号 Play 三角轮廓。
+            draw(cx - 11, cy - 18, cx - 11, cy + 18);
+            draw(cx - 11, cy - 18, cx + 16, cy);
+            draw(cx + 16, cy, cx - 11, cy + 18);
+        }
+    }
+}
+
+static void player_home_mode_icon_draw_cb(lv_event_t *event)
+{
+    if (event == nullptr || lv_event_get_code(event) != LV_EVENT_DRAW_MAIN) {
+        return;
+    }
+
+    lv_layer_t *layer = lv_event_get_layer(event);
+    lv_obj_t *obj = lv_event_get_current_target_obj(event);
+    if (layer == nullptr || obj == nullptr) {
+        return;
+    }
+
+    lv_area_t coords = {};
+    lv_obj_get_coords(obj, &coords);
+    const int32_t cx = (coords.x1 + coords.x2) / 2;
+    const int32_t cy = (coords.y1 + coords.y2) / 2;
+
+    lv_draw_line_dsc_t line = {};
+    lv_draw_line_dsc_init(&line);
+    line.color = lv_color_hex(0xF5F7FA);
+    line.width = 2;
+    line.opa = LV_OPA_COVER;
+    line.round_start = 1U;
+    line.round_end = 1U;
+
+    auto draw = [&](int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
+        line.p1.x = x0; line.p1.y = y0;
+        line.p2.x = x1; line.p2.y = y1;
+        lv_draw_line(layer, &line);
+    };
+    auto arrow_right = [&](int32_t x, int32_t y) {
+        draw(x - 6, y - 5, x, y);
+        draw(x - 6, y + 5, x, y);
+    };
+    auto arrow_left = [&](int32_t x, int32_t y) {
+        draw(x + 6, y - 5, x, y);
+        draw(x + 6, y + 5, x, y);
+    };
+
+    switch (player_control_get_loop_mode()) {
+        case PlayerLoopMode::Sequential:
+            draw(cx - 15, cy, cx + 13, cy);
+            arrow_right(cx + 13, cy);
+            break;
+
+        case PlayerLoopMode::ListRepeat:
+        case PlayerLoopMode::SingleRepeat:
+            draw(cx - 13, cy - 9, cx + 11, cy - 9);
+            arrow_right(cx + 11, cy - 9);
+            draw(cx + 14, cy - 5, cx + 14, cy + 6);
+            draw(cx + 13, cy + 9, cx - 11, cy + 9);
+            arrow_left(cx - 11, cy + 9);
+            draw(cx - 14, cy + 5, cx - 14, cy - 6);
+            if (player_control_get_loop_mode() == PlayerLoopMode::SingleRepeat) {
+                // 不依赖额外 Unicode glyph，用两根短线在中心画一个小“1”。
+                draw(cx, cy - 3, cx, cy + 4);
+                draw(cx - 2, cy - 1, cx, cy - 3);
+            }
+            break;
+
+        case PlayerLoopMode::Shuffle:
+            // 两条交叉路径直接自绘 Shuffle 图标，避免当前字体缺少随机播放 glyph。
+            draw(cx - 15, cy - 9, cx - 7, cy - 9);
+            draw(cx - 7, cy - 9, cx + 6, cy + 9);
+            draw(cx + 6, cy + 9, cx + 14, cy + 9);
+            arrow_right(cx + 14, cy + 9);
+
+            draw(cx - 15, cy + 9, cx - 7, cy + 9);
+            draw(cx - 7, cy + 9, cx + 6, cy - 9);
+            draw(cx + 6, cy - 9, cx + 14, cy - 9);
+            arrow_right(cx + 14, cy - 9);
+            break;
+    }
+}
+
+static lv_obj_t *player_home_create_mode_button(lv_obj_t *parent)
+{
+    lv_obj_t *button = lv_button_create(parent);
+    ui_common_lock_object(button);
+    lv_obj_add_flag(button, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(button, player_home_control_capture_cb, LV_EVENT_ALL, nullptr);
+    lv_obj_add_event_cb(button, player_home_mode_icon_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
+    lv_obj_set_size(button, 60, 60);
+    lv_obj_set_style_radius(button, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(button, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(button, 32, 0);
+    lv_obj_set_style_border_width(button, 0, 0);
+    lv_obj_set_style_shadow_width(button, 0, 0);
+    lv_obj_set_style_pad_all(button, 0, 0);
+    return button;
+}
+
+static void player_home_volume_icon_draw_cb(lv_event_t *event)
+{
+    if (event == nullptr || lv_event_get_code(event) != LV_EVENT_DRAW_MAIN) {
+        return;
+    }
+
+    lv_layer_t *layer = lv_event_get_layer(event);
+    lv_obj_t *obj = lv_event_get_current_target_obj(event);
+    if (layer == nullptr || obj == nullptr) {
+        return;
+    }
+
+    lv_area_t coords = {};
+    lv_obj_get_coords(obj, &coords);
+    const int32_t cx = (coords.x1 + coords.x2) / 2;
+    const int32_t cy = (coords.y1 + coords.y2) / 2;
+
+    lv_draw_line_dsc_t line = {};
+    lv_draw_line_dsc_init(&line);
+    line.color = lv_color_hex(0xF5F7FA);
+    line.width = 3;
+    line.opa = LV_OPA_COVER;
+    line.round_start = 1U;
+    line.round_end = 1U;
+
+    auto draw = [&](int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
+        line.p1.x = x0; line.p1.y = y0;
+        line.p2.x = x1; line.p2.y = y1;
+        lv_draw_line(layer, &line);
+    };
+
+    // 直接自绘较大的扬声器图标，避免默认 LV_SYMBOL_AUDIO 在 60px 按钮里显得过小。
+    draw(cx - 15, cy - 6, cx - 8, cy - 6);
+    draw(cx - 15, cy + 6, cx - 8, cy + 6);
+    draw(cx - 15, cy - 6, cx - 15, cy + 6);
+    draw(cx - 8, cy - 6, cx + 1, cy - 14);
+    draw(cx - 8, cy + 6, cx + 1, cy + 14);
+    draw(cx + 1, cy - 14, cx + 1, cy + 14);
+    draw(cx + 7, cy - 7, cx + 11, cy - 3);
+    draw(cx + 11, cy - 3, cx + 11, cy + 3);
+    draw(cx + 11, cy + 3, cx + 7, cy + 7);
+    draw(cx + 13, cy - 12, cx + 18, cy - 6);
+    draw(cx + 18, cy - 6, cx + 18, cy + 6);
+    draw(cx + 18, cy + 6, cx + 13, cy + 12);
+}
+
+static lv_obj_t *player_home_create_volume_mode_button(lv_obj_t *parent)
+{
+    lv_obj_t *button = lv_button_create(parent);
+    ui_common_lock_object(button);
+    lv_obj_add_flag(button, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(button, player_home_control_capture_cb, LV_EVENT_ALL, nullptr);
+    lv_obj_add_event_cb(button, player_home_volume_icon_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
+    lv_obj_set_size(button, 60, 60);
+    lv_obj_set_style_radius(button, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(button, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(button, 36, 0);
+    lv_obj_set_style_border_width(button, 0, 0);
+    lv_obj_set_style_shadow_width(button, 0, 0);
+    lv_obj_set_style_pad_all(button, 0, 0);
+    return button;
+}
+
 static lv_obj_t *player_home_create_pill_button(
     lv_obj_t *parent,
     int32_t width,
@@ -195,6 +463,196 @@ static lv_obj_t *player_home_create_pill_button(
         *out_label = label;
     }
     return button;
+}
+
+static void player_home_launcher_arc_draw_cb(lv_event_t *event)
+{
+    if (event == nullptr || lv_event_get_code(event) != LV_EVENT_DRAW_MAIN) {
+        return;
+    }
+
+    lv_layer_t *layer = lv_event_get_layer(event);
+    lv_obj_t *obj = lv_event_get_current_target_obj(event);
+    if (layer == nullptr || obj == nullptr) {
+        return;
+    }
+
+    // 用一条低亮度圆弧提示“圆环菜单”轮廓，不额外引入复杂图元。
+    // 中心点位于屏幕下方，正好把 7 个图标挂在弧线上。
+    constexpr int32_t center_x = 230;
+    constexpr int32_t center_y = 522;
+    constexpr int32_t radius = 178;
+
+    lv_draw_line_dsc_t line = {};
+    lv_draw_line_dsc_init(&line);
+    line.color = lv_color_hex(0xFFFFFF);
+    line.width = 2;
+    line.opa = 42;
+    line.round_start = 1U;
+    line.round_end = 1U;
+
+    auto draw_segment = [&](int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
+        line.p1.x = x0; line.p1.y = y0;
+        line.p2.x = x1; line.p2.y = y1;
+        lv_draw_line(layer, &line);
+    };
+
+    static const int16_t arc_points[][2] = {
+        { 74, 418 }, { 102, 360 }, { 147, 303 }, { 205, 260 },
+        { 230, 252 }, { 255, 260 }, { 313, 303 }, { 358, 360 }, { 386, 418 },
+    };
+    (void)center_x;
+    (void)center_y;
+    (void)radius;
+    for (size_t i = 1; i < sizeof(arc_points) / sizeof(arc_points[0]); ++i) {
+        draw_segment(
+            arc_points[i - 1][0], arc_points[i - 1][1],
+            arc_points[i][0], arc_points[i][1]);
+    }
+}
+
+static void player_home_launcher_apply_selection()
+{
+    for (uint8_t i = 0; i < kLauncherItemCount; ++i) {
+        if (g_launcher_buttons[i] == nullptr) {
+            continue;
+        }
+        const bool selected = (i == g_launcher_selected_index);
+        lv_obj_set_style_bg_color(
+            g_launcher_buttons[i],
+            lv_color_hex(selected ? kLauncherAccentRgb : 0xFFFFFF),
+            0);
+        lv_obj_set_style_bg_opa(
+            g_launcher_buttons[i],
+            selected ? 210 : 38,
+            0);
+        lv_obj_set_style_border_width(g_launcher_buttons[i], selected ? 2 : 0, 0);
+        lv_obj_set_style_border_color(
+            g_launcher_buttons[i],
+            lv_color_hex(selected ? 0xFFD4EA : 0xFFFFFF),
+            0);
+
+        lv_obj_t *icon_label = lv_obj_get_child(g_launcher_buttons[i], 0);
+        if (icon_label != nullptr) {
+            lv_obj_set_style_text_color(
+                icon_label,
+                lv_color_hex(selected ? 0xFFFFFF : 0xF5F7FA),
+                0);
+        }
+        if (g_launcher_captions[i] != nullptr) {
+            lv_obj_set_style_text_color(
+                g_launcher_captions[i],
+                lv_color_hex(selected ? kLauncherAccentRgb : 0xE7E9ED),
+                0);
+            lv_obj_set_style_text_opa(g_launcher_captions[i], selected ? LV_OPA_COVER : 220, 0);
+        }
+    }
+}
+
+static void player_home_launcher_show()
+{
+    if (g_launcher == nullptr) {
+        return;
+    }
+    if (!g_launcher_visible) {
+        g_launcher_visible = true;
+        lv_obj_remove_flag(g_launcher, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(g_launcher);
+    }
+    player_home_overlay_hide();
+    player_home_launcher_apply_selection();
+}
+
+static void player_home_launcher_hide()
+{
+    if (g_launcher == nullptr || !g_launcher_visible) {
+        return;
+    }
+    g_launcher_visible = false;
+    lv_obj_add_flag(g_launcher, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void player_home_launcher_backdrop_tap_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED || !g_launcher_visible ||
+        player_home_click_suppressed() || !gesture_router_press_was_tap(kOverlayTapMaxMovePx)) {
+        return;
+    }
+    player_home_launcher_hide();
+}
+
+static void player_home_launcher_item_cb(lv_event_t *event)
+{
+    if (event == nullptr || lv_event_get_code(event) != LV_EVENT_CLICKED ||
+        player_home_click_suppressed()) {
+        return;
+    }
+    const uint8_t index = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
+    if (index >= kLauncherItemCount) {
+        return;
+    }
+    g_launcher_selected_index = index;
+    player_home_launcher_apply_selection();
+}
+
+static lv_obj_t *player_home_create_launcher_button(
+    lv_obj_t *parent,
+    uint8_t index)
+{
+    lv_obj_t *button = lv_button_create(parent);
+    ui_common_lock_object(button);
+    lv_obj_add_flag(button, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(button, player_home_control_capture_cb, LV_EVENT_ALL, nullptr);
+    lv_obj_add_event_cb(
+        button,
+        player_home_launcher_item_cb,
+        LV_EVENT_CLICKED,
+        reinterpret_cast<void *>(static_cast<uintptr_t>(index)));
+    lv_obj_set_size(button, 56, 56);
+    lv_obj_set_style_radius(button, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(button, 0, 0);
+    lv_obj_set_style_shadow_width(button, 0, 0);
+    lv_obj_set_style_pad_all(button, 0, 0);
+    lv_obj_set_pos(
+        button,
+        kLauncherItems[index].center_x - 28,
+        kLauncherItems[index].center_y - 28);
+
+    lv_obj_t *icon = player_home_create_label(
+        button,
+        kLauncherItems[index].icon_text,
+        lv_color_hex(0xFFFFFF),
+        font_manager_get_ui_font());
+    lv_obj_set_style_text_align(icon, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_center(icon);
+
+    lv_obj_t *caption = player_home_create_label(
+        parent,
+        kLauncherItems[index].caption,
+        lv_color_hex(0xE7E9ED),
+        font_manager_get_ui_font());
+    lv_obj_set_size(caption, 86, 24);
+    lv_obj_set_style_text_align(caption, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align_to(caption, button, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
+    g_launcher_captions[index] = caption;
+    return button;
+}
+
+static void player_home_set_volume_adjust_armed(bool armed)
+{
+    g_volume_adjust_armed = armed && g_overlay_visible;
+    gesture_router_set_vertical_adjust_enabled(g_volume_adjust_armed);
+    if (!g_volume_adjust_armed) {
+        g_volume_dragging = false;
+    }
+
+    // 音量图标同时作为“当前允许纵向调音量”的状态提示。
+    if (g_volume_mode_button != nullptr) {
+        lv_obj_set_style_bg_opa(
+            g_volume_mode_button,
+            g_volume_adjust_armed ? 150 : 36,
+            0);
+    }
 }
 
 static void player_home_overlay_arm_timeout()
@@ -234,13 +692,15 @@ static void player_home_overlay_show()
         return;
     }
 
+    player_home_launcher_hide();
+
     if (!g_overlay_visible) {
         g_overlay_visible = true;
         g_overlay_dim_path_valid = false;
+        player_home_set_volume_adjust_armed(false);
         player_home_overlay_apply_dim_path();
         lv_obj_remove_flag(g_overlay, LV_OBJ_FLAG_HIDDEN);
     }
-    gesture_router_set_vertical_adjust_enabled(true);
     player_home_overlay_arm_timeout();
 }
 
@@ -249,9 +709,8 @@ static void player_home_overlay_hide()
     if (g_overlay == nullptr || !g_overlay_visible) {
         return;
     }
+    player_home_set_volume_adjust_armed(false);
     g_overlay_visible = false;
-    gesture_router_set_vertical_adjust_enabled(false);
-    g_volume_dragging = false;
     if (g_overlay_timer != nullptr) {
         lv_timer_pause(g_overlay_timer);
     }
@@ -270,32 +729,6 @@ static void player_home_overlay_timeout_cb(lv_timer_t *timer)
         return;
     }
     player_home_overlay_hide();
-}
-
-static void player_home_gesture_hint_timeout_cb(lv_timer_t *timer)
-{
-    (void)timer;
-    if (g_gesture_hint != nullptr) {
-        lv_obj_add_flag(g_gesture_hint, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (g_gesture_hint_timer != nullptr) {
-        lv_timer_pause(g_gesture_hint_timer);
-    }
-}
-
-static void player_home_show_gesture_hint(const char *text)
-{
-    if (g_gesture_hint == nullptr || g_gesture_hint_label == nullptr || text == nullptr) {
-        return;
-    }
-    lv_label_set_text(g_gesture_hint_label, text);
-    lv_obj_remove_flag(g_gesture_hint, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(g_gesture_hint);
-    if (g_gesture_hint_timer != nullptr) {
-        lv_timer_set_period(g_gesture_hint_timer, kGestureHintTimeoutMs);
-        lv_timer_reset(g_gesture_hint_timer);
-        lv_timer_resume(g_gesture_hint_timer);
-    }
 }
 
 static uint8_t player_home_volume_preview_from_delta(uint8_t start_percent, int16_t delta_y)
@@ -324,7 +757,7 @@ static void player_home_volume_apply_preview(uint8_t value)
 
 static bool player_home_volume_gesture_update()
 {
-    if (!g_overlay_visible) {
+    if (!g_overlay_visible || !g_volume_adjust_armed) {
         return false;
     }
 
@@ -378,6 +811,7 @@ static bool player_home_volume_gesture_update()
         ESP_LOGW(TAG, "Overlay 纵向音量请求未能入队");
         player_home_refresh();
     }
+
     player_home_overlay_arm_timeout();
     return true;
 }
@@ -467,6 +901,16 @@ static void player_home_gesture_timer_cb(lv_timer_t *timer)
         return;
     }
 
+    // Launcher 菜单显示时，页面级导航先全部让位；外部轻点由 backdrop 关闭，
+    // 若继续滑动任意方向，也直接先收起 Launcher，不在这一版里叠加更多行为。
+    if (g_launcher_visible) {
+        UiGestureAction launcher_action = UiGestureAction::None;
+        if (gesture_router_take_action(&launcher_action)) {
+            player_home_launcher_hide();
+        }
+        return;
+    }
+
     // Overlay 纵向调音量是最高优先级的播放器手势。拖动期间只更新 UI 预览，
     // RELEASE 后才向 AudioTask 提交一次 volume 命令。
     if (player_home_volume_gesture_update()) {
@@ -505,7 +949,7 @@ static void player_home_gesture_timer_cb(lv_timer_t *timer)
             break;
         case UiGestureAction::PullUpFromBottom:
             player_home_overlay_hide();
-            player_home_show_gesture_hint("Launcher · P1.7");
+            player_home_launcher_show();
             break;
         default:
             break;
@@ -514,7 +958,11 @@ static void player_home_gesture_timer_cb(lv_timer_t *timer)
 
 static void player_home_screen_tap_cb(lv_event_t *event)
 {
-    if (lv_event_get_code(event) != LV_EVENT_CLICKED || player_home_click_suppressed()) {
+    if (g_launcher_visible) {
+        return;
+    }
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED || player_home_click_suppressed() ||
+        !gesture_router_press_was_tap(kOverlayTapMaxMovePx)) {
         return;
     }
     if (!gesture_router_press_started_in_rect(
@@ -530,7 +978,7 @@ static void player_home_screen_tap_cb(lv_event_t *event)
 static void player_home_overlay_backdrop_tap_cb(lv_event_t *event)
 {
     if (lv_event_get_code(event) != LV_EVENT_CLICKED || !g_overlay_visible ||
-        player_home_click_suppressed()) {
+        player_home_click_suppressed() || !gesture_router_press_was_tap(kOverlayTapMaxMovePx)) {
         return;
     }
     // 暗色背景是独立的最底层命中面。按钮和 Slider 均位于它上方，因此空白处
@@ -788,24 +1236,41 @@ static void player_home_progress_cb(lv_event_t *event)
     player_home_overlay_arm_timeout();
 }
 
-static const char *player_home_state_name(const AudioStateSnapshot *snapshot)
+static void player_home_format_sample_info(
+    uint32_t sample_rate_hz,
+    uint16_t bits_per_sample,
+    char *out,
+    size_t out_size)
 {
-    if (snapshot == nullptr) {
-        return "";
+    if (out == nullptr || out_size == 0U) {
+        return;
     }
-    switch (snapshot->state) {
-        case AudioPlaybackState::Playing: return "播放中";
-        case AudioPlaybackState::Paused: return "已暂停";
-        case AudioPlaybackState::Seeking: return "跳转中";
-        case AudioPlaybackState::Finished: return "播放结束";
-        case AudioPlaybackState::Error: return "播放错误";
-        default: return "";
+    out[0] = '\0';
+    if (sample_rate_hz == 0U) {
+        return;
+    }
+
+    char rate[24] = {};
+    if ((sample_rate_hz % 1000U) == 0U) {
+        snprintf(rate, sizeof(rate), "%lukHz",
+            static_cast<unsigned long>(sample_rate_hz / 1000U));
+    } else {
+        const uint32_t tenth_khz = (sample_rate_hz + 50U) / 100U;
+        snprintf(rate, sizeof(rate), "%lu.%lukHz",
+            static_cast<unsigned long>(tenth_khz / 10U),
+            static_cast<unsigned long>(tenth_khz % 10U));
+    }
+
+    if (bits_per_sample > 0U) {
+        snprintf(out, out_size, "%s / %ubit", rate, static_cast<unsigned>(bits_per_sample));
+    } else {
+        snprintf(out, out_size, "%s", rate);
     }
 }
 
 static void player_home_refresh_track(const AudioStateSnapshot *audio_snapshot)
 {
-    if (g_title == nullptr || g_track_info == nullptr) {
+    if (g_title == nullptr || g_artist == nullptr || g_track_info == nullptr) {
         return;
     }
 
@@ -813,31 +1278,54 @@ static void player_home_refresh_track(const AudioStateSnapshot *audio_snapshot)
     const size_t list_count = player_state_get_list_count();
     if (library_count == 0U || list_count == 0U) {
         lv_label_set_text(g_title, "暂无歌曲");
+        lv_label_set_text(g_artist, "");
         lv_label_set_text(g_track_info, "音乐库为空");
         return;
     }
 
     const size_t index = player_state_get_index();
     const size_t list_position = player_state_get_list_position();
-    char title[512] = {};
-    if (!media_library_copy_display_name(index, title, sizeof(title))) {
-        snprintf(title, sizeof(title), "歌曲 %u", static_cast<unsigned>(index + 1U));
+    MediaTrackViewV2 view = {};
+    const bool have_view = media_catalog_v2_get_track_view(index, &view);
+
+    char title_fallback[512] = {};
+    const char *title = nullptr;
+    if (have_view && view.title != nullptr && view.title[0] != '\0') {
+        title = view.title;
+    } else if (media_library_copy_display_name(index, title_fallback, sizeof(title_fallback))) {
+        title = title_fallback;
+    } else {
+        snprintf(title_fallback, sizeof(title_fallback), "歌曲 %u", static_cast<unsigned>(index + 1U));
+        title = title_fallback;
     }
     lv_label_set_text(g_title, title);
 
-    const char *state_name = "";
+    const char *artist = have_view && view.artist != nullptr && view.artist[0] != '\0'
+        ? view.artist
+        : "未知歌手";
+    lv_label_set_text(g_artist, artist);
+
+    uint32_t sample_rate_hz = 0U;
+    uint16_t bits_per_sample = 0U;
     if (audio_snapshot != nullptr && audio_snapshot->track_index == index) {
-        state_name = player_home_state_name(audio_snapshot);
+        sample_rate_hz = audio_snapshot->sample_rate_hz;
+        bits_per_sample = audio_snapshot->bits_per_sample;
+    }
+    if (sample_rate_hz == 0U && have_view && view.row != nullptr) {
+        sample_rate_hz = view.row->technical.sample_rate_hz;
+        bits_per_sample = view.row->technical.bits_per_sample;
     }
 
-    if (state_name[0] != '\0') {
+    char sample_info[48] = {};
+    player_home_format_sample_info(sample_rate_hz, bits_per_sample, sample_info, sizeof(sample_info));
+    if (sample_info[0] != '\0') {
         lv_label_set_text_fmt(
             g_track_info,
             "%u / %u  ·  %s  ·  %s",
             static_cast<unsigned>(list_position + 1U),
             static_cast<unsigned>(list_count),
             media_format_name(player_state_get_format()),
-            state_name);
+            sample_info);
     } else {
         lv_label_set_text_fmt(
             g_track_info,
@@ -850,9 +1338,9 @@ static void player_home_refresh_track(const AudioStateSnapshot *audio_snapshot)
 
 static void player_home_refresh_transport_controls(const AudioStateSnapshot *snapshot)
 {
-    if (g_loop_label != nullptr) {
-        lv_label_set_text(g_loop_label,
-            player_transport_loop_mode_name(player_control_get_loop_mode()));
+    if (g_loop_button != nullptr) {
+        // 模式按钮使用自绘图标；切换模式后只需要重绘这个 42x42 小对象。
+        lv_obj_invalidate(g_loop_button);
     }
 
     if (snapshot != nullptr) {
@@ -871,10 +1359,17 @@ static void player_home_refresh_transport_controls(const AudioStateSnapshot *sna
 
 static void player_home_apply_audio_snapshot(const AudioStateSnapshot &snapshot)
 {
+    const bool pause_icon = snapshot.state == AudioPlaybackState::Playing;
     if (g_play_symbol != nullptr) {
         lv_label_set_text(
             g_play_symbol,
-            snapshot.state == AudioPlaybackState::Playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+            pause_icon ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+    }
+    if (g_play_icon_pause != pause_icon) {
+        g_play_icon_pause = pause_icon;
+        if (g_play_button != nullptr) {
+            lv_obj_invalidate(g_play_button);
+        }
     }
 
     player_home_progress_sync(snapshot);
@@ -958,11 +1453,24 @@ static void player_home_loop_cb(lv_event_t *event)
         return;
     }
     player_home_overlay_show();
-    ESP_LOGI(TAG, "P1.2 控件命中：循环模式");
+    ESP_LOGI(TAG, "P1.5.3.2R.8 控件命中：播放模式图标");
     player_control_cycle_loop_mode();
     AudioStateSnapshot snapshot = {};
     audio_service_get_snapshot(&snapshot);
     player_home_refresh_transport_controls(&snapshot);
+}
+
+static void player_home_volume_mode_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED || !g_overlay_visible ||
+        player_home_click_suppressed()) {
+        return;
+    }
+
+    const bool armed = !g_volume_adjust_armed;
+    player_home_set_volume_adjust_armed(armed);
+    player_home_overlay_arm_timeout();
+    ESP_LOGI(TAG, "P1.5.3.2R.7 音量手势：%s", armed ? "已进入纵向调节" : "已退出纵向调节");
 }
 
 static void player_home_mute_cb(lv_event_t *event)
@@ -1005,13 +1513,26 @@ void player_home_create(lv_obj_t *screen)
 
     player_home_cancel_progress_interaction();
     g_volume_dragging = false;
+    g_volume_adjust_armed = false;
     g_overlay_visible = false;
     g_overlay_fast_dim = false;
     g_overlay_dim_path_valid = false;
     g_overlay_backdrop = nullptr;
-    g_gesture_hint = nullptr;
-    g_gesture_hint_label = nullptr;
-    g_gesture_hint_timer = nullptr;
+    g_launcher = nullptr;
+    g_launcher_backdrop = nullptr;
+    g_launcher_arc = nullptr;
+    g_launcher_visible = false;
+    g_launcher_selected_index = 0U;
+    for (uint8_t i = 0; i < kLauncherItemCount; ++i) {
+        g_launcher_buttons[i] = nullptr;
+        g_launcher_captions[i] = nullptr;
+    }
+    g_prev_button = nullptr;
+    g_play_button = nullptr;
+    g_next_button = nullptr;
+    g_play_symbol = nullptr;
+    g_play_icon_pause = false;
+    g_volume_mode_button = nullptr;
     g_audio_timer = nullptr;
     g_artwork_timer = nullptr;
     g_background_timers_running = true;
@@ -1062,49 +1583,113 @@ void player_home_create(lv_obj_t *screen)
     lv_obj_add_event_cb(
         g_overlay_backdrop, player_home_overlay_backdrop_tap_cb, LV_EVENT_CLICKED, nullptr);
 
-    // P1.3 首版只验证路由，不提前创建歌词/频谱/Launcher 页面。
-    // 未落地的方向用一个短暂提示确认手势命中；顶部下拉已经直接复用现有曲库页。
-    g_gesture_hint = lv_obj_create(screen);
-    ui_common_lock_object(g_gesture_hint);
-    lv_obj_set_size(g_gesture_hint, 250, 52);
-    lv_obj_align(g_gesture_hint, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(g_gesture_hint, 26, 0);
-    lv_obj_set_style_bg_color(g_gesture_hint, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(g_gesture_hint, 205, 0);
-    lv_obj_set_style_border_width(g_gesture_hint, 0, 0);
-    lv_obj_set_style_shadow_width(g_gesture_hint, 0, 0);
-    lv_obj_set_style_pad_all(g_gesture_hint, 0, 0);
-    lv_obj_remove_flag(g_gesture_hint, LV_OBJ_FLAG_CLICKABLE);
-    g_gesture_hint_label = player_home_create_label(
-        g_gesture_hint, "", lv_color_hex(0xFFFFFF), font_manager_get_ui_font());
-    lv_obj_center(g_gesture_hint_label);
-    lv_obj_add_flag(g_gesture_hint, LV_OBJ_FLAG_HIDDEN);
+    // P1.5.3.2R.14：上滑 Launcher 第一版先实现为底部圆环菜单。
+    // 采用独立全屏容器 + 点击外部关闭；7 个图标只先做点位与选中态。
+    g_launcher = lv_obj_create(screen);
+    ui_common_lock_object(g_launcher);
+    lv_obj_set_pos(g_launcher, 0, 0);
+    lv_obj_set_size(g_launcher, FAKEPOD_LCD_WIDTH, FAKEPOD_LCD_HEIGHT);
+    lv_obj_set_style_radius(g_launcher, 0, 0);
+    lv_obj_set_style_bg_opa(g_launcher, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(g_launcher, 0, 0);
+    lv_obj_set_style_shadow_width(g_launcher, 0, 0);
+    lv_obj_set_style_pad_all(g_launcher, 0, 0);
+    lv_obj_remove_flag(g_launcher, LV_OBJ_FLAG_CLICKABLE);
 
-    // 顶部只保留轻量状态：左侧循环模式；右侧区域预留给后续 BatteryService。
-    lv_obj_t *loop = player_home_create_pill_button(g_overlay, 94, 36, "顺序", &g_loop_label);
-    lv_obj_align(loop, LV_ALIGN_TOP_LEFT, 104, 40);
-    lv_obj_add_event_cb(loop, player_home_loop_cb, LV_EVENT_CLICKED, nullptr);
+    g_launcher_backdrop = lv_obj_create(g_launcher);
+    ui_common_lock_object(g_launcher_backdrop);
+    lv_obj_set_pos(g_launcher_backdrop, 0, 0);
+    lv_obj_set_size(g_launcher_backdrop, FAKEPOD_LCD_WIDTH, FAKEPOD_LCD_HEIGHT);
+    lv_obj_set_style_radius(g_launcher_backdrop, 0, 0);
+    lv_obj_set_style_bg_color(g_launcher_backdrop, lv_color_hex(kLauncherBackdropRgb), 0);
+    lv_obj_set_style_bg_opa(g_launcher_backdrop, kLauncherBackdropOpa, 0);
+    lv_obj_set_style_border_width(g_launcher_backdrop, 0, 0);
+    lv_obj_set_style_shadow_width(g_launcher_backdrop, 0, 0);
+    lv_obj_set_style_pad_all(g_launcher_backdrop, 0, 0);
+    lv_obj_add_flag(g_launcher_backdrop, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(
+        g_launcher_backdrop,
+        player_home_launcher_backdrop_tap_cb,
+        LV_EVENT_CLICKED,
+        nullptr);
 
+    g_launcher_arc = lv_obj_create(g_launcher);
+    ui_common_lock_object(g_launcher_arc);
+    lv_obj_set_pos(g_launcher_arc, 0, 0);
+    lv_obj_set_size(g_launcher_arc, FAKEPOD_LCD_WIDTH, FAKEPOD_LCD_HEIGHT);
+    lv_obj_set_style_bg_opa(g_launcher_arc, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(g_launcher_arc, 0, 0);
+    lv_obj_set_style_shadow_width(g_launcher_arc, 0, 0);
+    lv_obj_set_style_pad_all(g_launcher_arc, 0, 0);
+    lv_obj_remove_flag(g_launcher_arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(g_launcher_arc, player_home_launcher_arc_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
+
+    for (uint8_t i = 0; i < kLauncherItemCount; ++i) {
+        g_launcher_buttons[i] = player_home_create_launcher_button(g_launcher, i);
+    }
+    player_home_launcher_apply_selection();
+    lv_obj_add_flag(g_launcher, LV_OBJ_FLAG_HIDDEN);
+
+    // P1.5.3.2R.9：重建 Overlay 为清晰的纵向信息层级：
+    // 歌名 -> 歌手 -> 列表位置/格式/采样 -> 大号播放控制 -> 进度 -> 模式/音量。
     g_title = player_home_create_label(
         g_overlay, "", lv_color_hex(0xFFFFFF), font_manager_get_ui_font());
     lv_label_set_long_mode(g_title, LV_LABEL_LONG_DOT);
-    lv_obj_set_size(g_title, 350, 34);
+    lv_obj_set_size(g_title, 388, 34);
     lv_obj_set_style_text_align(g_title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(g_title, LV_ALIGN_TOP_MID, 0, 92);
+    lv_obj_align(g_title, LV_ALIGN_TOP_MID, 0, 26);
+
+    g_artist = player_home_create_label(
+        g_overlay, "", lv_color_hex(0xD6DAE0), font_manager_get_ui_font());
+    lv_label_set_long_mode(g_artist, LV_LABEL_LONG_DOT);
+    lv_obj_set_size(g_artist, 380, 30);
+    lv_obj_set_style_text_align(g_artist, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(g_artist, LV_ALIGN_TOP_MID, 0, 61);
 
     g_track_info = player_home_create_label(
-        g_overlay, "", lv_color_hex(0xD2D6DC), font_manager_get_ui_font());
+        g_overlay, "", lv_color_hex(0x9CA6B4), font_manager_get_ui_font());
     lv_label_set_long_mode(g_track_info, LV_LABEL_LONG_DOT);
-    lv_obj_set_size(g_track_info, 360, 30);
+    lv_obj_set_size(g_track_info, 410, 28);
     lv_obj_set_style_text_align(g_track_info, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(g_track_info, LV_ALIGN_TOP_MID, 0, 127);
+    lv_obj_align(g_track_info, LV_ALIGN_TOP_MID, 0, 94);
 
-    // 中部进度区继续复用 Stage 11.2 Seek 语义。
+    // P1.5.3.2R.10：播放控制整体再下移约12px，让顶部信息、播放区、进度区之间留白更均匀。
+    // R.9 的 74/94px 真实按钮和触摸面积保持不变，只把内部 Transport 图标明显放大。
+    g_prev_button = player_home_create_round_button(g_overlay, 74, LV_SYMBOL_PREV);
+    lv_obj_align(g_prev_button, LV_ALIGN_TOP_MID, -98, 157);
+    lv_obj_t *prev_symbol = lv_obj_get_child(g_prev_button, 0);
+    if (prev_symbol != nullptr) {
+        lv_obj_add_flag(prev_symbol, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_add_event_cb(g_prev_button, player_home_transport_icon_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
+    lv_obj_add_event_cb(g_prev_button, player_home_prev_cb, LV_EVENT_CLICKED, nullptr);
+
+    g_play_button = player_home_create_round_button(g_overlay, 94, LV_SYMBOL_PLAY);
+    lv_obj_align(g_play_button, LV_ALIGN_TOP_MID, 0, 147);
+    lv_obj_set_style_bg_opa(g_play_button, 225, 0);
+    g_play_symbol = lv_obj_get_child(g_play_button, 0);
+    if (g_play_symbol != nullptr) {
+        // label 仅保存 Play/Pause 状态；实际图标由按钮 DRAW_MAIN 自绘。
+        lv_obj_add_flag(g_play_symbol, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_add_event_cb(g_play_button, player_home_transport_icon_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
+    lv_obj_add_event_cb(g_play_button, player_home_play_cb, LV_EVENT_CLICKED, nullptr);
+
+    g_next_button = player_home_create_round_button(g_overlay, 74, LV_SYMBOL_NEXT);
+    lv_obj_align(g_next_button, LV_ALIGN_TOP_MID, 98, 157);
+    lv_obj_t *next_symbol = lv_obj_get_child(g_next_button, 0);
+    if (next_symbol != nullptr) {
+        lv_obj_add_flag(next_symbol, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_add_event_cb(g_next_button, player_home_transport_icon_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
+    lv_obj_add_event_cb(g_next_button, player_home_next_cb, LV_EVENT_CLICKED, nullptr);
+
+    // 进度区跟随播放控制下移约11px；Stage 11.2 Seek 行为保持不变。
     g_progress = lv_slider_create(g_overlay);
     ui_common_lock_object(g_progress);
     lv_obj_add_flag(g_progress, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_size(g_progress, 326, 10);
-    lv_obj_align(g_progress, LV_ALIGN_TOP_MID, 0, 205);
+    lv_obj_set_size(g_progress, 340, 10);
+    lv_obj_align(g_progress, LV_ALIGN_TOP_MID, 0, 264);
     lv_slider_set_range(g_progress, 0, kProgressScale);
     lv_slider_set_value(g_progress, 0, LV_ANIM_OFF);
     lv_obj_set_style_radius(g_progress, LV_RADIUS_CIRCLE, LV_PART_MAIN);
@@ -1130,44 +1715,27 @@ void player_home_create(lv_obj_t *screen)
 
     g_current_time = player_home_create_label(
         g_overlay, "0:00", lv_color_hex(0xE7E9ED), font_manager_get_ui_font());
-    lv_obj_set_size(g_current_time, 100, 28);
+    lv_obj_set_size(g_current_time, 110, 28);
     lv_obj_set_style_text_align(g_current_time, LV_TEXT_ALIGN_LEFT, 0);
-    lv_obj_align(g_current_time, LV_ALIGN_TOP_MID, -113, 220);
+    lv_obj_align(g_current_time, LV_ALIGN_TOP_MID, -115, 279);
 
     g_total_time = player_home_create_label(
         g_overlay, "0:00", lv_color_hex(0xE7E9ED), font_manager_get_ui_font());
-    lv_obj_set_size(g_total_time, 100, 28);
+    lv_obj_set_size(g_total_time, 110, 28);
     lv_obj_set_style_text_align(g_total_time, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_obj_align(g_total_time, LV_ALIGN_TOP_MID, 113, 220);
+    lv_obj_align(g_total_time, LV_ALIGN_TOP_MID, 115, 279);
 
-    // 播放控制区。
-    lv_obj_t *prev = player_home_create_round_button(g_overlay, 60, LV_SYMBOL_PREV);
-    lv_obj_align(prev, LV_ALIGN_CENTER, -88, 70);
-    lv_obj_add_event_cb(prev, player_home_prev_cb, LV_EVENT_CLICKED, nullptr);
-
-    lv_obj_t *play = player_home_create_round_button(g_overlay, 78, LV_SYMBOL_PLAY);
-    lv_obj_align(play, LV_ALIGN_CENTER, 0, 70);
-    lv_obj_set_style_bg_opa(play, 225, 0);
-    g_play_symbol = lv_obj_get_child(play, 0);
-    if (g_play_symbol != nullptr) {
-        lv_obj_set_style_text_color(g_play_symbol, lv_color_hex(0x111111), 0);
-    }
-    lv_obj_add_event_cb(play, player_home_play_cb, LV_EVENT_CLICKED, nullptr);
-
-    lv_obj_t *next = player_home_create_round_button(g_overlay, 60, LV_SYMBOL_NEXT);
-    lv_obj_align(next, LV_ALIGN_CENTER, 88, 70);
-    lv_obj_add_event_cb(next, player_home_next_cb, LV_EVENT_CLICKED, nullptr);
-
-    // 底部音量条仅作为视觉指示器；Overlay 任意位置上下拖动负责音量预览，松手后提交一次。点击百分比仍切换静音。
-    lv_obj_t *volume_status = player_home_create_pill_button(g_overlay, 74, 32, "80%", &g_volume_label);
-    lv_obj_align(volume_status, LV_ALIGN_BOTTOM_MID, -100, -52);
-    lv_obj_add_event_cb(volume_status, player_home_mute_cb, LV_EVENT_CLICKED, nullptr);
+    // 底部固定为：模式图标 / 音量条 / 音量图标。
+    // 模式和音量入口都扩大到 60x60，直接扩大触摸面积；音量图标仍是纵向调节的显式开关。
+    g_loop_button = player_home_create_mode_button(g_overlay);
+    lv_obj_set_pos(g_loop_button, 48, 346);
+    lv_obj_add_event_cb(g_loop_button, player_home_loop_cb, LV_EVENT_CLICKED, nullptr);
 
     g_volume_slider = lv_slider_create(g_overlay);
     ui_common_lock_object(g_volume_slider);
     lv_obj_remove_flag(g_volume_slider, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_size(g_volume_slider, 190, 9);
-    lv_obj_align(g_volume_slider, LV_ALIGN_BOTTOM_MID, 34, -63);
+    lv_obj_set_size(g_volume_slider, 214, 9);
+    lv_obj_set_pos(g_volume_slider, 123, 374);
     lv_slider_set_range(g_volume_slider, 0, 100);
     lv_slider_set_value(g_volume_slider, 80, LV_ANIM_OFF);
     lv_obj_set_style_radius(g_volume_slider, LV_RADIUS_CIRCLE, LV_PART_MAIN);
@@ -1182,6 +1750,15 @@ void player_home_create(lv_obj_t *screen)
     lv_obj_set_style_bg_color(g_volume_slider, lv_color_hex(0xFFFFFF), LV_PART_KNOB);
     lv_obj_set_style_bg_opa(g_volume_slider, LV_OPA_COVER, LV_PART_KNOB);
 
+    // 百分比仍保留原静音入口，但收在音量条上方，不打断底部“模式-音量条-音量图标”的主结构。
+    lv_obj_t *volume_status = player_home_create_pill_button(g_overlay, 68, 28, "80%", &g_volume_label);
+    lv_obj_align(volume_status, LV_ALIGN_TOP_MID, 0, 319);
+    lv_obj_add_event_cb(volume_status, player_home_mute_cb, LV_EVENT_CLICKED, nullptr);
+
+    g_volume_mode_button = player_home_create_volume_mode_button(g_overlay);
+    lv_obj_set_pos(g_volume_mode_button, 352, 346);
+    lv_obj_add_event_cb(g_volume_mode_button, player_home_volume_mode_cb, LV_EVENT_CLICKED, nullptr);
+
     AudioStateSnapshot snapshot = {};
     audio_service_get_snapshot(&snapshot);
     player_home_apply_audio_snapshot(snapshot);
@@ -1191,11 +1768,6 @@ void player_home_create(lv_obj_t *screen)
     g_artwork_timer = lv_timer_create(player_home_artwork_timer_cb, 100, nullptr);
     lv_timer_create(player_home_gesture_timer_cb, 20, nullptr);
     g_overlay_timer = lv_timer_create(player_home_overlay_timeout_cb, kOverlayTimeoutMs, nullptr);
-    g_gesture_hint_timer = lv_timer_create(
-        player_home_gesture_hint_timeout_cb, kGestureHintTimeoutMs, nullptr);
-    if (g_gesture_hint_timer != nullptr) {
-        lv_timer_pause(g_gesture_hint_timer);
-    }
     if (g_overlay_timer != nullptr) {
         lv_timer_pause(g_overlay_timer);
     }
@@ -1208,7 +1780,7 @@ void player_home_create(lv_obj_t *screen)
         snprintf(list_label, sizeof(list_label), "未知列表");
     }
     ESP_LOGI(TAG,
-        "P1.5R.1.2.2 已启用：主页隐藏释放Artwork lease，恢复时重新绑定当前曲；两槽Surface cache保持current+next；列表=%s 位置=%u/%u track=%u loop=%s volume=%u%% mute=%u",
+        "P1.5.3.2R.15：清理旧GestureHint死代码；主页上滑 Launcher 保持 7 点圆环菜单，默认选中音乐并使用粉红色高亮；列表=%s 位置=%u/%u track=%u loop=%s volume=%u%% mute=%u",
         list_label,
         static_cast<unsigned>(player_state_get_list_count() > 0 ? player_state_get_list_position() + 1 : 0),
         static_cast<unsigned>(player_state_get_list_count()),
@@ -1216,6 +1788,16 @@ void player_home_create(lv_obj_t *screen)
         player_transport_loop_mode_name(player_control_get_loop_mode()),
         static_cast<unsigned>(snapshot.volume_percent),
         static_cast<unsigned>(snapshot.user_muted));
+    ESP_LOGI(TAG,
+        "P1.5.3.2R.7 Overlay：默认仅点击；点击音量图标后才启用纵向滑动调音量，再次点击或隐藏Overlay即退出；其余行为保持");
+    ESP_LOGI(TAG,
+        "P1.5.3.2R.8 收口：播放模式图标+随机模式+分段听感音量曲线保持");
+    ESP_LOGI(TAG,
+        "P1.5.3.2R.10 Overlay微调：上一曲/播放/下一曲整体下移12px，进度与时间下移11px，纵向层级间距更均匀；74/94px触摸按钮保持，Transport图标改为更大的自绘线框");
+    ESP_LOGI(TAG,
+        "P1.5.3.2R.12 收口：R.11首页纯Tap规则保持；歌词Overlay底部增加模式图标并放大音量入口");
+    ESP_LOGI(TAG,
+        "P1.5.3.2R.13 音量曲线重分配：30%=-26dB，50%=-18dB，70%=-10dB，80%=-7dB，90%=-4dB，100%=0dB；默认50%保持接近旧版启动响度");
     ESP_LOGI(TAG,
         "P1.3 GestureRouter 已启用：横滑>=72px，顶部/底部边缘=42px，控件优先，滑动后抑制CLICK；顶部下拉=曲库");
 }

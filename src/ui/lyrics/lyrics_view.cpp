@@ -38,7 +38,8 @@ static constexpr uint32_t LYRICS_INTERACTION_YIELD_MS = 120U;
 static constexpr uint32_t LYRICS_ACCENT_RGB = 0x74B5E3U;
 
 // P1.4.3：歌词页只增加底部局部控制 Overlay，不做 460x460 全屏 alpha。
-// 5 秒自动隐藏；Overlay 显示期间纵向拖动复用 GestureRouter，松手只提交一次音量。
+// P1.5.3.2R.12：5 秒自动隐藏；默认只接受点击。控制行改为
+// “模式 / 上一曲 / 播放 / 下一曲 / 音量”，音量仍必须先点击图标才开启纵向调节。
 static constexpr uint32_t LYRICS_OVERLAY_TIMEOUT_MS = 5000U;
 static constexpr int32_t LYRICS_OVERLAY_Y = 318;
 static constexpr int32_t LYRICS_OVERLAY_H = 142;
@@ -49,6 +50,7 @@ static constexpr int16_t LYRICS_OVERLAY_TAP_SAFE_LEFT_PX = 36;
 static constexpr int16_t LYRICS_OVERLAY_TAP_SAFE_TOP_PX = 60;
 static constexpr int16_t LYRICS_OVERLAY_TAP_SAFE_RIGHT_PX = 423;
 static constexpr int16_t LYRICS_OVERLAY_TAP_SAFE_BOTTOM_PX = 404;
+static constexpr int16_t LYRICS_OVERLAY_TAP_MAX_MOVE_PX = 12;
 
 struct LyricsLayout
 {
@@ -71,6 +73,8 @@ static lv_obj_t *g_overlay_progress = nullptr;
 static lv_obj_t *g_overlay_current_time = nullptr;
 static lv_obj_t *g_overlay_total_time = nullptr;
 static lv_obj_t *g_overlay_volume = nullptr;
+static lv_obj_t *g_overlay_volume_button = nullptr;
+static lv_obj_t *g_overlay_mode_button = nullptr;
 static lv_obj_t *g_overlay_play_symbol = nullptr;
 static lv_timer_t *g_overlay_timer = nullptr;
 static bool g_overlay_visible = false;
@@ -85,6 +89,7 @@ static uint32_t g_overlay_seek_base_revision = 0U;
 static uint32_t g_overlay_seek_started_tick = 0U;
 
 static bool g_overlay_volume_dragging = false;
+static bool g_overlay_volume_adjust_armed = false;
 static uint8_t g_overlay_volume_start = 0U;
 static uint8_t g_overlay_volume_preview = 0U;
 static uint32_t g_overlay_volume_sequence = 0U;
@@ -175,6 +180,143 @@ static lv_obj_t *lyrics_view_create_symbol_button(
     return button;
 }
 
+static void lyrics_view_mode_icon_draw_cb(lv_event_t *event)
+{
+    if (event == nullptr || lv_event_get_code(event) != LV_EVENT_DRAW_MAIN) {
+        return;
+    }
+
+    lv_layer_t *layer = lv_event_get_layer(event);
+    lv_obj_t *obj = lv_event_get_current_target_obj(event);
+    if (layer == nullptr || obj == nullptr) {
+        return;
+    }
+
+    lv_area_t coords = {};
+    lv_obj_get_coords(obj, &coords);
+    const int32_t cx = (coords.x1 + coords.x2) / 2;
+    const int32_t cy = (coords.y1 + coords.y2) / 2;
+
+    lv_draw_line_dsc_t line = {};
+    lv_draw_line_dsc_init(&line);
+    line.color = lv_color_hex(0xF5F7FA);
+    line.width = 3;
+    line.opa = LV_OPA_COVER;
+    line.round_start = 1U;
+    line.round_end = 1U;
+
+    auto draw = [&](int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
+        line.p1.x = x0; line.p1.y = y0;
+        line.p2.x = x1; line.p2.y = y1;
+        lv_draw_line(layer, &line);
+    };
+    auto arrow_right = [&](int32_t x, int32_t y) {
+        draw(x - 6, y - 5, x, y);
+        draw(x - 6, y + 5, x, y);
+    };
+    auto arrow_left = [&](int32_t x, int32_t y) {
+        draw(x + 6, y - 5, x, y);
+        draw(x + 6, y + 5, x, y);
+    };
+
+    switch (player_control_get_loop_mode()) {
+        case PlayerLoopMode::Sequential:
+            draw(cx - 15, cy, cx + 13, cy);
+            arrow_right(cx + 13, cy);
+            break;
+        case PlayerLoopMode::ListRepeat:
+        case PlayerLoopMode::SingleRepeat:
+            draw(cx - 13, cy - 9, cx + 11, cy - 9);
+            arrow_right(cx + 11, cy - 9);
+            draw(cx + 14, cy - 5, cx + 14, cy + 6);
+            draw(cx + 13, cy + 9, cx - 11, cy + 9);
+            arrow_left(cx - 11, cy + 9);
+            draw(cx - 14, cy + 5, cx - 14, cy - 6);
+            if (player_control_get_loop_mode() == PlayerLoopMode::SingleRepeat) {
+                draw(cx, cy - 3, cx, cy + 4);
+                draw(cx - 2, cy - 1, cx, cy - 3);
+            }
+            break;
+        case PlayerLoopMode::Shuffle:
+            draw(cx - 15, cy - 9, cx - 7, cy - 9);
+            draw(cx - 7, cy - 9, cx + 6, cy + 9);
+            draw(cx + 6, cy + 9, cx + 14, cy + 9);
+            arrow_right(cx + 14, cy + 9);
+            draw(cx - 15, cy + 9, cx - 7, cy + 9);
+            draw(cx - 7, cy + 9, cx + 6, cy - 9);
+            draw(cx + 6, cy - 9, cx + 14, cy - 9);
+            arrow_right(cx + 14, cy - 9);
+            break;
+    }
+}
+
+static void lyrics_view_volume_icon_draw_cb(lv_event_t *event)
+{
+    if (event == nullptr || lv_event_get_code(event) != LV_EVENT_DRAW_MAIN) {
+        return;
+    }
+
+    lv_layer_t *layer = lv_event_get_layer(event);
+    lv_obj_t *obj = lv_event_get_current_target_obj(event);
+    if (layer == nullptr || obj == nullptr) {
+        return;
+    }
+
+    lv_area_t coords = {};
+    lv_obj_get_coords(obj, &coords);
+    const int32_t cx = (coords.x1 + coords.x2) / 2;
+    const int32_t cy = (coords.y1 + coords.y2) / 2;
+
+    lv_draw_line_dsc_t line = {};
+    lv_draw_line_dsc_init(&line);
+    line.color = lv_color_hex(g_overlay_volume_adjust_armed ? LYRICS_ACCENT_RGB : 0xF5F7FA);
+    line.width = 3;
+    line.opa = LV_OPA_COVER;
+    line.round_start = 1U;
+    line.round_end = 1U;
+
+    auto draw = [&](int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
+        line.p1.x = x0; line.p1.y = y0;
+        line.p2.x = x1; line.p2.y = y1;
+        lv_draw_line(layer, &line);
+    };
+
+    // 58px 触摸圆内使用和主页同量级的大号扬声器，歌词页不再使用小字体 glyph。
+    draw(cx - 15, cy - 6, cx - 8, cy - 6);
+    draw(cx - 15, cy + 6, cx - 8, cy + 6);
+    draw(cx - 15, cy - 6, cx - 15, cy + 6);
+    draw(cx - 8, cy - 6, cx + 1, cy - 14);
+    draw(cx - 8, cy + 6, cx + 1, cy + 14);
+    draw(cx + 1, cy - 14, cx + 1, cy + 14);
+    draw(cx + 7, cy - 7, cx + 11, cy - 3);
+    draw(cx + 11, cy - 3, cx + 11, cy + 3);
+    draw(cx + 11, cy + 3, cx + 7, cy + 7);
+    draw(cx + 13, cy - 12, cx + 18, cy - 6);
+    draw(cx + 18, cy - 6, cx + 18, cy + 6);
+    draw(cx + 18, cy + 6, cx + 13, cy + 12);
+}
+
+static lv_obj_t *lyrics_view_create_draw_button(
+    lv_obj_t *parent,
+    int32_t size,
+    lv_event_cb_t draw_cb)
+{
+    lv_obj_t *button = lv_button_create(parent);
+    ui_common_lock_object(button);
+    lv_obj_set_size(button, size, size);
+    lv_obj_set_style_radius(button, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(button, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(button, 38, 0);
+    lv_obj_set_style_border_width(button, 0, 0);
+    lv_obj_set_style_shadow_width(button, 0, 0);
+    lv_obj_set_style_pad_all(button, 0, 0);
+    lv_obj_add_event_cb(button, lyrics_view_control_capture_cb, LV_EVENT_ALL, nullptr);
+    if (draw_cb != nullptr) {
+        lv_obj_add_event_cb(button, draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
+    }
+    return button;
+}
+
 static void lyrics_view_overlay_arm_timeout()
 {
     if (!g_overlay_visible || g_overlay_timer == nullptr) {
@@ -197,6 +339,22 @@ static void lyrics_view_overlay_cancel_progress()
     g_overlay_seek_started_tick = 0U;
 }
 
+static void lyrics_view_set_volume_adjust_armed(bool armed)
+{
+    g_overlay_volume_adjust_armed = armed && g_overlay_visible;
+    gesture_router_set_vertical_adjust_enabled(g_overlay_volume_adjust_armed);
+    if (!g_overlay_volume_adjust_armed) {
+        g_overlay_volume_dragging = false;
+    }
+    if (g_overlay_volume_button != nullptr) {
+        lv_obj_set_style_bg_opa(
+            g_overlay_volume_button,
+            g_overlay_volume_adjust_armed ? 150 : 38,
+            0);
+        lv_obj_invalidate(g_overlay_volume_button);
+    }
+}
+
 static void lyrics_view_overlay_show()
 {
     if (g_control_overlay == nullptr) {
@@ -204,10 +362,13 @@ static void lyrics_view_overlay_show()
     }
     if (!g_overlay_visible) {
         g_overlay_visible = true;
+        lyrics_view_set_volume_adjust_armed(false);
         lv_obj_remove_flag(g_control_overlay, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(g_control_overlay);
     }
-    gesture_router_set_vertical_adjust_enabled(true);
+    if (g_overlay_mode_button != nullptr) {
+        lv_obj_invalidate(g_overlay_mode_button);
+    }
     lyrics_view_overlay_arm_timeout();
 }
 
@@ -216,10 +377,9 @@ static void lyrics_view_overlay_hide()
     if (g_control_overlay == nullptr || !g_overlay_visible) {
         return;
     }
+    lyrics_view_set_volume_adjust_armed(false);
     g_overlay_visible = false;
-    g_overlay_volume_dragging = false;
     lyrics_view_overlay_cancel_progress();
-    gesture_router_set_vertical_adjust_enabled(false);
     if (g_overlay_timer != nullptr) {
         lv_timer_pause(g_overlay_timer);
     }
@@ -239,7 +399,8 @@ static void lyrics_view_overlay_timeout_cb(lv_timer_t *timer)
 static void lyrics_view_root_tap_cb(lv_event_t *event)
 {
     if (event == nullptr || lv_event_get_code(event) != LV_EVENT_CLICKED ||
-        lyrics_view_click_suppressed()) {
+        lyrics_view_click_suppressed() ||
+        !gesture_router_press_was_tap(LYRICS_OVERLAY_TAP_MAX_MOVE_PX)) {
         return;
     }
     if (g_overlay_visible) {
@@ -508,6 +669,36 @@ static void lyrics_view_overlay_next_cb(lv_event_t *event)
     }
 }
 
+static void lyrics_view_overlay_mode_cb(lv_event_t *event)
+{
+    if (event == nullptr || lv_event_get_code(event) != LV_EVENT_CLICKED ||
+        !g_overlay_visible || lyrics_view_click_suppressed()) {
+        return;
+    }
+
+    const PlayerLoopMode mode = player_control_cycle_loop_mode();
+    if (g_overlay_mode_button != nullptr) {
+        lv_obj_invalidate(g_overlay_mode_button);
+    }
+    lyrics_view_overlay_arm_timeout();
+    ESP_LOGI(TAG, "P1.5.3.2R.12 歌词Overlay播放模式：%s",
+        player_transport_loop_mode_name(mode));
+}
+
+static void lyrics_view_overlay_volume_mode_cb(lv_event_t *event)
+{
+    if (event == nullptr || lv_event_get_code(event) != LV_EVENT_CLICKED ||
+        !g_overlay_visible || lyrics_view_click_suppressed()) {
+        return;
+    }
+
+    const bool armed = !g_overlay_volume_adjust_armed;
+    lyrics_view_set_volume_adjust_armed(armed);
+    lyrics_view_overlay_arm_timeout();
+    ESP_LOGI(TAG, "P1.5.3.2R.12 歌词Overlay音量手势：%s",
+        armed ? "已进入纵向调节" : "已退出纵向调节");
+}
+
 static uint8_t lyrics_view_volume_preview_from_delta(uint8_t start_percent, int16_t delta_y)
 {
     const int32_t delta_percent =
@@ -523,7 +714,7 @@ static uint8_t lyrics_view_volume_preview_from_delta(uint8_t start_percent, int1
 
 static bool lyrics_view_overlay_volume_gesture_update()
 {
-    if (!g_overlay_visible) {
+    if (!g_overlay_visible || !g_overlay_volume_adjust_armed) {
         return false;
     }
     UiVerticalAdjustSnapshot drag = {};
@@ -1076,8 +1267,10 @@ void lyrics_view_create(lv_obj_t *screen)
     lv_obj_set_style_text_align(g_overlay_current_time, LV_TEXT_ALIGN_LEFT, 0);
     lv_obj_set_pos(g_overlay_current_time, 65, 28);
 
+    // R.12：时间行中间只保留音量百分比；底部统一成五按钮一行：
+    // 模式 / 上一曲 / 播放 / 下一曲 / 音量。两侧 58px 大按钮同时扩大视觉和触摸区域。
     g_overlay_volume = lyrics_view_create_label(
-        g_control_overlay, "80%", lv_color_hex(LYRICS_ACCENT_RGB), 80, 24);
+        g_control_overlay, "80%", lv_color_hex(LYRICS_ACCENT_RGB), 54, 24);
     lv_obj_set_style_text_align(g_overlay_volume, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(g_overlay_volume, LV_ALIGN_TOP_MID, 0, 28);
 
@@ -1086,12 +1279,18 @@ void lyrics_view_create(lv_obj_t *screen)
     lv_obj_set_style_text_align(g_overlay_total_time, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_set_pos(g_overlay_total_time, 295, 28);
 
+    g_overlay_mode_button = lyrics_view_create_draw_button(
+        g_control_overlay, 58, lyrics_view_mode_icon_draw_cb);
+    lv_obj_align(g_overlay_mode_button, LV_ALIGN_BOTTOM_MID, -164, -9);
+    lv_obj_add_event_cb(
+        g_overlay_mode_button, lyrics_view_overlay_mode_cb, LV_EVENT_CLICKED, nullptr);
+
     lv_obj_t *prev = lyrics_view_create_symbol_button(g_control_overlay, 52, LV_SYMBOL_PREV);
-    lv_obj_align(prev, LV_ALIGN_BOTTOM_MID, -78, -24);
+    lv_obj_align(prev, LV_ALIGN_BOTTOM_MID, -82, -12);
     lv_obj_add_event_cb(prev, lyrics_view_overlay_prev_cb, LV_EVENT_CLICKED, nullptr);
 
     lv_obj_t *play = lyrics_view_create_symbol_button(g_control_overlay, 62, LV_SYMBOL_PLAY);
-    lv_obj_align(play, LV_ALIGN_BOTTOM_MID, 0, -19);
+    lv_obj_align(play, LV_ALIGN_BOTTOM_MID, 0, -7);
     lv_obj_set_style_bg_opa(play, 225, 0);
     g_overlay_play_symbol = lv_obj_get_child(play, 0);
     if (g_overlay_play_symbol != nullptr) {
@@ -1100,8 +1299,14 @@ void lyrics_view_create(lv_obj_t *screen)
     lv_obj_add_event_cb(play, lyrics_view_overlay_play_cb, LV_EVENT_CLICKED, nullptr);
 
     lv_obj_t *next = lyrics_view_create_symbol_button(g_control_overlay, 52, LV_SYMBOL_NEXT);
-    lv_obj_align(next, LV_ALIGN_BOTTOM_MID, 78, -24);
+    lv_obj_align(next, LV_ALIGN_BOTTOM_MID, 82, -12);
     lv_obj_add_event_cb(next, lyrics_view_overlay_next_cb, LV_EVENT_CLICKED, nullptr);
+
+    g_overlay_volume_button = lyrics_view_create_draw_button(
+        g_control_overlay, 58, lyrics_view_volume_icon_draw_cb);
+    lv_obj_align(g_overlay_volume_button, LV_ALIGN_BOTTOM_MID, 164, -9);
+    lv_obj_add_event_cb(
+        g_overlay_volume_button, lyrics_view_overlay_volume_mode_cb, LV_EVENT_CLICKED, nullptr);
 
     lv_obj_add_flag(g_control_overlay, LV_OBJ_FLAG_HIDDEN);
 
@@ -1121,7 +1326,8 @@ void lyrics_view_create(lv_obj_t *screen)
         lv_timer_pause(g_overlay_timer);
     }
     ESP_LOGI(TAG,
-        "P1.5R.1.2 歌词页QoS：隐藏时poll暂停；触摸期间平滑动画直接收束；Overlay/按钮/布局保持");
+        "P1.5.3.2R.12 歌词Overlay：底部五按钮=模式/上一曲/播放/下一曲/音量；音量图标58px并仍需点击后才启用纵向调节；纯Tap阈值=%dpx",
+        static_cast<int>(LYRICS_OVERLAY_TAP_MAX_MOVE_PX));
 }
 
 void lyrics_view_open()
@@ -1145,8 +1351,16 @@ void lyrics_view_open()
     g_clock_observed_position_ms = UINT64_MAX;
     g_overlay_visible = false;
     g_overlay_volume_dragging = false;
+    g_overlay_volume_adjust_armed = false;
     lyrics_view_overlay_cancel_progress();
     gesture_router_set_vertical_adjust_enabled(false);
+    if (g_overlay_volume_button != nullptr) {
+        lv_obj_set_style_bg_opa(g_overlay_volume_button, 38, 0);
+        lv_obj_invalidate(g_overlay_volume_button);
+    }
+    if (g_overlay_mode_button != nullptr) {
+        lv_obj_invalidate(g_overlay_mode_button);
+    }
     if (g_control_overlay != nullptr) {
         lv_obj_add_flag(g_control_overlay, LV_OBJ_FLAG_HIDDEN);
     }

@@ -34,6 +34,9 @@ bool player_state_select_artist_group(size_t group_index, size_t position);
 bool player_state_select_album_group(size_t group_index, size_t position);
 bool player_state_select_decade_group(size_t group_index, size_t position);
 
+// 在当前列表内直接选择 position，不改变当前 Playlist Context 身份。
+bool player_state_select_position(size_t position);
+
 // 在当前列表内选择上一首/下一首，首尾循环；列表为空或 stale 时返回 false。
 bool player_state_previous();
 bool player_state_next();
