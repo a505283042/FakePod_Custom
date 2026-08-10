@@ -2,8 +2,10 @@
 
 #include "lvgl.h"
 
-// P1.5.1：频谱页框架。当前只使用轻量假数据验证 460x460 方屏页面、横向导航与持续刷新开销。
-// 不读取 PCM、不做 FFT、不访问 decoder/I2S；隐藏后动画 timer 完全暂停。
+// P1.5.2R.4.4：消费真实16-band FFT Snapshot，单对象绘制24根渐变主柱 + Peak降落点 + 短暗倒影，20 FPS。
+// 频谱下方固定预留两行高度，只显示当前同步歌词；同一句过长时按实际 glyph 像素宽度寻找更均衡的两行断点。
+// 触摸不暂停频谱；Tap 暂为空操作并预留样式切换；页面级只允许右滑返回主页。
+// UI不读取PCM、不做FFT、不访问decoder/I2S；隐藏后动画timer完全暂停。
 void spectrum_view_create(lv_obj_t *screen);
 void spectrum_view_open();
 void spectrum_view_close();

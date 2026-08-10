@@ -13,6 +13,13 @@ bool audio_service_is_ready();
 // 获取 AudioTask 发布的只读状态快照。
 bool audio_service_get_snapshot(AudioStateSnapshot *out_snapshot);
 
+// P1.5.2R.3：获取低优先级 SpectrumFFT 任务发布的 16 路真实频率 band。
+// UI 只能读取快照，不能直接访问 PCM/decoder/I2S。
+bool audio_service_get_spectrum_snapshot(AudioSpectrumSnapshot *out_snapshot);
+
+// 频谱页面显示/隐藏时启停旁路分析。这里只控制观察者，不改变音频 pipeline。
+void audio_service_set_spectrum_enabled(bool enabled);
+
 // 请求播放指定曲目。路径和技术索引都会复制到请求对象，避免跨任务悬空指针。
 // Stage 10.1 只传递/校验索引快照，decoder 仍以实际文件解析结果作为播放真值。
 bool audio_service_play_track(

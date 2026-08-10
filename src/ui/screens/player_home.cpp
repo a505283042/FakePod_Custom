@@ -39,6 +39,39 @@ static constexpr int16_t kOverlayTapSafeTopPx = 60;
 static constexpr int16_t kOverlayTapSafeRightPx = 423;
 static constexpr int16_t kOverlayTapSafeBottomPx = 404;
 
+// P1.5.2R.4.2：播放页页面级手势统一用白名单过滤。
+// TouchInput / GestureRouter 仍识别所有动作；页面层只执行当前上下文允许的动作。
+// 这样“禁止歌词下拉曲库”和“频谱只允许右滑返回”共享同一条规则。
+enum class PlaybackGestureScope : uint8_t
+{
+    Home = 0,
+    HomeOverlay,
+    Lyrics,
+    LyricsOverlay,
+    Spectrum,
+};
+
+static bool player_home_page_allows_gesture(
+    PlaybackGestureScope scope,
+    UiGestureAction action)
+{
+    switch (scope) {
+        case PlaybackGestureScope::Home:
+            return action == UiGestureAction::SwipeLeft ||
+                action == UiGestureAction::SwipeRight ||
+                action == UiGestureAction::PullDownFromTop ||
+                action == UiGestureAction::PullUpFromBottom;
+        case PlaybackGestureScope::Lyrics:
+            return action == UiGestureAction::SwipeLeft;
+        case PlaybackGestureScope::Spectrum:
+            return action == UiGestureAction::SwipeRight;
+        case PlaybackGestureScope::HomeOverlay:
+        case PlaybackGestureScope::LyricsOverlay:
+        default:
+            return false;
+    }
+}
+
 static lv_obj_t *g_overlay = nullptr;
 static lv_obj_t *g_overlay_backdrop = nullptr;
 static lv_timer_t *g_overlay_timer = nullptr;
@@ -401,46 +434,36 @@ static void player_home_gesture_timer_cb(lv_timer_t *timer)
         if (!gesture_router_take_action(&lyrics_action)) {
             return;
         }
-        if (lyrics_view_overlay_is_visible()) {
-            ESP_LOGI(TAG, "歌词Overlay 已锁定页面手势：忽略 %s", gesture_router_action_name(lyrics_action));
+        const PlaybackGestureScope lyrics_scope = lyrics_view_overlay_is_visible()
+            ? PlaybackGestureScope::LyricsOverlay
+            : PlaybackGestureScope::Lyrics;
+        if (!player_home_page_allows_gesture(lyrics_scope, lyrics_action)) {
+            // 页面不允许的动作只在业务层丢弃；GestureRouter 仍完整消费本轮触摸。
             return;
         }
-        ESP_LOGI(TAG, "P1.4.3.2 歌词页手势命中：%s", gesture_router_action_name(lyrics_action));
-        switch (lyrics_action) {
-            case UiGestureAction::SwipeLeft:
-                lyrics_view_close();
-                player_home_refresh();
-                break;
-            case UiGestureAction::PullDownFromTop:
-                // P1.4.3.2：歌词页不再下拉进入曲库。曲库入口只保留在封面主页，
-                // 避免“歌词 -> 曲库 -> 返回主页”破坏当前页面上下文。
-                ESP_LOGI(TAG, "歌词页顶部下拉已禁用：请返回封面主页后进入曲库");
-                break;
-            default:
-                break;
+
+        ESP_LOGI(TAG, "P1.5.2R.4.2 歌词页允许手势：%s", gesture_router_action_name(lyrics_action));
+        if (lyrics_action == UiGestureAction::SwipeLeft) {
+            lyrics_view_close();
+            player_home_refresh();
         }
         return;
     }
 
-    // P1.5.1：频谱页复用同一个 GestureRouter，但第一版只验证横向返回和持续刷新负载。
-    // 与歌词页一致，曲库入口仍只保留在封面主页；频谱页不开放顶部下拉。
+    // P1.5.2R.4.2：频谱页是纯观赏页。触摸照常采集/识别，但页面级业务只允许右滑返回主页。
+    // Tap 暂时保持空操作，后续可直接复用为“切换频谱显示样式”。
     if (spectrum_view_is_visible()) {
         UiGestureAction spectrum_action = UiGestureAction::None;
         if (!gesture_router_take_action(&spectrum_action)) {
             return;
         }
-        ESP_LOGI(TAG, "P1.5R.1.2 频谱页手势命中：%s", gesture_router_action_name(spectrum_action));
-        switch (spectrum_action) {
-            case UiGestureAction::SwipeRight:
-                spectrum_view_close();
-                player_home_refresh();
-                break;
-            case UiGestureAction::PullDownFromTop:
-                ESP_LOGI(TAG, "频谱页顶部下拉已禁用：请返回封面主页后进入曲库");
-                break;
-            default:
-                break;
+        if (!player_home_page_allows_gesture(PlaybackGestureScope::Spectrum, spectrum_action)) {
+            return;
         }
+
+        ESP_LOGI(TAG, "P1.5.2R.4.2 频谱页允许手势：%s", gesture_router_action_name(spectrum_action));
+        spectrum_view_close();
+        player_home_refresh();
         return;
     }
 
@@ -455,16 +478,18 @@ static void player_home_gesture_timer_cb(lv_timer_t *timer)
         return;
     }
 
-    // Overlay 是控制层：显示期间横向手势归控件层所有，不允许切换到歌词/频谱页。
-    // 纯封面态才允许 SwipeLeft / SwipeRight 做播放页横向导航。
-    if (g_overlay_visible &&
-        (action == UiGestureAction::SwipeLeft || action == UiGestureAction::SwipeRight)) {
-        ESP_LOGI(TAG, "Overlay 已锁定横滑：忽略 %s", gesture_router_action_name(action));
-        player_home_overlay_arm_timeout();
+    const PlaybackGestureScope home_scope = g_overlay_visible
+        ? PlaybackGestureScope::HomeOverlay
+        : PlaybackGestureScope::Home;
+    if (!player_home_page_allows_gesture(home_scope, action)) {
+        // Overlay 是控制层：页面级导航统一锁定；纵向音量已在上方优先消费。
+        if (g_overlay_visible) {
+            player_home_overlay_arm_timeout();
+        }
         return;
     }
 
-    ESP_LOGI(TAG, "P1.3 手势命中：%s", gesture_router_action_name(action));
+    ESP_LOGI(TAG, "P1.5.2R.4.2 主页允许手势：%s", gesture_router_action_name(action));
     switch (action) {
         case UiGestureAction::PullDownFromTop:
             player_home_overlay_hide();

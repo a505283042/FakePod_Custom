@@ -41,7 +41,17 @@ static constexpr BaseType_t FLAC_PREFETCH_TASK_CORE = 1;
 // P1.2.15: cooperative waits must be expressed in RTOS ticks, not sub-tick milliseconds.
 // On a 100Hz FreeRTOS tick, pdMS_TO_TICKS(1) becomes 0 and does not truly block the task.
 static constexpr TickType_t FLAC_PREFETCH_COOPERATIVE_BLOCK_TICKS = 1;
-static constexpr uint32_t FLAC_PREFETCH_COOPERATIVE_READ_BATCH = 4;
+// P1.5R.2：播放进入稳态后，不再固定“每4次读取休眠1 tick”。
+// ring 水位越低，允许连续补充的读取次数越多；但 Emergency 也保留硬上限，
+// 最迟连续8次真实 SD 读取后必须阻塞1 tick，避免重新引入 P1.2.9 的 IDLE1 WDT。
+static constexpr uint32_t FLAC_PREFETCH_COOPERATIVE_READ_BATCH = 4;  // 起播阶段保持 P1.2.15 行为
+static constexpr uint32_t FLAC_PREFETCH_QOS_EMERGENCY_PERCENT = 60;
+static constexpr uint32_t FLAC_PREFETCH_QOS_RECOVERY_PERCENT = 80;
+static constexpr uint32_t FLAC_PREFETCH_QOS_PLENTY_PERCENT = 92;
+static constexpr uint32_t FLAC_PREFETCH_QOS_BATCH_EMERGENCY = 8;
+static constexpr uint32_t FLAC_PREFETCH_QOS_BATCH_RECOVERY = 6;
+static constexpr uint32_t FLAC_PREFETCH_QOS_BATCH_NORMAL = 4;
+static constexpr uint32_t FLAC_PREFETCH_QOS_BATCH_PLENTY = 2;
 static constexpr TickType_t FLAC_PREFETCH_SEND_WAIT = pdMS_TO_TICKS(20);
 static constexpr TickType_t FLAC_PREFETCH_RECEIVE_WAIT = pdMS_TO_TICKS(20);
 // 首块 PCM 预解码发生在 I2S 启动前，不受实时播放预算约束。
@@ -109,6 +119,14 @@ static FlacPrefetchProfile flac_prefetch_profile_for_rate(uint32_t sample_rate_h
     return {};
 }
 
+enum class FlacPrefetchQosState : uint8_t
+{
+    Emergency = 0,
+    Recovery,
+    Normal,
+    Plenty,
+};
+
 struct FlacPrefetchContext
 {
     AudioSource *source = nullptr;
@@ -131,6 +149,18 @@ struct FlacPrefetchContext
     volatile bool stop_requested = false;
     volatile bool eof = false;
     volatile bool io_error = false;
+
+    // P1.5R.2 Adaptive Prefetch QoS。起播预充完成前保持 P1.2.15 固定批次，
+    // 正式播放后才按 ring 水位动态决定下一次 cooperative block 的批次。
+    volatile bool adaptive_qos_active = false;
+    bool qos_tracking_started = false;
+    bool qos_pressure_active = false;
+    FlacPrefetchQosState qos_state = FlacPrefetchQosState::Normal;
+    size_t qos_min_buffered_bytes = 0;
+    uint32_t qos_emergency_entries = 0;
+    uint32_t qos_recovered_count = 0;
+    uint32_t qos_max_consecutive_reads = 0;
+    uint32_t qos_cooperative_blocks = 0;
 #if APP_DIAG_FLAC_PERFORMANCE
     volatile UBaseType_t stack_hwm = 0;
     uint64_t perf_read_total_us = 0;
@@ -193,6 +223,108 @@ static FlacPrefetchContext *flac_prefetch_context(FlacDecoder *decoder)
     return decoder != nullptr
         ? static_cast<FlacPrefetchContext *>(decoder->prefetch_context)
         : nullptr;
+}
+
+static uint32_t flac_prefetch_qos_percent(size_t buffered_bytes, size_t capacity_bytes)
+{
+    if (capacity_bytes == 0) {
+        return 0;
+    }
+    const uint64_t scaled = static_cast<uint64_t>(buffered_bytes) * 100ULL;
+    return static_cast<uint32_t>((scaled + capacity_bytes / 2U) / capacity_bytes);
+}
+
+static FlacPrefetchQosState flac_prefetch_qos_state_for_level(
+    size_t buffered_bytes,
+    size_t capacity_bytes
+)
+{
+    const uint32_t percent = flac_prefetch_qos_percent(buffered_bytes, capacity_bytes);
+    if (percent < FLAC_PREFETCH_QOS_EMERGENCY_PERCENT) {
+        return FlacPrefetchQosState::Emergency;
+    }
+    if (percent < FLAC_PREFETCH_QOS_RECOVERY_PERCENT) {
+        return FlacPrefetchQosState::Recovery;
+    }
+    if (percent < FLAC_PREFETCH_QOS_PLENTY_PERCENT) {
+        return FlacPrefetchQosState::Normal;
+    }
+    return FlacPrefetchQosState::Plenty;
+}
+
+static uint32_t flac_prefetch_qos_batch_for_state(FlacPrefetchQosState state)
+{
+    switch (state) {
+        case FlacPrefetchQosState::Emergency:
+            return FLAC_PREFETCH_QOS_BATCH_EMERGENCY;
+        case FlacPrefetchQosState::Recovery:
+            return FLAC_PREFETCH_QOS_BATCH_RECOVERY;
+        case FlacPrefetchQosState::Plenty:
+            return FLAC_PREFETCH_QOS_BATCH_PLENTY;
+        case FlacPrefetchQosState::Normal:
+        default:
+            return FLAC_PREFETCH_QOS_BATCH_NORMAL;
+    }
+}
+
+static FlacPrefetchQosState flac_prefetch_qos_observe(
+    FlacPrefetchContext *context,
+    size_t buffered_bytes
+)
+{
+    if (context == nullptr || !context->adaptive_qos_active || context->ring_bytes == 0) {
+        return FlacPrefetchQosState::Normal;
+    }
+
+    const FlacPrefetchQosState state = flac_prefetch_qos_state_for_level(
+        buffered_bytes,
+        context->ring_bytes
+    );
+
+    if (!context->qos_tracking_started) {
+        // 起播目标本来就可能只有 ring 的25%/50%，不能把这段“有意的低水位”
+        // 计入稳态最小值。首次恢复到 >=80% 后再开始记录运行期 QoS。
+        context->qos_state = state;
+        if (state == FlacPrefetchQosState::Normal || state == FlacPrefetchQosState::Plenty) {
+            context->qos_tracking_started = true;
+            context->qos_min_buffered_bytes = buffered_bytes;
+        }
+        return state;
+    }
+
+    if (buffered_bytes < context->qos_min_buffered_bytes) {
+        context->qos_min_buffered_bytes = buffered_bytes;
+    }
+
+    // Emergency 进入阈值与恢复阈值分离（<60% / >=80%），避免水位在边界附近抖动时刷日志。
+    if (
+        state == FlacPrefetchQosState::Emergency &&
+        context->qos_state != FlacPrefetchQosState::Emergency &&
+        !context->qos_pressure_active
+    ) {
+        context->qos_pressure_active = true;
+        ++context->qos_emergency_entries;
+        ESP_LOGW(TAG,
+            "P1.5R.2 FLAC预取进入Emergency：ring=%u/%uB (%u%%)，切换到最多%u次连续读取",
+            static_cast<unsigned>(buffered_bytes),
+            static_cast<unsigned>(context->ring_bytes),
+            static_cast<unsigned>(flac_prefetch_qos_percent(buffered_bytes, context->ring_bytes)),
+            static_cast<unsigned>(FLAC_PREFETCH_QOS_BATCH_EMERGENCY));
+    } else if (
+        context->qos_pressure_active &&
+        (state == FlacPrefetchQosState::Normal || state == FlacPrefetchQosState::Plenty)
+    ) {
+        context->qos_pressure_active = false;
+        ++context->qos_recovered_count;
+        ESP_LOGI(TAG,
+            "P1.5R.2 FLAC预取已恢复Normal：ring=%u/%uB (%u%%)",
+            static_cast<unsigned>(buffered_bytes),
+            static_cast<unsigned>(context->ring_bytes),
+            static_cast<unsigned>(flac_prefetch_qos_percent(buffered_bytes, context->ring_bytes)));
+    }
+
+    context->qos_state = state;
+    return state;
 }
 
 #if APP_DIAG_FLAC_PERFORMANCE
@@ -487,9 +619,17 @@ static void flac_prefetch_task(void *arg)
             continue;
         }
 
+        const size_t buffered_before = xStreamBufferBytesAvailable(context->stream);
+        if (context->adaptive_qos_active) {
+            flac_prefetch_qos_observe(context, buffered_before);
+        }
+
         const size_t free_bytes = xStreamBufferSpacesAvailable(context->stream);
         if (free_bytes < context->read_chunk_bytes) {
             flac_storage_window_publish(context);
+            // ring 本身已经逼近满水位，这次容量等待就是一次真实 cooperative block。
+            // 清零连续读取计数，避免刚有空间后又因为旧计数立即二次 sleep。
+            cooperative_read_count = 0;
             vTaskDelay(FLAC_PREFETCH_COOPERATIVE_BLOCK_TICKS);
             continue;
         }
@@ -522,10 +662,31 @@ static void flac_prefetch_task(void *arg)
             }
             flac_storage_window_publish(context);
 
-            // Give Core1 a real idle window periodically without sleeping after every SD read.
-            // 48/96/192k profiles therefore move 32/64/128KB respectively before one tick block.
-            if (++cooperative_read_count >= FLAC_PREFETCH_COOPERATIVE_READ_BATCH) {
+            // P1.5R.2：起播预充阶段仍保持 P1.2.15 固定4次读取后阻塞1 tick；
+            // 正式播放后按 ring 水位动态调整批次。低水位允许更连续地补粮，
+            // 高水位更积极让出 Core1，但任何状态都保留真实阻塞，防止 IDLE1 WDT 回归。
+            uint32_t cooperative_batch = FLAC_PREFETCH_COOPERATIVE_READ_BATCH;
+            if (context->adaptive_qos_active) {
+                const size_t buffered_after = xStreamBufferBytesAvailable(context->stream);
+                const FlacPrefetchQosState qos_state = flac_prefetch_qos_observe(
+                    context,
+                    buffered_after
+                );
+                cooperative_batch = flac_prefetch_qos_batch_for_state(qos_state);
+            }
+
+            ++cooperative_read_count;
+            if (
+                context->adaptive_qos_active &&
+                cooperative_read_count > context->qos_max_consecutive_reads
+            ) {
+                context->qos_max_consecutive_reads = cooperative_read_count;
+            }
+            if (cooperative_read_count >= cooperative_batch) {
                 cooperative_read_count = 0;
+                if (context->adaptive_qos_active) {
+                    ++context->qos_cooperative_blocks;
+                }
                 vTaskDelay(FLAC_PREFETCH_COOPERATIVE_BLOCK_TICKS);
             }
         }
@@ -572,6 +733,21 @@ static void flac_prefetch_destroy(FlacDecoder *decoder)
             vTaskDelete(context->task);
         }
         context->task = nullptr;
+    }
+
+    if (context->adaptive_qos_active && context->qos_tracking_started) {
+        ESP_LOGI(TAG,
+            "P1.5R.2 FLAC预取QoS汇总：min=%u/%uB (%u%%) emergency=%u recovered=%u max_batch=%u blocks=%u",
+            static_cast<unsigned>(context->qos_min_buffered_bytes),
+            static_cast<unsigned>(context->ring_bytes),
+            static_cast<unsigned>(flac_prefetch_qos_percent(
+                context->qos_min_buffered_bytes,
+                context->ring_bytes
+            )),
+            static_cast<unsigned>(context->qos_emergency_entries),
+            static_cast<unsigned>(context->qos_recovered_count),
+            static_cast<unsigned>(context->qos_max_consecutive_reads),
+            static_cast<unsigned>(context->qos_cooperative_blocks));
     }
 
     if (context->stream != nullptr) {
@@ -686,6 +862,30 @@ static esp_err_t flac_prefetch_start(FlacDecoder *decoder)
         flac_prefetch_destroy(decoder);
         return io_error ? ESP_FAIL : ESP_ERR_TIMEOUT;
     }
+
+    // 起播预充已经达到最低要求后才启用自适应 QoS，避免改变已经验证过的启动路径。
+    // active 最后写入；PrefetchTask 看到 true 时，其余统计初值已经完整。
+    context->qos_state = flac_prefetch_qos_state_for_level(primed, context->ring_bytes);
+    context->qos_tracking_started = false;
+    context->qos_pressure_active = false;
+    context->qos_min_buffered_bytes = 0;
+    context->qos_emergency_entries = 0;
+    context->qos_recovered_count = 0;
+    context->qos_max_consecutive_reads = 0;
+    context->qos_cooperative_blocks = 0;
+    context->adaptive_qos_active = true;
+    ESP_LOGI(TAG,
+        "P1.5R.2 Adaptive Prefetch QoS已启用：ring=%uKB，起始=%uB (%u%%)，阈值=<%u/%u/%u%%，batch=%u/%u/%u/%u",
+        static_cast<unsigned>(context->ring_bytes / 1024U),
+        static_cast<unsigned>(primed),
+        static_cast<unsigned>(flac_prefetch_qos_percent(primed, context->ring_bytes)),
+        static_cast<unsigned>(FLAC_PREFETCH_QOS_EMERGENCY_PERCENT),
+        static_cast<unsigned>(FLAC_PREFETCH_QOS_RECOVERY_PERCENT),
+        static_cast<unsigned>(FLAC_PREFETCH_QOS_PLENTY_PERCENT),
+        static_cast<unsigned>(FLAC_PREFETCH_QOS_BATCH_EMERGENCY),
+        static_cast<unsigned>(FLAC_PREFETCH_QOS_BATCH_RECOVERY),
+        static_cast<unsigned>(FLAC_PREFETCH_QOS_BATCH_NORMAL),
+        static_cast<unsigned>(FLAC_PREFETCH_QOS_BATCH_PLENTY));
 
 #if APP_DIAG_AUDIO_CODEC
     ESP_LOGI(TAG,

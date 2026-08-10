@@ -22,6 +22,7 @@ idf_component_register(
 
         "audio/audio_service.cpp"
         "audio/audio_decode_workspace.cpp"
+        "audio/audio_spectrum_snapshot.cpp"
         "audio/sources/audio_source.cpp"
         "audio/sources/sd_file_audio_source.cpp"
         "audio/decoders/pcm_decoder.cpp"

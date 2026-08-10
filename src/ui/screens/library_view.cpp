@@ -1917,9 +1917,9 @@ void library_view_create(lv_obj_t *screen)
     lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
     library_view_render(false);
 
-    ESP_LOGI(TAG, "Build=P1.5R.1.2.2 ArtworkLeaseLifecycle");
+    ESP_LOGI(TAG, "Build=P1.5.2R.4.4 BalancedLyricWrap");
     ESP_LOGI(TAG,
-        "P1.5R.1.2.2：Artwork Lease Lifecycle已启用；主页隐藏释放旧Surface lease，恢复时重绑当前曲；两槽cache保持current+next；P1.5R.1.2 Interaction QoS保持；右侧%dpx位置条保持",
+        "P1.5.2R.4.4：频谱当前歌词保持固定两行区域；长句按实际glyph像素宽度均衡断行并优先自然边界，极端超长仅第二行末尾省略；其它FFT/Peak/倒影/手势/Adaptive Prefetch保持；右侧%dpx位置条保持",
         static_cast<int>(LIBRARY_SCROLLBAR_W));
 }
 
@@ -1994,6 +1994,13 @@ void library_view_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick
         if (!g_gesture.pressed) {
             const bool stopped_inertia = g_inertia.active;
             library_view_inertia_stop(true);
+
+            // P1.5R.2.1：点击抑制只能属于“上一轮拖动自身”，不能跨到下一次独立点击。
+            // 拖动 MOVE/UP 后仍保留 suppress_click_until，用于拦截 LVGL 为该拖动产生的 CLICK；
+            // 一旦收到下一轮新的 DOWN，就清除上一手势残留。若此 DOWN 正好用于刹停列表惯性，
+            // 下面会仅对本轮列表按压重新建立 suppression，因此 Header 仍可一次点击生效。
+            g_gesture.suppress_click_until = 0U;
+
             g_gesture.pressed = true;
             g_gesture.start_x = x;
             g_gesture.start_y = y;

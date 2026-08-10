@@ -59,4 +59,22 @@ struct AudioStateSnapshot
     bool user_muted = false;
 };
 
+// P1.5.2R.3：AudioTask 只旁路抽取真实 PCM；低优先级 SpectrumFFT 任务
+// 计算 256 点 FFT 并发布 16 个低频→高频 band。UI 只消费 POD 快照，
+// 不接触 decoder、PCM 工作区或 I2S。
+static constexpr uint8_t AUDIO_SPECTRUM_BAND_COUNT = 16U;
+
+struct AudioSpectrumSnapshot
+{
+    bool valid = false;
+    uint32_t revision = 0;
+    uint32_t playback_revision = 0;
+    uint32_t track_index = UINT32_MAX;
+    uint32_t sample_rate_hz = 0;
+    uint32_t analysis_sample_rate_hz = 0;
+    uint16_t fft_size = 0;
+    uint64_t position_frames = 0;
+    uint8_t levels[AUDIO_SPECTRUM_BAND_COUNT] = {};
+};
+
 const char *audio_playback_state_name_cn(AudioPlaybackState state);

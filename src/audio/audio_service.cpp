@@ -13,6 +13,7 @@
 #include "pcm_decoder.h"
 #include "audio_decode_workspace.h"
 #include "audio_playback_clock.h"
+#include "audio_spectrum_snapshot.h"
 #include "app_diag_config.h"
 
 static const char *TAG = "音频服务";
@@ -871,6 +872,12 @@ static esp_err_t audio_task_start_pcm_pipeline(
     g_last_progress_publish_frame = g_playback_clock.submitted_frames;
     g_ram_trace_first_pcm_done = false;
     g_ram_trace_steady_5s_done = false;
+    // P1.5.2R.3：新曲/Seek 建立新 PCM pipeline 时先清空旧 FFT 快照。
+    // UI 会同时核对 playback_revision + track_index，绝不会把上一首的 PCM 当成当前频谱。
+    audio_spectrum_snapshot_reset(
+        g_task_playback_revision,
+        g_task_track_index,
+        g_task_sample_rate_hz);
     audio_task_publish_snapshot();
 
     AUDIO_POP_TRACE_LOG(
@@ -1131,6 +1138,16 @@ static void audio_task_service_pcm_playback()
     // i2s_output_stream_write_pcm32() 成功表示整块真实 PCM 已复制进 DMA。
     // 启动 prime、暂停保持时钟和 EOF drain 都走 silence API，因此不会污染该计数。
     audio_playback_clock_commit_pcm(&g_playback_clock, frames);
+
+    // P1.5.2R.3：只在“真实 PCM 已成功进入 I2S DMA”之后旁路采样。
+    // AudioTask 只负责约20Hz抽取/降采样并填充256点mono窗；FFT在Core1/P1任务执行。
+    audio_spectrum_snapshot_publish_pcm(
+        g_pcm_block,
+        frames,
+        g_task_playback_revision,
+        g_task_track_index,
+        g_task_sample_rate_hz,
+        g_playback_clock.submitted_frames);
 
     // FLAC/simple-decoder 可能在真正 process 首帧时才完成内部工作区的延迟分配。
     // 这里只采样一次首个 PCM 块和一次 5 秒稳定态，避免 RAM 诊断日志进入实时热循环。
@@ -1456,6 +1473,7 @@ static void audio_task_handle_stop(AudioRequest *request)
     g_task_last_seek_request_id = 0;
     g_task_last_seek_target_ms = 0;
     audio_task_reset_media_fields();
+    audio_spectrum_snapshot_reset(g_task_playback_revision, UINT32_MAX, 0U);
 
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "停止播放时清理音频链路失败：%s", esp_err_to_name(ret));
@@ -1914,6 +1932,12 @@ esp_err_t audio_service_start()
         return ESP_OK;
     }
 
+    // P1.5.2R.3：FFT 是低优先级旁路观察者。即使创建失败也不能阻止核心音频服务启动。
+    const esp_err_t spectrum_ret = audio_spectrum_snapshot_start();
+    if (spectrum_ret != ESP_OK) {
+        ESP_LOGW(TAG, "SpectrumFFT旁路启动失败，继续无频谱运行：%s", esp_err_to_name(spectrum_ret));
+    }
+
     if (g_command_queue == nullptr) {
         g_command_queue = xQueueCreate(AUDIO_COMMAND_QUEUE_LENGTH, sizeof(AudioRequest *));
         if (g_command_queue == nullptr) {
@@ -1986,6 +2010,16 @@ bool audio_service_get_snapshot(AudioStateSnapshot *out_snapshot)
     *out_snapshot = g_snapshot;
     portEXIT_CRITICAL(&g_snapshot_mux);
     return true;
+}
+
+bool audio_service_get_spectrum_snapshot(AudioSpectrumSnapshot *out_snapshot)
+{
+    return audio_spectrum_snapshot_get(out_snapshot);
+}
+
+void audio_service_set_spectrum_enabled(bool enabled)
+{
+    audio_spectrum_snapshot_set_enabled(enabled);
 }
 
 bool audio_service_play_track(
