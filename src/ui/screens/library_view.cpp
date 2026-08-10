@@ -1917,9 +1917,9 @@ void library_view_create(lv_obj_t *screen)
     lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
     library_view_render(false);
 
-    ESP_LOGI(TAG, "Build=P1.5.2R.4.4 BalancedLyricWrap");
+    ESP_LOGI(TAG, "Build=P1.5.3.3 SpectrumScaleDensityPolish");
     ESP_LOGI(TAG,
-        "P1.5.2R.4.4：频谱当前歌词保持固定两行区域；长句按实际glyph像素宽度均衡断行并优先自然边界，极端超长仅第二行末尾省略；其它FFT/Peak/倒影/手势/Adaptive Prefetch保持；右侧%dpx位置条保持",
+        "P1.5.3.3：Neon Ridge竖向stems加密到40根且亮度降至40%%，山脊高度约+20%%；横向频谱高度约+18%%，Peak/55%%倒影同步；其它位置与FFT/手势/歌词/Adaptive Prefetch保持；右侧%dpx位置条保持",
         static_cast<int>(LIBRARY_SCROLLBAR_W));
 }
 
