@@ -42,30 +42,51 @@ static constexpr int16_t kOverlayTapSafeBottomPx = 404;
 // 即使没有达到 72px 页面手势触发阈值，也绝不补成 Overlay 点击。
 static constexpr int16_t kOverlayTapMaxMovePx = 12;
 
-// P1.5.3.2R.14：上滑 Launcher 改为真正的圆环菜单。第一版只先落 7 个图标点位，
-// 不接功能页面；默认高亮“音乐”，点击其他图标仅改变选中态。选中项使用粉红色。
+// P1.5.3.2R.16：按目标图重做为真正的 7 分区圆环菜单。
+// 外环由 7 个厚 Arc 扇区拼成，选中扇区使用青色高亮；中心黑圆显示当前选中图标，使用粉红色。
+// 本轮仍只验证菜单视觉、点击选中和命中区域，不接 7 个功能页面。
 static constexpr uint32_t kLauncherAccentRgb = 0xFF4FA3;
+static constexpr uint32_t kLauncherSelectedSectorRgb = 0x28E6F2;
 static constexpr uint32_t kLauncherBackdropRgb = 0x000000;
-static constexpr lv_opa_t kLauncherBackdropOpa = 150;
+static constexpr lv_opa_t kLauncherBackdropOpa = 142;
 static constexpr uint8_t kLauncherItemCount = 7U;
+static constexpr int16_t kLauncherCenterX = 230;
+static constexpr int16_t kLauncherCenterY = 230;
+static constexpr uint16_t kLauncherOuterRadius = 158U;
+static constexpr int16_t kLauncherRingWidth = 74;
+static constexpr int16_t kLauncherCenterDiameter = 126;
+static constexpr int16_t kLauncherHitSize = 82;
 
-// 手工布局的 7 个圆环点位：上中最突出，两侧沿弧线分布。
-// 第一版只验证 Launcher 视觉/手感，后续再给各项接页面能力。
+// LVGL 9.2 的 arc 角度：0°在下、90°在右、180°在上、270°在左。
+// 每个分区预留约 3°暗缝，视觉上形成目标图里的独立扇区。
+enum class LauncherIconKind : uint8_t {
+    Music = 0,
+    Nsf,
+    MicSpectrum,
+    Mjpg,
+    Picture,
+    Ebook,
+    Settings,
+};
+
 struct LauncherMenuItemDef {
-    const char *icon_text;
-    const char *caption;
-    int16_t center_x;
-    int16_t center_y;
+    LauncherIconKind icon;
+    const char *name;
+    int16_t icon_x;
+    int16_t icon_y;
+    int16_t start_angle;
+    int16_t end_angle;
+    uint32_t idle_rgb;
 };
 
 static constexpr LauncherMenuItemDef kLauncherItems[kLauncherItemCount] = {
-    {"M",   "音乐",     230, 208},
-    {"NSF", "NSF播放",  152, 240},
-    {"MIC", "拾音频谱", 108, 315},
-    {"MJ",  "MJPG播放", 308, 240},
-    {"PIC", "图片播放", 352, 315},
-    {"TXT", "电子书",   176, 390},
-    {"SET", "设置",     284, 390},
+    {LauncherIconKind::Music,       "音乐",     230, 112, 156, 204, 0x3C527F},
+    {LauncherIconKind::Nsf,         "NSF播放",  322, 156, 105, 153, 0x334A78},
+    {LauncherIconKind::MicSpectrum, "拾音频谱", 345, 256,  54, 102, 0x2B426F},
+    {LauncherIconKind::Mjpg,        "MJPG播放", 281, 336,   3,  51, 0x263D69},
+    {LauncherIconKind::Picture,     "图片播放", 179, 336, 312, 357, 0x233861},
+    {LauncherIconKind::Ebook,       "电子书",   115, 256, 261, 309, 0x2A406C},
+    {LauncherIconKind::Settings,    "设置",     138, 156, 207, 258, 0x354B77},
 };
 
 // P1.5.2R.4.2：播放页页面级手势统一用白名单过滤。
@@ -112,9 +133,9 @@ static bool g_overlay_dim_path_valid = false;
 
 static lv_obj_t *g_launcher = nullptr;
 static lv_obj_t *g_launcher_backdrop = nullptr;
-static lv_obj_t *g_launcher_arc = nullptr;
+static lv_obj_t *g_launcher_ring = nullptr;
+static lv_obj_t *g_launcher_center = nullptr;
 static lv_obj_t *g_launcher_buttons[kLauncherItemCount] = {};
-static lv_obj_t *g_launcher_captions[kLauncherItemCount] = {};
 static bool g_launcher_visible = false;
 static uint8_t g_launcher_selected_index = 0U;
 
@@ -465,7 +486,188 @@ static lv_obj_t *player_home_create_pill_button(
     return button;
 }
 
-static void player_home_launcher_arc_draw_cb(lv_event_t *event)
+static void player_home_launcher_draw_line(
+    lv_layer_t *layer,
+    lv_draw_line_dsc_t *line,
+    int32_t x0,
+    int32_t y0,
+    int32_t x1,
+    int32_t y1)
+{
+    line->p1.x = x0;
+    line->p1.y = y0;
+    line->p2.x = x1;
+    line->p2.y = y1;
+    lv_draw_line(layer, line);
+}
+
+static void player_home_launcher_draw_dot(
+    lv_layer_t *layer,
+    int32_t cx,
+    int32_t cy,
+    int32_t diameter,
+    lv_color_t color)
+{
+    lv_draw_rect_dsc_t dot = {};
+    lv_draw_rect_dsc_init(&dot);
+    dot.bg_color = color;
+    dot.bg_opa = LV_OPA_COVER;
+    dot.radius = LV_RADIUS_CIRCLE;
+    dot.border_width = 0;
+    const int32_t half = diameter / 2;
+    lv_area_t area = {cx - half, cy - half, cx + half, cy + half};
+    lv_draw_rect(layer, &dot, &area);
+}
+
+static void player_home_launcher_draw_icon(
+    lv_layer_t *layer,
+    LauncherIconKind icon,
+    int32_t cx,
+    int32_t cy,
+    lv_color_t color,
+    int32_t scale_percent)
+{
+    if (layer == nullptr) {
+        return;
+    }
+
+    auto s = [scale_percent](int32_t value) -> int32_t {
+        const int32_t scaled = (value * scale_percent + (value >= 0 ? 50 : -50)) / 100;
+        if (value != 0 && scaled == 0) {
+            return value > 0 ? 1 : -1;
+        }
+        return scaled;
+    };
+
+    lv_draw_line_dsc_t line = {};
+    lv_draw_line_dsc_init(&line);
+    line.color = color;
+    line.width = scale_percent >= 120 ? 4 : 3;
+    line.opa = LV_OPA_COVER;
+    line.round_start = 1U;
+    line.round_end = 1U;
+
+    auto draw = [&](int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
+        player_home_launcher_draw_line(
+            layer, &line,
+            cx + s(x0), cy + s(y0),
+            cx + s(x1), cy + s(y1));
+    };
+    auto dot = [&](int32_t x, int32_t y, int32_t d) {
+        player_home_launcher_draw_dot(
+            layer, cx + s(x), cy + s(y), s(d) < 3 ? 3 : s(d), color);
+    };
+
+    switch (icon) {
+        case LauncherIconKind::Music:
+            // 双音符：中心圆里的默认选中图标会略放大。
+            draw(4, -17, 4, 9);
+            draw(4, -17, 16, -20);
+            draw(16, -20, 16, 4);
+            dot(-2, 10, 10);
+            dot(10, 5, 10);
+            break;
+
+        case LauncherIconKind::Nsf:
+            // 芯片/游戏音源图标：方形主体 + 四周引脚 + 中心脉冲。
+            draw(-13, -13, 13, -13);
+            draw(13, -13, 13, 13);
+            draw(13, 13, -13, 13);
+            draw(-13, 13, -13, -13);
+            draw(-8, -18, -8, -13);
+            draw(0, -18, 0, -13);
+            draw(8, -18, 8, -13);
+            draw(-8, 13, -8, 18);
+            draw(0, 13, 0, 18);
+            draw(8, 13, 8, 18);
+            draw(-18, -8, -13, -8);
+            draw(-18, 0, -13, 0);
+            draw(-18, 8, -13, 8);
+            draw(13, -8, 18, -8);
+            draw(13, 0, 18, 0);
+            draw(13, 8, 18, 8);
+            draw(-7, 4, -2, -4);
+            draw(-2, -4, 3, 4);
+            draw(3, 4, 8, -4);
+            break;
+
+        case LauncherIconKind::MicSpectrum:
+            // 麦克风 + 右侧三根频谱条。
+            draw(-11, -14, -11, 6);
+            draw(-11, -14, -4, -18);
+            draw(-4, -18, 3, -14);
+            draw(3, -14, 3, 6);
+            draw(3, 6, -4, 10);
+            draw(-4, 10, -11, 6);
+            draw(-15, 4, -15, 7);
+            draw(-15, 7, -9, 13);
+            draw(-9, 13, -4, 14);
+            draw(-4, 14, 2, 12);
+            draw(-4, 14, -4, 19);
+            draw(-10, 19, 2, 19);
+            draw(8, 10, 8, 17);
+            draw(13, 4, 13, 17);
+            draw(18, -3, 18, 17);
+            break;
+
+        case LauncherIconKind::Mjpg:
+            // 视频：矩形画框 + 播放三角。
+            draw(-18, -13, 11, -13);
+            draw(11, -13, 11, 13);
+            draw(11, 13, -18, 13);
+            draw(-18, 13, -18, -13);
+            draw(11, -7, 18, -12);
+            draw(18, -12, 18, 12);
+            draw(18, 12, 11, 7);
+            draw(-6, -7, -6, 7);
+            draw(-6, -7, 5, 0);
+            draw(5, 0, -6, 7);
+            break;
+
+        case LauncherIconKind::Picture:
+            // 图片：相框 + 山峰 + 太阳。
+            draw(-18, -15, 18, -15);
+            draw(18, -15, 18, 15);
+            draw(18, 15, -18, 15);
+            draw(-18, 15, -18, -15);
+            draw(-14, 10, -5, 0);
+            draw(-5, 0, 1, 6);
+            draw(1, 6, 8, -4);
+            draw(8, -4, 15, 10);
+            dot(9, -9, 6);
+            break;
+
+        case LauncherIconKind::Ebook:
+            // 打开的书本：左右页 + 中缝。
+            draw(0, -14, 0, 15);
+            draw(-1, -12, -7, -15);
+            draw(-7, -15, -18, -12);
+            draw(-18, -12, -18, 12);
+            draw(-18, 12, -7, 10);
+            draw(-7, 10, -1, 13);
+            draw(1, -12, 7, -15);
+            draw(7, -15, 18, -12);
+            draw(18, -12, 18, 12);
+            draw(18, 12, 7, 10);
+            draw(7, 10, 1, 13);
+            break;
+
+        case LauncherIconKind::Settings:
+            // 轻量齿轮：中心圆 + 8 个短辐条。
+            dot(0, 0, 10);
+            draw(0, -18, 0, -11);
+            draw(0, 11, 0, 18);
+            draw(-18, 0, -11, 0);
+            draw(11, 0, 18, 0);
+            draw(-13, -13, -8, -8);
+            draw(8, 8, 13, 13);
+            draw(13, -13, 8, -8);
+            draw(-8, 8, -13, 13);
+            break;
+    }
+}
+
+static void player_home_launcher_ring_draw_cb(lv_event_t *event)
 {
     if (event == nullptr || lv_event_get_code(event) != LV_EVENT_DRAW_MAIN) {
         return;
@@ -477,75 +679,78 @@ static void player_home_launcher_arc_draw_cb(lv_event_t *event)
         return;
     }
 
-    // 用一条低亮度圆弧提示“圆环菜单”轮廓，不额外引入复杂图元。
-    // 中心点位于屏幕下方，正好把 7 个图标挂在弧线上。
-    constexpr int32_t center_x = 230;
-    constexpr int32_t center_y = 522;
-    constexpr int32_t radius = 178;
+    lv_area_t coords = {};
+    lv_obj_get_coords(obj, &coords);
+    const int32_t cx = coords.x1 + kLauncherCenterX;
+    const int32_t cy = coords.y1 + kLauncherCenterY;
 
-    lv_draw_line_dsc_t line = {};
-    lv_draw_line_dsc_init(&line);
-    line.color = lv_color_hex(0xFFFFFF);
-    line.width = 2;
-    line.opa = 42;
-    line.round_start = 1U;
-    line.round_end = 1U;
-
-    auto draw_segment = [&](int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
-        line.p1.x = x0; line.p1.y = y0;
-        line.p2.x = x1; line.p2.y = y1;
-        lv_draw_line(layer, &line);
-    };
-
-    static const int16_t arc_points[][2] = {
-        { 74, 418 }, { 102, 360 }, { 147, 303 }, { 205, 260 },
-        { 230, 252 }, { 255, 260 }, { 313, 303 }, { 358, 360 }, { 386, 418 },
-    };
-    (void)center_x;
-    (void)center_y;
-    (void)radius;
-    for (size_t i = 1; i < sizeof(arc_points) / sizeof(arc_points[0]); ++i) {
-        draw_segment(
-            arc_points[i - 1][0], arc_points[i - 1][1],
-            arc_points[i][0], arc_points[i][1]);
+    for (uint8_t i = 0; i < kLauncherItemCount; ++i) {
+        const LauncherMenuItemDef &item = kLauncherItems[i];
+        lv_draw_arc_dsc_t arc = {};
+        lv_draw_arc_dsc_init(&arc);
+        arc.color = lv_color_hex(
+            i == g_launcher_selected_index ? kLauncherSelectedSectorRgb : item.idle_rgb);
+        arc.width = kLauncherRingWidth;
+        arc.start_angle = item.start_angle;
+        arc.end_angle = item.end_angle;
+        arc.center.x = cx;
+        arc.center.y = cy;
+        arc.radius = kLauncherOuterRadius;
+        arc.opa = LV_OPA_COVER;
+        arc.rounded = 0U;
+        lv_draw_arc(layer, &arc);
     }
+}
+
+static void player_home_launcher_icon_draw_cb(lv_event_t *event)
+{
+    if (event == nullptr || lv_event_get_code(event) != LV_EVENT_DRAW_MAIN) {
+        return;
+    }
+
+    lv_layer_t *layer = lv_event_get_layer(event);
+    lv_obj_t *obj = lv_event_get_current_target_obj(event);
+    if (layer == nullptr || obj == nullptr) {
+        return;
+    }
+
+    lv_area_t coords = {};
+    lv_obj_get_coords(obj, &coords);
+    const int32_t cx = (coords.x1 + coords.x2) / 2;
+    const int32_t cy = (coords.y1 + coords.y2) / 2;
+
+    if (obj == g_launcher_center) {
+        player_home_launcher_draw_icon(
+            layer,
+            kLauncherItems[g_launcher_selected_index].icon,
+            cx,
+            cy,
+            lv_color_hex(kLauncherAccentRgb),
+            132);
+        return;
+    }
+
+    const uint8_t index = static_cast<uint8_t>(
+        reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
+    if (index >= kLauncherItemCount) {
+        return;
+    }
+    player_home_launcher_draw_icon(
+        layer,
+        kLauncherItems[index].icon,
+        cx,
+        cy,
+        lv_color_hex(0xF8FAFF),
+        100);
 }
 
 static void player_home_launcher_apply_selection()
 {
-    for (uint8_t i = 0; i < kLauncherItemCount; ++i) {
-        if (g_launcher_buttons[i] == nullptr) {
-            continue;
-        }
-        const bool selected = (i == g_launcher_selected_index);
-        lv_obj_set_style_bg_color(
-            g_launcher_buttons[i],
-            lv_color_hex(selected ? kLauncherAccentRgb : 0xFFFFFF),
-            0);
-        lv_obj_set_style_bg_opa(
-            g_launcher_buttons[i],
-            selected ? 210 : 38,
-            0);
-        lv_obj_set_style_border_width(g_launcher_buttons[i], selected ? 2 : 0, 0);
-        lv_obj_set_style_border_color(
-            g_launcher_buttons[i],
-            lv_color_hex(selected ? 0xFFD4EA : 0xFFFFFF),
-            0);
-
-        lv_obj_t *icon_label = lv_obj_get_child(g_launcher_buttons[i], 0);
-        if (icon_label != nullptr) {
-            lv_obj_set_style_text_color(
-                icon_label,
-                lv_color_hex(selected ? 0xFFFFFF : 0xF5F7FA),
-                0);
-        }
-        if (g_launcher_captions[i] != nullptr) {
-            lv_obj_set_style_text_color(
-                g_launcher_captions[i],
-                lv_color_hex(selected ? kLauncherAccentRgb : 0xE7E9ED),
-                0);
-            lv_obj_set_style_text_opa(g_launcher_captions[i], selected ? LV_OPA_COVER : 220, 0);
-        }
+    if (g_launcher_ring != nullptr) {
+        lv_obj_invalidate(g_launcher_ring);
+    }
+    if (g_launcher_center != nullptr) {
+        lv_obj_invalidate(g_launcher_center);
     }
 }
 
@@ -587,15 +792,18 @@ static void player_home_launcher_item_cb(lv_event_t *event)
         player_home_click_suppressed()) {
         return;
     }
-    const uint8_t index = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
+    const uint8_t index = static_cast<uint8_t>(
+        reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
     if (index >= kLauncherItemCount) {
         return;
     }
     g_launcher_selected_index = index;
     player_home_launcher_apply_selection();
+    ESP_LOGI(TAG, "R.16 Launcher选中：index=%u name=%s",
+        static_cast<unsigned>(index), kLauncherItems[index].name);
 }
 
-static lv_obj_t *player_home_create_launcher_button(
+static lv_obj_t *player_home_create_launcher_hit_button(
     lv_obj_t *parent,
     uint8_t index)
 {
@@ -608,33 +816,21 @@ static lv_obj_t *player_home_create_launcher_button(
         player_home_launcher_item_cb,
         LV_EVENT_CLICKED,
         reinterpret_cast<void *>(static_cast<uintptr_t>(index)));
-    lv_obj_set_size(button, 56, 56);
+    lv_obj_add_event_cb(
+        button,
+        player_home_launcher_icon_draw_cb,
+        LV_EVENT_DRAW_MAIN,
+        reinterpret_cast<void *>(static_cast<uintptr_t>(index)));
+    lv_obj_set_size(button, kLauncherHitSize, kLauncherHitSize);
     lv_obj_set_style_radius(button, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(button, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(button, 0, 0);
     lv_obj_set_style_shadow_width(button, 0, 0);
     lv_obj_set_style_pad_all(button, 0, 0);
     lv_obj_set_pos(
         button,
-        kLauncherItems[index].center_x - 28,
-        kLauncherItems[index].center_y - 28);
-
-    lv_obj_t *icon = player_home_create_label(
-        button,
-        kLauncherItems[index].icon_text,
-        lv_color_hex(0xFFFFFF),
-        font_manager_get_ui_font());
-    lv_obj_set_style_text_align(icon, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_center(icon);
-
-    lv_obj_t *caption = player_home_create_label(
-        parent,
-        kLauncherItems[index].caption,
-        lv_color_hex(0xE7E9ED),
-        font_manager_get_ui_font());
-    lv_obj_set_size(caption, 86, 24);
-    lv_obj_set_style_text_align(caption, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align_to(caption, button, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
-    g_launcher_captions[index] = caption;
+        kLauncherItems[index].icon_x - kLauncherHitSize / 2,
+        kLauncherItems[index].icon_y - kLauncherHitSize / 2);
     return button;
 }
 
@@ -1520,12 +1716,12 @@ void player_home_create(lv_obj_t *screen)
     g_overlay_backdrop = nullptr;
     g_launcher = nullptr;
     g_launcher_backdrop = nullptr;
-    g_launcher_arc = nullptr;
+    g_launcher_ring = nullptr;
+    g_launcher_center = nullptr;
     g_launcher_visible = false;
     g_launcher_selected_index = 0U;
     for (uint8_t i = 0; i < kLauncherItemCount; ++i) {
         g_launcher_buttons[i] = nullptr;
-        g_launcher_captions[i] = nullptr;
     }
     g_prev_button = nullptr;
     g_play_button = nullptr;
@@ -1583,8 +1779,8 @@ void player_home_create(lv_obj_t *screen)
     lv_obj_add_event_cb(
         g_overlay_backdrop, player_home_overlay_backdrop_tap_cb, LV_EVENT_CLICKED, nullptr);
 
-    // P1.5.3.2R.14：上滑 Launcher 第一版先实现为底部圆环菜单。
-    // 采用独立全屏容器 + 点击外部关闭；7 个图标只先做点位与选中态。
+    // P1.5.3.2R.16：按参考图重建为完整 7 分区圆环。
+    // backdrop 负责空白关闭；ring 只负责扇区绘制；7 个透明大触摸区负责选择；中心圆显示当前选中图标。
     g_launcher = lv_obj_create(screen);
     ui_common_lock_object(g_launcher);
     lv_obj_set_pos(g_launcher, 0, 0);
@@ -1613,19 +1809,43 @@ void player_home_create(lv_obj_t *screen)
         LV_EVENT_CLICKED,
         nullptr);
 
-    g_launcher_arc = lv_obj_create(g_launcher);
-    ui_common_lock_object(g_launcher_arc);
-    lv_obj_set_pos(g_launcher_arc, 0, 0);
-    lv_obj_set_size(g_launcher_arc, FAKEPOD_LCD_WIDTH, FAKEPOD_LCD_HEIGHT);
-    lv_obj_set_style_bg_opa(g_launcher_arc, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(g_launcher_arc, 0, 0);
-    lv_obj_set_style_shadow_width(g_launcher_arc, 0, 0);
-    lv_obj_set_style_pad_all(g_launcher_arc, 0, 0);
-    lv_obj_remove_flag(g_launcher_arc, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(g_launcher_arc, player_home_launcher_arc_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
+    g_launcher_ring = lv_obj_create(g_launcher);
+    ui_common_lock_object(g_launcher_ring);
+    lv_obj_set_pos(g_launcher_ring, 0, 0);
+    lv_obj_set_size(g_launcher_ring, FAKEPOD_LCD_WIDTH, FAKEPOD_LCD_HEIGHT);
+    lv_obj_set_style_bg_opa(g_launcher_ring, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(g_launcher_ring, 0, 0);
+    lv_obj_set_style_shadow_width(g_launcher_ring, 0, 0);
+    lv_obj_set_style_pad_all(g_launcher_ring, 0, 0);
+    lv_obj_remove_flag(g_launcher_ring, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(
+        g_launcher_ring,
+        player_home_launcher_ring_draw_cb,
+        LV_EVENT_DRAW_MAIN,
+        nullptr);
+
+    g_launcher_center = lv_obj_create(g_launcher);
+    ui_common_lock_object(g_launcher_center);
+    lv_obj_set_size(g_launcher_center, kLauncherCenterDiameter, kLauncherCenterDiameter);
+    lv_obj_align(g_launcher_center, LV_ALIGN_TOP_LEFT,
+        kLauncherCenterX - kLauncherCenterDiameter / 2,
+        kLauncherCenterY - kLauncherCenterDiameter / 2);
+    lv_obj_set_style_radius(g_launcher_center, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(g_launcher_center, lv_color_hex(0x05070B), 0);
+    lv_obj_set_style_bg_opa(g_launcher_center, 245, 0);
+    lv_obj_set_style_border_width(g_launcher_center, 2, 0);
+    lv_obj_set_style_border_color(g_launcher_center, lv_color_hex(0x161B27), 0);
+    lv_obj_set_style_shadow_width(g_launcher_center, 0, 0);
+    lv_obj_set_style_pad_all(g_launcher_center, 0, 0);
+    lv_obj_remove_flag(g_launcher_center, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(
+        g_launcher_center,
+        player_home_launcher_icon_draw_cb,
+        LV_EVENT_DRAW_MAIN,
+        nullptr);
 
     for (uint8_t i = 0; i < kLauncherItemCount; ++i) {
-        g_launcher_buttons[i] = player_home_create_launcher_button(g_launcher, i);
+        g_launcher_buttons[i] = player_home_create_launcher_hit_button(g_launcher, i);
     }
     player_home_launcher_apply_selection();
     lv_obj_add_flag(g_launcher, LV_OBJ_FLAG_HIDDEN);
@@ -1780,7 +2000,7 @@ void player_home_create(lv_obj_t *screen)
         snprintf(list_label, sizeof(list_label), "未知列表");
     }
     ESP_LOGI(TAG,
-        "P1.5.3.2R.15：清理旧GestureHint死代码；主页上滑 Launcher 保持 7 点圆环菜单，默认选中音乐并使用粉红色高亮；列表=%s 位置=%u/%u track=%u loop=%s volume=%u%% mute=%u",
+        "P1.5.3.2R.16：主页上滑 Launcher 重建为 7 分区圆环；外环选中扇区青色、中心当前图标粉红色，7 个功能本轮只做选中不跳转；列表=%s 位置=%u/%u track=%u loop=%s volume=%u%% mute=%u",
         list_label,
         static_cast<unsigned>(player_state_get_list_count() > 0 ? player_state_get_list_position() + 1 : 0),
         static_cast<unsigned>(player_state_get_list_count()),
