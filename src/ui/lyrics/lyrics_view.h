@@ -14,3 +14,6 @@ bool lyrics_view_is_visible();
 // 由播放器唯一 GestureRouter 消费点调用；Overlay 显示时先处理纵向音量，页面级横滑由调用方锁定。
 bool lyrics_view_overlay_is_visible();
 bool lyrics_view_process_overlay_interaction();
+
+// R.30 性能审计只读状态。
+bool lyrics_view_motion_is_active();

@@ -131,6 +131,17 @@ uint32_t g_last_lyrics_line = UINT32_MAX;
 uint16_t g_bar_height[SPECTRUM_BAR_COUNT] = {};
 uint16_t g_bar_target[SPECTRUM_BAR_COUNT] = {};
 uint16_t g_peak_height[SPECTRUM_VISUAL_BAR_COUNT] = {};
+// R.31：绘制层几何缓存。原实现会在每个 draw primitive 内重复做 16→24 / 16→40
+// 插值、比例换算和 Neon 颜色插值；这些值每帧只需要计算一次。
+uint16_t g_visual_height_cache[SPECTRUM_VISUAL_BAR_COUNT] = {};
+int16_t g_segmented_height_cache[SPECTRUM_SEGMENTED_COLUMN_COUNT] = {};
+int16_t g_segmented_peak_cache[SPECTRUM_SEGMENTED_COLUMN_COUNT] = {};
+int16_t g_ridge_height_cache[SPECTRUM_RIDGE_POINT_COUNT] = {};
+uint32_t g_ridge_color_cache[SPECTRUM_RIDGE_POINT_COUNT] = {};
+uint32_t g_ridge_trail_color_cache[SPECTRUM_RIDGE_POINT_COUNT] = {};
+uint32_t g_ridge_stem_color_cache[SPECTRUM_RIDGE_POINT_COUNT] = {};
+bool g_ridge_color_cache_ready = false;
+uint64_t g_last_displayed_second = UINT64_MAX;
 SpectrumStyle g_style = SpectrumStyle::SegmentedColumns;
 
 static void spectrum_format_time(uint64_t ms, char *out, size_t out_size)
@@ -655,14 +666,11 @@ static void spectrum_apply_pcm_snapshot(const AudioSpectrumSnapshot &spectrum)
     }
 }
 
-static uint16_t spectrum_visual_height(uint8_t visual_index)
+static uint16_t spectrum_visual_height_uncached(uint8_t visual_index)
 {
     if (visual_index >= SPECTRUM_VISUAL_BAR_COUNT) {
         return SPECTRUM_MIN_H;
     }
-
-    // 16个真实FFT band -> 24根视觉柱，仅在绘制层做线性插值。
-    // 不创建额外LVGL对象，也不改变FFT数据本身。
     const uint32_t pos =
         (static_cast<uint32_t>(visual_index) *
             static_cast<uint32_t>(SPECTRUM_BAR_COUNT - 1U) << 8U) /
@@ -673,6 +681,20 @@ static uint16_t spectrum_visual_height(uint8_t visual_index)
     const uint32_t a = g_bar_height[left];
     const uint32_t b = g_bar_height[right];
     return static_cast<uint16_t>((a * (256U - frac) + b * frac) >> 8U);
+}
+
+static uint16_t spectrum_visual_height(uint8_t visual_index)
+{
+    return visual_index < SPECTRUM_VISUAL_BAR_COUNT
+        ? g_visual_height_cache[visual_index]
+        : SPECTRUM_MIN_H;
+}
+
+static void spectrum_rebuild_visual_cache()
+{
+    for (uint8_t i = 0U; i < SPECTRUM_VISUAL_BAR_COUNT; ++i) {
+        g_visual_height_cache[i] = spectrum_visual_height_uncached(i);
+    }
 }
 
 static void spectrum_draw_horizontal(lv_layer_t *layer, lv_obj_t *obj)
@@ -748,7 +770,7 @@ static void spectrum_draw_horizontal(lv_layer_t *layer, lv_obj_t *obj)
     }
 }
 
-static uint16_t spectrum_ridge_source_height(uint8_t point_index)
+static uint16_t spectrum_ridge_source_height_uncached(uint8_t point_index)
 {
     if (point_index >= SPECTRUM_RIDGE_POINT_COUNT) {
         return SPECTRUM_MIN_H;
@@ -796,19 +818,39 @@ static uint32_t spectrum_scale_rgb(uint32_t rgb, uint8_t percent)
     return (r << 16U) | (g << 8U) | b;
 }
 
-static int16_t spectrum_ridge_height_px(uint8_t point_index)
+static void spectrum_init_static_draw_cache()
 {
-    const int32_t source = spectrum_ridge_source_height(point_index);
+    if (g_ridge_color_cache_ready) {
+        return;
+    }
+    for (uint8_t i = 0U; i < SPECTRUM_RIDGE_POINT_COUNT; ++i) {
+        const uint32_t rgb = spectrum_ridge_gradient_rgb(i);
+        g_ridge_color_cache[i] = rgb;
+        g_ridge_trail_color_cache[i] = spectrum_scale_rgb(rgb, SPECTRUM_RIDGE_TRAIL_PERCENT);
+        g_ridge_stem_color_cache[i] = spectrum_scale_rgb(rgb, SPECTRUM_RIDGE_STEM_PERCENT);
+    }
+    g_ridge_color_cache_ready = true;
+}
+
+static int16_t spectrum_ridge_scale_height(uint16_t source)
+{
     constexpr int32_t source_span = SPECTRUM_MAX_H - SPECTRUM_MIN_H;
     constexpr int32_t ridge_span = SPECTRUM_RIDGE_MAX_H - SPECTRUM_RIDGE_MIN_H;
     if (source_span <= 0) {
         return SPECTRUM_RIDGE_MIN_H;
     }
     int32_t h = SPECTRUM_RIDGE_MIN_H +
-        ((source - SPECTRUM_MIN_H) * ridge_span + source_span / 2) / source_span;
+        ((static_cast<int32_t>(source) - SPECTRUM_MIN_H) * ridge_span + source_span / 2) / source_span;
     if (h < SPECTRUM_RIDGE_MIN_H) h = SPECTRUM_RIDGE_MIN_H;
     if (h > SPECTRUM_RIDGE_MAX_H) h = SPECTRUM_RIDGE_MAX_H;
     return static_cast<int16_t>(h);
+}
+
+static int16_t spectrum_ridge_height_px(uint8_t point_index)
+{
+    return point_index < SPECTRUM_RIDGE_POINT_COUNT
+        ? g_ridge_height_cache[point_index]
+        : SPECTRUM_RIDGE_MIN_H;
 }
 
 static void spectrum_draw_neon_ridge(lv_layer_t *layer, lv_obj_t *obj)
@@ -847,8 +889,7 @@ static void spectrum_draw_neon_ridge(lv_layer_t *layer, lv_obj_t *obj)
     for (uint8_t i = 0U; i < SPECTRUM_RIDGE_POINT_COUNT; i = static_cast<uint8_t>(i + SPECTRUM_RIDGE_STEM_STEP)) {
         const int32_t x = coords.x1 + ((static_cast<int32_t>(i) * x_step_q8) >> 8);
         const int32_t ridge_y = baseline_y - spectrum_ridge_height_px(i);
-        stem.color = lv_color_hex(spectrum_scale_rgb(
-            spectrum_ridge_gradient_rgb(i), SPECTRUM_RIDGE_STEM_PERCENT));
+        stem.color = lv_color_hex(g_ridge_stem_color_cache[i]);
         stem.p1.x = x; stem.p1.y = baseline_y - 1;
         stem.p2.x = x; stem.p2.y = ridge_y + 2;
         lv_draw_line(layer, &stem);
@@ -866,9 +907,7 @@ static void spectrum_draw_neon_ridge(lv_layer_t *layer, lv_obj_t *obj)
         const int32_t x1 = coords.x1 + ((static_cast<int32_t>(i + 1U) * x_step_q8) >> 8);
         const int32_t y0 = baseline_y - spectrum_ridge_height_px(i) + SPECTRUM_RIDGE_TRAIL_OFFSET_Y;
         const int32_t y1 = baseline_y - spectrum_ridge_height_px(i + 1U) + SPECTRUM_RIDGE_TRAIL_OFFSET_Y;
-        const uint32_t rgb = spectrum_scale_rgb(
-            spectrum_ridge_gradient_rgb(i), SPECTRUM_RIDGE_TRAIL_PERCENT);
-        line.color = lv_color_hex(rgb);
+        line.color = lv_color_hex(g_ridge_trail_color_cache[i]);
         line.p1.x = x0; line.p1.y = y0;
         line.p2.x = x1; line.p2.y = y1;
         lv_draw_line(layer, &line);
@@ -881,7 +920,7 @@ static void spectrum_draw_neon_ridge(lv_layer_t *layer, lv_obj_t *obj)
         const int32_t x1 = coords.x1 + ((static_cast<int32_t>(i + 1U) * x_step_q8) >> 8);
         const int32_t y0 = baseline_y - spectrum_ridge_height_px(i);
         const int32_t y1 = baseline_y - spectrum_ridge_height_px(i + 1U);
-        line.color = lv_color_hex(spectrum_ridge_gradient_rgb(i));
+        line.color = lv_color_hex(g_ridge_color_cache[i]);
         line.p1.x = x0; line.p1.y = y0;
         line.p2.x = x1; line.p2.y = y1;
         lv_draw_line(layer, &line);
@@ -901,7 +940,7 @@ static void spectrum_draw_neon_ridge(lv_layer_t *layer, lv_obj_t *obj)
         }
         const int32_t x = coords.x1 + ((static_cast<int32_t>(i) * x_step_q8) >> 8);
         const int32_t y = baseline_y - h - 5;
-        dot.bg_color = lv_color_hex(spectrum_ridge_gradient_rgb(i));
+        dot.bg_color = lv_color_hex(g_ridge_color_cache[i]);
         lv_area_t a = {x - 1, y - 1, x + 1, y + 1};
         lv_draw_rect(layer, &dot, &a);
         ++emitted;
@@ -939,14 +978,37 @@ static int16_t spectrum_segmented_scale_height(uint16_t source_height)
 
 static int16_t spectrum_segmented_height_px(uint8_t column_index)
 {
-    const uint8_t visual_index = spectrum_segmented_visual_index(column_index);
-    return spectrum_segmented_scale_height(spectrum_visual_height(visual_index));
+    return column_index < SPECTRUM_SEGMENTED_COLUMN_COUNT
+        ? g_segmented_height_cache[column_index]
+        : 0;
 }
 
 static int16_t spectrum_segmented_peak_height_px(uint8_t column_index)
 {
-    const uint8_t visual_index = spectrum_segmented_visual_index(column_index);
-    return spectrum_segmented_scale_height(g_peak_height[visual_index]);
+    return column_index < SPECTRUM_SEGMENTED_COLUMN_COUNT
+        ? g_segmented_peak_cache[column_index]
+        : 0;
+}
+
+static void spectrum_rebuild_style_geometry_cache()
+{
+    if (g_style == SpectrumStyle::SegmentedColumns) {
+        for (uint8_t i = 0U; i < SPECTRUM_SEGMENTED_COLUMN_COUNT; ++i) {
+            const uint8_t visual_index = spectrum_segmented_visual_index(i);
+            g_segmented_height_cache[i] =
+                spectrum_segmented_scale_height(g_visual_height_cache[visual_index]);
+            g_segmented_peak_cache[i] =
+                spectrum_segmented_scale_height(g_peak_height[visual_index]);
+        }
+        return;
+    }
+
+    if (g_style == SpectrumStyle::NeonRidge) {
+        for (uint8_t i = 0U; i < SPECTRUM_RIDGE_POINT_COUNT; ++i) {
+            g_ridge_height_cache[i] =
+                spectrum_ridge_scale_height(spectrum_ridge_source_height_uncached(i));
+        }
+    }
 }
 
 static void spectrum_draw_segmented_columns(lv_layer_t *layer, lv_obj_t *obj)
@@ -1075,6 +1137,23 @@ static void spectrum_widget_draw_cb(lv_event_t *event)
 
 static void spectrum_update_bars()
 {
+    // R.31：保留当前样式上一帧“真正画出来的几何”，raw bar 有细小变化但没有跨越
+    // 当前样式的像素/分段量化边界时，不再无条件 invalidate 整个 spectrum widget。
+    uint16_t old_visual[SPECTRUM_VISUAL_BAR_COUNT] = {};
+    uint16_t old_peak[SPECTRUM_VISUAL_BAR_COUNT] = {};
+    int16_t old_segmented[SPECTRUM_SEGMENTED_COLUMN_COUNT] = {};
+    int16_t old_segmented_peak[SPECTRUM_SEGMENTED_COLUMN_COUNT] = {};
+    int16_t old_ridge[SPECTRUM_RIDGE_POINT_COUNT] = {};
+    if (g_style == SpectrumStyle::HorizontalMirror) {
+        memcpy(old_visual, g_visual_height_cache, sizeof(old_visual));
+        memcpy(old_peak, g_peak_height, sizeof(old_peak));
+    } else if (g_style == SpectrumStyle::NeonRidge) {
+        memcpy(old_ridge, g_ridge_height_cache, sizeof(old_ridge));
+    } else {
+        memcpy(old_segmented, g_segmented_height_cache, sizeof(old_segmented));
+        memcpy(old_segmented_peak, g_segmented_peak_cache, sizeof(old_segmented_peak));
+    }
+
     bool changed = false;
     for (uint8_t i = 0U; i < SPECTRUM_BAR_COUNT; ++i) {
         int32_t current = g_bar_height[i];
@@ -1100,6 +1179,9 @@ static void spectrum_update_bars()
         changed = true;
     }
 
+    // R.31：16→24 插值每帧只算一次，Peak 与绘制共享。
+    spectrum_rebuild_visual_cache();
+
     // P1.5.2R.4.1：Peak Dot 使用24根视觉柱自己的保持值。
     // 新峰值立即抬升；没有新峰值时每50ms下降3px，形成“降落点”。
     for (uint8_t i = 0U; i < SPECTRUM_VISUAL_BAR_COUNT; ++i) {
@@ -1120,8 +1202,27 @@ static void spectrum_update_bars()
         }
     }
 
-    // 16 个真实 FFT frequency band 仍共享一个自绘对象；当前样式一次绘完。
-    if (changed && g_spectrum_widget != nullptr) {
+    // R.31：Segmented / Neon 的比例换算也只在状态更新阶段执行一次；
+    // DRAW_MAIN 只查缓存，避免每根线/矩形重复插值。
+    spectrum_rebuild_style_geometry_cache();
+
+    bool render_changed = changed;
+    if (changed) {
+        if (g_style == SpectrumStyle::HorizontalMirror) {
+            render_changed =
+                memcmp(old_visual, g_visual_height_cache, sizeof(old_visual)) != 0 ||
+                memcmp(old_peak, g_peak_height, sizeof(old_peak)) != 0;
+        } else if (g_style == SpectrumStyle::NeonRidge) {
+            render_changed = memcmp(old_ridge, g_ridge_height_cache, sizeof(old_ridge)) != 0;
+        } else {
+            render_changed =
+                memcmp(old_segmented, g_segmented_height_cache, sizeof(old_segmented)) != 0 ||
+                memcmp(old_segmented_peak, g_segmented_peak_cache, sizeof(old_segmented_peak)) != 0;
+        }
+    }
+
+    // 三种 FFT 样式继续共享一个自绘对象；只有当前样式实际像素几何变化才重绘。
+    if (render_changed && g_spectrum_widget != nullptr) {
         lv_obj_invalidate(g_spectrum_widget);
     }
 }
@@ -1139,9 +1240,11 @@ static void spectrum_root_click_cb(lv_event_t *event)
     const uint8_t next =
         (static_cast<uint8_t>(g_style) + 1U) % static_cast<uint8_t>(SpectrumStyle::Count);
     g_style = static_cast<SpectrumStyle>(next);
+    // R.31：新样式第一次 DRAW_MAIN 前先用当前 bar 状态准备对应几何 cache。
+    spectrum_rebuild_style_geometry_cache();
     spectrum_apply_style_layout();
 
-    ESP_LOGI(TAG, "P1.5.3.2R.6 Tap切换频谱样式：style=%u %s",
+    ESP_LOGI(TAG, "P1.5.3.2R.31 Tap切换频谱样式：style=%u %s",
         static_cast<unsigned>(g_style), spectrum_style_name(g_style));
 }
 
@@ -1187,10 +1290,14 @@ static void spectrum_timer_cb(lv_timer_t *timer)
     spectrum_update_bars();
     ++g_frame;
 
-    if ((g_frame % 4U) == 0U && g_time != nullptr) {
-        char current[20] = {};
-        spectrum_format_time(audio.position_ms, current, sizeof(current));
-        lv_label_set_text(g_time, current);
+    if (g_time != nullptr) {
+        const uint64_t displayed_second = audio.position_ms / 1000ULL;
+        if (displayed_second != g_last_displayed_second) {
+            g_last_displayed_second = displayed_second;
+            char current[20] = {};
+            spectrum_format_time(audio.position_ms, current, sizeof(current));
+            lv_label_set_text(g_time, current);
+        }
     }
 }
 } // namespace
@@ -1242,6 +1349,9 @@ void spectrum_view_create(lv_obj_t *screen)
     for (uint8_t i = 0U; i < SPECTRUM_VISUAL_BAR_COUNT; ++i) {
         g_peak_height[i] = SPECTRUM_MIN_H;
     }
+    spectrum_init_static_draw_cache();
+    spectrum_rebuild_visual_cache();
+    spectrum_rebuild_style_geometry_cache();
 
     g_lyric = spectrum_create_label(
         g_root, "", lv_color_hex(0xE8E8E8), SPECTRUM_LYRIC_W, SPECTRUM_LYRIC_H);
@@ -1260,7 +1370,7 @@ void spectrum_view_create(lv_obj_t *screen)
     }
 
     ESP_LOGI(TAG,
-        "P1.5.3.2R.6 频谱样式：默认SegmentedColumns=18列分段小矩形（每列至少1格+暗倒影+同宽3px窄Peak落点），HorizontalMirror第二，NeonRidge第三；歌词仍为短句单行/超长两行；Tap三态循环；刷新=%ums",
+        "P1.5.3.2R.31 SpectrumFastPath：三样式视觉保持不变；连续帧TE bypass；16→24/40几何与Neon颜色帧级缓存；时间标签仅跨秒更新；刷新=%ums",
         static_cast<unsigned>(SPECTRUM_FRAME_MS));
 }
 
@@ -1274,12 +1384,15 @@ void spectrum_view_open()
     g_last_track = UINT32_MAX;
     g_frame = 0U;
     g_last_pcm_revision = 0U;
+    g_last_displayed_second = UINT64_MAX;
     spectrum_clear_current_lyric(true);
     spectrum_set_idle_targets();
     spectrum_apply_style_layout();
     for (uint8_t i = 0U; i < SPECTRUM_VISUAL_BAR_COUNT; ++i) {
         g_peak_height[i] = SPECTRUM_MIN_H;
     }
+    spectrum_rebuild_visual_cache();
+    spectrum_rebuild_style_geometry_cache();
     lv_obj_remove_flag(g_root, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(g_root);
 
@@ -1301,13 +1414,14 @@ void spectrum_view_open()
         char current[20] = {};
         spectrum_format_time(audio.position_ms, current, sizeof(current));
         lv_label_set_text(g_time, current);
+        g_last_displayed_second = audio.position_ms / 1000ULL;
     }
     spectrum_update_bars();
     if (g_timer != nullptr) {
         lv_timer_resume(g_timer);
     }
     audio_service_set_spectrum_enabled(true);
-    ESP_LOGI(TAG, "打开频谱页：P1.5.3.2R.6 当前样式=%u %s；默认SegmentedColumns；Tap三态切换；右滑返回主页",
+    ESP_LOGI(TAG, "打开频谱页：P1.5.3.2R.31 当前样式=%u %s；连续帧TE bypass + draw cache；Tap三态切换；右滑返回主页",
         static_cast<unsigned>(g_style), spectrum_style_name(g_style));
 }
 
@@ -1330,4 +1444,10 @@ void spectrum_view_close()
 bool spectrum_view_is_visible()
 {
     return g_visible && g_root != nullptr && !lv_obj_has_flag(g_root, LV_OBJ_FLAG_HIDDEN);
+}
+
+
+const char *spectrum_view_current_style_name()
+{
+    return spectrum_style_name(g_style);
 }

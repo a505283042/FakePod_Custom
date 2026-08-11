@@ -1416,3 +1416,9 @@ bool lyrics_view_process_overlay_interaction()
     }
     return lyrics_view_overlay_volume_gesture_update();
 }
+
+
+bool lyrics_view_motion_is_active()
+{
+    return g_visible && g_motion_active;
+}

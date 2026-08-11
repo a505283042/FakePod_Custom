@@ -15,6 +15,7 @@ constexpr BaseType_t TOUCH_INPUT_TASK_CORE = 1;
 constexpr UBaseType_t TOUCH_INPUT_TASK_PRIORITY = 3;
 constexpr uint32_t TOUCH_INPUT_TASK_STACK_BYTES = 3072U;
 constexpr UBaseType_t TOUCH_EDGE_QUEUE_LENGTH = 8U;
+constexpr uint8_t TOUCH_RELEASE_DEBOUNCE_SAMPLES = 3U;
 constexpr uint32_t TOUCH_SAMPLE_PERIOD_MS = 8U;
 constexpr TickType_t TOUCH_SAMPLE_PERIOD_TICKS =
     pdMS_TO_TICKS(TOUCH_SAMPLE_PERIOD_MS) > 0 ? pdMS_TO_TICKS(TOUCH_SAMPLE_PERIOD_MS) : 1U;
@@ -26,10 +27,73 @@ UiTouchSnapshot g_snapshot = {};
 bool g_ready = false;
 uint32_t g_last_activity_tick = 0U;
 uint32_t g_edge_drop_count = 0U;
+uint32_t g_edge_coalesce_count = 0U;
+uint32_t g_edge_coalesced_events = 0U;
+uint32_t g_release_glitch_suppressed_count = 0U;
 
 static int16_t touch_clamp_coord(uint16_t value, uint16_t max_value)
 {
     return static_cast<int16_t>(value > max_value ? max_value : value);
+}
+
+static bool touch_enqueue_edge_with_backpressure(const UiTouchEdgeEvent &event)
+{
+    if (g_edge_queue == nullptr) {
+        return false;
+    }
+
+    if (xQueueSend(g_edge_queue, &event, 0) == pdPASS) {
+        return true;
+    }
+
+    // R.33.2.3：边沿 FIFO 满时不继续堆积过期手势。TouchInputTask 是唯一生产者，
+    // 因此可以安全地抽干旧边沿，并优先保留“最近一次 DOWN + 当前 RELEASE”。
+    // 这样 UI 长时间被 DirectPresent 占用时，宁可合并已经过期的完整点击，也不能
+    // 丢掉最新物理状态，尤其不能让 RELEASE 丢失导致 GestureRouter/LVGL 卡在 pressed。
+    UiTouchEdgeEvent stale[TOUCH_EDGE_QUEUE_LENGTH] = {};
+    UBaseType_t stale_count = 0U;
+    while (stale_count < TOUCH_EDGE_QUEUE_LENGTH &&
+           xQueueReceive(g_edge_queue, &stale[stale_count], 0) == pdPASS) {
+        ++stale_count;
+    }
+
+    bool kept_down = false;
+    if (!event.pressed) {
+        for (UBaseType_t i = stale_count; i > 0U; --i) {
+            if (stale[i - 1U].pressed) {
+                if (xQueueSend(g_edge_queue, &stale[i - 1U], 0) == pdPASS) {
+                    kept_down = true;
+                }
+                break;
+            }
+        }
+    }
+
+    const bool queued = xQueueSend(g_edge_queue, &event, 0) == pdPASS;
+    ++g_edge_coalesce_count;
+    g_edge_coalesced_events += static_cast<uint32_t>(stale_count);
+
+    if (g_edge_coalesce_count == 1U || (g_edge_coalesce_count % 8U) == 0U || !queued) {
+        ESP_LOGW(TAG,
+            "R.33.2.3 触摸边沿背压：coalesce=%lu stale_total=%lu drained=%u latest=%s keep_down=%u queued=%u",
+            static_cast<unsigned long>(g_edge_coalesce_count),
+            static_cast<unsigned long>(g_edge_coalesced_events),
+            static_cast<unsigned>(stale_count),
+            event.pressed ? "DOWN" : "UP",
+            static_cast<unsigned>(kept_down),
+            static_cast<unsigned>(queued));
+    }
+
+    if (queued) {
+        return true;
+    }
+
+    ++g_edge_drop_count;
+    ESP_LOGE(TAG,
+        "R.33.2.3 触摸边沿背压最终入队失败：drop=%lu state=%s",
+        static_cast<unsigned long>(g_edge_drop_count),
+        event.pressed ? "DOWN" : "UP");
+    return false;
 }
 
 static void touch_publish_snapshot(const CST820Point &point, uint32_t tick_ms, bool edge)
@@ -87,19 +151,15 @@ static void touch_publish_snapshot(const CST820Point &point, uint32_t tick_ms, b
     event.tick_ms = tick_ms;
     event.sequence = sequence;
 
-    if (xQueueSend(g_edge_queue, &event, 0) != pdPASS) {
-        ++g_edge_drop_count;
-        if (g_edge_drop_count == 1U || (g_edge_drop_count % 16U) == 0U) {
-            ESP_LOGW(TAG, "触摸边沿队列已满：drop=%lu", static_cast<unsigned long>(g_edge_drop_count));
-        }
-    }
+    (void)touch_enqueue_edge_with_backpressure(event);
 }
 
 static void touch_input_task(void *argument)
 {
     (void)argument;
     TickType_t last_wake = xTaskGetTickCount();
-    bool last_pressed = false;
+    bool stable_pressed = false;
+    uint8_t release_candidate_samples = 0U;
     uint32_t read_error_count = 0U;
 
     for (;;) {
@@ -107,12 +167,45 @@ static void touch_input_task(void *argument)
         const esp_err_t ret = cst820_read_point(&point);
         if (ret == ESP_OK) {
             const uint32_t now_ms = static_cast<uint32_t>(xTaskGetTickCount() * portTICK_PERIOD_MS);
-            const bool edge = point.pressed != last_pressed;
-            touch_publish_snapshot(point, now_ms, edge);
-            last_pressed = point.pressed;
             read_error_count = 0U;
+
+            if (point.pressed) {
+                if (release_candidate_samples > 0U) {
+                    // CST820 在手指移动/DirectPresent 重负载期间偶尔会短暂报告 0 指。
+                    // 只要在确认 RELEASE 前又恢复 pressed，就把这次零样本视为毛刺。
+                    ++g_release_glitch_suppressed_count;
+                    if (g_release_glitch_suppressed_count == 1U ||
+                        (g_release_glitch_suppressed_count % 32U) == 0U) {
+                        ESP_LOGI(TAG,
+                            "R.33.2.3 RELEASE毛刺已抑制：count=%lu candidate_samples=%u",
+                            static_cast<unsigned long>(g_release_glitch_suppressed_count),
+                            static_cast<unsigned>(release_candidate_samples));
+                    }
+                }
+                release_candidate_samples = 0U;
+
+                const bool edge = !stable_pressed;
+                stable_pressed = true;
+                touch_publish_snapshot(point, now_ms, edge);
+            } else if (stable_pressed) {
+                if (release_candidate_samples < TOUCH_RELEASE_DEBOUNCE_SAMPLES) {
+                    ++release_candidate_samples;
+                }
+
+                if (release_candidate_samples >= TOUCH_RELEASE_DEBOUNCE_SAMPLES) {
+                    // RELEASE 延迟到连续 3 个零触点样本后确认。8ms 采样下只增加约 16ms
+                    // 的抬手确认延迟，却能阻断 0/1 指抖动产生的 DOWN/UP 风暴。
+                    stable_pressed = false;
+                    release_candidate_samples = 0U;
+                    touch_publish_snapshot(point, now_ms, true);
+                }
+                // 未达到确认阈值时保持上一份 pressed 快照，不发布伪 RELEASE。
+            } else {
+                release_candidate_samples = 0U;
+            }
         } else {
-            // 短暂 I2C 错误时保留最近状态，不伪造 RELEASED，避免误触/误点击。
+            // 短暂 I2C 错误时保留最近稳定状态，不推进 RELEASE debounce，
+            // 避免总线忙导致一次假抬手。
             ++read_error_count;
             if (read_error_count == 1U || (read_error_count % 100U) == 0U) {
                 ESP_LOGW(TAG, "CST820采样失败：%s count=%lu",
@@ -149,6 +242,9 @@ esp_err_t ui_touch_input_start()
     g_last_activity_tick = 0U;
     portEXIT_CRITICAL(&g_snapshot_mux);
     g_edge_drop_count = 0U;
+    g_edge_coalesce_count = 0U;
+    g_edge_coalesced_events = 0U;
+    g_release_glitch_suppressed_count = 0U;
 
     const BaseType_t created = xTaskCreatePinnedToCore(
         touch_input_task,
@@ -166,12 +262,13 @@ esp_err_t ui_touch_input_start()
 
     g_ready = true;
     ESP_LOGI(TAG,
-        "P1.5R.1.2 Touch Fast Path/QoS：core=%ld priority=%u poll=%ums/%utick edge_queue=%u；坐标变化sequence去重；LVGL回调不再访问I2C",
+        "R.33.2.3 Touch Fast Path Backpressure：core=%ld priority=%u poll=%ums/%utick edge_queue=%u release_debounce=%u samples；MOVE仅latest snapshot；队列满时合并旧边沿并优先保留最新DOWN/UP",
         static_cast<long>(TOUCH_INPUT_TASK_CORE),
         static_cast<unsigned>(TOUCH_INPUT_TASK_PRIORITY),
         static_cast<unsigned>(TOUCH_SAMPLE_PERIOD_MS),
         static_cast<unsigned>(TOUCH_SAMPLE_PERIOD_TICKS),
-        static_cast<unsigned>(TOUCH_EDGE_QUEUE_LENGTH));
+        static_cast<unsigned>(TOUCH_EDGE_QUEUE_LENGTH),
+        static_cast<unsigned>(TOUCH_RELEASE_DEBOUNCE_SAMPLES));
     return ESP_OK;
 }
 

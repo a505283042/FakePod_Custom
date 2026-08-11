@@ -1,6 +1,7 @@
 #include "ui_manager.h"
 
 #include <stdint.h>
+#include <string.h>
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -63,13 +64,416 @@ struct UiLargeRefreshProfile
 static UiLargeRefreshProfile g_large_refresh_profile = {};
 static uint32_t g_large_refresh_profile_count = 0U;
 
+// P1.5.3.2R.30：全页面 LVGL 性能审计。
+// 不改变任何页面绘制策略，只在 display event 上做轻量计数/计时，并每2秒汇总一次。
+// inv_sum 是所有 invalidation 面积之和（可能重叠）；bbox 是这些 invalidation 的包围盒，
+// 两者一起看可以区分“很多小对象反复失效”和“单个大对象整块失效”。
+enum class UiPerfContext : uint8_t
+{
+    Home = 0,
+    HomeOverlay,
+    Launcher,
+    LauncherAnim,
+    Lyrics,
+    LyricsMotion,
+    LyricsOverlay,
+    LyricsMotionOverlay,
+    SpectrumSegmented,
+    SpectrumHorizontal,
+    SpectrumNeon,
+    Library,
+    LibraryInertia,
+    LibrarySearch,
+    LibrarySearchInertia,
+};
+
+struct UiPerfInvalidationAccum
+{
+    uint32_t count = 0U;
+    uint64_t sum_pixels = 0U;
+    uint32_t max_pixels = 0U;
+    bool bbox_valid = false;
+    int16_t x1 = 0;
+    int16_t y1 = 0;
+    int16_t x2 = 0;
+    int16_t y2 = 0;
+};
+
+struct UiPerfRefreshFrame
+{
+    bool active = false;
+    UiPerfContext context = UiPerfContext::Home;
+    int64_t refr_started_us = 0;
+    int64_t render_started_us = 0;
+    int64_t flush_started_us = 0;
+    int64_t wait_started_us = 0;
+    uint32_t render_us = 0U;
+    uint32_t flush_us = 0U;
+    uint32_t wait_us = 0U;
+    uint32_t te_wait_us = 0U;
+    uint16_t render_count = 0U;
+    uint16_t flush_count = 0U;
+    uint32_t invalid_count = 0U;
+    uint64_t invalid_sum_pixels = 0U;
+    uint32_t invalid_max_pixels = 0U;
+    uint32_t invalid_bbox_pixels = 0U;
+};
+
+struct UiPerfWindow
+{
+    bool active = false;
+    UiPerfContext context = UiPerfContext::Home;
+    int64_t started_us = 0;
+    int64_t last_refresh_started_us = 0;
+    uint32_t refresh_count = 0U;
+    uint64_t total_us = 0U;
+    uint64_t render_us = 0U;
+    uint64_t flush_us = 0U;
+    uint64_t wait_us = 0U;
+    uint64_t te_wait_us = 0U;
+    uint64_t invalid_sum_pixels = 0U;
+    uint64_t invalid_bbox_pixels = 0U;
+    uint64_t invalid_count = 0U;
+    uint64_t flush_count = 0U;
+    uint64_t gap_us = 0U;
+    uint32_t gap_count = 0U;
+    uint32_t late_gap_count = 0U;
+    uint32_t max_total_us = 0U;
+    uint32_t max_render_us = 0U;
+    uint32_t max_flush_us = 0U;
+    uint32_t max_wait_us = 0U;
+    uint32_t max_te_wait_us = 0U;
+    uint32_t max_invalid_sum_pixels = 0U;
+    uint32_t max_invalid_bbox_pixels = 0U;
+    uint32_t max_invalid_count = 0U;
+    uint16_t max_flush_count = 0U;
+    uint32_t max_gap_us = 0U;
+};
+
+static UiPerfInvalidationAccum g_perf_invalid = {};
+static UiPerfRefreshFrame g_perf_frame = {};
+static UiPerfWindow g_perf_window = {};
+static lv_timer_t *g_perf_audit_timer = nullptr;
+static constexpr uint32_t kPerfAuditWindowMs = 2000U;
+static constexpr uint32_t kPerfScreenPixels = FAKEPOD_LCD_WIDTH * FAKEPOD_LCD_HEIGHT;
+
 static constexpr uint32_t kTeSyncDisableAfterTimeouts = 3U;
 static constexpr uint32_t kTeSyncMinPixels =
     (FAKEPOD_LCD_WIDTH * FAKEPOD_LCD_HEIGHT) / 4U;
+// R.31：连续动画不能每帧都支付 0~16.7ms 的 TE 等待；但真正接近整屏的
+// 页面切换仍保留 TE，因此用 90% 屏作为“强制同步”门槛。
+static constexpr uint32_t kTeSyncForceFullFramePixels =
+    (FAKEPOD_LCD_WIDTH * FAKEPOD_LCD_HEIGHT * 9U) / 10U;
+static uint32_t g_te_animation_bypass_count = 0U;
 
 // P1.5.3.2R.18：LVGL RGB565 DMA 条带由 20 行提升到 40 行。
 // 双缓冲总像素 RAM = 460 * 40 * 2B * 2 = 73,600B。
 static constexpr uint32_t kLvglDmaBufferLines = 40U;
+
+static const char *ui_perf_context_name(UiPerfContext context)
+{
+    switch (context) {
+        case UiPerfContext::HomeOverlay: return "主页/Overlay";
+        case UiPerfContext::Launcher: return "Launcher/静态";
+        case UiPerfContext::LauncherAnim: return "Launcher/动画";
+        case UiPerfContext::Lyrics: return "歌词/静态";
+        case UiPerfContext::LyricsMotion: return "歌词/缓动";
+        case UiPerfContext::LyricsOverlay: return "歌词/Overlay";
+        case UiPerfContext::LyricsMotionOverlay: return "歌词/缓动+Overlay";
+        case UiPerfContext::SpectrumSegmented: return "频谱/SegmentedColumns";
+        case UiPerfContext::SpectrumHorizontal: return "频谱/HorizontalMirror";
+        case UiPerfContext::SpectrumNeon: return "频谱/NeonRidge";
+        case UiPerfContext::Library: return "曲库/列表";
+        case UiPerfContext::LibraryInertia: return "曲库/惯性";
+        case UiPerfContext::LibrarySearch: return "曲库/搜索";
+        case UiPerfContext::LibrarySearchInertia: return "曲库/搜索惯性";
+        case UiPerfContext::Home:
+        default:
+            return "主页/封面";
+    }
+}
+
+static uint32_t ui_perf_context_target_period_ms(UiPerfContext context)
+{
+    switch (context) {
+        case UiPerfContext::LauncherAnim:
+        case UiPerfContext::LibraryInertia:
+        case UiPerfContext::LibrarySearchInertia:
+            return 16U;
+        case UiPerfContext::LyricsMotion:
+        case UiPerfContext::LyricsMotionOverlay:
+            return 33U;
+        case UiPerfContext::SpectrumSegmented:
+        case UiPerfContext::SpectrumHorizontal:
+        case UiPerfContext::SpectrumNeon:
+            return 50U;
+        default:
+            return 0U;
+    }
+}
+
+static UiPerfContext ui_perf_resolve_context()
+{
+    if (library_view_is_visible()) {
+        const bool search = library_view_search_is_active();
+        const bool inertia = library_view_inertia_is_active();
+        if (search && inertia) return UiPerfContext::LibrarySearchInertia;
+        if (search) return UiPerfContext::LibrarySearch;
+        if (inertia) return UiPerfContext::LibraryInertia;
+        return UiPerfContext::Library;
+    }
+
+    if (lyrics_view_is_visible()) {
+        const bool motion = lyrics_view_motion_is_active();
+        const bool overlay = lyrics_view_overlay_is_visible();
+        if (motion && overlay) return UiPerfContext::LyricsMotionOverlay;
+        if (motion) return UiPerfContext::LyricsMotion;
+        if (overlay) return UiPerfContext::LyricsOverlay;
+        return UiPerfContext::Lyrics;
+    }
+
+    if (spectrum_view_is_visible()) {
+        const char *style = spectrum_view_current_style_name();
+        if (style != nullptr && strcmp(style, "HorizontalMirror") == 0) {
+            return UiPerfContext::SpectrumHorizontal;
+        }
+        if (style != nullptr && strcmp(style, "NeonRidge") == 0) {
+            return UiPerfContext::SpectrumNeon;
+        }
+        return UiPerfContext::SpectrumSegmented;
+    }
+
+    if (player_home_launcher_is_visible()) {
+        return player_home_launcher_is_animating()
+            ? UiPerfContext::LauncherAnim
+            : UiPerfContext::Launcher;
+    }
+    if (player_home_overlay_is_visible()) {
+        return UiPerfContext::HomeOverlay;
+    }
+    return UiPerfContext::Home;
+}
+
+static bool ui_te_context_is_continuous_animation(UiPerfContext context)
+{
+    switch (context) {
+        case UiPerfContext::LauncherAnim:
+        case UiPerfContext::LyricsMotion:
+        case UiPerfContext::LyricsMotionOverlay:
+        case UiPerfContext::SpectrumSegmented:
+        case UiPerfContext::SpectrumHorizontal:
+        case UiPerfContext::SpectrumNeon:
+        case UiPerfContext::LibraryInertia:
+        case UiPerfContext::LibrarySearchInertia:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void ui_perf_reset_window(UiPerfContext context, int64_t now_us)
+{
+    g_perf_window = {};
+    g_perf_window.active = true;
+    g_perf_window.context = context;
+    g_perf_window.started_us = now_us;
+}
+
+static void ui_perf_dump_window(int64_t now_us, bool context_switch)
+{
+    if (!g_perf_window.active || g_perf_window.refresh_count == 0U) {
+        return;
+    }
+
+    uint32_t elapsed_ms = now_us > g_perf_window.started_us
+        ? static_cast<uint32_t>((now_us - g_perf_window.started_us) / 1000LL)
+        : 0U;
+    if (elapsed_ms == 0U) elapsed_ms = 1U;
+
+    const uint32_t n = g_perf_window.refresh_count;
+    const uint32_t hz_x10 = static_cast<uint32_t>(
+        (static_cast<uint64_t>(n) * 10000ULL) / elapsed_ms);
+    const uint32_t avg_total = static_cast<uint32_t>(g_perf_window.total_us / n);
+    const uint32_t avg_render = static_cast<uint32_t>(g_perf_window.render_us / n);
+    const uint32_t avg_flush = static_cast<uint32_t>(g_perf_window.flush_us / n);
+    const uint32_t avg_wait = static_cast<uint32_t>(g_perf_window.wait_us / n);
+    const uint32_t avg_te = static_cast<uint32_t>(g_perf_window.te_wait_us / n);
+    const uint32_t avg_inv_sum = static_cast<uint32_t>(g_perf_window.invalid_sum_pixels / n);
+    const uint32_t avg_bbox = static_cast<uint32_t>(g_perf_window.invalid_bbox_pixels / n);
+    const uint32_t avg_inv_count_x10 = static_cast<uint32_t>(
+        (g_perf_window.invalid_count * 10ULL) / n);
+    const uint32_t avg_flush_count_x10 = static_cast<uint32_t>(
+        (g_perf_window.flush_count * 10ULL) / n);
+    const uint32_t avg_gap = g_perf_window.gap_count > 0U
+        ? static_cast<uint32_t>(g_perf_window.gap_us / g_perf_window.gap_count)
+        : 0U;
+    const uint32_t avg_bbox_pct = static_cast<uint32_t>(
+        (static_cast<uint64_t>(avg_bbox) * 100ULL) / kPerfScreenPixels);
+    const uint32_t max_bbox_pct = static_cast<uint32_t>(
+        (static_cast<uint64_t>(g_perf_window.max_invalid_bbox_pixels) * 100ULL) / kPerfScreenPixels);
+
+    ESP_LOGI(TAG,
+        "R.30 LVGL审计[%s] window=%ums refresh=%u hz=%u.%u total(avg/max)=%u/%uus render=%u/%uus flush=%u/%uus wait=%u/%uus TE=%u/%uus gap=%u/%uus late=%u%s",
+        ui_perf_context_name(g_perf_window.context),
+        static_cast<unsigned>(elapsed_ms),
+        static_cast<unsigned>(n),
+        static_cast<unsigned>(hz_x10 / 10U),
+        static_cast<unsigned>(hz_x10 % 10U),
+        static_cast<unsigned>(avg_total),
+        static_cast<unsigned>(g_perf_window.max_total_us),
+        static_cast<unsigned>(avg_render),
+        static_cast<unsigned>(g_perf_window.max_render_us),
+        static_cast<unsigned>(avg_flush),
+        static_cast<unsigned>(g_perf_window.max_flush_us),
+        static_cast<unsigned>(avg_wait),
+        static_cast<unsigned>(g_perf_window.max_wait_us),
+        static_cast<unsigned>(avg_te),
+        static_cast<unsigned>(g_perf_window.max_te_wait_us),
+        static_cast<unsigned>(avg_gap),
+        static_cast<unsigned>(g_perf_window.max_gap_us),
+        static_cast<unsigned>(g_perf_window.late_gap_count),
+        context_switch ? " switch" : "");
+
+    ESP_LOGI(TAG,
+        "R.30 LVGL失效[%s] inv(avg/max)=%u.%u/%u次 sum(avg/max)=%u/%upx bbox(avg/max)=%u%%/%u%% flushN(avg/max)=%u.%u/%u DMAfree=%u largest=%u PSRAM=%u",
+        ui_perf_context_name(g_perf_window.context),
+        static_cast<unsigned>(avg_inv_count_x10 / 10U),
+        static_cast<unsigned>(avg_inv_count_x10 % 10U),
+        static_cast<unsigned>(g_perf_window.max_invalid_count),
+        static_cast<unsigned>(avg_inv_sum),
+        static_cast<unsigned>(g_perf_window.max_invalid_sum_pixels),
+        static_cast<unsigned>(avg_bbox_pct),
+        static_cast<unsigned>(max_bbox_pct),
+        static_cast<unsigned>(avg_flush_count_x10 / 10U),
+        static_cast<unsigned>(avg_flush_count_x10 % 10U),
+        static_cast<unsigned>(g_perf_window.max_flush_count),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)),
+        static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+}
+
+static void ui_perf_ensure_window(UiPerfContext context, int64_t now_us)
+{
+    if (!g_perf_window.active) {
+        ui_perf_reset_window(context, now_us);
+        return;
+    }
+    if (g_perf_window.context != context) {
+        ui_perf_dump_window(now_us, true);
+        ui_perf_reset_window(context, now_us);
+    }
+}
+
+static void ui_perf_note_invalidation(const lv_area_t &area)
+{
+    const int32_t width = area.x2 - area.x1 + 1;
+    const int32_t height = area.y2 - area.y1 + 1;
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+    const uint32_t pixels = static_cast<uint32_t>(width) * static_cast<uint32_t>(height);
+    ++g_perf_invalid.count;
+    g_perf_invalid.sum_pixels += pixels;
+    if (pixels > g_perf_invalid.max_pixels) g_perf_invalid.max_pixels = pixels;
+    if (!g_perf_invalid.bbox_valid) {
+        g_perf_invalid.bbox_valid = true;
+        g_perf_invalid.x1 = area.x1; g_perf_invalid.y1 = area.y1;
+        g_perf_invalid.x2 = area.x2; g_perf_invalid.y2 = area.y2;
+    } else {
+        if (area.x1 < g_perf_invalid.x1) g_perf_invalid.x1 = area.x1;
+        if (area.y1 < g_perf_invalid.y1) g_perf_invalid.y1 = area.y1;
+        if (area.x2 > g_perf_invalid.x2) g_perf_invalid.x2 = area.x2;
+        if (area.y2 > g_perf_invalid.y2) g_perf_invalid.y2 = area.y2;
+    }
+}
+
+static void ui_perf_begin_refresh(int64_t now_us)
+{
+    const UiPerfContext context = ui_perf_resolve_context();
+    ui_perf_ensure_window(context, now_us);
+
+    g_perf_frame = {};
+    g_perf_frame.active = true;
+    g_perf_frame.context = context;
+    g_perf_frame.refr_started_us = now_us;
+    g_perf_frame.invalid_count = g_perf_invalid.count;
+    g_perf_frame.invalid_sum_pixels = g_perf_invalid.sum_pixels;
+    g_perf_frame.invalid_max_pixels = g_perf_invalid.max_pixels;
+    if (g_perf_invalid.bbox_valid) {
+        const int32_t width = g_perf_invalid.x2 - g_perf_invalid.x1 + 1;
+        const int32_t height = g_perf_invalid.y2 - g_perf_invalid.y1 + 1;
+        if (width > 0 && height > 0) {
+            g_perf_frame.invalid_bbox_pixels =
+                static_cast<uint32_t>(width) * static_cast<uint32_t>(height);
+        }
+    }
+    g_perf_invalid = {};
+}
+
+static void ui_perf_finalize_refresh(int64_t now_us)
+{
+    if (!g_perf_frame.active) {
+        return;
+    }
+    ui_perf_ensure_window(g_perf_frame.context, now_us);
+    const uint32_t total_us = now_us > g_perf_frame.refr_started_us
+        ? static_cast<uint32_t>(now_us - g_perf_frame.refr_started_us)
+        : 0U;
+    UiPerfWindow &w = g_perf_window;
+
+    if (w.last_refresh_started_us != 0 && g_perf_frame.refr_started_us > w.last_refresh_started_us) {
+        const uint32_t gap_us = static_cast<uint32_t>(
+            g_perf_frame.refr_started_us - w.last_refresh_started_us);
+        w.gap_us += gap_us;
+        ++w.gap_count;
+        if (gap_us > w.max_gap_us) w.max_gap_us = gap_us;
+        const uint32_t target_ms = ui_perf_context_target_period_ms(w.context);
+        if (target_ms > 0U && gap_us > target_ms * 1500U) {
+            ++w.late_gap_count;
+        }
+    }
+    w.last_refresh_started_us = g_perf_frame.refr_started_us;
+
+    ++w.refresh_count;
+    w.total_us += total_us;
+    w.render_us += g_perf_frame.render_us;
+    w.flush_us += g_perf_frame.flush_us;
+    w.wait_us += g_perf_frame.wait_us;
+    w.te_wait_us += g_perf_frame.te_wait_us;
+    w.invalid_sum_pixels += g_perf_frame.invalid_sum_pixels;
+    w.invalid_bbox_pixels += g_perf_frame.invalid_bbox_pixels;
+    w.invalid_count += g_perf_frame.invalid_count;
+    w.flush_count += g_perf_frame.flush_count;
+
+    if (total_us > w.max_total_us) w.max_total_us = total_us;
+    if (g_perf_frame.render_us > w.max_render_us) w.max_render_us = g_perf_frame.render_us;
+    if (g_perf_frame.flush_us > w.max_flush_us) w.max_flush_us = g_perf_frame.flush_us;
+    if (g_perf_frame.wait_us > w.max_wait_us) w.max_wait_us = g_perf_frame.wait_us;
+    if (g_perf_frame.te_wait_us > w.max_te_wait_us) w.max_te_wait_us = g_perf_frame.te_wait_us;
+    const uint32_t inv_sum_clamped = g_perf_frame.invalid_sum_pixels > UINT32_MAX
+        ? UINT32_MAX : static_cast<uint32_t>(g_perf_frame.invalid_sum_pixels);
+    if (inv_sum_clamped > w.max_invalid_sum_pixels) w.max_invalid_sum_pixels = inv_sum_clamped;
+    if (g_perf_frame.invalid_bbox_pixels > w.max_invalid_bbox_pixels) {
+        w.max_invalid_bbox_pixels = g_perf_frame.invalid_bbox_pixels;
+    }
+    if (g_perf_frame.invalid_count > w.max_invalid_count) w.max_invalid_count = g_perf_frame.invalid_count;
+    if (g_perf_frame.flush_count > w.max_flush_count) w.max_flush_count = g_perf_frame.flush_count;
+
+    g_perf_frame = {};
+}
+
+static void ui_perf_audit_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    const int64_t now_us = esp_timer_get_time();
+    const UiPerfContext context = ui_perf_resolve_context();
+    ui_perf_ensure_window(context, now_us);
+    if (g_perf_window.active &&
+        now_us - g_perf_window.started_us >= static_cast<int64_t>(kPerfAuditWindowMs) * 1000LL) {
+        ui_perf_dump_window(now_us, false);
+        ui_perf_reset_window(context, now_us);
+    }
+}
 
 // CO5300 对局部刷新窗口有偶数对齐要求：
 // 起始 X/Y 必须为偶数，刷新宽度和高度也必须为偶数。
@@ -96,6 +500,8 @@ static void ui_display_align_area_cb(lv_event_t *event)
     if (area->x2 > max_x) area->x2 = max_x;
     if (area->y2 > max_y) area->y2 = max_y;
 
+    ui_perf_note_invalidation(*area);
+
     if (g_te_sync_runtime_enabled) {
         const int32_t width = area->x2 - area->x1 + 1;
         const int32_t height = area->y2 - area->y1 + 1;
@@ -103,7 +509,16 @@ static void ui_display_align_area_cb(lv_event_t *event)
             const uint32_t pixels =
                 static_cast<uint32_t>(width) * static_cast<uint32_t>(height);
             if (pixels >= kTeSyncMinPixels) {
-                g_te_sync_pending = true;
+                const UiPerfContext context = ui_perf_resolve_context();
+                const bool continuous_animation =
+                    ui_te_context_is_continuous_animation(context);
+                // R.31：频谱 / Launcher / 歌词缓动 / 惯性滚动的中等面积动画帧
+                // 直接刷新；>=90% 屏的真正页面切换仍同步 TE。
+                if (!continuous_animation || pixels >= kTeSyncForceFullFramePixels) {
+                    g_te_sync_pending = true;
+                } else {
+                    ++g_te_animation_bypass_count;
+                }
             }
         }
     }
@@ -111,19 +526,61 @@ static void ui_display_align_area_cb(lv_event_t *event)
 
 static void ui_display_profile_cb(lv_event_t *event)
 {
-    if (event == nullptr || !g_large_refresh_profile.active) {
+    if (event == nullptr) {
         return;
     }
 
     const int64_t now_us = esp_timer_get_time();
-    switch (lv_event_get_code(event)) {
+    const lv_event_code_t code = lv_event_get_code(event);
+
+    // R.30：所有刷新都记录，供页面级2秒窗口汇总。
+    if (g_perf_frame.active) {
+        switch (code) {
+            case LV_EVENT_RENDER_START:
+                if (g_perf_frame.render_started_us == 0) g_perf_frame.render_started_us = now_us;
+                ++g_perf_frame.render_count;
+                break;
+            case LV_EVENT_RENDER_READY:
+                if (g_perf_frame.render_started_us != 0) {
+                    g_perf_frame.render_us += static_cast<uint32_t>(now_us - g_perf_frame.render_started_us);
+                    g_perf_frame.render_started_us = 0;
+                }
+                break;
+            case LV_EVENT_FLUSH_START:
+                if (g_perf_frame.flush_started_us == 0) g_perf_frame.flush_started_us = now_us;
+                ++g_perf_frame.flush_count;
+                break;
+            case LV_EVENT_FLUSH_FINISH:
+                if (g_perf_frame.flush_started_us != 0) {
+                    g_perf_frame.flush_us += static_cast<uint32_t>(now_us - g_perf_frame.flush_started_us);
+                    g_perf_frame.flush_started_us = 0;
+                }
+                break;
+            case LV_EVENT_FLUSH_WAIT_START:
+                if (g_perf_frame.wait_started_us == 0) g_perf_frame.wait_started_us = now_us;
+                break;
+            case LV_EVENT_FLUSH_WAIT_FINISH:
+                if (g_perf_frame.wait_started_us != 0) {
+                    g_perf_frame.wait_us += static_cast<uint32_t>(now_us - g_perf_frame.wait_started_us);
+                    g_perf_frame.wait_started_us = 0;
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    // 保留 R.23 的大刷新逐帧诊断，便于和历史日志直接对比。
+    if (!g_large_refresh_profile.active) {
+        return;
+    }
+    switch (code) {
         case LV_EVENT_RENDER_START:
             if (g_large_refresh_profile.render_started_us == 0) {
                 g_large_refresh_profile.render_started_us = now_us;
             }
             ++g_large_refresh_profile.render_count;
             break;
-
         case LV_EVENT_RENDER_READY:
             if (g_large_refresh_profile.render_started_us != 0) {
                 g_large_refresh_profile.render_us += static_cast<uint32_t>(
@@ -131,14 +588,12 @@ static void ui_display_profile_cb(lv_event_t *event)
                 g_large_refresh_profile.render_started_us = 0;
             }
             break;
-
         case LV_EVENT_FLUSH_START:
             if (g_large_refresh_profile.flush_started_us == 0) {
                 g_large_refresh_profile.flush_started_us = now_us;
             }
             ++g_large_refresh_profile.flush_count;
             break;
-
         case LV_EVENT_FLUSH_FINISH:
             if (g_large_refresh_profile.flush_started_us != 0) {
                 g_large_refresh_profile.flush_us += static_cast<uint32_t>(
@@ -146,13 +601,11 @@ static void ui_display_profile_cb(lv_event_t *event)
                 g_large_refresh_profile.flush_started_us = 0;
             }
             break;
-
         case LV_EVENT_FLUSH_WAIT_START:
             if (g_large_refresh_profile.wait_started_us == 0) {
                 g_large_refresh_profile.wait_started_us = now_us;
             }
             break;
-
         case LV_EVENT_FLUSH_WAIT_FINISH:
             if (g_large_refresh_profile.wait_started_us != 0) {
                 g_large_refresh_profile.wait_us += static_cast<uint32_t>(
@@ -160,7 +613,6 @@ static void ui_display_profile_cb(lv_event_t *event)
                 g_large_refresh_profile.wait_started_us = 0;
             }
             break;
-
         default:
             break;
     }
@@ -175,6 +627,9 @@ static void ui_display_refresh_start_cb(lv_event_t *event)
     if (lv_event_get_code(event) != LV_EVENT_REFR_START) {
         return;
     }
+
+    const int64_t refresh_started_us = esp_timer_get_time();
+    ui_perf_begin_refresh(refresh_started_us);
 
     const bool large_refresh = g_te_sync_pending;
     const bool present_requested = display_present_take_hold_request();
@@ -191,6 +646,7 @@ static void ui_display_refresh_start_cb(lv_event_t *event)
         if (display_te_wait_next(g_te_sync_timeout_ms)) {
             const uint32_t waited_us = static_cast<uint32_t>(
                 esp_timer_get_time() - wait_started_us);
+            if (g_perf_frame.active) g_perf_frame.te_wait_us = waited_us;
             ++g_te_sync_success_count;
             g_te_sync_consecutive_timeouts = 0U;
             if (g_te_sync_success_count <= 3U || (g_te_sync_success_count % 60U) == 0U) {
@@ -200,6 +656,10 @@ static void ui_display_refresh_start_cb(lv_event_t *event)
                     static_cast<unsigned>(waited_us));
             }
         } else {
+            if (g_perf_frame.active) {
+                g_perf_frame.te_wait_us = static_cast<uint32_t>(
+                    esp_timer_get_time() - wait_started_us);
+            }
             ++g_te_sync_timeout_count;
             ++g_te_sync_consecutive_timeouts;
             ESP_LOGW(TAG,
@@ -238,6 +698,8 @@ static void ui_display_refresh_ready_cb(lv_event_t *event)
     if (lv_event_get_code(event) != LV_EVENT_REFR_READY) {
         return;
     }
+
+    ui_perf_finalize_refresh(esp_timer_get_time());
 
     if (g_large_refresh_profile.active) {
         const uint32_t total_us = static_cast<uint32_t>(
@@ -300,7 +762,7 @@ static uint16_t ui_clamp_coord(uint16_t value, uint16_t max_value)
 }
 
 // P1.5R.1.2：LVGL 输入回调只消费 TouchInputTask 发布的边沿队列/最新坐标快照。
-// DOWN/UP 必达；MOVE 只在坐标 sequence 真正变化时分发给业务层，避免同一快照反复喂给页面。
+// DOWN/UP 走边沿队列；R.33.2.3 在生产端做 RELEASE debounce + 满队列背压合并；MOVE 只按最新 snapshot 分发。
 static void ui_touch_dispatch_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick_ms)
 {
     if (!library_view_is_visible()) {
@@ -458,6 +920,15 @@ esp_err_t ui_manager_init()
         g_te_sync_timeout_ms = timeout_ms;
     }
 
+    // P1.5.3.2R.32.1：lvgl_port_init() 启动独立 LVGL task 后，所有直接 lv_* 调用都必须
+    // 与 lv_timer_handler() 共用同一把 port mutex。此前 display event callback 注册发生在锁外，
+    // 启动时若恰好与 Core1 LVGL task 并发修改 event/TLSF 链表，会卡在 lv_tlsf_malloc()。
+    // 初始化阶段不需要抢占式失败，因此使用 -1 永久等待，并一直持锁到全部 UI 对象创建完成。
+    if (!lvgl_port_lock(-1)) {
+        ESP_LOGE(TAG, "R.32.1 获取 LVGL 初始化互斥锁失败");
+        return ESP_FAIL;
+    }
+
     lv_display_add_event_cb(g_display, ui_display_align_area_cb, LV_EVENT_INVALIDATE_AREA, nullptr);
     lv_display_add_event_cb(g_display, ui_display_refresh_start_cb, LV_EVENT_REFR_START, nullptr);
     lv_display_add_event_cb(g_display, ui_display_refresh_ready_cb, LV_EVENT_REFR_READY, nullptr);
@@ -467,10 +938,11 @@ esp_err_t ui_manager_init()
     lv_display_add_event_cb(g_display, ui_display_profile_cb, LV_EVENT_FLUSH_FINISH, nullptr);
     lv_display_add_event_cb(g_display, ui_display_profile_cb, LV_EVENT_FLUSH_WAIT_START, nullptr);
     lv_display_add_event_cb(g_display, ui_display_profile_cb, LV_EVENT_FLUSH_WAIT_FINISH, nullptr);
+    ESP_LOGI(TAG, "R.32.1 LVGL初始化互斥：display callbacks -> indev -> decoder -> screens 全程持锁");
     ESP_LOGI(TAG, "已启用 CO5300 局部刷新偶数对齐");
     if (g_te_sync_runtime_enabled) {
         ESP_LOGI(TAG,
-            "R.21 LVGL大刷新TE同步已启用：阈值=%u像素(25%%屏)，timeout=%ums，TE period=%uus",
+            "R.31 TE策略已启用：静态大刷新阈值=%u像素；连续动画中等刷新绕过TE，>=90%%屏仍同步；timeout=%ums，TE period=%uus",
             static_cast<unsigned>(kTeSyncMinPixels),
             static_cast<unsigned>(g_te_sync_timeout_ms),
             static_cast<unsigned>(te_period_us));
@@ -486,11 +958,7 @@ esp_err_t ui_manager_init()
         ESP_LOGW(TAG, "Touch Fast Path 启动失败，将降级为 LVGL 同步读取 CST820：%s",
             esp_err_to_name(touch_fast_ret));
     }
-    if (!lvgl_port_lock(0)) {
-        ESP_LOGE(TAG, "获取 LVGL 锁失败");
-        return ESP_FAIL;
-    }
-
+    // R.32.1：这里已经持有初始化互斥锁，不再二次 lock。
     g_touch = lv_indev_create();
     if (g_touch == nullptr) {
         lvgl_port_unlock();
@@ -532,8 +1000,14 @@ esp_err_t ui_manager_init()
     lyrics_view_create(lv_screen_active());
     spectrum_view_create(lv_screen_active());
     library_view_create(lv_screen_active());
+    g_perf_audit_timer = lv_timer_create(ui_perf_audit_timer_cb, kPerfAuditWindowMs, nullptr);
+    if (g_perf_audit_timer == nullptr) {
+        ESP_LOGW(TAG, "R.30 性能审计汇总timer创建失败，仅保留逐刷新计数");
+    }
     lvgl_port_unlock();
 
+    ESP_LOGI(TAG,
+        "R.30 全页面LVGL性能审计已启用：2s窗口；主页/Overlay/Launcher动画、歌词静态/缓动/Overlay、三种频谱、曲库列表/惯性/搜索分别统计");
     g_ready = true;
     ESP_LOGI(TAG, "Stage 6 正式 UI 基础框架初始化成功");
     return ESP_OK;

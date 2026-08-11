@@ -31,6 +31,7 @@ idf_component_register(
         "audio/decoders/mp3_decoder.cpp"
 
         "assets/artwork_loader.cpp"
+        "assets/launcher_animation_frames.cpp"
 
         "media/library/media_library.cpp"
         "media/library/media_index_store.cpp"

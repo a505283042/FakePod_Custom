@@ -10,3 +10,6 @@ void spectrum_view_create(lv_obj_t *screen);
 void spectrum_view_open();
 void spectrum_view_close();
 bool spectrum_view_is_visible();
+
+// R.30 性能审计：返回当前自绘样式名。
+const char *spectrum_view_current_style_name();

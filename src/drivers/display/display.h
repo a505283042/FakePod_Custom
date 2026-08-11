@@ -78,3 +78,15 @@ esp_err_t display_present_rgb565_direct(
     uint16_t height,
     bool wire_order,
     DisplayDirectPresentStats *out_stats = nullptr);
+
+// P1.5.3.2R.33.2：Launcher 等局部静态 RGB565 帧复用 R.29 Continuous GRAM，
+// 但窗口可位于屏幕任意区域。连续动画可关闭 TE 等待，避免每个离散帧额外等待一轮 VBlank。
+esp_err_t display_present_rgb565_region_direct(
+    const uint8_t *rgb565,
+    uint16_t x,
+    uint16_t y,
+    uint16_t width,
+    uint16_t height,
+    bool wire_order,
+    bool wait_for_te,
+    DisplayDirectPresentStats *out_stats = nullptr);

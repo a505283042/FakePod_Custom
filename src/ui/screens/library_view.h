@@ -14,3 +14,7 @@ bool library_view_is_visible();
 // 由 ui_manager 的 CST820 原始指针路径旁路观察：
 // 普通曲库负责横向分类 + 纵向直驱列表；搜索模式只允许结果区纵向滚动，键盘区域交给 LVGL Button。
 void library_view_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick_ms);
+
+// R.30 性能审计只读状态。
+bool library_view_inertia_is_active();
+bool library_view_search_is_active();

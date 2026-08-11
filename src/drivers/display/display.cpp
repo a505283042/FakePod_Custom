@@ -1282,11 +1282,15 @@ esp_err_t display_install_lvgl_color_done_bridge(void *lvgl_display)
 // R.29 封面 Direct Surface Present / Continuous GRAM Stream
 // ============================================================
 
-esp_err_t display_present_rgb565_direct(
+static esp_err_t display_present_rgb565_region_direct_impl(
     const uint8_t *rgb565,
+    uint16_t x,
+    uint16_t y,
     uint16_t width,
     uint16_t height,
     bool wire_order,
+    bool wait_for_te,
+    bool log_summary,
     DisplayDirectPresentStats *out_stats)
 {
     DisplayDirectPresentStats stats = {};
@@ -1298,7 +1302,10 @@ esp_err_t display_present_rgb565_direct(
         !g_color_done_bridge_installed || g_lvgl_display == nullptr || rgb565 == nullptr) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (width != FAKEPOD_LCD_WIDTH || height != FAKEPOD_LCD_HEIGHT) {
+    if (width == 0U || height == 0U ||
+        x >= FAKEPOD_LCD_WIDTH || y >= FAKEPOD_LCD_HEIGHT ||
+        static_cast<uint32_t>(x) + width > FAKEPOD_LCD_WIDTH ||
+        static_cast<uint32_t>(y) + height > FAKEPOD_LCD_HEIGHT) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -1393,10 +1400,10 @@ esp_err_t display_present_rgb565_direct(
 
     // 在 TE 到来前先设置一次完整 GRAM 窗口。官方 CO5300 draw_bitmap() 每个 strip 都会
     // CASET + RASET + RAMWR；R.29 将 CASET/RASET 从 N 次缩为 1 次。
-    const uint16_t x_start = static_cast<uint16_t>(FAKEPOD_LCD_X_OFFSET);
-    const uint16_t x_end = static_cast<uint16_t>(FAKEPOD_LCD_X_OFFSET + width - 1U);
-    const uint16_t y_start = static_cast<uint16_t>(FAKEPOD_LCD_Y_OFFSET);
-    const uint16_t y_end = static_cast<uint16_t>(FAKEPOD_LCD_Y_OFFSET + height - 1U);
+    const uint16_t x_start = static_cast<uint16_t>(FAKEPOD_LCD_X_OFFSET + x);
+    const uint16_t x_end = static_cast<uint16_t>(FAKEPOD_LCD_X_OFFSET + x + width - 1U);
+    const uint16_t y_start = static_cast<uint16_t>(FAKEPOD_LCD_Y_OFFSET + y);
+    const uint16_t y_end = static_cast<uint16_t>(FAKEPOD_LCD_Y_OFFSET + y + height - 1U);
     const uint8_t caset[4] = {
         static_cast<uint8_t>(x_start >> 8U),
         static_cast<uint8_t>(x_start & 0xFFU),
@@ -1448,7 +1455,7 @@ esp_err_t display_present_rgb565_direct(
         }
     }
 
-    if (result == ESP_OK && display_te_is_ready()) {
+    if (result == ESP_OK && wait_for_te && display_te_is_ready()) {
         const uint32_t period_us = display_te_get_period_us();
         uint32_t timeout_ms = 25U;
         if (period_us > 0U) {
@@ -1584,33 +1591,60 @@ esp_err_t display_present_rgb565_direct(
     }
 
     static uint32_t s_direct_present_count = 0U;
-    ++s_direct_present_count;
-    if (s_direct_present_count <= 12U || (s_direct_present_count % 60U) == 0U || result != ESP_OK) {
-        ESP_LOGI(TAG,
-            "R.29 ContinuousGRAM：count=%u result=%s source=%s total=%uus barrier=%uus window=%uus te=%uus pipeline=%uus stream=%uus copy=%uus swap=%uus wait=%uus overlap≈%uus chunks=%u queue_peak=%u staging=%u行×%u total=%uB free=%u largest=%u aligned=%u",
-            static_cast<unsigned>(s_direct_present_count),
-            esp_err_to_name(result),
-            stats.wire_order ? "wire" : "native",
-            static_cast<unsigned>(stats.total_us),
-            static_cast<unsigned>(stats.io_barrier_us),
-            static_cast<unsigned>(stats.window_setup_us),
-            static_cast<unsigned>(stats.te_wait_us),
-            static_cast<unsigned>(stats.pipeline_us),
-            static_cast<unsigned>(stats.stream_us),
-            static_cast<unsigned>(stats.copy_us),
-            static_cast<unsigned>(stats.byte_swap_us),
-            static_cast<unsigned>(stats.dma_wait_us),
-            static_cast<unsigned>(stats.overlap_saved_us),
-            static_cast<unsigned>(stats.chunks),
-            static_cast<unsigned>(stats.queue_peak),
-            static_cast<unsigned>(stats.staging_rows),
-            static_cast<unsigned>(stats.staging_buffers),
-            static_cast<unsigned>(stats.staging_total_bytes),
-            static_cast<unsigned>(dma_free_before),
-            static_cast<unsigned>(dma_largest_before),
-            static_cast<unsigned>(stats.te_aligned));
+    if (log_summary) {
+        ++s_direct_present_count;
+        if (s_direct_present_count <= 12U || (s_direct_present_count % 60U) == 0U || result != ESP_OK) {
+            ESP_LOGI(TAG,
+                "R.29 ContinuousGRAM：count=%u result=%s source=%s total=%uus barrier=%uus window=%uus te=%uus pipeline=%uus stream=%uus copy=%uus swap=%uus wait=%uus overlap≈%uus chunks=%u queue_peak=%u staging=%u行×%u total=%uB free=%u largest=%u aligned=%u",
+                static_cast<unsigned>(s_direct_present_count),
+                esp_err_to_name(result),
+                stats.wire_order ? "wire" : "native",
+                static_cast<unsigned>(stats.total_us),
+                static_cast<unsigned>(stats.io_barrier_us),
+                static_cast<unsigned>(stats.window_setup_us),
+                static_cast<unsigned>(stats.te_wait_us),
+                static_cast<unsigned>(stats.pipeline_us),
+                static_cast<unsigned>(stats.stream_us),
+                static_cast<unsigned>(stats.copy_us),
+                static_cast<unsigned>(stats.byte_swap_us),
+                static_cast<unsigned>(stats.dma_wait_us),
+                static_cast<unsigned>(stats.overlap_saved_us),
+                static_cast<unsigned>(stats.chunks),
+                static_cast<unsigned>(stats.queue_peak),
+                static_cast<unsigned>(stats.staging_rows),
+                static_cast<unsigned>(stats.staging_buffers),
+                static_cast<unsigned>(stats.staging_total_bytes),
+                static_cast<unsigned>(dma_free_before),
+                static_cast<unsigned>(dma_largest_before),
+                static_cast<unsigned>(stats.te_aligned));
+        }
     }
     return result;
+}
+
+esp_err_t display_present_rgb565_direct(
+    const uint8_t *rgb565,
+    uint16_t width,
+    uint16_t height,
+    bool wire_order,
+    DisplayDirectPresentStats *out_stats)
+{
+    return display_present_rgb565_region_direct_impl(
+        rgb565, 0U, 0U, width, height, wire_order, true, true, out_stats);
+}
+
+esp_err_t display_present_rgb565_region_direct(
+    const uint8_t *rgb565,
+    uint16_t x,
+    uint16_t y,
+    uint16_t width,
+    uint16_t height,
+    bool wire_order,
+    bool wait_for_te,
+    DisplayDirectPresentStats *out_stats)
+{
+    return display_present_rgb565_region_direct_impl(
+        rgb565, x, y, width, height, wire_order, wait_for_te, false, out_stats);
 }
 
 
