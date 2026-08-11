@@ -187,8 +187,6 @@ static lv_obj_t *g_overlay = nullptr;
 static lv_obj_t *g_overlay_backdrop = nullptr;
 static lv_timer_t *g_overlay_timer = nullptr;
 static bool g_overlay_visible = false;
-static bool g_overlay_fast_dim = false;
-static bool g_overlay_dim_path_valid = false;
 
 static lv_obj_t *g_launcher = nullptr;
 static lv_obj_t *g_launcher_backdrop = nullptr;
@@ -242,6 +240,9 @@ static lv_obj_t *g_progress = nullptr;
 static lv_obj_t *g_current_time = nullptr;
 static lv_obj_t *g_total_time = nullptr;
 static lv_obj_t *g_loop_button = nullptr;
+// R.34：播放模式按钮只在模式真正变化时重绘，避免每个 Audio Snapshot 无条件 invalidate。
+static PlayerLoopMode g_last_loop_mode = PlayerLoopMode::Sequential;
+static bool g_last_loop_mode_valid = false;
 static lv_obj_t *g_volume_label = nullptr;
 static lv_obj_t *g_volume_slider = nullptr;
 static lv_obj_t *g_volume_mode_button = nullptr;
@@ -304,6 +305,29 @@ static lv_obj_t *player_home_create_label(
     return label;
 }
 
+// P1.5.3.2R.34：所有高频 Audio Snapshot -> LVGL 写入都先比较当前值。
+// 目标不是增加缓存，而是阻止“值没变仍 set_*”制造 dirty area。
+static void player_home_label_set_text_if_changed(lv_obj_t *label, const char *text)
+{
+    if (label == nullptr) {
+        return;
+    }
+    const char *target = text != nullptr ? text : "";
+    const char *current = lv_label_get_text(label);
+    if (current != nullptr && strcmp(current, target) == 0) {
+        return;
+    }
+    lv_label_set_text(label, target);
+}
+
+static void player_home_slider_set_value_if_changed(lv_obj_t *slider, int32_t value)
+{
+    if (slider == nullptr || lv_slider_get_value(slider) == value) {
+        return;
+    }
+    lv_slider_set_value(slider, value, LV_ANIM_OFF);
+}
+
 static lv_obj_t *player_home_create_round_button(lv_obj_t *parent, int32_t size, const char *symbol)
 {
     lv_obj_t *button = lv_button_create(parent);
@@ -359,23 +383,28 @@ static void player_home_transport_icon_draw_cb(lv_event_t *event)
         lv_draw_line(layer, &line);
     };
 
-    if (obj == g_prev_button) {
-        // 34x30 左右的大号 Previous：竖线 + 双折返箭头。
-        draw(cx - 17, cy - 15, cx - 17, cy + 15);
-        draw(cx + 12, cy - 14, cx - 3, cy);
-        draw(cx - 3, cy, cx + 12, cy + 14);
-        draw(cx - 1, cy - 14, cx - 16, cy);
-        draw(cx - 16, cy, cx - 1, cy + 14);
-        return;
-    }
+    if (obj == g_prev_button || obj == g_next_button) {
+        // R.34：上一曲/下一曲改成标准 Track Previous / Track Next：
+        // 独立 track bar + 实心三角。仍使用原 74px 实体按钮和命中区域。
+        const bool previous = obj == g_prev_button;
+        const int32_t dir = previous ? -1 : 1;
+        line.width = 5;
+        line.round_start = 0U;
+        line.round_end = 0U;
 
-    if (obj == g_next_button) {
-        // Previous 的镜像，保持三颗按钮内部图标视觉重量一致。
-        draw(cx + 17, cy - 15, cx + 17, cy + 15);
-        draw(cx - 12, cy - 14, cx + 3, cy);
-        draw(cx + 3, cy, cx - 12, cy + 14);
-        draw(cx + 1, cy - 14, cx + 16, cy);
-        draw(cx + 16, cy, cx + 1, cy + 14);
+        // Track bar。
+        draw(cx + dir * 16, cy - 15, cx + dir * 16, cy + 15);
+
+        // 用 2px 水平扫描线填充三角形，避免引入额外图片/字体资源。
+        line.width = 2;
+        for (int32_t y = -14; y <= 14; y += 2) {
+            const int32_t inset = (abs(y) * 20) / 14;
+            if (previous) {
+                draw(cx - 10 + inset, cy + y, cx + 10, cy + y);
+            } else {
+                draw(cx - 10, cy + y, cx + 10 - inset, cy + y);
+            }
+        }
         return;
     }
 
@@ -1903,14 +1932,17 @@ static void player_home_launcher_panel_click_cb(lv_event_t *event)
 
 static void player_home_set_volume_adjust_armed(bool armed)
 {
-    g_volume_adjust_armed = armed && g_overlay_visible;
+    const bool target = armed && g_overlay_visible;
+    const bool changed = g_volume_adjust_armed != target;
+    g_volume_adjust_armed = target;
     gesture_router_set_vertical_adjust_enabled(g_volume_adjust_armed);
     if (!g_volume_adjust_armed) {
         g_volume_dragging = false;
     }
 
-    // 音量图标同时作为“当前允许纵向调音量”的状态提示。
-    if (g_volume_mode_button != nullptr) {
+    // 音量图标同时作为“当前允许纵向调音量”的状态提示；
+    // 状态没变时不重复写 style。
+    if (changed && g_volume_mode_button != nullptr) {
         lv_obj_set_style_bg_opa(
             g_volume_mode_button,
             g_volume_adjust_armed ? 150 : 36,
@@ -1928,6 +1960,93 @@ static void player_home_overlay_arm_timeout()
     lv_timer_resume(g_overlay_timer);
 }
 
+struct PlayerHomeOverlayInvalidationBatch {
+    lv_display_t *display = nullptr;
+    bool restore_invalidation = false;
+};
+
+static PlayerHomeOverlayInvalidationBatch player_home_overlay_begin_atomic_transition()
+{
+    PlayerHomeOverlayInvalidationBatch batch = {};
+    batch.display = lv_display_get_default();
+    batch.restore_invalidation =
+        batch.display != nullptr && lv_display_is_invalidation_enabled(batch.display);
+    if (batch.restore_invalidation) {
+        // R.34.2：Overlay 显隐、normal/dimmed source 与 child HIDDEN 属于同一视觉事务。
+        // 先暂停 invalidation，避免 13 个 child + lv_image_set_src() 旧/新区重复登记 dirty。
+        lv_display_enable_invalidation(batch.display, false);
+    }
+    return batch;
+}
+
+static void player_home_overlay_end_atomic_transition(
+    const PlayerHomeOverlayInvalidationBatch &batch)
+{
+    if (!batch.restore_invalidation || batch.display == nullptr) {
+        return;
+    }
+
+    lv_display_enable_invalidation(batch.display, true);
+    if (g_overlay != nullptr) {
+        // normal<->dimmed 本来就改变整张 460x460 封面；事务完成后只登记一次整屏 dirty。
+        // 这一帧同时重画封面与最终显隐状态的 Overlay 控件。
+        lv_obj_invalidate(g_overlay);
+    }
+}
+
+static void player_home_overlay_set_backdrop_opa_if_changed(lv_opa_t opa)
+{
+    if (g_overlay_backdrop == nullptr) {
+        return;
+    }
+    if (lv_obj_get_style_bg_opa(g_overlay_backdrop, LV_PART_MAIN) == opa) {
+        return;
+    }
+    lv_obj_set_style_bg_opa(g_overlay_backdrop, opa, 0);
+}
+
+static void player_home_overlay_set_backdrop_clickable(bool clickable)
+{
+    if (g_overlay_backdrop == nullptr) {
+        return;
+    }
+    const bool current = lv_obj_has_flag(g_overlay_backdrop, LV_OBJ_FLAG_CLICKABLE);
+    if (current == clickable) {
+        return;
+    }
+    if (clickable) {
+        lv_obj_add_flag(g_overlay_backdrop, LV_OBJ_FLAG_CLICKABLE);
+    } else {
+        lv_obj_remove_flag(g_overlay_backdrop, LV_OBJ_FLAG_CLICKABLE);
+    }
+}
+
+static void player_home_overlay_set_controls_visible(bool visible)
+{
+    if (g_overlay == nullptr) {
+        return;
+    }
+
+    // R.34.1：460x460 overlay root 常驻透明，绝不再通过 HIDDEN 切整屏 bounds。
+    // 只显隐真正有视觉内容的 child；backdrop 自己始终存在，隐藏态只关闭点击。
+    for (int32_t index = 0;; ++index) {
+        lv_obj_t *child = lv_obj_get_child(g_overlay, index);
+        if (child == nullptr) {
+            break;
+        }
+        if (child == g_overlay_backdrop) {
+            continue;
+        }
+
+        const bool hidden = lv_obj_has_flag(child, LV_OBJ_FLAG_HIDDEN);
+        if (visible && hidden) {
+            lv_obj_remove_flag(child, LV_OBJ_FLAG_HIDDEN);
+        } else if (!visible && !hidden) {
+            lv_obj_add_flag(child, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
 static void player_home_overlay_apply_dim_path()
 {
     if (g_overlay_backdrop == nullptr) {
@@ -1935,18 +2054,13 @@ static void player_home_overlay_apply_dim_path()
     }
 
     // R.20：CoverSurface 命中时直接切预暗 RGB565，backdrop 保持全透明；
-    // 只有压缩 JPEG/PNG 等兼容回退路径不具备 dimmed Surface 时，才启用旧 alpha 黑层。
+    // 只有 Overlay 可见且压缩 JPEG/PNG 回退路径没有 dimmed Surface 时，才启用旧 alpha 黑层。
     const bool fast_dim = now_playing_artwork_set_dimmed(g_overlay_visible);
-    if (!g_overlay_dim_path_valid || g_overlay_fast_dim != fast_dim) {
-        g_overlay_fast_dim = fast_dim;
-        g_overlay_dim_path_valid = true;
-        const lv_opa_t backdrop_opa =
-            fast_dim ? static_cast<lv_opa_t>(LV_OPA_TRANSP) : kOverlayDimOpacity;
-        lv_obj_set_style_bg_opa(
-            g_overlay_backdrop,
-            backdrop_opa,
-            0);
-    }
+    const lv_opa_t backdrop_opa =
+        (g_overlay_visible && !fast_dim)
+            ? kOverlayDimOpacity
+            : static_cast<lv_opa_t>(LV_OPA_TRANSP);
+    player_home_overlay_set_backdrop_opa_if_changed(backdrop_opa);
 }
 
 static void player_home_overlay_show()
@@ -1958,11 +2072,14 @@ static void player_home_overlay_show()
     player_home_launcher_hide();
 
     if (!g_overlay_visible) {
+        const PlayerHomeOverlayInvalidationBatch batch =
+            player_home_overlay_begin_atomic_transition();
         g_overlay_visible = true;
-        g_overlay_dim_path_valid = false;
         player_home_set_volume_adjust_armed(false);
         player_home_overlay_apply_dim_path();
-        lv_obj_remove_flag(g_overlay, LV_OBJ_FLAG_HIDDEN);
+        player_home_overlay_set_controls_visible(true);
+        player_home_overlay_set_backdrop_clickable(true);
+        player_home_overlay_end_atomic_transition(batch);
     }
     player_home_overlay_arm_timeout();
 }
@@ -1972,16 +2089,20 @@ static void player_home_overlay_hide()
     if (g_overlay == nullptr || !g_overlay_visible) {
         return;
     }
+
+    const PlayerHomeOverlayInvalidationBatch batch =
+        player_home_overlay_begin_atomic_transition();
     player_home_set_volume_adjust_armed(false);
     g_overlay_visible = false;
     if (g_overlay_timer != nullptr) {
         lv_timer_pause(g_overlay_timer);
     }
-    lv_obj_add_flag(g_overlay, LV_OBJ_FLAG_HIDDEN);
-    // Overlay 关闭后立即切回 normal RGB565。
-    now_playing_artwork_set_dimmed(false);
-    g_overlay_fast_dim = false;
-    g_overlay_dim_path_valid = false;
+
+    // R.34.2：child 显隐和 normal Surface 恢复统一在同一 invalidation 事务中完成。
+    player_home_overlay_set_controls_visible(false);
+    player_home_overlay_set_backdrop_clickable(false);
+    player_home_overlay_apply_dim_path();
+    player_home_overlay_end_atomic_transition(batch);
 }
 
 static void player_home_overlay_timeout_cb(lv_timer_t *timer)
@@ -2010,12 +2131,11 @@ static uint8_t player_home_volume_preview_from_delta(uint8_t start_percent, int1
 static void player_home_volume_apply_preview(uint8_t value)
 {
     g_volume_preview_percent = value;
-    if (g_volume_slider != nullptr) {
-        lv_slider_set_value(g_volume_slider, value, LV_ANIM_OFF);
-    }
-    if (g_volume_label != nullptr) {
-        lv_label_set_text_fmt(g_volume_label, "%u%%", static_cast<unsigned>(value));
-    }
+    player_home_slider_set_value_if_changed(g_volume_slider, value);
+
+    char label[16] = {};
+    snprintf(label, sizeof(label), "%u%%", static_cast<unsigned>(value));
+    player_home_label_set_text_if_changed(g_volume_label, label);
 }
 
 static bool player_home_volume_gesture_update()
@@ -2423,12 +2543,8 @@ static void player_home_update_time_labels(uint64_t position_ms, uint64_t total_
     char total[24] = {};
     player_home_format_time(position_ms, current, sizeof(current));
     player_home_format_time(total_ms, total, sizeof(total));
-    if (g_current_time != nullptr) {
-        lv_label_set_text(g_current_time, current);
-    }
-    if (g_total_time != nullptr) {
-        lv_label_set_text(g_total_time, total);
-    }
+    player_home_label_set_text_if_changed(g_current_time, current);
+    player_home_label_set_text_if_changed(g_total_time, total);
 }
 
 static bool player_home_snapshot_can_scrub(const AudioStateSnapshot &snapshot)
@@ -2460,9 +2576,10 @@ static void player_home_progress_set_enabled(bool enabled)
     if (g_progress == nullptr) {
         return;
     }
-    if (enabled) {
+    const bool disabled = lv_obj_has_state(g_progress, LV_STATE_DISABLED);
+    if (enabled && disabled) {
         lv_obj_remove_state(g_progress, LV_STATE_DISABLED);
-    } else {
+    } else if (!enabled && !disabled) {
         lv_obj_add_state(g_progress, LV_STATE_DISABLED);
     }
 }
@@ -2516,15 +2633,14 @@ static void player_home_progress_sync(const AudioStateSnapshot &snapshot)
     }
 
     if (!same_track || total_ms == 0U) {
-        lv_slider_set_value(g_progress, 0, LV_ANIM_OFF);
+        player_home_slider_set_value_if_changed(g_progress, 0);
         player_home_update_time_labels(0U, total_ms);
         return;
     }
 
-    lv_slider_set_value(
+    player_home_slider_set_value_if_changed(
         g_progress,
-        player_home_progress_value_from_ms(snapshot.position_ms, total_ms),
-        LV_ANIM_OFF);
+        player_home_progress_value_from_ms(snapshot.position_ms, total_ms));
     player_home_update_time_labels(snapshot.position_ms, total_ms);
 }
 
@@ -2657,9 +2773,9 @@ static void player_home_refresh_track(const AudioStateSnapshot *audio_snapshot)
     const size_t library_count = media_library_get_count();
     const size_t list_count = player_state_get_list_count();
     if (library_count == 0U || list_count == 0U) {
-        lv_label_set_text(g_title, "暂无歌曲");
-        lv_label_set_text(g_artist, "");
-        lv_label_set_text(g_track_info, "音乐库为空");
+        player_home_label_set_text_if_changed(g_title, "暂无歌曲");
+        player_home_label_set_text_if_changed(g_artist, "");
+        player_home_label_set_text_if_changed(g_track_info, "音乐库为空");
         return;
     }
 
@@ -2678,12 +2794,12 @@ static void player_home_refresh_track(const AudioStateSnapshot *audio_snapshot)
         snprintf(title_fallback, sizeof(title_fallback), "歌曲 %u", static_cast<unsigned>(index + 1U));
         title = title_fallback;
     }
-    lv_label_set_text(g_title, title);
+    player_home_label_set_text_if_changed(g_title, title);
 
     const char *artist = have_view && view.artist != nullptr && view.artist[0] != '\0'
         ? view.artist
         : "未知歌手";
-    lv_label_set_text(g_artist, artist);
+    player_home_label_set_text_if_changed(g_artist, artist);
 
     uint32_t sample_rate_hz = 0U;
     uint16_t bits_per_sample = 0U;
@@ -2698,41 +2814,53 @@ static void player_home_refresh_track(const AudioStateSnapshot *audio_snapshot)
 
     char sample_info[48] = {};
     player_home_format_sample_info(sample_rate_hz, bits_per_sample, sample_info, sizeof(sample_info));
+    char track_info[128] = {};
     if (sample_info[0] != '\0') {
-        lv_label_set_text_fmt(
-            g_track_info,
+        snprintf(
+            track_info,
+            sizeof(track_info),
             "%u / %u  ·  %s  ·  %s",
             static_cast<unsigned>(list_position + 1U),
             static_cast<unsigned>(list_count),
             media_format_name(player_state_get_format()),
             sample_info);
     } else {
-        lv_label_set_text_fmt(
-            g_track_info,
+        snprintf(
+            track_info,
+            sizeof(track_info),
             "%u / %u  ·  %s",
             static_cast<unsigned>(list_position + 1U),
             static_cast<unsigned>(list_count),
             media_format_name(player_state_get_format()));
     }
+    player_home_label_set_text_if_changed(g_track_info, track_info);
 }
 
 static void player_home_refresh_transport_controls(const AudioStateSnapshot *snapshot)
 {
-    if (g_loop_button != nullptr) {
-        // 模式按钮使用自绘图标；切换模式后只需要重绘这个 42x42 小对象。
-        lv_obj_invalidate(g_loop_button);
+    const PlayerLoopMode loop_mode = player_control_get_loop_mode();
+    if (!g_last_loop_mode_valid || g_last_loop_mode != loop_mode) {
+        g_last_loop_mode = loop_mode;
+        g_last_loop_mode_valid = true;
+        if (g_loop_button != nullptr) {
+            // 模式真正变化时才重绘这个小对象。
+            lv_obj_invalidate(g_loop_button);
+        }
     }
 
-    if (snapshot != nullptr) {
-        if (!g_volume_dragging && g_volume_slider != nullptr) {
-            lv_slider_set_value(g_volume_slider, snapshot->volume_percent, LV_ANIM_OFF);
-        }
-        if (!g_volume_dragging && g_volume_label != nullptr) {
-            if (snapshot->user_muted) {
-                lv_label_set_text(g_volume_label, "静音");
-            } else {
-                lv_label_set_text_fmt(g_volume_label, "%u%%", static_cast<unsigned>(snapshot->volume_percent));
-            }
+    if (snapshot != nullptr && !g_volume_dragging) {
+        player_home_slider_set_value_if_changed(g_volume_slider, snapshot->volume_percent);
+
+        if (snapshot->user_muted) {
+            player_home_label_set_text_if_changed(g_volume_label, "静音");
+        } else {
+            char volume[16] = {};
+            snprintf(
+                volume,
+                sizeof(volume),
+                "%u%%",
+                static_cast<unsigned>(snapshot->volume_percent));
+            player_home_label_set_text_if_changed(g_volume_label, volume);
         }
     }
 }
@@ -2740,11 +2868,9 @@ static void player_home_refresh_transport_controls(const AudioStateSnapshot *sna
 static void player_home_apply_audio_snapshot(const AudioStateSnapshot &snapshot)
 {
     const bool pause_icon = snapshot.state == AudioPlaybackState::Playing;
-    if (g_play_symbol != nullptr) {
-        lv_label_set_text(
-            g_play_symbol,
-            pause_icon ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
-    }
+    player_home_label_set_text_if_changed(
+        g_play_symbol,
+        pause_icon ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
     if (g_play_icon_pause != pause_icon) {
         g_play_icon_pause = pause_icon;
         if (g_play_button != nullptr) {
@@ -2909,8 +3035,7 @@ void player_home_create(lv_obj_t *screen)
     g_volume_dragging = false;
     g_volume_adjust_armed = false;
     g_overlay_visible = false;
-    g_overlay_fast_dim = false;
-    g_overlay_dim_path_valid = false;
+    g_last_loop_mode_valid = false;
     g_overlay_backdrop = nullptr;
     g_launcher = nullptr;
     g_launcher_backdrop = nullptr;
@@ -2991,7 +3116,8 @@ void player_home_create(lv_obj_t *screen)
     lv_obj_set_style_border_width(g_overlay_backdrop, 0, 0);
     lv_obj_set_style_shadow_width(g_overlay_backdrop, 0, 0);
     lv_obj_set_style_pad_all(g_overlay_backdrop, 0, 0);
-    lv_obj_add_flag(g_overlay_backdrop, LV_OBJ_FLAG_CLICKABLE);
+    // 初始为纯封面；事件回调常驻，但只有 Overlay 显示时才打开 CLICKABLE。
+    lv_obj_remove_flag(g_overlay_backdrop, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(
         g_overlay_backdrop, player_home_overlay_backdrop_tap_cb, LV_EVENT_CLICKED, nullptr);
 
@@ -3273,8 +3399,10 @@ void player_home_create(lv_obj_t *screen)
         lv_timer_pause(g_overlay_timer);
     }
 
-    // 开机/进入播放器先保持纯封面，不把控制层闪现出来。
-    lv_obj_add_flag(g_overlay, LV_OBJ_FLAG_HIDDEN);
+    // 开机/进入播放器先保持纯封面。R.34.1 不再隐藏 460x460 root，
+    // 只隐藏真正有视觉内容的 child，避免以后显隐 root 时制造整屏 dirty。
+    player_home_overlay_set_controls_visible(false);
+    player_home_overlay_set_backdrop_clickable(false);
 
     char list_label[96] = {};
     if (!player_state_copy_list_label(list_label, sizeof(list_label))) {
@@ -3294,7 +3422,9 @@ void player_home_create(lv_obj_t *screen)
     ESP_LOGI(TAG,
         "P1.5.3.2R.8 收口：播放模式图标+随机模式+分段听感音量曲线保持");
     ESP_LOGI(TAG,
-        "P1.5.3.2R.10 Overlay微调：上一曲/播放/下一曲整体下移12px，进度与时间下移11px，纵向层级间距更均匀；74/94px触摸按钮保持，Transport图标改为更大的自绘线框");
+        "P1.5.3.2R.34 Overlay收口：无条件LVGL setter已做值变化门控；上一曲/下一曲保持74px触摸区并重绘为实心Track glyph");
+    ESP_LOGI(TAG,
+        "P1.5.3.2R.34.1 DirtyRegionIsolation：Overlay 460x460透明root常驻；只显隐真实控件；normal/dimmed source单一失效所有者");
     ESP_LOGI(TAG,
         "P1.5.3.2R.12 收口：R.11首页纯Tap规则保持；歌词Overlay底部增加模式图标并放大音量入口");
     ESP_LOGI(TAG,

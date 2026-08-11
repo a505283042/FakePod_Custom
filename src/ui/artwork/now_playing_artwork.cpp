@@ -697,7 +697,8 @@ bool now_playing_artwork_set_dimmed(bool dimmed)
             g_image,
             dimmed ? &g_surface_dimmed_dsc : &g_surface_normal_dsc);
         g_dimmed_applied = dimmed;
-        lv_obj_invalidate(g_image);
+        // R.34.1：lv_image_set_src() 已经负责 image 的绘制失效。
+        // 禁止再次 invalidate 460x460 image，避免同一整屏 dirty 重复登记。
         ARTWORK_UI_TRACE("SURFACE_DIM_SWITCH track=%lu dim=%u",
             static_cast<unsigned long>(g_surface_lease.track_index),
             static_cast<unsigned>(g_dimmed_applied));
