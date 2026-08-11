@@ -9,7 +9,9 @@
 
 #include "app_diag_config.h"
 #include "artwork_loader.h"
+#include "board_pins.h"
 #include "cover_surface_cache.h"
+#include "display.h"
 #include "font/font_manager.h"
 #include "media_catalog_v2.h"
 #include "media_library.h"
@@ -25,7 +27,10 @@ static const char *TAG = "封面界面";
 #endif
 
 // 压缩图直接交给 LVGL 的路径只保留为兼容回退（例如不受 esp_new_jpeg 支持的 JPEG）。
-// 正常路径由 CoverSurfaceTask 预处理成 460x460 RGB565。点击 Overlay 时只在最终 RGB565 上做一次 alpha 合成，不再解码/缩放。
+// R.20 正常路径由 CoverSurfaceTask 同时预处理 normal + dimmed 两张 460x460 RGB565。
+// R.22 起跨 Track 替换时保留旧封面直到新 Surface 真正可用，“准备封面/读取封面”不再可见。
+// R.29 优先使用 R.28 wire-order Surface，并通过 Continuous GRAM Stream 提交 CO5300；
+// wire 明暗模式未及时跟上时才回退 R.27 native 在线 swap，不改变 LVGL image source 仍使用 native Surface。
 static constexpr size_t kArtworkDecodedBudgetBytes = 3U * 1024U * 1024U;
 static constexpr size_t kArtworkPsramSafetyReserveBytes = 768U * 1024U;
 static constexpr uint32_t kLvImageScaleNone = 256U;
@@ -36,13 +41,16 @@ static lv_obj_t *g_placeholder_icon = nullptr;
 static lv_obj_t *g_status = nullptr;
 static int32_t g_image_max_size = 0;
 
-// P1.2.5 快速路径：最终 RGB565 单 surface lease。
+// R.20 快速路径：一个 lease 同时持有 normal + dimmed 两张最终 RGB565 Surface。
 static CoverSurfaceLease g_surface_lease = {};
 static lv_image_dsc_t g_surface_normal_dsc = {};
+static lv_image_dsc_t g_surface_dimmed_dsc = {};
 static bool g_has_surface_source = false;
 static bool g_dimmed_requested = false;
 static bool g_dimmed_applied = false;
 static uint32_t g_last_surface_state_revision = UINT32_MAX;
+static bool g_direct_present_allowed = true;
+static bool g_direct_present_event_pending = false;
 
 // 兼容回退：Stage 12.2 压缩图直接交给 LVGL decoder。
 static ArtworkCacheLease g_compressed_lease = {};
@@ -68,6 +76,37 @@ static lv_obj_t *artwork_ui_create_label(
     return label;
 }
 
+static uint32_t artwork_ui_displayed_track()
+{
+    if (g_has_surface_source) return g_surface_lease.track_index;
+    if (g_has_compressed_source) return g_compressed_lease.track_index;
+    return UINT32_MAX;
+}
+
+static bool artwork_ui_source_matches_context()
+{
+    if (g_has_surface_source) {
+        return g_surface_lease.catalog_generation == g_context_generation &&
+            g_surface_lease.track_index == g_context_track;
+    }
+    if (g_has_compressed_source) {
+        return g_compressed_lease.catalog_generation == g_context_generation &&
+            g_compressed_lease.track_index == g_context_track;
+    }
+    return false;
+}
+
+// R.22：等待新封面时不显示“准备封面/读取封面”。
+// 已经有上一首封面就继续保持；首次启动还没有任何 Source 时保持纯黑底。
+static void artwork_ui_show_waiting_without_placeholder()
+{
+    if (g_placeholder_icon != nullptr) lv_obj_add_flag(g_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
+    if (g_status != nullptr) lv_obj_add_flag(g_status, LV_OBJ_FLAG_HIDDEN);
+    if (!g_has_surface_source && !g_has_compressed_source && g_image != nullptr) {
+        lv_obj_add_flag(g_image, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 static void artwork_ui_show_placeholder(const char *status)
 {
     if (g_image != nullptr) lv_obj_add_flag(g_image, LV_OBJ_FLAG_HIDDEN);
@@ -82,10 +121,10 @@ static void artwork_ui_show_placeholder(const char *status)
     }
 }
 
-static void artwork_ui_release_compressed_source()
+static void artwork_ui_release_compressed_source(bool hide_image = true)
 {
     if (g_has_compressed_source) {
-        if (g_image != nullptr) lv_obj_add_flag(g_image, LV_OBJ_FLAG_HIDDEN);
+        if (hide_image && g_image != nullptr) lv_obj_add_flag(g_image, LV_OBJ_FLAG_HIDDEN);
         lv_image_cache_drop(&g_compressed_dsc);
         lv_image_header_cache_drop(&g_compressed_dsc);
         g_has_compressed_source = false;
@@ -94,21 +133,22 @@ static void artwork_ui_release_compressed_source()
     g_compressed_dsc = {};
 }
 
-static void artwork_ui_release_surface_source()
+static void artwork_ui_release_surface_source(bool hide_image = true)
 {
-    if (g_has_surface_source && g_image != nullptr) {
+    if (g_has_surface_source && hide_image && g_image != nullptr) {
         lv_obj_add_flag(g_image, LV_OBJ_FLAG_HIDDEN);
     }
     cover_surface_cache_release(&g_surface_lease);
     g_surface_normal_dsc = {};
+    g_surface_dimmed_dsc = {};
     g_has_surface_source = false;
     g_dimmed_applied = false;
 }
 
-static void artwork_ui_release_all_sources()
+static void artwork_ui_release_all_sources(bool hide_image = true)
 {
-    artwork_ui_release_compressed_source();
-    artwork_ui_release_surface_source();
+    artwork_ui_release_compressed_source(hide_image);
+    artwork_ui_release_surface_source(hide_image);
 }
 
 static void artwork_ui_init_rgb565_dsc(lv_image_dsc_t *dsc, const uint8_t *data, uint16_t width, uint16_t height, size_t size)
@@ -129,13 +169,60 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
 {
     CoverSurfaceLease lease = {};
     if (!cover_surface_cache_acquire(track_index, &lease)) return false;
-    if (lease.normal_rgb565 == nullptr ||
+    if (lease.normal_rgb565 == nullptr || lease.dimmed_rgb565 == nullptr ||
         lease.width == 0U || lease.height == 0U || lease.data_size == 0U) {
         cover_surface_cache_release(&lease);
         return false;
     }
 
-    artwork_ui_release_all_sources();
+    const uint32_t previous_track = artwork_ui_displayed_track();
+    const bool replacing_track = previous_track != UINT32_MAX && previous_track != track_index;
+    const uint8_t *present_surface = g_dimmed_requested
+        ? lease.dimmed_rgb565
+        : lease.normal_rgb565;
+    const bool wire_match = lease.wire_rgb565 != nullptr &&
+        lease.wire_dimmed == g_dimmed_requested;
+    const uint8_t *direct_surface = wire_match
+        ? lease.wire_rgb565
+        : present_surface;
+
+    bool direct_presented = false;
+    DisplayDirectPresentStats direct_stats = {};
+    if (replacing_track && g_direct_present_allowed &&
+        lease.width == FAKEPOD_LCD_WIDTH && lease.height == FAKEPOD_LCD_HEIGHT) {
+        const esp_err_t direct_ret = display_present_rgb565_direct(
+            direct_surface,
+            lease.width,
+            lease.height,
+            wire_match,
+            &direct_stats);
+        direct_presented = direct_ret == ESP_OK;
+        if (!direct_presented && direct_ret == ESP_ERR_NO_MEM) {
+            // R.27：双 staging 临时拿不到时不要黑屏、不要切换 LVGL source。
+            // 释放刚 acquire 的新 lease，继续保持旧封面；下一次 Artwork update 会自动重试。
+            ESP_LOGW(TAG,
+                "R.29 封面ContinuousGRAM暂缓：%lu -> %lu 双staging内存不足，保持旧封面并重试",
+                static_cast<unsigned long>(previous_track),
+                static_cast<unsigned long>(track_index));
+            cover_surface_cache_release(&lease);
+            return false;
+        }
+        if (!direct_presented) {
+            ESP_LOGW(TAG,
+                "R.29 封面ContinuousGRAM失败：%lu -> %lu ret=%s，退回R.22 LVGL PresentHold",
+                static_cast<unsigned long>(previous_track),
+                static_cast<unsigned long>(track_index),
+                esp_err_to_name(direct_ret));
+        }
+    }
+
+    if (replacing_track && !direct_presented) {
+        // 非内存类错误才保留 R.22 兼容回退；NO_MEM 已在上方保持旧封面等待重试。
+        display_present_request_hold();
+    }
+
+    // 新 lease 已经到手后才释放旧 lease；等待阶段旧图一直可见。
+    artwork_ui_release_all_sources(false);
     g_surface_lease = lease;
     artwork_ui_init_rgb565_dsc(
         &g_surface_normal_dsc,
@@ -143,22 +230,75 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
         g_surface_lease.width,
         g_surface_lease.height,
         g_surface_lease.data_size);
-    g_dimmed_applied = false;
-    lv_image_set_src(g_image, &g_surface_normal_dsc);
+    artwork_ui_init_rgb565_dsc(
+        &g_surface_dimmed_dsc,
+        g_surface_lease.dimmed_rgb565,
+        g_surface_lease.width,
+        g_surface_lease.height,
+        g_surface_lease.data_size);
+    g_dimmed_applied = g_dimmed_requested;
+
+    // DirectPresent 已经把完整新封面写进 CO5300 GRAM。此时必须同步更新 LVGL 的 image source，
+    // 但不能再次把 460x460 image 标成 invalid，否则会重新走 70ms 左右的整屏 render/flush。
+    lv_display_t *display = lv_display_get_default();
+    const bool invalidation_was_enabled =
+        display != nullptr && lv_display_is_invalidation_enabled(display);
+    if (direct_presented && invalidation_was_enabled) {
+        lv_display_enable_invalidation(display, false);
+    }
+
+    lv_image_set_src(
+        g_image,
+        g_dimmed_applied ? &g_surface_dimmed_dsc : &g_surface_normal_dsc);
     lv_image_set_scale(g_image, kLvImageScaleNone);
     lv_image_set_antialias(g_image, false);
     lv_obj_center(g_image);
     lv_obj_remove_flag(g_image, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(g_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(g_status, LV_OBJ_FLAG_HIDDEN);
-    g_has_surface_source = true;
 
-    ARTWORK_UI_TRACE("SURFACE_READY generation=%lu track=%lu %ux%u dim=%u",
+    if (direct_presented && invalidation_was_enabled) {
+        lv_display_enable_invalidation(display, true);
+    }
+
+    g_has_surface_source = true;
+    if (direct_presented) {
+        g_direct_present_event_pending = true;
+        ESP_LOGI(TAG,
+            "R.29 封面ContinuousGRAM完成：%lu -> %lu source=%s total=%uus barrier=%uus window=%uus te=%uus pipeline=%uus stream=%uus copy=%uus swap=%uus wait=%uus overlap≈%uus chunks=%u queue_peak=%u staging=%u行×%u total=%uB dim=%u",
+            static_cast<unsigned long>(previous_track),
+            static_cast<unsigned long>(track_index),
+            direct_stats.wire_order ? "wire" : "native-fallback",
+            static_cast<unsigned>(direct_stats.total_us),
+            static_cast<unsigned>(direct_stats.io_barrier_us),
+            static_cast<unsigned>(direct_stats.window_setup_us),
+            static_cast<unsigned>(direct_stats.te_wait_us),
+            static_cast<unsigned>(direct_stats.pipeline_us),
+            static_cast<unsigned>(direct_stats.stream_us),
+            static_cast<unsigned>(direct_stats.copy_us),
+            static_cast<unsigned>(direct_stats.byte_swap_us),
+            static_cast<unsigned>(direct_stats.dma_wait_us),
+            static_cast<unsigned>(direct_stats.overlap_saved_us),
+            static_cast<unsigned>(direct_stats.chunks),
+            static_cast<unsigned>(direct_stats.queue_peak),
+            static_cast<unsigned>(direct_stats.staging_rows),
+            static_cast<unsigned>(direct_stats.staging_buffers),
+            static_cast<unsigned>(direct_stats.staging_total_bytes),
+            static_cast<unsigned>(g_dimmed_applied));
+    } else if (replacing_track) {
+        ESP_LOGI(TAG,
+            "R.29 封面整屏回退请求：%lu -> %lu，旧图保持到新Surface就绪",
+            static_cast<unsigned long>(previous_track),
+            static_cast<unsigned long>(track_index));
+    }
+
+    ARTWORK_UI_TRACE("SURFACE_READY generation=%lu track=%lu %ux%u dim=%u direct=%u",
         static_cast<unsigned long>(g_surface_lease.catalog_generation),
         static_cast<unsigned long>(g_surface_lease.track_index),
         static_cast<unsigned>(g_surface_lease.width),
         static_cast<unsigned>(g_surface_lease.height),
-        static_cast<unsigned>(g_dimmed_applied));
+        static_cast<unsigned>(g_dimmed_applied),
+        static_cast<unsigned>(direct_presented));
     return true;
 }
 
@@ -297,26 +437,32 @@ static bool artwork_ui_apply_compressed_fallback(uint32_t track_index)
         return false;
     }
 
-    artwork_ui_release_all_sources();
-    g_compressed_lease = lease;
-    g_compressed_dsc = {};
-    g_compressed_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
-    g_compressed_dsc.header.cf = lease.format == MediaArtworkFormatV2::Png
+    lv_image_dsc_t new_dsc = {};
+    new_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+    new_dsc.header.cf = lease.format == MediaArtworkFormatV2::Png
         ? LV_COLOR_FORMAT_RAW_ALPHA
         : LV_COLOR_FORMAT_RAW;
-    g_compressed_dsc.header.w = static_cast<uint16_t>(width > UINT16_MAX ? UINT16_MAX : width);
-    g_compressed_dsc.header.h = static_cast<uint16_t>(height > UINT16_MAX ? UINT16_MAX : height);
-    g_compressed_dsc.data_size = static_cast<uint32_t>(lease.size);
-    g_compressed_dsc.data = lease.data;
+    new_dsc.header.w = static_cast<uint16_t>(width > UINT16_MAX ? UINT16_MAX : width);
+    new_dsc.header.h = static_cast<uint16_t>(height > UINT16_MAX ? UINT16_MAX : height);
+    new_dsc.data_size = static_cast<uint32_t>(lease.size);
+    new_dsc.data = lease.data;
 
     lv_image_header_t decoded_header = {};
-    if (lv_image_decoder_get_info(&g_compressed_dsc, &decoded_header) != LV_RESULT_OK ||
+    if (lv_image_decoder_get_info(&new_dsc, &decoded_header) != LV_RESULT_OK ||
         decoded_header.w == 0U || decoded_header.h == 0U) {
-        artwork_ui_release_compressed_source();
+        artwork_loader_release_cached(&lease);
         return false;
     }
-    g_compressed_dsc.header.w = decoded_header.w;
-    g_compressed_dsc.header.h = decoded_header.h;
+    new_dsc.header.w = decoded_header.w;
+    new_dsc.header.h = decoded_header.h;
+
+    const uint32_t previous_track = artwork_ui_displayed_track();
+    const bool replacing_track = previous_track != UINT32_MAX && previous_track != track_index;
+    if (replacing_track) display_present_request_hold();
+
+    artwork_ui_release_all_sources(false);
+    g_compressed_lease = lease;
+    g_compressed_dsc = new_dsc;
 
     lv_image_set_src(g_image, &g_compressed_dsc);
     const uint32_t min_dim = decoded_header.w < decoded_header.h ? decoded_header.w : decoded_header.h;
@@ -350,18 +496,20 @@ static void artwork_ui_sync_context(bool force)
     g_context_track = track_index;
     g_last_loader_state_revision = UINT32_MAX;
     g_last_surface_state_revision = UINT32_MAX;
-    artwork_ui_release_all_sources();
 
-    // 最近使用过的封面若仍在最终 surface cache，切回时可立即显示，不再经过 decoder。
+    // R.22：先尝试新曲最终 Surface。命中时 artwork_ui_apply_surface() 会“先 acquire 新、后 release 旧”。
+    // 未命中时绝不先释放旧封面，也不显示“准备封面”。
     if (cover_surface_cache_is_ready() && artwork_ui_apply_surface(track_index)) return;
 
     MediaArtworkViewV2 artwork = {};
     if (!media_library_get_artwork_view(track_index, &artwork)) {
+        artwork_ui_release_all_sources();
         artwork_ui_show_placeholder("暂无封面");
     } else if (!artwork_loader_is_ready()) {
+        artwork_ui_release_all_sources();
         artwork_ui_show_placeholder("封面服务不可用");
     } else {
-        artwork_ui_show_placeholder("准备封面...");
+        artwork_ui_show_waiting_without_placeholder();
     }
 }
 
@@ -404,9 +552,11 @@ esp_err_t now_playing_artwork_create(lv_obj_t *parent, int32_t size_px, lv_obj_t
     lv_obj_align(g_placeholder_icon, LV_ALIGN_CENTER, 0, -10);
 
     g_status = artwork_ui_create_label(
-        g_container, "准备封面...", lv_color_hex(0x6F7A89), font_manager_get_ui_font());
+        g_container, "", lv_color_hex(0x6F7A89), font_manager_get_ui_font());
     lv_obj_set_style_text_align(g_status, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(g_status, LV_ALIGN_CENTER, 0, 28);
+    lv_obj_add_flag(g_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(g_status, LV_OBJ_FLAG_HIDDEN);
 
     artwork_ui_sync_context(true);
     *out_container = g_container;
@@ -425,6 +575,7 @@ void now_playing_artwork_set_active(bool active)
     g_active = active;
 
     if (!g_active) {
+        g_direct_present_event_pending = false;
         // 页面被完整覆盖后，LVGL 不会再绘制这张图。立即释放 UI lease，
         // 让两槽 cache 可以稳定保存 current + next，而不是 hidden-old + next。
         artwork_ui_release_all_sources();
@@ -436,7 +587,7 @@ void now_playing_artwork_set_active(bool active)
     }
 
     // 恢复时强制重新读取 Player context。即便切歌期间 UI timer 一直暂停，
-    // 也能直接 acquire 已预热好的当前曲 Surface；未命中则显示正确占位状态。
+    // 也能直接 acquire 已预热好的当前曲 Surface；未命中时保持纯黑，不显示“准备封面”。
     artwork_ui_sync_context(true);
     ARTWORK_UI_TRACE("RESUME rebind context_track=%lu",
         static_cast<unsigned long>(g_context_track));
@@ -451,7 +602,7 @@ void now_playing_artwork_update()
 
     // 先直接查最终 RGB565 cache。预热任务可能在 UI 消费 Ready 事件前就开始处理下一首，
     // 因此显示正确性以 cache 命中为准，不依赖“必须看到某一次 Ready Snapshot”。
-    if (cover_surface_cache_is_ready() && !g_has_surface_source) {
+    if (cover_surface_cache_is_ready() && !artwork_ui_source_matches_context()) {
         (void)artwork_ui_apply_surface(g_context_track);
     }
 
@@ -463,15 +614,16 @@ void now_playing_artwork_update()
             g_last_surface_state_revision = surface.state_revision;
             if (surface.catalog_generation == g_context_generation && surface.track_index == g_context_track) {
                 if (surface.state == CoverSurfaceState::Ready) {
-                    if (!g_has_surface_source && !artwork_ui_apply_surface(g_context_track)) {
-                        artwork_ui_show_placeholder("封面缓存不可用");
+                    if (!artwork_ui_source_matches_context() && !artwork_ui_apply_surface(g_context_track)) {
+                        artwork_ui_show_waiting_without_placeholder();
                     }
                 } else if (surface.state == CoverSurfaceState::Preparing) {
-                    if (!g_has_surface_source && !g_has_compressed_source) artwork_ui_show_placeholder("准备封面...");
+                    if (!artwork_ui_source_matches_context()) artwork_ui_show_waiting_without_placeholder();
                 } else if (surface.state == CoverSurfaceState::Failed) {
                     // progressive JPEG 等无法走 esp_new_jpeg 时保留旧 decoder 兼容能力。
-                    if (!g_has_surface_source && !g_has_compressed_source &&
+                    if (!artwork_ui_source_matches_context() &&
                         !artwork_ui_apply_compressed_fallback(g_context_track)) {
+                        artwork_ui_release_all_sources();
                         artwork_ui_show_placeholder("封面不可显示");
                     }
                 }
@@ -489,15 +641,15 @@ void now_playing_artwork_update()
 
     switch (snapshot.state) {
         case ArtworkLoadState::Loading:
-            if (!g_has_surface_source && !g_has_compressed_source) artwork_ui_show_placeholder("读取封面...");
+            if (!artwork_ui_source_matches_context()) artwork_ui_show_waiting_without_placeholder();
             break;
 
         case ArtworkLoadState::Ready:
             // P1.2.6：Surface 请求统一由 system_loop 的资源编排器发出，UI 只消费缓存。
             // 这样当前曲与下一曲预热不会在两个线程里重复提交 latest-wins 请求。
             if (cover_surface_cache_is_ready()) {
-                if (!g_has_surface_source && !g_has_compressed_source) {
-                    artwork_ui_show_placeholder("准备封面...");
+                if (!artwork_ui_source_matches_context()) {
+                    artwork_ui_show_waiting_without_placeholder();
                 }
             } else if (!artwork_ui_apply_compressed_fallback(g_context_track)) {
                 artwork_ui_show_placeholder("封面不可显示");
@@ -527,15 +679,45 @@ void now_playing_artwork_update()
 
 bool now_playing_artwork_set_dimmed(bool dimmed)
 {
-    // P1.2.5：最终缓存只保留 normal RGB565。
-    // 返回 false 告诉 player_home 使用固定 alpha 黑层；底图已经是 RGB565，
-    // 因此该合成不会再触发 JPEG/PNG 解码或缩放。
     g_dimmed_requested = dimmed;
-    g_dimmed_applied = false;
-    return false;
+    // R.28：仅通知后台 CoverSurfaceTask 刷新下一曲 wire-order Surface；
+    // UI 线程不做 423KB byte-swap，因此 Overlay 开关本身不会增加一帧级卡顿。
+    cover_surface_cache_set_wire_dimmed_preference(dimmed);
+
+    // R.20：最终 Surface 命中时直接在 normal / dimmed 两张 RGB565 之间切换。
+    // 没有 alpha blend、JPEG/PNG decode 或 resize；调用方可把全屏黑色 backdrop 设为透明。
+    if (!g_has_surface_source || g_image == nullptr ||
+        g_surface_lease.normal_rgb565 == nullptr || g_surface_lease.dimmed_rgb565 == nullptr) {
+        g_dimmed_applied = false;
+        return false;
+    }
+
+    if (g_dimmed_applied != dimmed) {
+        lv_image_set_src(
+            g_image,
+            dimmed ? &g_surface_dimmed_dsc : &g_surface_normal_dsc);
+        g_dimmed_applied = dimmed;
+        lv_obj_invalidate(g_image);
+        ARTWORK_UI_TRACE("SURFACE_DIM_SWITCH track=%lu dim=%u",
+            static_cast<unsigned long>(g_surface_lease.track_index),
+            static_cast<unsigned>(g_dimmed_applied));
+    }
+    return true;
 }
 
 bool now_playing_artwork_has_fast_surface()
 {
     return g_has_surface_source;
+}
+
+void now_playing_artwork_set_direct_present_allowed(bool allowed)
+{
+    g_direct_present_allowed = allowed;
+}
+
+bool now_playing_artwork_take_direct_present_event()
+{
+    const bool pending = g_direct_present_event_pending;
+    g_direct_present_event_pending = false;
+    return pending;
 }

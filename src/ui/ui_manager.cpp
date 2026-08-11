@@ -3,6 +3,8 @@
 #include <stdint.h>
 
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "esp_lvgl_port.h"
 #include "esp_lv_decoder.h"
 #include "lvgl.h"
@@ -28,6 +30,47 @@ static int16_t g_touch_last_y = 0;
 static uint32_t g_touch_last_dispatch_sequence = 0U;
 static bool g_touch_dispatch_sequence_valid = false;
 
+// P1.5.3.2R.21：大面积刷新才等待 TE。
+// 小型进度条/按钮局部更新继续立即刷新，避免所有 UI 交互都额外等待一帧。
+static bool g_te_sync_pending = false;
+static bool g_te_sync_runtime_enabled = false;
+static uint8_t g_te_sync_consecutive_timeouts = 0U;
+static uint32_t g_te_sync_success_count = 0U;
+static uint32_t g_te_sync_timeout_count = 0U;
+static uint32_t g_te_sync_timeout_ms = 25U;
+
+// R.22：只有 Artwork 明确请求“另一首封面整帧提交”时才临时关闭面板输出。
+// 这不是全局大刷新策略，歌词/频谱/Launcher 不会因此黑屏。
+static bool g_present_hold_active = false;
+static uint32_t g_present_hold_count = 0U;
+static int64_t g_present_hold_started_us = 0;
+
+// P1.5.3.2R.23：把 R.22 观测到的约70ms整屏周期拆成 render / flush / flush-wait。
+// 只对 >=25% 屏的大刷新采样，避免进度条等小刷新刷日志。
+struct UiLargeRefreshProfile
+{
+    bool active = false;
+    int64_t refr_started_us = 0;
+    int64_t render_started_us = 0;
+    int64_t flush_started_us = 0;
+    int64_t wait_started_us = 0;
+    uint32_t render_us = 0U;
+    uint32_t flush_us = 0U;
+    uint32_t wait_us = 0U;
+    uint16_t render_count = 0U;
+    uint16_t flush_count = 0U;
+};
+static UiLargeRefreshProfile g_large_refresh_profile = {};
+static uint32_t g_large_refresh_profile_count = 0U;
+
+static constexpr uint32_t kTeSyncDisableAfterTimeouts = 3U;
+static constexpr uint32_t kTeSyncMinPixels =
+    (FAKEPOD_LCD_WIDTH * FAKEPOD_LCD_HEIGHT) / 4U;
+
+// P1.5.3.2R.18：LVGL RGB565 DMA 条带由 20 行提升到 40 行。
+// 双缓冲总像素 RAM = 460 * 40 * 2B * 2 = 73,600B。
+static constexpr uint32_t kLvglDmaBufferLines = 40U;
+
 // CO5300 对局部刷新窗口有偶数对齐要求：
 // 起始 X/Y 必须为偶数，刷新宽度和高度也必须为偶数。
 static void ui_display_align_area_cb(lv_event_t *event)
@@ -52,6 +95,188 @@ static void ui_display_align_area_cb(lv_event_t *event)
     const int32_t max_y = FAKEPOD_LCD_HEIGHT - 1;
     if (area->x2 > max_x) area->x2 = max_x;
     if (area->y2 > max_y) area->y2 = max_y;
+
+    if (g_te_sync_runtime_enabled) {
+        const int32_t width = area->x2 - area->x1 + 1;
+        const int32_t height = area->y2 - area->y1 + 1;
+        if (width > 0 && height > 0) {
+            const uint32_t pixels =
+                static_cast<uint32_t>(width) * static_cast<uint32_t>(height);
+            if (pixels >= kTeSyncMinPixels) {
+                g_te_sync_pending = true;
+            }
+        }
+    }
+}
+
+static void ui_display_profile_cb(lv_event_t *event)
+{
+    if (event == nullptr || !g_large_refresh_profile.active) {
+        return;
+    }
+
+    const int64_t now_us = esp_timer_get_time();
+    switch (lv_event_get_code(event)) {
+        case LV_EVENT_RENDER_START:
+            if (g_large_refresh_profile.render_started_us == 0) {
+                g_large_refresh_profile.render_started_us = now_us;
+            }
+            ++g_large_refresh_profile.render_count;
+            break;
+
+        case LV_EVENT_RENDER_READY:
+            if (g_large_refresh_profile.render_started_us != 0) {
+                g_large_refresh_profile.render_us += static_cast<uint32_t>(
+                    now_us - g_large_refresh_profile.render_started_us);
+                g_large_refresh_profile.render_started_us = 0;
+            }
+            break;
+
+        case LV_EVENT_FLUSH_START:
+            if (g_large_refresh_profile.flush_started_us == 0) {
+                g_large_refresh_profile.flush_started_us = now_us;
+            }
+            ++g_large_refresh_profile.flush_count;
+            break;
+
+        case LV_EVENT_FLUSH_FINISH:
+            if (g_large_refresh_profile.flush_started_us != 0) {
+                g_large_refresh_profile.flush_us += static_cast<uint32_t>(
+                    now_us - g_large_refresh_profile.flush_started_us);
+                g_large_refresh_profile.flush_started_us = 0;
+            }
+            break;
+
+        case LV_EVENT_FLUSH_WAIT_START:
+            if (g_large_refresh_profile.wait_started_us == 0) {
+                g_large_refresh_profile.wait_started_us = now_us;
+            }
+            break;
+
+        case LV_EVENT_FLUSH_WAIT_FINISH:
+            if (g_large_refresh_profile.wait_started_us != 0) {
+                g_large_refresh_profile.wait_us += static_cast<uint32_t>(
+                    now_us - g_large_refresh_profile.wait_started_us);
+                g_large_refresh_profile.wait_started_us = 0;
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+
+// R.22：刷新周期开始时先完成 R.21 TE 对齐，再按需暂停面板输出。
+// display_present_take_hold_request() 只会被“跨 Track 封面 Source 替换”触发，
+// 因此普通大面积页面切换继续只做 TE 同步，不会产生额外黑场。
+static void ui_display_refresh_start_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_REFR_START) {
+        return;
+    }
+
+    const bool large_refresh = g_te_sync_pending;
+    const bool present_requested = display_present_take_hold_request();
+    g_te_sync_pending = false;
+
+    if (large_refresh) {
+        g_large_refresh_profile = {};
+        g_large_refresh_profile.active = true;
+        g_large_refresh_profile.refr_started_us = esp_timer_get_time();
+    }
+
+    if (g_te_sync_runtime_enabled && large_refresh) {
+        const int64_t wait_started_us = esp_timer_get_time();
+        if (display_te_wait_next(g_te_sync_timeout_ms)) {
+            const uint32_t waited_us = static_cast<uint32_t>(
+                esp_timer_get_time() - wait_started_us);
+            ++g_te_sync_success_count;
+            g_te_sync_consecutive_timeouts = 0U;
+            if (g_te_sync_success_count <= 3U || (g_te_sync_success_count % 60U) == 0U) {
+                ESP_LOGI(TAG,
+                    "R.21 TE对齐成功：count=%u wait=%uus",
+                    static_cast<unsigned>(g_te_sync_success_count),
+                    static_cast<unsigned>(waited_us));
+            }
+        } else {
+            ++g_te_sync_timeout_count;
+            ++g_te_sync_consecutive_timeouts;
+            ESP_LOGW(TAG,
+                "R.21 TE等待超时：%ums，连续=%u success=%u timeout=%u",
+                static_cast<unsigned>(g_te_sync_timeout_ms),
+                static_cast<unsigned>(g_te_sync_consecutive_timeouts),
+                static_cast<unsigned>(g_te_sync_success_count),
+                static_cast<unsigned>(g_te_sync_timeout_count));
+
+            if (g_te_sync_consecutive_timeouts >= kTeSyncDisableAfterTimeouts) {
+                g_te_sync_runtime_enabled = false;
+                ESP_LOGW(TAG, "R.21 TE运行期自动降级：连续%u次超时，后续刷新不再等待TE",
+                    static_cast<unsigned>(kTeSyncDisableAfterTimeouts));
+            }
+        }
+    }
+
+    if (!present_requested) {
+        return;
+    }
+
+    // 请求是在 lv_image_set_src() 之前发出；正常情况下这一轮会包含 460x460 封面 invalidation。
+    // 即便区域合并方式发生变化，也宁可只 hold 一轮刷新，不把请求泄漏到下一次 UI 更新。
+    if (!display_present_set_output(false)) {
+        ESP_LOGW(TAG, "R.23 PresentHold回退：无法暂停面板输出，本轮退回可见刷新");
+        return;
+    }
+
+    g_present_hold_active = true;
+    g_present_hold_started_us = esp_timer_get_time();
+}
+
+
+static void ui_display_refresh_ready_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_REFR_READY) {
+        return;
+    }
+
+    if (g_large_refresh_profile.active) {
+        const uint32_t total_us = static_cast<uint32_t>(
+            esp_timer_get_time() - g_large_refresh_profile.refr_started_us);
+        ++g_large_refresh_profile_count;
+        if (g_large_refresh_profile_count <= 12U || (g_large_refresh_profile_count % 60U) == 0U) {
+            ESP_LOGI(TAG,
+                "R.23 LVGL大刷新画像：count=%u total=%uus render=%uus(%u) flush=%uus(%u) wait=%uus",
+                static_cast<unsigned>(g_large_refresh_profile_count),
+                static_cast<unsigned>(total_us),
+                static_cast<unsigned>(g_large_refresh_profile.render_us),
+                static_cast<unsigned>(g_large_refresh_profile.render_count),
+                static_cast<unsigned>(g_large_refresh_profile.flush_us),
+                static_cast<unsigned>(g_large_refresh_profile.flush_count),
+                static_cast<unsigned>(g_large_refresh_profile.wait_us));
+        }
+        g_large_refresh_profile = {};
+    }
+
+    if (!g_present_hold_active) {
+        return;
+    }
+
+    const uint32_t held_us = static_cast<uint32_t>(
+        esp_timer_get_time() - g_present_hold_started_us);
+
+    // R.23 正常跨Track应优先走 DirectPresent；这里只保留 R.22 兼容回退。
+    const bool restored = display_present_set_output(true);
+    g_present_hold_active = false;
+    g_present_hold_started_us = 0;
+    ++g_present_hold_count;
+
+    if (g_present_hold_count <= 8U || (g_present_hold_count % 30U) == 0U || !restored) {
+        ESP_LOGI(TAG,
+            "R.23 PresentHold回退完成：count=%u hidden=%uus restored=%u",
+            static_cast<unsigned>(g_present_hold_count),
+            static_cast<unsigned>(held_us),
+            static_cast<unsigned>(restored));
+    }
 }
 
 // 输入设备一旦准备进入滚动状态，就在送到控件前终止本轮滚动处理。
@@ -179,7 +404,7 @@ esp_err_t ui_manager_init()
     lvgl_port_display_cfg_t disp_cfg = {};
     disp_cfg.io_handle = display_get_panel_io();
     disp_cfg.panel_handle = display_get_panel();
-    disp_cfg.buffer_size = FAKEPOD_LCD_WIDTH * 20;
+    disp_cfg.buffer_size = FAKEPOD_LCD_WIDTH * kLvglDmaBufferLines;
     disp_cfg.double_buffer = true;
     disp_cfg.hres = FAKEPOD_LCD_WIDTH;
     disp_cfg.vres = FAKEPOD_LCD_HEIGHT;
@@ -191,14 +416,68 @@ esp_err_t ui_manager_init()
     disp_cfg.flags.buff_dma = true;
     disp_cfg.flags.swap_bytes = true;
 
+    const size_t dma_free_before = heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    const size_t dma_largest_before = heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     g_display = lvgl_port_add_disp(&disp_cfg);
     if (g_display == nullptr) {
         ESP_LOGE(TAG, "注册 LVGL 显示设备失败");
         return ESP_FAIL;
     }
 
+    // R.26：esp_lvgl_port_add_disp() 会覆盖 Panel IO 的 color-done callback。
+    // 立即换成统一桥接，保持 LVGL flush_ready，同时给 DirectPresent 单独的 DMA 完成信号。
+    ret = display_install_lvgl_color_done_bridge(g_display);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "R.26 安装显示color-done桥接失败：%s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    const size_t dma_free_after = heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    const size_t dma_largest_after = heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    ESP_LOGI(TAG,
+        "R.18 LVGL DMA双缓冲：%u行/块，理论总计=%uB；DMA free=%u->%u largest=%u->%u",
+        static_cast<unsigned>(kLvglDmaBufferLines),
+        static_cast<unsigned>(FAKEPOD_LCD_WIDTH * kLvglDmaBufferLines * 2U * 2U),
+        static_cast<unsigned>(dma_free_before),
+        static_cast<unsigned>(dma_free_after),
+        static_cast<unsigned>(dma_largest_before),
+        static_cast<unsigned>(dma_largest_after));
+
+    g_te_sync_runtime_enabled = display_te_is_ready();
+    g_te_sync_pending = false;
+    g_te_sync_consecutive_timeouts = 0U;
+    g_te_sync_success_count = 0U;
+    g_te_sync_timeout_count = 0U;
+
+    const uint32_t te_period_us = display_te_get_period_us();
+    if (te_period_us > 0U) {
+        const uint32_t period_ms_ceil = (te_period_us + 999U) / 1000U;
+        uint32_t timeout_ms = period_ms_ceil + 8U;
+        if (timeout_ms < 25U) timeout_ms = 25U;
+        if (timeout_ms > 50U) timeout_ms = 50U;
+        g_te_sync_timeout_ms = timeout_ms;
+    }
+
     lv_display_add_event_cb(g_display, ui_display_align_area_cb, LV_EVENT_INVALIDATE_AREA, nullptr);
+    lv_display_add_event_cb(g_display, ui_display_refresh_start_cb, LV_EVENT_REFR_START, nullptr);
+    lv_display_add_event_cb(g_display, ui_display_refresh_ready_cb, LV_EVENT_REFR_READY, nullptr);
+    lv_display_add_event_cb(g_display, ui_display_profile_cb, LV_EVENT_RENDER_START, nullptr);
+    lv_display_add_event_cb(g_display, ui_display_profile_cb, LV_EVENT_RENDER_READY, nullptr);
+    lv_display_add_event_cb(g_display, ui_display_profile_cb, LV_EVENT_FLUSH_START, nullptr);
+    lv_display_add_event_cb(g_display, ui_display_profile_cb, LV_EVENT_FLUSH_FINISH, nullptr);
+    lv_display_add_event_cb(g_display, ui_display_profile_cb, LV_EVENT_FLUSH_WAIT_START, nullptr);
+    lv_display_add_event_cb(g_display, ui_display_profile_cb, LV_EVENT_FLUSH_WAIT_FINISH, nullptr);
     ESP_LOGI(TAG, "已启用 CO5300 局部刷新偶数对齐");
+    if (g_te_sync_runtime_enabled) {
+        ESP_LOGI(TAG,
+            "R.21 LVGL大刷新TE同步已启用：阈值=%u像素(25%%屏)，timeout=%ums，TE period=%uus",
+            static_cast<unsigned>(kTeSyncMinPixels),
+            static_cast<unsigned>(g_te_sync_timeout_ms),
+            static_cast<unsigned>(te_period_us));
+    } else {
+        ESP_LOGW(TAG, "R.21 LVGL TE同步未启用，保持无TE刷新路径");
+    }
+    ESP_LOGI(TAG, "R.23 Direct Surface Present：跨Track优先绕过LVGL整屏image render；R.22 Display Hold仅作失败回退，QSPI=50MHz");
 
     ESP_LOGI(TAG, "正在注册 CST820 触摸输入");
     gesture_router_reset();

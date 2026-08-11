@@ -7,8 +7,19 @@ sdkconfig.*
 *.bin
 *.elf
 *.map
+*.o
+*.a
 
 FakePod_1.4.0_FULL_16MB.bin
 otadata_original.bin
 partition-table.bin
 compile_commands.json
+.cache/
+.cache
+
+# 媒体资源（如通过 git LFS 管理则排除）
+*.flac
+*.mp3
+*.wav
+*.jpg
+*.png
