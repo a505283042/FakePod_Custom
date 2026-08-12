@@ -7,7 +7,7 @@
 
 // R.36：最终封面只保留当前曲 normal + dimmed 两张 native RGB565。CoverTask 固定 Core1；
 // 2 个槽只承担切歌瞬间“旧 lease + 新 Surface”的安全交换，绑定完成后立即清理旧槽，
-// 不再长期保存下一曲，也不再维护第三张 wire-order Surface。DirectPresent 使用 native 在线 swap。
+// 不再长期保存下一曲，也不再维护第三张 wire-order Surface。BoundedSPI Cover Present 直接消费 native Surface，并在传输层按需转换 wire-order。
 enum class CoverSurfaceState : uint8_t
 {
     Stopped = 0,

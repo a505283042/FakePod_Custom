@@ -48,7 +48,7 @@ static bool touch_enqueue_edge_with_backpressure(const UiTouchEdgeEvent &event)
 
     // R.33.2.3：边沿 FIFO 满时不继续堆积过期手势。TouchInputTask 是唯一生产者，
     // 因此可以安全地抽干旧边沿，并优先保留“最近一次 DOWN + 当前 RELEASE”。
-    // 这样 UI 长时间被 DirectPresent 占用时，宁可合并已经过期的完整点击，也不能
+    // 这样 UI 长时间被 BoundedSPI 大面积物理提交占用时，宁可合并已经过期的完整点击，也不能
     // 丢掉最新物理状态，尤其不能让 RELEASE 丢失导致 GestureRouter/LVGL 卡在 pressed。
     UiTouchEdgeEvent stale[TOUCH_EDGE_QUEUE_LENGTH] = {};
     UBaseType_t stale_count = 0U;
@@ -171,7 +171,7 @@ static void touch_input_task(void *argument)
 
             if (point.pressed) {
                 if (release_candidate_samples > 0U) {
-                    // CST820 在手指移动/DirectPresent 重负载期间偶尔会短暂报告 0 指。
+                    // CST820 在手指移动/BoundedSPI 重负载期间偶尔会短暂报告 0 指。
                     // 只要在确认 RELEASE 前又恢复 pressed，就把这次零样本视为毛刺。
                     ++g_release_glitch_suppressed_count;
                     if (g_release_glitch_suppressed_count == 1U ||

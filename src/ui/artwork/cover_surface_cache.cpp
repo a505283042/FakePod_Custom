@@ -57,6 +57,12 @@ struct CoverCacheEntry
     bool valid = false;
 };
 
+struct CoverDetachedSurface
+{
+    uint8_t *normal = nullptr;
+    uint8_t *dimmed = nullptr;
+};
+
 struct Rgb888Source
 {
     uint8_t *data = nullptr;
@@ -99,7 +105,7 @@ static CoverCacheEntry g_cache[COVER_CACHE_SLOT_COUNT] = {};
 static uint32_t g_lru_counter = 1U;
 static uint32_t g_next_slot_revision = 1U;
 
-// R.36：取消第三张 wire-order Surface。DirectPresent 统一从 native RGB565 在线 byte-swap。
+// R.36：取消第三张 wire-order Surface。BoundedSPI Cover Present 统一消费 native RGB565，由传输层按需转换 wire-order。
 
 static uint32_t cover_next_request_id()
 {
@@ -157,12 +163,25 @@ static void cover_publish(
     portEXIT_CRITICAL(&g_snapshot_mux);
 }
 
-static void cover_release_entry_locked(CoverCacheEntry *entry)
+static bool cover_detach_entry_locked(CoverCacheEntry *entry, CoverDetachedSurface *out)
 {
-    if (entry == nullptr || !entry->valid || entry->pin_count != 0U) return;
-    heap_caps_free(entry->normal);
-    heap_caps_free(entry->dimmed);
+    if (entry == nullptr || out == nullptr || !entry->valid || entry->pin_count != 0U) {
+        return false;
+    }
+    out->normal = entry->normal;
+    out->dimmed = entry->dimmed;
     *entry = {};
+    return true;
+}
+
+static void cover_free_detached(CoverDetachedSurface *detached, size_t count)
+{
+    if (detached == nullptr) return;
+    for (size_t i = 0U; i < count; ++i) {
+        heap_caps_free(detached[i].normal);
+        heap_caps_free(detached[i].dimmed);
+        detached[i] = {};
+    }
 }
 
 static int cover_find_locked(uint32_t generation, uint32_t track_index)
@@ -207,18 +226,25 @@ static bool cover_cache_has(uint32_t generation, uint32_t track_index)
 static void cover_cache_release_unpinned_except(uint32_t generation, uint32_t track_index)
 {
     if (g_cache_mutex == nullptr || xSemaphoreTake(g_cache_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
-    size_t released = 0U;
+
+    CoverDetachedSurface detached[COVER_CACHE_SLOT_COUNT] = {};
+    size_t detached_count = 0U;
     for (size_t i = 0; i < COVER_CACHE_SLOT_COUNT; ++i) {
         CoverCacheEntry &entry = g_cache[i];
         if (!entry.valid || entry.pin_count != 0U) continue;
         if (entry.catalog_generation == generation && entry.track_index == track_index) continue;
-        released += COVER_SURFACE_BYTES * 2U;
-        cover_release_entry_locked(&entry);
+        if (cover_detach_entry_locked(&entry, &detached[detached_count])) {
+            ++detached_count;
+        }
     }
     xSemaphoreGive(g_cache_mutex);
-    if (released > 0U) {
+
+    // PSRAM free 可能明显慢于元数据更新，绝不能持有 cache mutex 做大块释放；否则 UI/Launcher
+    // release 在 20ms 窗口内可能拿不到 mutex，形成“token 丢失但 pin_count 未减”的幽灵 pin。
+    cover_free_detached(detached, detached_count);
+    if (detached_count > 0U) {
         COVER_TRACE("提前释放旧Surface：%uB PSRAM_free=%u",
-            static_cast<unsigned>(released),
+            static_cast<unsigned>(detached_count * COVER_SURFACE_BYTES * 2U),
             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
     }
 }
@@ -233,24 +259,61 @@ static bool cover_cache_insert(
         return false;
     }
 
+    CoverDetachedSurface detached[COVER_CACHE_SLOT_COUNT] = {};
+    size_t detached_count = 0U;
     for (size_t i = 0; i < COVER_CACHE_SLOT_COUNT; ++i) {
-        if (g_cache[i].valid && g_cache[i].catalog_generation != request.catalog_generation &&
-            g_cache[i].pin_count == 0U) {
-            cover_release_entry_locked(&g_cache[i]);
+        CoverCacheEntry &entry = g_cache[i];
+        if (entry.valid && entry.catalog_generation != request.catalog_generation &&
+            entry.pin_count == 0U && detached_count < COVER_CACHE_SLOT_COUNT &&
+            cover_detach_entry_locked(&entry, &detached[detached_count])) {
+            ++detached_count;
         }
     }
 
     int slot = cover_find_locked(request.catalog_generation, request.track_index);
     if (slot >= 0 && g_cache[slot].pin_count != 0U) {
+        const uint16_t pin_count = g_cache[slot].pin_count;
+        const uint32_t slot_revision = g_cache[slot].slot_revision;
         xSemaphoreGive(g_cache_mutex);
+        cover_free_detached(detached, detached_count);
+        ESP_LOGW(TAG,
+            "Surface替换被pin阻止：track=%lu slot=%d pin=%u revision=%lu",
+            static_cast<unsigned long>(request.track_index), slot,
+            static_cast<unsigned>(pin_count), static_cast<unsigned long>(slot_revision));
         return false;
     }
     if (slot < 0) slot = cover_find_lru_evictable_locked();
     if (slot < 0) {
+        struct SlotState {
+            bool valid;
+            uint32_t track;
+            uint16_t pin;
+            uint32_t revision;
+        } states[COVER_CACHE_SLOT_COUNT] = {};
+        for (size_t i = 0U; i < COVER_CACHE_SLOT_COUNT; ++i) {
+            states[i].valid = g_cache[i].valid;
+            states[i].track = g_cache[i].track_index;
+            states[i].pin = g_cache[i].pin_count;
+            states[i].revision = g_cache[i].slot_revision;
+        }
         xSemaphoreGive(g_cache_mutex);
+        cover_free_detached(detached, detached_count);
+        ESP_LOGW(TAG,
+            "Surface无可用交换槽：request=%lu slot0(valid=%d track=%lu pin=%u rev=%lu) slot1(valid=%d track=%lu pin=%u rev=%lu)",
+            static_cast<unsigned long>(request.track_index),
+            states[0].valid ? 1 : 0, static_cast<unsigned long>(states[0].track),
+            static_cast<unsigned>(states[0].pin), static_cast<unsigned long>(states[0].revision),
+            states[1].valid ? 1 : 0, static_cast<unsigned long>(states[1].track),
+            static_cast<unsigned>(states[1].pin), static_cast<unsigned long>(states[1].revision));
         return false;
     }
-    if (g_cache[slot].valid) cover_release_entry_locked(&g_cache[slot]);
+
+    if (g_cache[slot].valid && detached_count < COVER_CACHE_SLOT_COUNT) {
+        (void)cover_detach_entry_locked(&g_cache[slot], &detached[detached_count]);
+        if (detached[detached_count].normal != nullptr || detached[detached_count].dimmed != nullptr) {
+            ++detached_count;
+        }
+    }
 
     CoverCacheEntry &entry = g_cache[slot];
     entry.normal = normal;
@@ -266,6 +329,7 @@ static bool cover_cache_insert(
     entry.valid = true;
 
     xSemaphoreGive(g_cache_mutex);
+    cover_free_detached(detached, detached_count);
     return true;
 }
 
@@ -750,17 +814,38 @@ bool cover_surface_cache_acquire(uint32_t track_index, CoverSurfaceLease *out_le
 
 void cover_surface_cache_release(CoverSurfaceLease *lease)
 {
-    if (lease == nullptr || lease->slot_index >= COVER_CACHE_SLOT_COUNT || g_cache_mutex == nullptr) {
-        if (lease != nullptr) *lease = {};
+    if (lease == nullptr) return;
+    if (lease->slot_index >= COVER_CACHE_SLOT_COUNT || g_cache_mutex == nullptr) {
+        *lease = {};
         return;
     }
-    if (xSemaphoreTake(g_cache_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-        CoverCacheEntry &entry = g_cache[lease->slot_index];
-        if (entry.valid && entry.slot_revision == lease->slot_revision && entry.pin_count > 0U) {
+
+    // Lease release 是所有权操作，不允许像普通 cache query 一样超时后“当作成功”。旧实现若
+    // 20ms 内拿不到 mutex 仍清空调用方 token，会永久遗失一次 pin_count--，两个交换槽最终
+    // 被幽灵 pin 占满。大块 PSRAM free 已移出 mutex，因此这里的等待只覆盖极短元数据临界区。
+    (void)xSemaphoreTake(g_cache_mutex, portMAX_DELAY);
+    CoverCacheEntry &entry = g_cache[lease->slot_index];
+    if (entry.valid && entry.slot_revision == lease->slot_revision) {
+        if (entry.pin_count > 0U) {
             --entry.pin_count;
+        } else {
+            ESP_LOGW(TAG,
+                "Surface lease重复释放：slot=%u track=%lu revision=%lu",
+                static_cast<unsigned>(lease->slot_index),
+                static_cast<unsigned long>(lease->track_index),
+                static_cast<unsigned long>(lease->slot_revision));
         }
-        xSemaphoreGive(g_cache_mutex);
+    } else {
+        ESP_LOGW(TAG,
+            "Surface lease身份失配：slot=%u track=%lu revision=%lu entry_valid=%d entry_track=%lu entry_revision=%lu",
+            static_cast<unsigned>(lease->slot_index),
+            static_cast<unsigned long>(lease->track_index),
+            static_cast<unsigned long>(lease->slot_revision),
+            entry.valid ? 1 : 0,
+            static_cast<unsigned long>(entry.track_index),
+            static_cast<unsigned long>(entry.slot_revision));
     }
+    xSemaphoreGive(g_cache_mutex);
     *lease = {};
 }
 

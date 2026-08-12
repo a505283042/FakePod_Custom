@@ -1,4 +1,6 @@
 #include "display.h"
+#include "display_backend.h"
+#include "display_bounded_spi.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -26,7 +28,7 @@ static const char *TAG = "显示";
 // P1.5.3.2R.36.4 Bounded SPI Transport
 // ============================================================
 //
-// 旧 Launcher DirectScene 与 R.29 Cover ContinuousGRAM 都通过 esp_lcd_panel_io_tx_param()/
+// 旧 Launcher PanelIO DirectScene 与 R.29 Cover ContinuousGRAM 都通过 esp_lcd_panel_io_tx_param()/
 // tx_color() 与 LVGL 共享 Panel IO。ESP-IDF 5.5 的 SPI Panel IO 在这些入口内部存在
 // portMAX_DELAY 的 bus acquire/result recycle：Launcher 已由 R.36.3 迁移后通过压力测试；
 // R.36.4 继续迁移 Cover，彻底移除主页换封面对旧 ContinuousGRAM 的运行时依赖。
@@ -63,7 +65,7 @@ struct DisplayPanelIoSpiV55Prefix
 // command_bits/address_bits/dummy_bits；esp_lcd SPI device 的 post-callback 又会把同一尾部
 // 解释为自己的 32-bit flags。这里显式保留4字节 tail：byte0=0 让 callback 的低2位恒为0，
 // byte1=32 给 SPI driver 提供32-bit address/header，byte2/3=0。项目固定 IDF 5.5 + ESP32-S3。
-struct DisplayLauncherRawSpiTransaction
+struct DisplayBoundedRawSpiTransaction
 {
     spi_transaction_t base = {};
     uint8_t command_bits = 0U;
@@ -72,10 +74,10 @@ struct DisplayLauncherRawSpiTransaction
     uint8_t callback_flags_guard = 0U;
 };
 
-static_assert(offsetof(DisplayLauncherRawSpiTransaction, command_bits) == sizeof(spi_transaction_t),
+static_assert(offsetof(DisplayBoundedRawSpiTransaction, command_bits) == sizeof(spi_transaction_t),
     "R.36.3 raw SPI descriptor tail must immediately follow spi_transaction_t");
 
-struct DisplayLauncherBoundedSpiState
+struct DisplayBoundedSpiState
 {
     bool active = false;
     bool faulted = false;
@@ -87,12 +89,12 @@ struct DisplayLauncherBoundedSpiState
     size_t staging_bytes = 0U;
     // control_tx 同样常驻，确保 CASET/RASET 若发生 result timeout，descriptor 生命周期
     // 不会随着函数栈退出而失效。color_tx 与 DMA staging 共同覆盖整个 session。
-    DisplayLauncherRawSpiTransaction control_tx[2] = {};
-    DisplayLauncherRawSpiTransaction color_tx[2] = {};
+    DisplayBoundedRawSpiTransaction control_tx[2] = {};
+    DisplayBoundedRawSpiTransaction color_tx[2] = {};
     uint32_t color_sequence[2] = {0U, 0U};
 };
 
-static DisplayLauncherBoundedSpiState g_launcher_bounded_spi = {};
+static DisplayBoundedSpiState g_bounded_spi = {};
 
 static constexpr uint16_t BOUNDED_SPI_STAGING_ROWS[] = {16U, 12U, 8U, 4U};
 static constexpr uint32_t BOUNDED_SPI_PANEL_DRAIN_TIMEOUT_MS = 80U;
@@ -116,7 +118,7 @@ static DisplayPanelIoSpiV55Prefix *display_panel_io_spi_v55_prefix()
 #endif
 }
 
-static bool display_launcher_bounded_spi_abi_valid(DisplayPanelIoSpiV55Prefix *io)
+static bool display_bounded_spi_abi_valid(DisplayPanelIoSpiV55Prefix *io)
 {
     // 当前板卡是 CO5300 QSPI：无独立 D/C、32-bit QSPI header、8-bit 参数。
     // 只有这组已验证配置才允许触碰 IDF 5.5 的 Panel IO 私有前缀。
@@ -125,22 +127,27 @@ static bool display_launcher_bounded_spi_abi_valid(DisplayPanelIoSpiV55Prefix *i
         io->spi_trans_max_bytes > 0U;
 }
 
-bool display_launcher_bounded_spi_available()
+static bool display_bounded_spi_available_internal()
 {
-    if (!display_is_ready() || display_get_panel_io() == nullptr || g_launcher_bounded_spi.faulted) {
+    if (!display_is_ready() || display_get_panel_io() == nullptr || g_bounded_spi.faulted) {
         return false;
     }
-    return display_launcher_bounded_spi_abi_valid(display_panel_io_spi_v55_prefix());
+    return display_bounded_spi_abi_valid(display_panel_io_spi_v55_prefix());
 }
 
-static esp_err_t display_launcher_bounded_spi_drain_panel(
+bool display_launcher_bounded_spi_available()
+{
+    return display_bounded_spi_available_internal();
+}
+
+static esp_err_t display_bounded_spi_drain_panel(
     DisplayPanelIoSpiV55Prefix *io,
     uint32_t *elapsed_us)
 {
     if (elapsed_us != nullptr) {
         *elapsed_us = 0U;
     }
-    if (!display_launcher_bounded_spi_abi_valid(io)) {
+    if (!display_bounded_spi_abi_valid(io)) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -184,8 +191,8 @@ static esp_err_t display_launcher_bounded_spi_drain_panel(
     return ESP_OK;
 }
 
-static void display_launcher_bounded_spi_prepare_transaction(
-    DisplayLauncherRawSpiTransaction *tx,
+static void display_bounded_spi_prepare_transaction(
+    DisplayBoundedRawSpiTransaction *tx,
     DisplayPanelIoSpiV55Prefix *io,
     uint32_t qspi_header,
     bool qio_data)
@@ -198,7 +205,7 @@ static void display_launcher_bounded_spi_prepare_transaction(
     }
     tx->base.addr = static_cast<uint64_t>(qspi_header);
     // Panel IO pre/post callback 的 user 仍需指向其内部对象；callback_flags_guard 让其私有
-    // en_trans_done_cb 位恒为0，因此 raw transaction 不会误触 LVGL/Direct color-done bridge。
+    // en_trans_done_cb 位恒为0，因此 raw transaction 不会误触 LVGL color-done bridge。
     tx->base.user = io;
     tx->command_bits = 0U;
     tx->address_bits = 32U;
@@ -206,9 +213,9 @@ static void display_launcher_bounded_spi_prepare_transaction(
     tx->callback_flags_guard = 0U;
 }
 
-static esp_err_t display_launcher_bounded_spi_queue_wait_single(
+static esp_err_t display_bounded_spi_queue_wait_single(
     DisplayPanelIoSpiV55Prefix *io,
-    DisplayLauncherRawSpiTransaction *tx,
+    DisplayBoundedRawSpiTransaction *tx,
     uint32_t *queue_wait_us)
 {
     const int64_t started_us = esp_timer_get_time();
@@ -266,15 +273,15 @@ static esp_err_t display_launcher_bounded_spi_queue_wait_single(
     return ESP_ERR_TIMEOUT;
 }
 
-static esp_err_t display_launcher_bounded_spi_send_window_param(
+static esp_err_t display_bounded_spi_send_window_param(
     DisplayPanelIoSpiV55Prefix *io,
     uint8_t control_index,
     uint8_t dcs_command,
     const uint8_t param[4],
     uint32_t *queue_wait_us)
 {
-    DisplayLauncherRawSpiTransaction &tx = g_launcher_bounded_spi.control_tx[control_index & 1U];
-    display_launcher_bounded_spi_prepare_transaction(
+    DisplayBoundedRawSpiTransaction &tx = g_bounded_spi.control_tx[control_index & 1U];
+    display_bounded_spi_prepare_transaction(
         &tx,
         io,
         display_bounded_qspi_header(CO5300_QSPI_OPCODE_WRITE_CMD, dcs_command),
@@ -282,83 +289,83 @@ static esp_err_t display_launcher_bounded_spi_send_window_param(
     tx.base.flags |= SPI_TRANS_USE_TXDATA;
     tx.base.length = 32U;
     memcpy(tx.base.tx_data, param, 4U);
-    return display_launcher_bounded_spi_queue_wait_single(io, &tx, queue_wait_us);
+    return display_bounded_spi_queue_wait_single(io, &tx, queue_wait_us);
 }
 
-static void display_launcher_bounded_spi_poison(const char *reason)
+static void display_bounded_spi_poison(const char *reason)
 {
-    if (!g_launcher_bounded_spi.faulted) {
+    if (!g_bounded_spi.faulted) {
         ESP_LOGE(TAG,
             "R.36.4 BoundedSPI熔断：owner=%s reason=%s；本次启动后续BoundedSPI固定回退LVGL",
-            g_launcher_bounded_spi.owner != nullptr ? g_launcher_bounded_spi.owner : "none",
+            g_bounded_spi.owner != nullptr ? g_bounded_spi.owner : "none",
             reason != nullptr ? reason : "unknown");
     }
-    g_launcher_bounded_spi.faulted = true;
+    g_bounded_spi.faulted = true;
 }
 
 static esp_err_t display_bounded_spi_session_begin(const char *owner)
 {
-    if (!display_launcher_bounded_spi_available() || g_launcher_bounded_spi.active) {
+    if (!display_bounded_spi_available_internal() || g_bounded_spi.active) {
         return ESP_ERR_INVALID_STATE;
     }
 
     DisplayPanelIoSpiV55Prefix *io = display_panel_io_spi_v55_prefix();
-    if (!display_launcher_bounded_spi_abi_valid(io)) {
+    if (!display_bounded_spi_abi_valid(io)) {
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    g_launcher_bounded_spi.staging_rows = 0U;
-    g_launcher_bounded_spi.staging_bytes = 0U;
+    g_bounded_spi.staging_rows = 0U;
+    g_bounded_spi.staging_bytes = 0U;
     for (uint16_t candidate_rows : BOUNDED_SPI_STAGING_ROWS) {
         const size_t bytes =
             static_cast<size_t>(FAKEPOD_LCD_WIDTH) * static_cast<size_t>(candidate_rows) * 2U;
         if (bytes > io->spi_trans_max_bytes) {
             continue;
         }
-        g_launcher_bounded_spi.dma_strip[0] = static_cast<uint8_t *>(heap_caps_aligned_alloc(
+        g_bounded_spi.dma_strip[0] = static_cast<uint8_t *>(heap_caps_aligned_alloc(
             16U, bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
-        if (g_launcher_bounded_spi.dma_strip[0] == nullptr) {
+        if (g_bounded_spi.dma_strip[0] == nullptr) {
             continue;
         }
-        g_launcher_bounded_spi.dma_strip[1] = static_cast<uint8_t *>(heap_caps_aligned_alloc(
+        g_bounded_spi.dma_strip[1] = static_cast<uint8_t *>(heap_caps_aligned_alloc(
             16U, bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
-        if (g_launcher_bounded_spi.dma_strip[1] != nullptr) {
-            g_launcher_bounded_spi.staging_rows = candidate_rows;
-            g_launcher_bounded_spi.staging_bytes = bytes;
+        if (g_bounded_spi.dma_strip[1] != nullptr) {
+            g_bounded_spi.staging_rows = candidate_rows;
+            g_bounded_spi.staging_bytes = bytes;
             break;
         }
-        heap_caps_free(g_launcher_bounded_spi.dma_strip[0]);
-        g_launcher_bounded_spi.dma_strip[0] = nullptr;
+        heap_caps_free(g_bounded_spi.dma_strip[0]);
+        g_bounded_spi.dma_strip[0] = nullptr;
     }
 
-    if (g_launcher_bounded_spi.dma_strip[0] == nullptr ||
-        g_launcher_bounded_spi.dma_strip[1] == nullptr ||
-        g_launcher_bounded_spi.staging_rows == 0U) {
-        if (g_launcher_bounded_spi.dma_strip[0] != nullptr) {
-            heap_caps_free(g_launcher_bounded_spi.dma_strip[0]);
+    if (g_bounded_spi.dma_strip[0] == nullptr ||
+        g_bounded_spi.dma_strip[1] == nullptr ||
+        g_bounded_spi.staging_rows == 0U) {
+        if (g_bounded_spi.dma_strip[0] != nullptr) {
+            heap_caps_free(g_bounded_spi.dma_strip[0]);
         }
-        if (g_launcher_bounded_spi.dma_strip[1] != nullptr) {
-            heap_caps_free(g_launcher_bounded_spi.dma_strip[1]);
+        if (g_bounded_spi.dma_strip[1] != nullptr) {
+            heap_caps_free(g_bounded_spi.dma_strip[1]);
         }
-        g_launcher_bounded_spi.dma_strip[0] = nullptr;
-        g_launcher_bounded_spi.dma_strip[1] = nullptr;
+        g_bounded_spi.dma_strip[0] = nullptr;
+        g_bounded_spi.dma_strip[1] = nullptr;
         return ESP_ERR_NO_MEM;
     }
 
-    ++g_launcher_bounded_spi.generation;
-    if (g_launcher_bounded_spi.generation == 0U) {
-        ++g_launcher_bounded_spi.generation;
+    ++g_bounded_spi.generation;
+    if (g_bounded_spi.generation == 0U) {
+        ++g_bounded_spi.generation;
     }
-    g_launcher_bounded_spi.next_sequence = 1U;
-    g_launcher_bounded_spi.owner = owner != nullptr ? owner : "unknown";
-    g_launcher_bounded_spi.active = true;
+    g_bounded_spi.next_sequence = 1U;
+    g_bounded_spi.owner = owner != nullptr ? owner : "unknown";
+    g_bounded_spi.active = true;
 #if APP_DIAG_DISPLAY_TRANSPORT
     ESP_LOGI(TAG,
         "BoundedSPI BEGIN：owner=%s gen=%u staging=%u行×2 total=%uB DMAfree=%u",
-        g_launcher_bounded_spi.owner,
-        static_cast<unsigned>(g_launcher_bounded_spi.generation),
-        static_cast<unsigned>(g_launcher_bounded_spi.staging_rows),
-        static_cast<unsigned>(g_launcher_bounded_spi.staging_bytes * 2U),
+        g_bounded_spi.owner,
+        static_cast<unsigned>(g_bounded_spi.generation),
+        static_cast<unsigned>(g_bounded_spi.staging_rows),
+        static_cast<unsigned>(g_bounded_spi.staging_bytes * 2U),
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)));
 #endif
     return ESP_OK;
@@ -371,45 +378,50 @@ esp_err_t display_launcher_bounded_spi_session_begin()
 
 bool display_launcher_bounded_spi_session_active()
 {
-    return g_launcher_bounded_spi.active;
+    return g_bounded_spi.active;
 }
 
-void display_launcher_bounded_spi_session_end()
+static void display_bounded_spi_session_end_internal()
 {
-    if (!g_launcher_bounded_spi.active && g_launcher_bounded_spi.dma_strip[0] == nullptr &&
-        g_launcher_bounded_spi.dma_strip[1] == nullptr) {
+    if (!g_bounded_spi.active && g_bounded_spi.dma_strip[0] == nullptr &&
+        g_bounded_spi.dma_strip[1] == nullptr) {
         return;
     }
 
 #if APP_DIAG_DISPLAY_TRANSPORT
-    const uint32_t generation = g_launcher_bounded_spi.generation;
-    const char *owner = g_launcher_bounded_spi.owner != nullptr ? g_launcher_bounded_spi.owner : "none";
+    const uint32_t generation = g_bounded_spi.generation;
+    const char *owner = g_bounded_spi.owner != nullptr ? g_bounded_spi.owner : "none";
 #endif
-    g_launcher_bounded_spi.active = false;
+    g_bounded_spi.active = false;
     // 能走到 Session END 就意味着本层所有 raw descriptor 已被有界回收；任何未回收路径
-    // 都会在 display_launcher_bounded_spi_present() 内直接受控重启，因此这里可以安全释放。
-    if (g_launcher_bounded_spi.dma_strip[0] != nullptr) {
-        heap_caps_free(g_launcher_bounded_spi.dma_strip[0]);
+    // 都会在 bounded present 内直接受控重启，因此这里可以安全释放。
+    if (g_bounded_spi.dma_strip[0] != nullptr) {
+        heap_caps_free(g_bounded_spi.dma_strip[0]);
     }
-    if (g_launcher_bounded_spi.dma_strip[1] != nullptr) {
-        heap_caps_free(g_launcher_bounded_spi.dma_strip[1]);
+    if (g_bounded_spi.dma_strip[1] != nullptr) {
+        heap_caps_free(g_bounded_spi.dma_strip[1]);
     }
-    g_launcher_bounded_spi.dma_strip[0] = nullptr;
-    g_launcher_bounded_spi.dma_strip[1] = nullptr;
-    g_launcher_bounded_spi.staging_rows = 0U;
-    g_launcher_bounded_spi.staging_bytes = 0U;
-    g_launcher_bounded_spi.owner = "none";
+    g_bounded_spi.dma_strip[0] = nullptr;
+    g_bounded_spi.dma_strip[1] = nullptr;
+    g_bounded_spi.staging_rows = 0U;
+    g_bounded_spi.staging_bytes = 0U;
+    g_bounded_spi.owner = "none";
 #if APP_DIAG_DISPLAY_TRANSPORT
     ESP_LOGI(TAG,
         "BoundedSPI END：owner=%s gen=%u faulted=%d DMAfree=%u",
         owner,
         static_cast<unsigned>(generation),
-        g_launcher_bounded_spi.faulted ? 1 : 0,
+        g_bounded_spi.faulted ? 1 : 0,
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)));
 #endif
 }
 
-static esp_err_t display_launcher_bounded_spi_present_internal(
+void display_launcher_bounded_spi_session_end()
+{
+    display_bounded_spi_session_end_internal();
+}
+
+static esp_err_t display_bounded_spi_present_internal(
     const uint8_t *rgb565,
     DisplayBoundedSpiStripProducer producer,
     void *producer_context,
@@ -422,11 +434,11 @@ static esp_err_t display_launcher_bounded_spi_present_internal(
     DisplayBoundedSpiStats *out_stats)
 {
     DisplayBoundedSpiStats stats = {};
-    stats.generation = g_launcher_bounded_spi.generation;
+    stats.generation = g_bounded_spi.generation;
     stats.wire_order = wire_order;
     const int64_t total_started_us = esp_timer_get_time();
 
-    if (!g_launcher_bounded_spi.active || g_launcher_bounded_spi.faulted ||
+    if (!g_bounded_spi.active || g_bounded_spi.faulted ||
         ((rgb565 == nullptr) == (producer == nullptr))) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -437,12 +449,12 @@ static esp_err_t display_launcher_bounded_spi_present_internal(
     }
 
     DisplayPanelIoSpiV55Prefix *io = display_panel_io_spi_v55_prefix();
-    if (!display_launcher_bounded_spi_abi_valid(io)) {
-        display_launcher_bounded_spi_poison("Panel IO ABI/配置不匹配");
+    if (!display_bounded_spi_abi_valid(io)) {
+        display_bounded_spi_poison("Panel IO ABI/配置不匹配");
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    esp_err_t result = display_launcher_bounded_spi_drain_panel(io, &stats.panel_drain_us);
+    esp_err_t result = display_bounded_spi_drain_panel(io, &stats.panel_drain_us);
     if (result != ESP_OK) {
         return result;
     }
@@ -459,15 +471,15 @@ static esp_err_t display_launcher_bounded_spi_present_internal(
         static_cast<uint8_t>(y_end >> 8U), static_cast<uint8_t>(y_end & 0xFFU)};
 
     const int64_t window_started_us = esp_timer_get_time();
-    result = display_launcher_bounded_spi_send_window_param(
+    result = display_bounded_spi_send_window_param(
         io, 0U, LCD_CMD_CASET, caset, &stats.queue_wait_us);
     if (result == ESP_OK) {
-        result = display_launcher_bounded_spi_send_window_param(
+        result = display_bounded_spi_send_window_param(
             io, 1U, LCD_CMD_RASET, raset, &stats.queue_wait_us);
     }
     stats.window_setup_us = static_cast<uint32_t>(esp_timer_get_time() - window_started_us);
     if (result != ESP_OK) {
-        display_launcher_bounded_spi_poison("CASET/RASET有界事务失败");
+        display_bounded_spi_poison("CASET/RASET有界事务失败");
         return result;
     }
 
@@ -485,13 +497,13 @@ static esp_err_t display_launcher_bounded_spi_present_internal(
         stats.te_wait_us = static_cast<uint32_t>(esp_timer_get_time() - te_started_us);
     }
 
-    const uint16_t staging_rows = g_launcher_bounded_spi.staging_rows;
+    const uint16_t staging_rows = g_bounded_spi.staging_rows;
     stats.staging_rows = staging_rows;
     stats.staging_buffers = 2U;
-    stats.staging_total_bytes = static_cast<uint32_t>(g_launcher_bounded_spi.staging_bytes * 2U);
+    stats.staging_total_bytes = static_cast<uint32_t>(g_bounded_spi.staging_bytes * 2U);
 
     auto prepare_strip = [&](uint8_t buffer_index, uint16_t source_y, uint16_t rows) -> esp_err_t {
-        uint8_t *dst = g_launcher_bounded_spi.dma_strip[buffer_index];
+        uint8_t *dst = g_bounded_spi.dma_strip[buffer_index];
         const size_t bytes = static_cast<size_t>(width) * rows * 2U;
         if (producer != nullptr) {
             const int64_t produced_us = esp_timer_get_time();
@@ -530,8 +542,8 @@ static esp_err_t display_launcher_bounded_spi_present_internal(
     };
 
     auto queue_color = [&](uint8_t buffer_index, uint8_t dcs_command, uint16_t rows) -> esp_err_t {
-        DisplayLauncherRawSpiTransaction &tx = g_launcher_bounded_spi.color_tx[buffer_index];
-        display_launcher_bounded_spi_prepare_transaction(
+        DisplayBoundedRawSpiTransaction &tx = g_bounded_spi.color_tx[buffer_index];
+        display_bounded_spi_prepare_transaction(
             &tx,
             io,
             display_bounded_qspi_header(CO5300_QSPI_OPCODE_WRITE_COLOR, dcs_command),
@@ -541,12 +553,12 @@ static esp_err_t display_launcher_bounded_spi_present_internal(
             return ESP_ERR_INVALID_ARG;
         }
         tx.base.length = color_bytes * 8U;
-        tx.base.tx_buffer = g_launcher_bounded_spi.dma_strip[buffer_index];
-        g_launcher_bounded_spi.color_sequence[buffer_index] = g_launcher_bounded_spi.next_sequence++;
+        tx.base.tx_buffer = g_bounded_spi.dma_strip[buffer_index];
+        g_bounded_spi.color_sequence[buffer_index] = g_bounded_spi.next_sequence++;
         if (stats.first_sequence == 0U) {
-            stats.first_sequence = g_launcher_bounded_spi.color_sequence[buffer_index];
+            stats.first_sequence = g_bounded_spi.color_sequence[buffer_index];
         }
-        stats.last_sequence = g_launcher_bounded_spi.color_sequence[buffer_index];
+        stats.last_sequence = g_bounded_spi.color_sequence[buffer_index];
         const int64_t queued_us = esp_timer_get_time();
         const esp_err_t ret = spi_device_queue_trans(
             io->spi_dev,
@@ -594,12 +606,12 @@ static esp_err_t display_launcher_bounded_spi_present_internal(
         }
 
         const uint8_t buffer_index = queued_order[completed & 1U];
-        if (returned != &g_launcher_bounded_spi.color_tx[buffer_index].base) {
+        if (returned != &g_bounded_spi.color_tx[buffer_index].base) {
             ESP_LOGE(TAG,
                 "R.36.4 BoundedSPI：color事务身份错位 gen=%u seq=%u expected=%p actual=%p；受控重启",
-                static_cast<unsigned>(g_launcher_bounded_spi.generation),
-                static_cast<unsigned>(g_launcher_bounded_spi.color_sequence[buffer_index]),
-                static_cast<void *>(&g_launcher_bounded_spi.color_tx[buffer_index].base),
+                static_cast<unsigned>(g_bounded_spi.generation),
+                static_cast<unsigned>(g_bounded_spi.color_sequence[buffer_index]),
+                static_cast<void *>(&g_bounded_spi.color_tx[buffer_index].base),
                 static_cast<void *>(returned));
             esp_restart();
         }
@@ -636,11 +648,11 @@ static esp_err_t display_launcher_bounded_spi_present_internal(
             break;
         }
         const uint8_t buffer_index = queued_order[completed & 1U];
-        if (returned != &g_launcher_bounded_spi.color_tx[buffer_index].base) {
+        if (returned != &g_bounded_spi.color_tx[buffer_index].base) {
             ESP_LOGE(TAG,
                 "R.36.4 BoundedSPI：尾部color事务身份错位 gen=%u expected=%p actual=%p；受控重启",
-                static_cast<unsigned>(g_launcher_bounded_spi.generation),
-                static_cast<void *>(&g_launcher_bounded_spi.color_tx[buffer_index].base),
+                static_cast<unsigned>(g_bounded_spi.generation),
+                static_cast<void *>(&g_bounded_spi.color_tx[buffer_index].base),
                 static_cast<void *>(returned));
             esp_restart();
         }
@@ -657,11 +669,11 @@ static esp_err_t display_launcher_bounded_spi_present_internal(
             spi_transaction_t *returned = nullptr;
             if (spi_device_get_trans_result(io->spi_dev, &returned, pdMS_TO_TICKS(10)) == ESP_OK) {
                 const uint8_t buffer_index = queued_order[completed & 1U];
-                if (returned != &g_launcher_bounded_spi.color_tx[buffer_index].base) {
+                if (returned != &g_bounded_spi.color_tx[buffer_index].base) {
                     ESP_LOGE(TAG,
                         "R.36.4 BoundedSPI恢复阶段color身份错位 gen=%u expected=%p actual=%p；受控重启",
-                        static_cast<unsigned>(g_launcher_bounded_spi.generation),
-                        static_cast<void *>(&g_launcher_bounded_spi.color_tx[buffer_index].base),
+                        static_cast<unsigned>(g_bounded_spi.generation),
+                        static_cast<void *>(&g_bounded_spi.color_tx[buffer_index].base),
                         static_cast<void *>(returned));
                     esp_restart();
                 }
@@ -671,12 +683,12 @@ static esp_err_t display_launcher_bounded_spi_present_internal(
         if (completed < submitted) {
             ESP_LOGE(TAG,
                 "R.36.4 BoundedSPI恢复未排空：gen=%u completed=%u submitted=%u；受控重启避免DMA descriptor/UAF与Panel IO结果队列污染",
-                static_cast<unsigned>(g_launcher_bounded_spi.generation),
+                static_cast<unsigned>(g_bounded_spi.generation),
                 static_cast<unsigned>(completed),
                 static_cast<unsigned>(submitted));
             esp_restart();
         }
-        display_launcher_bounded_spi_poison("raw transaction queue/result失败");
+        display_bounded_spi_poison("raw transaction queue/result失败");
     }
 
     stats.total_us = static_cast<uint32_t>(esp_timer_get_time() - total_started_us);
@@ -700,7 +712,7 @@ esp_err_t display_launcher_bounded_spi_present_stream(
     if (producer == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    return display_launcher_bounded_spi_present_internal(
+    return display_bounded_spi_present_internal(
         nullptr, producer, producer_context, x, y, width, height, wire_order, wait_for_te, out_stats);
 }
 
@@ -714,7 +726,7 @@ esp_err_t display_launcher_bounded_spi_present(
     bool wait_for_te,
     DisplayBoundedSpiStats *out_stats)
 {
-    return display_launcher_bounded_spi_present_internal(
+    return display_bounded_spi_present_internal(
         rgb565, nullptr, nullptr, x, y, width, height, wire_order, wait_for_te, out_stats);
 }
 
@@ -728,7 +740,7 @@ esp_err_t display_cover_bounded_spi_present(
     if (rgb565 == nullptr || width != FAKEPOD_LCD_WIDTH || height != FAKEPOD_LCD_HEIGHT) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!display_launcher_bounded_spi_available() || g_launcher_bounded_spi.active) {
+    if (!display_bounded_spi_available_internal() || g_bounded_spi.active) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -737,15 +749,8 @@ esp_err_t display_cover_bounded_spi_present(
         return result;
     }
 
-    result = display_launcher_bounded_spi_present(
-        rgb565,
-        0U,
-        0U,
-        width,
-        height,
-        wire_order,
-        true,
-        out_stats);
-    display_launcher_bounded_spi_session_end();
+    result = display_bounded_spi_present_internal(
+        rgb565, nullptr, nullptr, 0U, 0U, width, height, wire_order, true, out_stats);
+    display_bounded_spi_session_end_internal();
     return result;
 }

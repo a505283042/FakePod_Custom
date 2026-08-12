@@ -2,7 +2,7 @@
 """R.37 source inventory helper.
 
 Pure source audit: counts C/C++ LOC and ESP_LOG calls by module, then reports
-legacy DirectPresent symbol callers. It never modifies the project.
+legacy display symbols and R.37 interface-boundary regressions. It never modifies the project.
 """
 
 from __future__ import annotations
@@ -22,7 +22,28 @@ FORBIDDEN_LEGACY_PATTERNS = {
     "display_present_rgb565_region_direct_owned": re.compile(r"\bdisplay_present_rgb565_region_direct_owned\b"),
     "kLauncherDirectSceneEnabled": re.compile(r"\bkLauncherDirectSceneEnabled\b"),
     "kFullscreenHomeResumeDirectEnabled": re.compile(r"\bkFullscreenHomeResumeDirectEnabled\b"),
+    "g_launcher_direct_frame_active": re.compile(r"\bg_launcher_direct_frame_active\b"),
+    "player_home_launcher_begin_direct_scene": re.compile(r"\bplayer_home_launcher_begin_direct_scene\b"),
+    "player_home_launcher_present_work_direct": re.compile(r"\bplayer_home_launcher_present_work_direct\b"),
+    "now_playing_artwork_set_direct_present_allowed": re.compile(r"\bnow_playing_artwork_set_direct_present_allowed\b"),
+    "now_playing_artwork_take_direct_present_event": re.compile(r"\bnow_playing_artwork_take_direct_present_event\b"),
 }
+
+BOUNDED_HEADER = SRC / "drivers" / "display" / "display_bounded_spi.h"
+BOUNDED_HEADER_ALLOWED_INCLUDES = {
+    Path("drivers/display/display_bounded_spi.cpp"),
+    Path("ui/artwork/now_playing_artwork.cpp"),
+    Path("ui/screens/player_home.cpp"),
+}
+BACKEND_HEADER_ALLOWED_INCLUDES = {
+    Path("drivers/display/display.cpp"),
+    Path("drivers/display/display_bounded_spi.cpp"),
+    Path("ui/ui_manager.cpp"),
+}
+BOUNDARY_FORBIDDEN_IN_DISPLAY_H = re.compile(
+    r"DisplayBoundedSpi|display_(?:launcher|cover)_bounded_spi|esp_lcd_panel|display_te_|display_install_lvgl"
+)
+
 
 
 def main() -> int:
@@ -33,6 +54,7 @@ def main() -> int:
     heavy: list[tuple[int, int, Path]] = []
     legacy_hits: list[tuple[str, Path, int, str]] = []
     empty_disabled_log_hits: list[tuple[Path, int, str]] = []
+    boundary_hits: list[tuple[Path, int, str]] = []
 
     for path in sorted(SRC.rglob("*")):
         if not path.is_file() or path.suffix not in CODE_SUFFIXES:
@@ -53,6 +75,12 @@ def main() -> int:
         heavy.append((logs, loc, rel))
 
         for line_no, line in enumerate(lines, 1):
+            if rel == Path("drivers/display/display.h") and BOUNDARY_FORBIDDEN_IN_DISPLAY_H.search(line):
+                boundary_hits.append((rel, line_no, line.strip()))
+            if '#include "display_bounded_spi.h"' in line and rel not in BOUNDED_HEADER_ALLOWED_INCLUDES:
+                boundary_hits.append((rel, line_no, line.strip()))
+            if '#include "display_backend.h"' in line and rel not in BACKEND_HEADER_ALLOWED_INCLUDES:
+                boundary_hits.append((rel, line_no, line.strip()))
             if EMPTY_DISABLED_LOG_RE.search(line):
                 empty_disabled_log_hits.append((rel, line_no, line.strip()))
             for name, pattern in FORBIDDEN_LEGACY_PATTERNS.items():
@@ -77,11 +105,20 @@ def main() -> int:
     else:
         print("  none")
 
+    print("\nDisplay API boundary violations:")
+    if boundary_hits:
+        for rel, line_no, line in boundary_hits:
+            print(f"  {rel}:{line_no}: {line}")
+    else:
+        print("  none")
+
     print("\nForbidden legacy display symbols:")
     if legacy_hits:
         for name, rel, line_no, line in legacy_hits:
             print(f"  {name}: {rel}:{line_no}: {line}")
         return 2
+    if boundary_hits:
+        return 4
     if empty_disabled_log_hits:
         return 3
     print("  none")

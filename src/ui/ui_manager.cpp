@@ -13,6 +13,7 @@
 #include "board_pins.h"
 #include "cst820.h"
 #include "display.h"
+#include "display_backend.h"
 #include "font/font_manager.h"
 #include "gesture/gesture_router.h"
 #include "input/touch_input.h"
@@ -179,7 +180,7 @@ static constexpr uint32_t kTeSyncForceFullFramePixels =
     (FAKEPOD_LCD_WIDTH * FAKEPOD_LCD_HEIGHT * 9U) / 10U;
 static uint32_t g_te_animation_bypass_count = 0U;
 
-// P1.5.3.2R.36.1：LVGL RGB565 DMA 条带从 40 行收紧到 24 行，为 DirectPresent 和音频留出更多内部 DMA headroom。
+// P1.5.3.2R.36.1：LVGL RGB565 DMA 条带从 40 行收紧到 24 行，为 BoundedSPI 和音频留出更多内部 DMA headroom。
 // 双缓冲总像素 RAM = 460 * 24 * 2B * 2 = 44,160B，比 R.18 回收 29,440B。
 static constexpr uint32_t kLvglDmaBufferLines = 24U;
 
@@ -746,7 +747,7 @@ static void ui_display_refresh_ready_cb(lv_event_t *event)
     const uint32_t held_us = static_cast<uint32_t>(
         esp_timer_get_time() - g_present_hold_started_us);
 
-    // R.23 正常跨Track应优先走 DirectPresent；这里只保留 R.22 兼容回退。
+    // R.23 正常跨Track应优先走 BoundedSPI；这里只保留 R.22 兼容回退。
     const bool restored = display_present_set_output(true);
     g_present_hold_active = false;
     g_present_hold_started_us = 0;
@@ -909,7 +910,7 @@ esp_err_t ui_manager_init()
     }
 
     // R.26：esp_lvgl_port_add_disp() 会覆盖 Panel IO 的 color-done callback。
-    // 立即换成统一桥接，保持 LVGL flush_ready，同时给 DirectPresent 单独的 DMA 完成信号。
+    // 立即换成统一桥接，保持 LVGL flush_ready，同时保持底层 BoundedSPI 可复用同一 Panel IO device。
     ret = display_install_lvgl_color_done_bridge(g_display);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "R.26 安装显示color-done桥接失败：%s", esp_err_to_name(ret));
@@ -975,7 +976,7 @@ esp_err_t ui_manager_init()
     } else {
         ESP_LOGW(TAG, "R.21 LVGL TE同步未启用，保持无TE刷新路径");
     }
-    UI_BOOT_LOGI("Direct Surface Present：跨Track走BoundedSPI，Display Hold仅作失败回退");
+    UI_BOOT_LOGI("Bounded Surface Present：跨Track走BoundedSPI，Display Hold仅作失败回退");
 
     UI_BOOT_LOGI("注册CST820触摸输入");
     gesture_router_reset();

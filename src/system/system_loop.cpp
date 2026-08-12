@@ -252,8 +252,15 @@ static void system_artwork_current_update()
             if (snapshot.state == CoverSurfaceState::Ready) {
                 g_artwork_stage = ArtworkCurrentStage::Complete;
             } else if (snapshot.state == CoverSurfaceState::Failed) {
-                // 保留压缩原图给 LVGL fallback；只有 Surface 成功才释放原图。
-                g_artwork_stage = ArtworkCurrentStage::Complete;
+                if (snapshot.result == ESP_ERR_NO_MEM) {
+                    // 两槽交换期间可能短暂同时被 pin，或 cache mutex 瞬态繁忙。Surface 插入失败
+                    // 不能永久宣告 Complete，否则当前曲会一直停在压缩图 LVGL fallback，直到再次切歌。
+                    // 保留压缩原图并走现有退避，槽位释放后自动重试 Surface。
+                    system_artwork_schedule_retry(current_track);
+                } else {
+                    // 真正解码/格式失败保留压缩原图给 LVGL fallback；只有 Surface 成功才释放原图。
+                    g_artwork_stage = ArtworkCurrentStage::Complete;
+                }
             }
             break;
         }

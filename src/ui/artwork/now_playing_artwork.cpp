@@ -12,6 +12,7 @@
 #include "board_pins.h"
 #include "cover_surface_cache.h"
 #include "display.h"
+#include "display_bounded_spi.h"
 #include "font/font_manager.h"
 #include "media_catalog_v2.h"
 #include "media_library.h"
@@ -50,8 +51,8 @@ static bool g_has_surface_source = false;
 static bool g_dimmed_requested = false;
 static bool g_dimmed_applied = false;
 static uint32_t g_last_surface_state_revision = UINT32_MAX;
-static bool g_direct_present_allowed = true;
-static bool g_direct_present_event_pending = false;
+static bool g_bounded_present_allowed = true;
+static bool g_bounded_present_event_pending = false;
 
 // 兼容回退：Stage 12.2 压缩图直接交给 LVGL decoder。
 static ArtworkCacheLease g_compressed_lease = {};
@@ -181,20 +182,20 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
     const uint8_t *present_surface = g_dimmed_requested
         ? lease.dimmed_rgb565
         : lease.normal_rgb565;
-    const uint8_t *direct_surface = present_surface;
+    const uint8_t *bounded_surface = present_surface;
 
-    bool direct_presented = false;
-    DisplayBoundedSpiStats direct_stats = {};
-    if (replacing_track && g_direct_present_allowed &&
+    bool bounded_presented = false;
+    DisplayBoundedSpiStats bounded_stats = {};
+    if (replacing_track && g_bounded_present_allowed &&
         lease.width == FAKEPOD_LCD_WIDTH && lease.height == FAKEPOD_LCD_HEIGHT) {
-        const esp_err_t direct_ret = display_cover_bounded_spi_present(
-            direct_surface,
+        const esp_err_t bounded_ret = display_cover_bounded_spi_present(
+            bounded_surface,
             lease.width,
             lease.height,
             false,
-            &direct_stats);
-        direct_presented = direct_ret == ESP_OK;
-        if (!direct_presented && direct_ret == ESP_ERR_NO_MEM) {
+            &bounded_stats);
+        bounded_presented = bounded_ret == ESP_OK;
+        if (!bounded_presented && bounded_ret == ESP_ERR_NO_MEM) {
             // R.27：双 staging 临时拿不到时不要黑屏、不要切换 LVGL source。
             // 释放刚 acquire 的新 lease，继续保持旧封面；下一次 Artwork update 会自动重试。
             ESP_LOGW(TAG,
@@ -204,16 +205,16 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
             cover_surface_cache_release(&lease);
             return false;
         }
-        if (!direct_presented) {
+        if (!bounded_presented) {
             ESP_LOGW(TAG,
                 "R.36.4 封面BoundedSPI失败：%lu -> %lu ret=%s，退回R.22 LVGL PresentHold",
                 static_cast<unsigned long>(previous_track),
                 static_cast<unsigned long>(track_index),
-                esp_err_to_name(direct_ret));
+                esp_err_to_name(bounded_ret));
         }
     }
 
-    if (replacing_track && !direct_presented) {
+    if (replacing_track && !bounded_presented) {
         // 非内存类错误才保留 R.22 兼容回退；NO_MEM 已在上方保持旧封面等待重试。
         display_present_request_hold();
     }
@@ -244,7 +245,7 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
     lv_display_t *display = lv_display_get_default();
     const bool invalidation_was_enabled =
         display != nullptr && lv_display_is_invalidation_enabled(display);
-    if (direct_presented && invalidation_was_enabled) {
+    if (bounded_presented && invalidation_was_enabled) {
         lv_display_enable_invalidation(display, false);
     }
 
@@ -258,27 +259,27 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
     lv_obj_add_flag(g_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(g_status, LV_OBJ_FLAG_HIDDEN);
 
-    if (direct_presented && invalidation_was_enabled) {
+    if (bounded_presented && invalidation_was_enabled) {
         lv_display_enable_invalidation(display, true);
     }
 
     g_has_surface_source = true;
-    if (direct_presented) {
-        g_direct_present_event_pending = true;
+    if (bounded_presented) {
+        g_bounded_present_event_pending = true;
 #if APP_DIAG_DISPLAY_TRANSPORT
         ESP_LOGI(TAG,
             "封面BoundedSPI：%lu -> %lu gen=%u total=%uus te=%uus stream=%uus swap=%uus wait=%uus chunks=%u staging=%u行×%u dim=%u",
             static_cast<unsigned long>(previous_track),
             static_cast<unsigned long>(track_index),
-            static_cast<unsigned>(direct_stats.generation),
-            static_cast<unsigned>(direct_stats.total_us),
-            static_cast<unsigned>(direct_stats.te_wait_us),
-            static_cast<unsigned>(direct_stats.stream_us),
-            static_cast<unsigned>(direct_stats.byte_swap_us),
-            static_cast<unsigned>(direct_stats.queue_wait_us),
-            static_cast<unsigned>(direct_stats.chunks),
-            static_cast<unsigned>(direct_stats.staging_rows),
-            static_cast<unsigned>(direct_stats.staging_buffers),
+            static_cast<unsigned>(bounded_stats.generation),
+            static_cast<unsigned>(bounded_stats.total_us),
+            static_cast<unsigned>(bounded_stats.te_wait_us),
+            static_cast<unsigned>(bounded_stats.stream_us),
+            static_cast<unsigned>(bounded_stats.byte_swap_us),
+            static_cast<unsigned>(bounded_stats.queue_wait_us),
+            static_cast<unsigned>(bounded_stats.chunks),
+            static_cast<unsigned>(bounded_stats.staging_rows),
+            static_cast<unsigned>(bounded_stats.staging_buffers),
             static_cast<unsigned>(g_dimmed_applied));
 #endif
     } else if (replacing_track) {
@@ -290,13 +291,13 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
 #endif
     }
 
-    ARTWORK_UI_TRACE("SURFACE_READY generation=%lu track=%lu %ux%u dim=%u direct=%u",
+    ARTWORK_UI_TRACE("SURFACE_READY generation=%lu track=%lu %ux%u dim=%u bounded=%u",
         static_cast<unsigned long>(g_surface_lease.catalog_generation),
         static_cast<unsigned long>(g_surface_lease.track_index),
         static_cast<unsigned>(g_surface_lease.width),
         static_cast<unsigned>(g_surface_lease.height),
         static_cast<unsigned>(g_dimmed_applied),
-        static_cast<unsigned>(direct_presented));
+        static_cast<unsigned>(bounded_presented));
     return true;
 }
 
@@ -567,28 +568,44 @@ void now_playing_artwork_refresh_context()
     artwork_ui_sync_context(false);
 }
 
-void now_playing_artwork_set_active(bool active)
+void now_playing_artwork_set_active(bool active, bool suppress_invalidation)
 {
     if (g_active == active) return;
+
+    // Launcher BoundedSPI 接管/归还 GRAM 时，lease 生命周期仍必须完整执行，但不能让
+    // lv_obj_add_flag()/lv_image_set_src() 产生一笔稍后才刷出的 460x460 invalidation。
+    // 否则 raw full-present 之后，迟到的 LVGL flush 会用主页黑底覆盖外圈，只剩中心 strip。
+    lv_display_t *display = lv_display_get_default();
+    const bool invalidation_was_enabled =
+        suppress_invalidation && display != nullptr && lv_display_is_invalidation_enabled(display);
+    if (invalidation_was_enabled) {
+        lv_display_enable_invalidation(display, false);
+    }
+
     g_active = active;
 
     if (!g_active) {
-        g_direct_present_event_pending = false;
-        // 页面被完整覆盖后，LVGL 不会再绘制这张图。立即释放 UI lease；
-        // R.36 的交换槽因此可在下一次 current 请求前提前回收旧 Surface。
+        g_bounded_present_event_pending = false;
+        // 页面被完整覆盖后立即释放 UI lease。quiet 模式只抑制物理重绘请求，
+        // hidden/source 状态仍同步更新，因此不会留下悬空 Surface 指针。
         artwork_ui_release_all_sources();
         if (g_placeholder_icon != nullptr) lv_obj_add_flag(g_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
         if (g_status != nullptr) lv_obj_add_flag(g_status, LV_OBJ_FLAG_HIDDEN);
-        ARTWORK_UI_TRACE("SUSPEND release leases context_track=%lu",
-            static_cast<unsigned long>(g_context_track));
-        return;
+        ARTWORK_UI_TRACE("SUSPEND release leases context_track=%lu quiet=%u",
+            static_cast<unsigned long>(g_context_track),
+            static_cast<unsigned>(suppress_invalidation));
+    } else {
+        // 恢复时强制重新读取 Player context。若外部 BoundedSPI 已把当前 Surface 恢复到 GRAM，
+        // quiet resume 只同步 LVGL source/lease，不再重复整屏 render/flush。
+        artwork_ui_sync_context(true);
+        ARTWORK_UI_TRACE("RESUME rebind context_track=%lu quiet=%u",
+            static_cast<unsigned long>(g_context_track),
+            static_cast<unsigned>(suppress_invalidation));
     }
 
-    // 恢复时强制重新读取 Player context。当前曲 Surface 已完成则直接 acquire；
-    // 尚未完成时保持 LCD/纯黑，不显示“准备封面”。
-    artwork_ui_sync_context(true);
-    ARTWORK_UI_TRACE("RESUME rebind context_track=%lu",
-        static_cast<unsigned long>(g_context_track));
+    if (invalidation_was_enabled) {
+        lv_display_enable_invalidation(display, true);
+    }
 }
 
 void now_playing_artwork_update()
@@ -706,14 +723,14 @@ bool now_playing_artwork_has_fast_surface()
     return g_has_surface_source;
 }
 
-void now_playing_artwork_set_direct_present_allowed(bool allowed)
+void now_playing_artwork_set_bounded_present_allowed(bool allowed)
 {
-    g_direct_present_allowed = allowed;
+    g_bounded_present_allowed = allowed;
 }
 
-bool now_playing_artwork_take_direct_present_event()
+bool now_playing_artwork_take_bounded_present_event()
 {
-    const bool pending = g_direct_present_event_pending;
-    g_direct_present_event_pending = false;
+    const bool pending = g_bounded_present_event_pending;
+    g_bounded_present_event_pending = false;
     return pending;
 }

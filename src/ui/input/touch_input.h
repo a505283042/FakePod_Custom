@@ -18,7 +18,7 @@ struct UiTouchSnapshot
 
 // DOWN/UP 边沿排队，避免 LVGL 忙时一次快速点按完全落在两个 indev poll 之间。
 // R.33.2.3：CST820 RELEASE 做短 debounce；队列满时合并过期边沿，优先保证最新物理状态
-// （尤其 RELEASE）不会因为 DirectPresent 长临界区而永久丢失。
+// （尤其 RELEASE）不会因为 BoundedSPI 大面积提交期间的长临界区而永久丢失。
 struct UiTouchEdgeEvent
 {
     bool pressed;
