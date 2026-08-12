@@ -16,6 +16,7 @@ idf_component_register(
         "drivers/storage/storage_io.cpp"
 
         "drivers/display/display.cpp"
+        "drivers/display/display_bounded_spi.cpp"
 
         "drivers/audio/cs43131.cpp"
         "drivers/audio/i2s_output.c"

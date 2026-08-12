@@ -29,8 +29,9 @@ static const char *TAG = "封面界面";
 // 压缩图直接交给 LVGL 的路径只保留为兼容回退（例如不受 esp_new_jpeg 支持的 JPEG）。
 // R.20 正常路径由 CoverSurfaceTask 同时预处理 normal + dimmed 两张 460x460 RGB565。
 // R.22 起跨 Track 替换时保留旧封面直到新 Surface 真正可用，“准备封面/读取封面”不再可见。
-// R.36 取消第三张 wire-order Surface；Continuous GRAM 直接消费 native normal/dimmed，
-// 在双 DMA staging 拷贝时在线 byte-swap。用少量切歌 CPU 时间换回 423KB 稳态 PSRAM。
+// R.36 取消第三张 wire-order Surface；R.36.4 起封面整屏提交改走 BoundedSPI，
+// 直接消费 native normal/dimmed，并在双 DMA staging 拷贝时在线 byte-swap。
+// 旧 R.29 ContinuousGRAM 不再作为主页换封面的运行时主路径。
 static constexpr size_t kArtworkDecodedBudgetBytes = 3U * 1024U * 1024U;
 static constexpr size_t kArtworkPsramSafetyReserveBytes = 768U * 1024U;
 static constexpr uint32_t kLvImageScaleNone = 256U;
@@ -183,10 +184,10 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
     const uint8_t *direct_surface = present_surface;
 
     bool direct_presented = false;
-    DisplayDirectPresentStats direct_stats = {};
+    DisplayBoundedSpiStats direct_stats = {};
     if (replacing_track && g_direct_present_allowed &&
         lease.width == FAKEPOD_LCD_WIDTH && lease.height == FAKEPOD_LCD_HEIGHT) {
-        const esp_err_t direct_ret = display_present_rgb565_direct(
+        const esp_err_t direct_ret = display_cover_bounded_spi_present(
             direct_surface,
             lease.width,
             lease.height,
@@ -197,7 +198,7 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
             // R.27：双 staging 临时拿不到时不要黑屏、不要切换 LVGL source。
             // 释放刚 acquire 的新 lease，继续保持旧封面；下一次 Artwork update 会自动重试。
             ESP_LOGW(TAG,
-                "R.29 封面ContinuousGRAM暂缓：%lu -> %lu 双staging内存不足，保持旧封面并重试",
+                "R.36.4 封面BoundedSPI暂缓：%lu -> %lu 双staging内存不足，保持旧封面并重试",
                 static_cast<unsigned long>(previous_track),
                 static_cast<unsigned long>(track_index));
             cover_surface_cache_release(&lease);
@@ -205,7 +206,7 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
         }
         if (!direct_presented) {
             ESP_LOGW(TAG,
-                "R.29 封面ContinuousGRAM失败：%lu -> %lu ret=%s，退回R.22 LVGL PresentHold",
+                "R.36.4 封面BoundedSPI失败：%lu -> %lu ret=%s，退回R.22 LVGL PresentHold",
                 static_cast<unsigned long>(previous_track),
                 static_cast<unsigned long>(track_index),
                 esp_err_to_name(direct_ret));
@@ -238,7 +239,7 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
         g_surface_lease.data_size);
     g_dimmed_applied = g_dimmed_requested;
 
-    // DirectPresent 已经把完整新封面写进 CO5300 GRAM。此时必须同步更新 LVGL 的 image source，
+    // BoundedSPI 已经把完整新封面写进 CO5300 GRAM。此时必须同步更新 LVGL 的 image source，
     // 但不能再次把 460x460 image 标成 invalid，否则会重新走 70ms 左右的整屏 render/flush。
     lv_display_t *display = lv_display_get_default();
     const bool invalidation_was_enabled =
@@ -265,29 +266,28 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
     if (direct_presented) {
         g_direct_present_event_pending = true;
         ESP_LOGI(TAG,
-            "R.29 封面ContinuousGRAM完成：%lu -> %lu source=%s total=%uus barrier=%uus window=%uus te=%uus pipeline=%uus stream=%uus copy=%uus swap=%uus wait=%uus overlap≈%uus chunks=%u queue_peak=%u staging=%u行×%u total=%uB dim=%u",
+            "R.36.4 封面BoundedSPI完成：%lu -> %lu gen=%u source=native total=%uus drain=%uus window=%uus te=%uus stream=%uus copy=%uus swap=%uus wait=%uus seq=%u..%u chunks=%u staging=%u行×%u total=%uB dim=%u",
             static_cast<unsigned long>(previous_track),
             static_cast<unsigned long>(track_index),
-            "native",
+            static_cast<unsigned>(direct_stats.generation),
             static_cast<unsigned>(direct_stats.total_us),
-            static_cast<unsigned>(direct_stats.io_barrier_us),
+            static_cast<unsigned>(direct_stats.panel_drain_us),
             static_cast<unsigned>(direct_stats.window_setup_us),
             static_cast<unsigned>(direct_stats.te_wait_us),
-            static_cast<unsigned>(direct_stats.pipeline_us),
             static_cast<unsigned>(direct_stats.stream_us),
             static_cast<unsigned>(direct_stats.copy_us),
             static_cast<unsigned>(direct_stats.byte_swap_us),
-            static_cast<unsigned>(direct_stats.dma_wait_us),
-            static_cast<unsigned>(direct_stats.overlap_saved_us),
+            static_cast<unsigned>(direct_stats.queue_wait_us),
+            static_cast<unsigned>(direct_stats.first_sequence),
+            static_cast<unsigned>(direct_stats.last_sequence),
             static_cast<unsigned>(direct_stats.chunks),
-            static_cast<unsigned>(direct_stats.queue_peak),
             static_cast<unsigned>(direct_stats.staging_rows),
             static_cast<unsigned>(direct_stats.staging_buffers),
             static_cast<unsigned>(direct_stats.staging_total_bytes),
             static_cast<unsigned>(g_dimmed_applied));
     } else if (replacing_track) {
         ESP_LOGI(TAG,
-            "R.29 封面整屏回退请求：%lu -> %lu，旧图保持到新Surface就绪",
+            "R.36.4 封面BoundedSPI回退请求：%lu -> %lu，旧图保持到新Surface就绪",
             static_cast<unsigned long>(previous_track),
             static_cast<unsigned long>(track_index));
     }

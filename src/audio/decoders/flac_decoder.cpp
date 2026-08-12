@@ -339,7 +339,7 @@ static FlacPrefetchQosState flac_prefetch_qos_observe(
         !context->qos_pressure_active
     ) {
         context->qos_pressure_active = true;
-        ++context->qos_emergency_entries;
+        context->qos_emergency_entries = context->qos_emergency_entries + 1U;
         ESP_LOGW(TAG,
             "R.36.2.2 FLAC预取进入Emergency：ring=%u/%uB (%u%%)，切换到最多%u次连续读取",
             static_cast<unsigned>(buffered_bytes),
@@ -351,7 +351,7 @@ static FlacPrefetchQosState flac_prefetch_qos_observe(
         (state == FlacPrefetchQosState::Normal || state == FlacPrefetchQosState::Plenty)
     ) {
         context->qos_pressure_active = false;
-        ++context->qos_recovered_count;
+        context->qos_recovered_count = context->qos_recovered_count + 1U;
         ESP_LOGI(TAG,
             "R.36.2.2 FLAC预取已恢复Normal：ring=%u/%uB (%u%%)",
             static_cast<unsigned>(buffered_bytes),
@@ -721,7 +721,7 @@ static void flac_prefetch_task(void *arg)
             if (cooperative_read_count >= cooperative_batch) {
                 cooperative_read_count = 0;
                 if (context->adaptive_qos_active) {
-                    ++context->qos_cooperative_blocks;
+                    context->qos_cooperative_blocks = context->qos_cooperative_blocks + 1U;
                 }
                 vTaskDelay(FLAC_PREFETCH_COOPERATIVE_BLOCK_TICKS);
             }

@@ -1,6 +1,7 @@
 #include "player_home.h"
 
 #include <stdio.h>
+#include <algorithm>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -85,26 +86,24 @@ static constexpr int16_t kLauncherTouchInnerRadius = kLauncherInnerRadius - 8;
 static constexpr int16_t kLauncherTouchOuterRadius =
     static_cast<int16_t>(kLauncherOuterRadius) + 8;
 static constexpr uint32_t kLauncherAnimDurationMs = 300U;
-// P1.5.3.2R.33.1：保留 R.33 的 12 帧 Flash I4 圆弧模板，但不再让 LVGL 每帧
-// 对整张 340x340 RGB565A8 做实时 Alpha Blend。Launcher 只从主页纯封面打开，Overlay
-// 会先隐藏，因此每次展开前从当前 CoverSurface normal RGB565 截取 340x340，并把与
-// 全屏 Launcher backdrop 完全相同的半透明黑层一次性预合成到 Base；动画帧只在 Work
-// 上覆盖扇区/图标，LVGL 最终消费纯 RGB565。视觉仍是“封面透过半透明黑层 + 圆弧展开”，
-// 但 300ms 动画关键路径不再扫描 115,600 个 A8 像素做背景混合。
-static constexpr uint32_t kLauncherFrameStride = kLauncherPanelSize * sizeof(uint16_t);
-static constexpr uint32_t kLauncherFrameBufferBytes = kLauncherFrameStride * kLauncherPanelSize;
-static constexpr uint32_t kLauncherBaseStride = FAKEPOD_LCD_WIDTH * sizeof(uint16_t);
-static constexpr uint32_t kLauncherBaseBufferBytes =
+// P1.5.3.2R.36.6.1：保持 R.36.6 的 0B PanelWork；进一步把 PackBits 热路径改成 run-level fast path。
+// BoundedSPI 每次请求下一块 DMA staging 时，Strip Compositor 直接从当前
+// CoverSurface.dimmed 拷入对应背景行、顺序展开 I4 RLE、叠加中心圆/图标，再由显示层
+// 原地 byte-swap 后入队。这样继续复用 R.36.4 的有界 transaction 生命周期，同时
+// 再释放 231,200B Launcher 专用 PSRAM。
+static constexpr uint32_t kLauncherSurfaceStride = FAKEPOD_LCD_WIDTH * sizeof(uint16_t);
+static constexpr uint32_t kLauncherPanelWorkBytesSaved =
+    static_cast<uint32_t>(kLauncherPanelSize) * kLauncherPanelSize * sizeof(uint16_t);
+static constexpr uint32_t kLauncherFullBaseBytesSaved =
     static_cast<uint32_t>(FAKEPOD_LCD_WIDTH) * FAKEPOD_LCD_HEIGHT * sizeof(uint16_t);
 static constexpr uint8_t kLauncherFrameInvalid = 0xFFU;
 static constexpr lv_opa_t kLauncherSectorAaOpa = 112U;
-static constexpr int16_t kLauncherCenterOverlaySize = 150;
 static_assert(kLauncherAnimationAssetWidth == kLauncherPanelSize);
 static_assert(kLauncherAnimationAssetHeight == kLauncherPanelSize);
 static_assert(kLauncherAnimationAssetPixelBytes * 2U ==
     static_cast<uint32_t>(kLauncherPanelSize) * static_cast<uint32_t>(kLauncherPanelSize));
-static_assert(kLauncherFrameBufferBytes == 231200U);
-static_assert(kLauncherBaseBufferBytes == 423200U);
+static_assert(kLauncherPanelWorkBytesSaved == 231200U);
+static_assert(kLauncherFullBaseBytesSaved == 423200U);
 
 // lv_draw_arc 的角度约定：0°在下、90°在右、180°在上、270°在左。
 enum class LauncherIconKind : uint8_t {
@@ -197,33 +196,38 @@ static bool g_overlay_visible = false;
 static lv_obj_t *g_launcher = nullptr;
 static lv_obj_t *g_launcher_backdrop = nullptr;
 static lv_obj_t *g_launcher_panel = nullptr;
-static lv_obj_t *g_launcher_frame_canvas = nullptr;
-static lv_obj_t *g_launcher_center_overlay = nullptr;
-static uint8_t *g_launcher_frame_buffer = nullptr;
-static uint8_t *g_launcher_base_buffer = nullptr;
-static lv_draw_buf_t g_launcher_frame_draw_buf = {};
+static CoverSurfaceLease g_launcher_surface_lease = {};
+static const uint8_t *g_launcher_surface_source = nullptr;
 static bool g_launcher_frame_cache_ready = false;
 static bool g_launcher_frame_cache_active = false;
-static bool g_launcher_base_ready = false;
-static uint32_t g_launcher_base_track = UINT32_MAX;
-static uint32_t g_launcher_base_prepare_us = 0U;
+static bool g_launcher_surface_lease_ready = false;
+static uint32_t g_launcher_surface_lease_track = UINT32_MAX;
+static uint32_t g_launcher_surface_lease_us = 0U;
 // I4 仍负责把 7 个扇区身份压在 Flash 中。纯 RGB565 路径只需要颜色 LUT；
-// index=0 直接保留已预合成好的 Base，8..14 仅在稀疏 AA 边缘做一次小范围 blend。
+// index=0 直接保留从 dimmed Surface lease 拷入 DMA strip 的背景，8..14 仅在稀疏 AA 边缘 blend。
 static uint16_t g_launcher_index_color565[16] = {};
 static uint8_t g_launcher_index_alpha[16] = {};
 static uint32_t g_launcher_color_pair_lut[256] = {};
+// R.36.6.1：把每个 packed pair 预分类，热路径不再每 pair 重复查两次 alpha。
+// 0=完全透明保留背景，1=双像素全不透明可32bit批量写，2=需要逐像素透明/AA处理。
+static uint8_t g_launcher_pair_mode[256] = {};
 static uint8_t g_launcher_frame_index = kLauncherFrameInvalid;
 static uint32_t g_launcher_frame_decode_count = 0U;
 static uint32_t g_launcher_frame_decode_us = 0U;
 static uint32_t g_launcher_frame_decode_max_us = 0U;
-// R.33.2：Launcher 动画帧原先可走局部 Continuous GRAM。
-// R.36.2.1：实机证明 esp_lcd SPI Panel IO 的 tx_param/tx_color 内部仍含 portMAX_DELAY
-// 队列回收；Launcher 高频 DirectFrame 反复切换 LVGL/Direct callback ownership 后，下一帧可能
-// 永久阻塞在驱动内部，应用层 250ms timeout 根本没有机会执行。先强制 Launcher 回到已经存在的
-// R.33.1 RGB565 Canvas/LVGL 官方 flush 路径，保持 Flash 12帧/预合成 Work 外观不变，优先保证 UI 不死。
+// R.33.2：Launcher 动画曾复用 esp_lcd Panel IO 做 Continuous GRAM，实机反复开关会被
+// Panel IO 内部 portMAX_DELAY 永久卡死。R.36.2.1 因此先回退 LVGL 安全路径。
+// R.36.3：重新启用高速路径，但不再调用旧 Panel IO DirectPresent；改用 display 层的
+// Launcher BoundedSPI session：同一个 SPI device、独立 transaction identity、所有 queue/get
+// 都有 deadline；可安全回收的失败结束 session 并回到 R.36.2.1 LVGL Canvas，无法回收
+// descriptor 的异常则受控重启，避免旧式永久卡死。
+#ifndef APP_DISPLAY_LAUNCHER_BOUNDED_SPI
+#define APP_DISPLAY_LAUNCHER_BOUNDED_SPI 1
+#endif
+static constexpr bool kLauncherBoundedSpiEnabled = APP_DISPLAY_LAUNCHER_BOUNDED_SPI != 0;
+// 旧共享 Panel IO DirectScene 永久保持关闭，作为历史代码/封面 DirectPresent 兼容路径保留。
 static constexpr bool kLauncherDirectSceneEnabled = false;
-// 同理，全屏页面回主页不再额外插入一次 DirectPresent；重新绑定 current Surface 后交给 LVGL
-// 完成物理刷新，避免页面恢复再次跨越同一套共享 Panel IO callback ownership。
+// 全屏页面回主页继续保持 R.36.2.1 的 LVGL 安全恢复，不参与 R.36.3 Launcher 专用实验。
 static constexpr bool kFullscreenHomeResumeDirectEnabled = false;
 static bool g_launcher_direct_frame_active = false;
 static uint32_t g_launcher_direct_present_count = 0U;
@@ -864,48 +868,36 @@ static uint16_t player_home_launcher_blend_rgb565(uint16_t background, uint16_t 
     return static_cast<uint16_t>((rr << 11) | (rg << 5) | rb);
 }
 
-static uint16_t player_home_launcher_dim_to_backdrop(uint16_t pixel)
+static void player_home_launcher_release_surface_lease()
 {
-    // R.33.2：Launcher backdrop 是纯黑，所以 alpha blend 可化简为 RGB 通道乘一个固定比例。
-    // 用 565 通道 LUT 避免 R.33.1 每像素 3 次除法，把整屏半透明 Base 准备移出关键路径。
-    static bool lut_ready = false;
-    static uint8_t r5[32] = {};
-    static uint8_t g6[64] = {};
-    static uint8_t b5[32] = {};
-    if (!lut_ready) {
-        const uint32_t keep = 255U - static_cast<uint32_t>(kLauncherBackdropOpa);
-        for (uint32_t i = 0U; i < 32U; ++i) {
-            r5[i] = static_cast<uint8_t>((i * keep + 127U) / 255U);
-            b5[i] = r5[i];
-        }
-        for (uint32_t i = 0U; i < 64U; ++i) {
-            g6[i] = static_cast<uint8_t>((i * keep + 127U) / 255U);
-        }
-        lut_ready = true;
+    if (g_launcher_surface_lease.slot_index != 0xFFU) {
+        cover_surface_cache_release(&g_launcher_surface_lease);
     }
-    return static_cast<uint16_t>(
-        (static_cast<uint16_t>(r5[(pixel >> 11U) & 0x1FU]) << 11U) |
-        (static_cast<uint16_t>(g6[(pixel >> 5U) & 0x3FU]) << 5U) |
-        b5[pixel & 0x1FU]);
+    g_launcher_surface_source = nullptr;
+    g_launcher_surface_lease_ready = false;
+    g_launcher_surface_lease_track = UINT32_MAX;
 }
 
-static bool player_home_launcher_prepare_precomposited_base()
+static bool player_home_launcher_acquire_surface(
+    uint32_t track_index,
+    CoverSurfaceLease *out_lease,
+    uint32_t *out_acquire_us)
 {
-    g_launcher_base_ready = false;
-    g_launcher_base_track = UINT32_MAX;
-    g_launcher_base_prepare_us = 0U;
-    if (g_launcher_base_buffer == nullptr || g_launcher_frame_buffer == nullptr ||
-        !player_state_is_ready()) {
+    if (out_lease == nullptr) {
         return false;
     }
+    *out_lease = {};
+    if (out_acquire_us != nullptr) {
+        *out_acquire_us = 0U;
+    }
 
-    const uint32_t track_index = static_cast<uint32_t>(player_state_get_index());
+    const int64_t started_us = esp_timer_get_time();
     CoverSurfaceLease lease = {};
     if (!cover_surface_cache_acquire(track_index, &lease)) {
         return false;
     }
 
-    const bool valid = lease.normal_rgb565 != nullptr &&
+    const bool valid = lease.dimmed_rgb565 != nullptr &&
         lease.width == FAKEPOD_LCD_WIDTH && lease.height == FAKEPOD_LCD_HEIGHT &&
         lease.data_size >= static_cast<size_t>(FAKEPOD_LCD_WIDTH) * FAKEPOD_LCD_HEIGHT * 2U;
     if (!valid) {
@@ -913,18 +905,35 @@ static bool player_home_launcher_prepare_precomposited_base()
         return false;
     }
 
-    const int64_t started_us = esp_timer_get_time();
-    const uint16_t *source = reinterpret_cast<const uint16_t *>(lease.normal_rgb565);
-    uint16_t *base = reinterpret_cast<uint16_t *>(g_launcher_base_buffer);
-    const size_t pixels = static_cast<size_t>(FAKEPOD_LCD_WIDTH) * FAKEPOD_LCD_HEIGHT;
-    for (size_t i = 0U; i < pixels; ++i) {
-        base[i] = player_home_launcher_dim_to_backdrop(source[i]);
+    if (out_acquire_us != nullptr) {
+        *out_acquire_us = static_cast<uint32_t>(esp_timer_get_time() - started_us);
     }
-    cover_surface_cache_release(&lease);
+    *out_lease = lease;
+    return true;
+}
 
-    g_launcher_base_prepare_us = static_cast<uint32_t>(esp_timer_get_time() - started_us);
-    g_launcher_base_track = track_index;
-    g_launcher_base_ready = true;
+static bool player_home_launcher_prepare_surface_lease()
+{
+    player_home_launcher_release_surface_lease();
+    g_launcher_surface_lease_us = 0U;
+    if (!player_state_is_ready()) {
+        return false;
+    }
+
+    const uint32_t track_index = static_cast<uint32_t>(player_state_get_index());
+    CoverSurfaceLease lease = {};
+    uint32_t acquire_us = 0U;
+    if (!player_home_launcher_acquire_surface(track_index, &lease, &acquire_us)) {
+        return false;
+    }
+
+    // R.36.6：lease 必须贯穿整个 Launcher 生命周期。Cover cache 的 pin_count 保证
+    // 切歌/retain 时这张 Surface 不会被回收；退出 Launcher 后再统一 release。
+    g_launcher_surface_lease = lease;
+    g_launcher_surface_source = lease.dimmed_rgb565;
+    g_launcher_surface_lease_us = acquire_us;
+    g_launcher_surface_lease_track = track_index;
+    g_launcher_surface_lease_ready = true;
     return true;
 }
 
@@ -954,49 +963,87 @@ static void player_home_launcher_update_frame_lut()
         g_launcher_color_pair_lut[packed] =
             static_cast<uint32_t>(g_launcher_index_color565[left]) |
             (static_cast<uint32_t>(g_launcher_index_color565[right]) << 16);
+        const uint8_t left_alpha = g_launcher_index_alpha[left];
+        const uint8_t right_alpha = g_launcher_index_alpha[right];
+        if (left_alpha == 0U && right_alpha == 0U) {
+            g_launcher_pair_mode[packed] = 0U;
+        }
+        else if (left_alpha == LV_OPA_COVER && right_alpha == LV_OPA_COVER) {
+            g_launcher_pair_mode[packed] = 1U;
+        }
+        else {
+            g_launcher_pair_mode[packed] = 2U;
+        }
     }
 }
 
+struct LauncherStripRasterTarget
+{
+    uint16_t *pixels = nullptr;
+    int32_t y_begin = 0;
+    int32_t rows = 0;
+};
+
+struct LauncherStripComposeContext
+{
+    const LauncherAnimationFrameAsset *asset = nullptr;
+    const uint8_t *surface = nullptr;
+    const uint8_t *src = nullptr;
+    const uint8_t *src_end = nullptr;
+    uint32_t pair_index = 0U;
+    uint32_t run_remaining = 0U;
+    uint32_t fast_skip_pairs = 0U;
+    uint32_t fast_fill_pairs = 0U;
+    uint32_t literal_pairs = 0U;
+    uint32_t repeat_blend_pairs = 0U;
+    uint8_t repeat_value = 0U;
+    bool repeat_run = false;
+};
+
 static void player_home_launcher_raster_pixel(
-    uint16_t *pixels,
+    const LauncherStripRasterTarget &target,
     int32_t x,
     int32_t y,
     uint16_t color,
     uint8_t opacity)
 {
-    if (pixels == nullptr || x < 0 || y < 0 || x >= kLauncherPanelSize || y >= kLauncherPanelSize) {
+    if (target.pixels == nullptr || x < 0 || x >= kLauncherPanelSize ||
+        y < target.y_begin || y >= target.y_begin + target.rows) {
         return;
     }
-    uint16_t &dst = pixels[static_cast<size_t>(y) * kLauncherPanelSize + x];
+    uint16_t &dst = target.pixels[
+        static_cast<size_t>(y - target.y_begin) * kLauncherPanelSize + x];
     dst = player_home_launcher_blend_rgb565(dst, color, opacity);
 }
 
 static void player_home_launcher_raster_disk(
-    uint16_t *pixels,
+    const LauncherStripRasterTarget &target,
     int32_t cx,
     int32_t cy,
     int32_t diameter,
     uint16_t color,
     uint8_t opacity)
 {
-    if (diameter <= 0) {
+    if (diameter <= 0 || target.rows <= 0) {
         return;
     }
     const int32_t radius = diameter / 2;
     const int32_t radius_sq = radius * radius;
-    for (int32_t y = cy - radius; y <= cy + radius; ++y) {
+    const int32_t y_first = std::max(cy - radius, target.y_begin);
+    const int32_t y_last = std::min(cy + radius, target.y_begin + target.rows - 1);
+    for (int32_t y = y_first; y <= y_last; ++y) {
         const int32_t dy = y - cy;
         for (int32_t x = cx - radius; x <= cx + radius; ++x) {
             const int32_t dx = x - cx;
             if (dx * dx + dy * dy <= radius_sq) {
-                player_home_launcher_raster_pixel(pixels, x, y, color, opacity);
+                player_home_launcher_raster_pixel(target, x, y, color, opacity);
             }
         }
     }
 }
 
 static void player_home_launcher_raster_line(
-    uint16_t *pixels,
+    const LauncherStripRasterTarget &target,
     int32_t x0,
     int32_t y0,
     int32_t x1,
@@ -1012,7 +1059,10 @@ static void player_home_launcher_raster_line(
     int32_t err = dx + dy;
     const int32_t diameter = width < 2 ? 2 : width;
     while (true) {
-        player_home_launcher_raster_disk(pixels, x0, y0, diameter, color, opacity);
+        if (y0 + diameter / 2 >= target.y_begin &&
+            y0 - diameter / 2 < target.y_begin + target.rows) {
+            player_home_launcher_raster_disk(target, x0, y0, diameter, color, opacity);
+        }
         if (x0 == x1 && y0 == y1) {
             break;
         }
@@ -1029,7 +1079,7 @@ static void player_home_launcher_raster_line(
 }
 
 static void player_home_launcher_raster_icon(
-    uint16_t *pixels,
+    const LauncherStripRasterTarget &target,
     LauncherIconKind icon,
     int32_t cx,
     int32_t cy,
@@ -1046,7 +1096,7 @@ static void player_home_launcher_raster_icon(
     const int32_t line_width = scale_percent >= 120 ? 4 : (scale_percent >= 70 ? 3 : 2);
     auto line = [&](int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
         player_home_launcher_raster_line(
-            pixels,
+            target,
             cx + scale(x0), cy + scale(y0),
             cx + scale(x1), cy + scale(y1),
             line_width, color, LV_OPA_COVER);
@@ -1054,12 +1104,11 @@ static void player_home_launcher_raster_icon(
     auto dot = [&](int32_t x, int32_t y, int32_t diameter) {
         const int32_t d = scale(diameter) < 3 ? 3 : scale(diameter);
         player_home_launcher_raster_disk(
-            pixels, cx + scale(x), cy + scale(y), d, color, LV_OPA_COVER);
+            target, cx + scale(x), cy + scale(y), d, color, LV_OPA_COVER);
     };
 
     switch (icon) {
         case LauncherIconKind::Music:
-            // R.35.3.2：中心 DirectFrame 与 Flash/LVGL fallback 同源几何。
             line(-4, -16, -4, 7); line(-4, -16, 15, -20); line(15, -20, 15, 2);
             dot(-11, 10, 10); dot(8, 4, 10);
             break;
@@ -1098,9 +1147,11 @@ static void player_home_launcher_raster_icon(
     }
 }
 
-static void player_home_launcher_raster_center(uint16_t *pixels, int32_t progress)
+static void player_home_launcher_raster_center(
+    const LauncherStripRasterTarget &target,
+    int32_t progress)
 {
-    if (pixels == nullptr || progress <= 0) {
+    if (target.pixels == nullptr || progress <= 0) {
         return;
     }
     if (progress > kLauncherAnimProgressMax) {
@@ -1119,7 +1170,10 @@ static void player_home_launcher_raster_center(uint16_t *pixels, int32_t progres
     const int32_t inner_sq = inner_radius * inner_radius;
     const uint16_t fill = lv_color_to_u16(lv_color_hex(0x05070B));
     const uint16_t border = lv_color_to_u16(lv_color_hex(0x161B27));
-    for (int32_t y = kLauncherCenterY - radius; y <= kLauncherCenterY + radius; ++y) {
+    const int32_t y_first = std::max(kLauncherCenterY - radius, target.y_begin);
+    const int32_t y_last = std::min(
+        kLauncherCenterY + radius, target.y_begin + target.rows - 1);
+    for (int32_t y = y_first; y <= y_last; ++y) {
         const int32_t dy = y - kLauncherCenterY;
         for (int32_t x = kLauncherCenterX - radius; x <= kLauncherCenterX + radius; ++x) {
             const int32_t dx = x - kLauncherCenterX;
@@ -1128,7 +1182,7 @@ static void player_home_launcher_raster_center(uint16_t *pixels, int32_t progres
                 continue;
             }
             player_home_launcher_raster_pixel(
-                pixels, x, y,
+                target, x, y,
                 d2 >= inner_sq ? border : fill,
                 d2 >= inner_sq ? static_cast<uint8_t>(LV_OPA_COVER) : static_cast<uint8_t>(245U));
         }
@@ -1137,7 +1191,7 @@ static void player_home_launcher_raster_center(uint16_t *pixels, int32_t progres
     const LauncherMenuItemDef &selected = kLauncherItems[g_launcher_selected_index];
     const int32_t icon_scale = 78 + (54 * progress) / kLauncherAnimProgressMax;
     player_home_launcher_raster_icon(
-        pixels,
+        target,
         selected.icon,
         kLauncherCenterX + (selected.optical_x * progress) / kLauncherAnimProgressMax,
         kLauncherCenterY + (selected.optical_y * progress) / kLauncherAnimProgressMax,
@@ -1145,127 +1199,184 @@ static void player_home_launcher_raster_center(uint16_t *pixels, int32_t progres
         lv_color_to_u16(lv_color_hex(kLauncherAccentRgb)));
 }
 
-static bool player_home_launcher_decode_cached_frame(uint8_t frame_index)
+static bool player_home_launcher_strip_load_run(
+    LauncherStripComposeContext *context)
 {
-    if (g_launcher_frame_buffer == nullptr || g_launcher_base_buffer == nullptr ||
-        !g_launcher_base_ready || frame_index >= kLauncherAnimationAssetFrameCount) {
+    if (context == nullptr || context->src == nullptr) {
+        return false;
+    }
+    if (context->run_remaining != 0U) {
+        return true;
+    }
+    if (context->src >= context->src_end) {
         return false;
     }
 
-    const LauncherAnimationFrameAsset &asset = g_launcher_animation_frames[frame_index];
-    const uint8_t *src = asset.data;
-    const uint8_t *src_end = asset.data + asset.size;
-    // R.33.2 Base 扩展为完整 460x460 半透明背景；Work 仍只保留中央 340x340。
-    // 每帧只复制 panel 对应行，随后覆盖预烘焙扇区/图标并软件合成中心圆。
-    for (int32_t y = 0; y < kLauncherPanelSize; ++y) {
-        const uint8_t *src_row = g_launcher_base_buffer +
-            static_cast<size_t>(y + kLauncherPanelShownY) * kLauncherBaseStride +
-            static_cast<size_t>(kLauncherPanelX) * sizeof(uint16_t);
-        uint8_t *dst_row = g_launcher_frame_buffer +
-            static_cast<size_t>(y) * kLauncherFrameStride;
-        memcpy(dst_row, src_row, kLauncherFrameStride);
-    }
-    uint32_t *color_pairs = reinterpret_cast<uint32_t *>(g_launcher_frame_buffer);
-    uint16_t *pixels = reinterpret_cast<uint16_t *>(g_launcher_frame_buffer);
-    const uint32_t pair_count_expected = kLauncherAnimationAssetPixelBytes;
-    uint32_t pair_count = 0U;
-    const int64_t started_us = esp_timer_get_time();
-
-    auto apply_packed = [&](uint32_t pair_index, uint8_t packed) {
-        if (packed == 0U) {
-            return;
-        }
-        const uint8_t left = static_cast<uint8_t>((packed >> 4) & 0x0FU);
-        const uint8_t right = static_cast<uint8_t>(packed & 0x0FU);
-        uint16_t *dst = pixels + pair_index * 2U;
-        const uint8_t left_alpha = g_launcher_index_alpha[left];
-        const uint8_t right_alpha = g_launcher_index_alpha[right];
-        if (left_alpha == LV_OPA_COVER && right_alpha == LV_OPA_COVER) {
-            color_pairs[pair_index] = g_launcher_color_pair_lut[packed];
-            return;
-        }
-        if (left_alpha != 0U) {
-            dst[0] = player_home_launcher_blend_rgb565(
-                dst[0], g_launcher_index_color565[left], left_alpha);
-        }
-        if (right_alpha != 0U) {
-            dst[1] = player_home_launcher_blend_rgb565(
-                dst[1], g_launcher_index_color565[right], right_alpha);
-        }
-    };
-
-    while (src < src_end && pair_count < pair_count_expected) {
-        const uint8_t control = *src++;
-        const uint32_t count = static_cast<uint32_t>(control & 0x7FU) + 1U;
-        if (count > pair_count_expected - pair_count) {
-            ESP_LOGE(TAG, "R.33.1 Launcher帧展开越界：frame=%u count=%u remain=%u",
-                static_cast<unsigned>(frame_index),
-                static_cast<unsigned>(count),
-                static_cast<unsigned>(pair_count_expected - pair_count));
+    const uint8_t control = *context->src++;
+    context->run_remaining = static_cast<uint32_t>(control & 0x7FU) + 1U;
+    context->repeat_run = (control & 0x80U) != 0U;
+    if (context->repeat_run) {
+        if (context->src >= context->src_end) {
             return false;
         }
+        context->repeat_value = *context->src++;
+    }
+    else if (context->run_remaining > static_cast<uint32_t>(context->src_end - context->src)) {
+        return false;
+    }
+    return true;
+}
 
-        if ((control & 0x80U) != 0U) {
-            if (src >= src_end) {
-                return false;
+static inline void player_home_launcher_apply_packed_pair(
+    uint8_t packed,
+    uint16_t *dst)
+{
+    const uint8_t mode = g_launcher_pair_mode[packed];
+    if (mode == 0U) {
+        return;
+    }
+    if (mode == 1U) {
+        const uint32_t pair_color = g_launcher_color_pair_lut[packed];
+        memcpy(dst, &pair_color, sizeof(pair_color));
+        return;
+    }
+
+    const uint8_t left = static_cast<uint8_t>((packed >> 4) & 0x0FU);
+    const uint8_t right = static_cast<uint8_t>(packed & 0x0FU);
+    const uint8_t left_alpha = g_launcher_index_alpha[left];
+    const uint8_t right_alpha = g_launcher_index_alpha[right];
+    if (left_alpha != 0U) {
+        dst[0] = player_home_launcher_blend_rgb565(
+            dst[0], g_launcher_index_color565[left], left_alpha);
+    }
+    if (right_alpha != 0U) {
+        dst[1] = player_home_launcher_blend_rgb565(
+            dst[1], g_launcher_index_color565[right], right_alpha);
+    }
+}
+
+static esp_err_t player_home_launcher_compose_strip(
+    void *opaque,
+    uint16_t source_y,
+    uint16_t rows,
+    uint16_t width,
+    uint8_t *dst_native_rgb565,
+    size_t dst_bytes)
+{
+    LauncherStripComposeContext *context =
+        static_cast<LauncherStripComposeContext *>(opaque);
+    if (context == nullptr || context->asset == nullptr || context->surface == nullptr ||
+        dst_native_rgb565 == nullptr || width != kLauncherPanelSize || rows == 0U ||
+        dst_bytes < static_cast<size_t>(width) * rows * sizeof(uint16_t)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const uint32_t expected_pair =
+        static_cast<uint32_t>(source_y) * static_cast<uint32_t>(width / 2U);
+    if (context->pair_index != expected_pair) {
+        ESP_LOGE(TAG,
+            "R.36.6.1 Launcher Strip顺序异常：expected_pair=%u actual=%u y=%u rows=%u",
+            static_cast<unsigned>(expected_pair),
+            static_cast<unsigned>(context->pair_index),
+            static_cast<unsigned>(source_y),
+            static_cast<unsigned>(rows));
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // 背景仍按行从 pinned CoverSurface.dimmed 拷入当前 DMA staging。
+    for (uint16_t row = 0U; row < rows; ++row) {
+        const uint8_t *src_row = context->surface +
+            static_cast<size_t>(source_y + row + kLauncherPanelShownY) * kLauncherSurfaceStride +
+            static_cast<size_t>(kLauncherPanelX) * sizeof(uint16_t);
+        uint8_t *dst_row = dst_native_rgb565 +
+            static_cast<size_t>(row) * width * sizeof(uint16_t);
+        memcpy(dst_row, src_row, static_cast<size_t>(width) * sizeof(uint16_t));
+    }
+
+    uint16_t *pixels = reinterpret_cast<uint16_t *>(dst_native_rgb565);
+    const uint32_t strip_pairs =
+        static_cast<uint32_t>(rows) * static_cast<uint32_t>(width / 2U);
+    uint32_t local_pair = 0U;
+    while (local_pair < strip_pairs) {
+        if (!player_home_launcher_strip_load_run(context)) {
+            ESP_LOGE(TAG,
+                "R.36.6.1 Launcher I4流提前结束：frame_progress=%d pair=%u/%u",
+                static_cast<int>(context->asset->progress),
+                static_cast<unsigned>(context->pair_index),
+                static_cast<unsigned>(kLauncherAnimationAssetPixelBytes));
+            return ESP_ERR_INVALID_SIZE;
+        }
+
+        const uint32_t take = std::min(
+            context->run_remaining, strip_pairs - local_pair);
+        uint16_t *dst = pixels + local_pair * 2U;
+
+        if (context->repeat_run) {
+            const uint8_t packed = context->repeat_value;
+            const uint8_t mode = g_launcher_pair_mode[packed];
+            if (mode == 0U) {
+                // 大段透明 pair 直接跨过，不再逐 pair 进入状态机。
+                context->fast_skip_pairs += take;
             }
-            const uint8_t packed = *src++;
-            if (packed == 0U) {
-                pair_count += count;
+            else if (mode == 1U) {
+                // 两个像素都全不透明时，一个32bit颜色对直接批量覆盖。
+                const uint32_t pair_color = g_launcher_color_pair_lut[packed];
+                uint32_t *dst32 = reinterpret_cast<uint32_t *>(dst);
+                std::fill_n(dst32, take, pair_color);
+                context->fast_fill_pairs += take;
             }
             else {
-                const uint8_t left = static_cast<uint8_t>((packed >> 4) & 0x0FU);
-                const uint8_t right = static_cast<uint8_t>(packed & 0x0FU);
-                if (g_launcher_index_alpha[left] == LV_OPA_COVER &&
-                    g_launcher_index_alpha[right] == LV_OPA_COVER) {
-                    const uint32_t pair_color = g_launcher_color_pair_lut[packed];
-                    for (uint32_t i = 0U; i < count; ++i) {
-                        color_pairs[pair_count++] = pair_color;
-                    }
+                for (uint32_t i = 0U; i < take; ++i) {
+                    player_home_launcher_apply_packed_pair(packed, dst + i * 2U);
                 }
-                else {
-                    for (uint32_t i = 0U; i < count; ++i) {
-                        apply_packed(pair_count, packed);
-                        ++pair_count;
-                    }
-                }
+                context->repeat_blend_pairs += take;
             }
         }
         else {
-            if (count > static_cast<uint32_t>(src_end - src)) {
-                return false;
+            // literal run 本来就很短；只对其实际 packed pair 做逐项处理。
+            for (uint32_t i = 0U; i < take; ++i) {
+                player_home_launcher_apply_packed_pair(context->src[i], dst + i * 2U);
             }
-            for (uint32_t i = 0U; i < count; ++i) {
-                apply_packed(pair_count, *src++);
-                ++pair_count;
-            }
+            context->src += take;
+            context->literal_pairs += take;
+        }
+
+        context->run_remaining -= take;
+        context->pair_index += take;
+        local_pair += take;
+    }
+
+    const LauncherStripRasterTarget target = {
+        pixels,
+        static_cast<int32_t>(source_y),
+        static_cast<int32_t>(rows)};
+    player_home_launcher_raster_center(target, context->asset->progress);
+
+    if (static_cast<uint32_t>(source_y) + rows == kLauncherPanelSize) {
+        if (context->pair_index != kLauncherAnimationAssetPixelBytes ||
+            context->run_remaining != 0U || context->src != context->src_end) {
+            ESP_LOGE(TAG,
+                "R.36.6.1 Launcher I4流长度异常：pairs=%u/%u src=%u/%u remain=%u",
+                static_cast<unsigned>(context->pair_index),
+                static_cast<unsigned>(kLauncherAnimationAssetPixelBytes),
+                static_cast<unsigned>(context->src - context->asset->data),
+                static_cast<unsigned>(context->asset->size),
+                static_cast<unsigned>(context->run_remaining));
+            return ESP_ERR_INVALID_SIZE;
         }
     }
+    return ESP_OK;
+}
 
-    if (src != src_end || pair_count != pair_count_expected) {
-        ESP_LOGE(TAG,
-            "R.33.1 Launcher帧展开长度异常：frame=%u src=%u/%u pairs=%u/%u",
-            static_cast<unsigned>(frame_index),
-            static_cast<unsigned>(src - asset.data),
-            static_cast<unsigned>(asset.size),
-            static_cast<unsigned>(pair_count),
-            static_cast<unsigned>(pair_count_expected));
+static bool player_home_launcher_decode_cached_frame(uint8_t frame_index)
+{
+    if (g_launcher_surface_source == nullptr || !g_launcher_surface_lease_ready ||
+        frame_index >= kLauncherAnimationAssetFrameCount) {
         return false;
     }
-
-    // 中心圆/粉色功能图标也直接烘到 Work，DirectPresent 动画期间不再依赖 LVGL overlay。
-    player_home_launcher_raster_center(pixels, asset.progress);
-
-    const uint32_t cost_us = static_cast<uint32_t>(esp_timer_get_time() - started_us);
-    ++g_launcher_frame_decode_count;
-    g_launcher_frame_decode_us += cost_us;
-    if (cost_us > g_launcher_frame_decode_max_us) {
-        g_launcher_frame_decode_max_us = cost_us;
-    }
+    // R.36.6 不再生成完整 340x340 Work；这里只更新离散帧身份。
+    // 真正 I4 解码在 BoundedSPI 请求每个 staging strip 时顺序完成。
     g_launcher_frame_index = frame_index;
-    if (!g_launcher_direct_frame_active && g_launcher_frame_canvas != nullptr) {
-        lv_obj_invalidate(g_launcher_frame_canvas);
-    }
     return true;
 }
 
@@ -1281,29 +1392,46 @@ static void player_home_launcher_reset_direct_stats()
 
 static bool player_home_launcher_present_work_direct()
 {
-    if (!g_launcher_direct_frame_active || g_launcher_frame_buffer == nullptr) {
+    if (!g_launcher_direct_frame_active || !g_launcher_surface_lease_ready ||
+        g_launcher_surface_source == nullptr ||
+        g_launcher_frame_index >= kLauncherAnimationAssetFrameCount ||
+        !display_launcher_bounded_spi_session_active()) {
         return false;
     }
-    DisplayDirectPresentStats stats = {};
-    const esp_err_t ret = display_present_rgb565_region_direct_owned(
-        g_launcher_frame_buffer,
+
+    const LauncherAnimationFrameAsset &asset = g_launcher_animation_frames[g_launcher_frame_index];
+    LauncherStripComposeContext compose = {};
+    compose.asset = &asset;
+    compose.surface = g_launcher_surface_source;
+    compose.src = asset.data;
+    compose.src_end = asset.data + asset.size;
+
+    DisplayBoundedSpiStats stats = {};
+    const esp_err_t ret = display_launcher_bounded_spi_present_stream(
+        player_home_launcher_compose_strip,
+        &compose,
         static_cast<uint16_t>(kLauncherPanelX),
         static_cast<uint16_t>(kLauncherPanelShownY),
         static_cast<uint16_t>(kLauncherPanelSize),
         static_cast<uint16_t>(kLauncherPanelSize),
         false,
-        false,
         &stats);
     if (ret != ESP_OK) {
         ++g_launcher_direct_failures;
         ESP_LOGW(TAG,
-            "R.33.2 Launcher局部DirectPresent失败：frame=%u ret=%s failures=%u",
+            "R.36.6 Launcher StripFrame失败：gen=%u frame=%u ret=%s failures=%u",
+            static_cast<unsigned>(stats.generation),
             static_cast<unsigned>(g_launcher_frame_index),
             esp_err_to_name(ret),
             static_cast<unsigned>(g_launcher_direct_failures));
         return false;
     }
 
+    ++g_launcher_frame_decode_count;
+    g_launcher_frame_decode_us += stats.producer_us;
+    if (stats.producer_us > g_launcher_frame_decode_max_us) {
+        g_launcher_frame_decode_max_us = stats.producer_us;
+    }
     ++g_launcher_direct_present_count;
     g_launcher_direct_present_us += stats.total_us;
     g_launcher_direct_stream_us += stats.stream_us;
@@ -1316,15 +1444,20 @@ static bool player_home_launcher_present_work_direct()
     if (g_launcher_direct_present_count <= 3U ||
         g_launcher_frame_index == static_cast<uint8_t>(kLauncherAnimationAssetFrameCount - 1U)) {
         ESP_LOGI(TAG,
-            "R.35.3.3 LauncherDirectFrame：frame=%u total=%uus barrier=%uus stream=%uus pipeline=%uus swap=%uus copy=%uus wait=%uus chunks=%u staging=%u行×%u",
+            "R.36.6.1 LauncherStripFrame：gen=%u seq=%u..%u frame=%u total=%uus compose=%uus stream=%uus swap=%uus wait=%uus pairs(skip/fill/lit/blend)=%u/%u/%u/%u chunks=%u staging=%u行×%u PanelWork=0B",
+            static_cast<unsigned>(stats.generation),
+            static_cast<unsigned>(stats.first_sequence),
+            static_cast<unsigned>(stats.last_sequence),
             static_cast<unsigned>(g_launcher_frame_index),
             static_cast<unsigned>(stats.total_us),
-            static_cast<unsigned>(stats.io_barrier_us),
+            static_cast<unsigned>(stats.producer_us),
             static_cast<unsigned>(stats.stream_us),
-            static_cast<unsigned>(stats.pipeline_us),
             static_cast<unsigned>(stats.byte_swap_us),
-            static_cast<unsigned>(stats.copy_us),
-            static_cast<unsigned>(stats.dma_wait_us),
+            static_cast<unsigned>(stats.queue_wait_us),
+            static_cast<unsigned>(compose.fast_skip_pairs),
+            static_cast<unsigned>(compose.fast_fill_pairs),
+            static_cast<unsigned>(compose.literal_pairs),
+            static_cast<unsigned>(compose.repeat_blend_pairs),
             static_cast<unsigned>(stats.chunks),
             static_cast<unsigned>(stats.staging_rows),
             static_cast<unsigned>(stats.staging_buffers));
@@ -1337,13 +1470,17 @@ static void player_home_launcher_switch_to_lvgl_fallback()
     if (!g_launcher_direct_frame_active) {
         return;
     }
+    // R.36.3：先结束 BoundedSPI session，释放固定 DMA staging。display 层保证只有在
+    // 所有 raw descriptor 已有界回收后才会返回；无法回收的极端状态直接受控重启。
+    display_launcher_bounded_spi_session_end();
     g_launcher_direct_frame_active = false;
     if (g_launcher_backdrop != nullptr) {
         lv_obj_set_style_bg_opa(g_launcher_backdrop, kLauncherBackdropOpa, 0);
     }
-    if (g_launcher_frame_canvas != nullptr && g_launcher_frame_cache_active) {
-        lv_obj_remove_flag(g_launcher_frame_canvas, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_invalidate(g_launcher_frame_canvas);
+    // R.36.6：没有整帧 Canvas。降级后直接启用 R.32 LVGL 实时圆弧绘制。
+    g_launcher_frame_cache_active = false;
+    if (g_launcher_panel != nullptr) {
+        lv_obj_invalidate(g_launcher_panel);
     }
     // R.33.2.2：DirectScene 正常路径让整个 Launcher LVGL 根对象保持隐藏，
     // 因此中途降级时必须在这里重新显示根对象，否则 fallback canvas 虽已解隐藏仍不可见。
@@ -1352,7 +1489,107 @@ static void player_home_launcher_switch_to_lvgl_fallback()
         lv_obj_move_foreground(g_launcher);
         lv_obj_invalidate(g_launcher);
     }
-    ESP_LOGW(TAG, "R.33.2.2 Launcher DirectFrame已降级到R.33.1 LVGL RGB565缓存路径");
+    ESP_LOGW(TAG, "R.36.6 Launcher BoundedSPI已降级到R.32 LVGL实时圆弧安全路径");
+}
+
+static void player_home_launcher_try_surface_rebind()
+{
+    if (!g_launcher_visible || g_launcher_motion != LauncherMotionState::Shown ||
+        !g_launcher_frame_cache_active || !g_launcher_surface_lease_ready ||
+        g_launcher_surface_source == nullptr || !player_state_is_ready()) {
+        return;
+    }
+
+    const uint32_t current_track = static_cast<uint32_t>(player_state_get_index());
+    if (current_track == g_launcher_surface_lease_track) {
+        return;
+    }
+
+    CoverSurfaceLease new_lease = {};
+    uint32_t acquire_us = 0U;
+    if (!player_home_launcher_acquire_surface(current_track, &new_lease, &acquire_us)) {
+        // 新曲 Surface 尚未 ready 时继续 pin/显示旧曲；SystemLoop 会继续准备 current Surface。
+        return;
+    }
+    // acquire 与提交之间 Playlist 仍可能由 AudioTask/EOF 推进；迟到 Surface 不允许覆盖更新后的 current。
+    if (!player_state_is_ready() || static_cast<uint32_t>(player_state_get_index()) != current_track) {
+        cover_surface_cache_release(&new_lease);
+        return;
+    }
+
+    const uint32_t old_track = g_launcher_surface_lease_track;
+    CoverSurfaceLease old_lease = g_launcher_surface_lease;
+    const uint8_t *old_source = g_launcher_surface_source;
+    const uint32_t old_acquire_us = g_launcher_surface_lease_us;
+    const uint8_t frame_index = g_launcher_frame_index < kLauncherAnimationAssetFrameCount
+        ? g_launcher_frame_index
+        : static_cast<uint8_t>(kLauncherAnimationAssetFrameCount - 1U);
+
+    // R.36.6：先同时 pin A/B，再临时把 source 指向 B；当前菜单帧不再预生成 Work，
+    // 而是在 B 全屏底图提交后直接 strip-recompose。旧 A 一直保留到 B frame 提交完成。
+    g_launcher_surface_lease = new_lease;
+    g_launcher_surface_source = new_lease.dimmed_rgb565;
+    g_launcher_surface_lease_track = current_track;
+    g_launcher_surface_lease_us = acquire_us;
+    g_launcher_surface_lease_ready = true;
+
+    if (!player_home_launcher_decode_cached_frame(frame_index)) {
+        g_launcher_surface_lease = old_lease;
+        g_launcher_surface_source = old_source;
+        g_launcher_surface_lease_track = old_track;
+        g_launcher_surface_lease_us = old_acquire_us;
+        g_launcher_surface_lease_ready = true;
+        cover_surface_cache_release(&new_lease);
+        (void) player_home_launcher_decode_cached_frame(frame_index);
+        ESP_LOGW(TAG,
+            "R.36.6 Launcher背景换绑取消：%u -> %u，新Surface/帧身份校验失败，继续旧背景",
+            static_cast<unsigned>(old_track),
+            static_cast<unsigned>(current_track));
+        return;
+    }
+
+    DisplayBoundedSpiStats base_stats = {};
+    bool direct_ok = g_launcher_direct_frame_active;
+    if (direct_ok) {
+        const esp_err_t base_ret = display_launcher_bounded_spi_present(
+            g_launcher_surface_source,
+            0U,
+            0U,
+            FAKEPOD_LCD_WIDTH,
+            FAKEPOD_LCD_HEIGHT,
+            false,
+            true,
+            &base_stats);
+        if (base_ret != ESP_OK) {
+            ESP_LOGW(TAG,
+                "R.36.6 Launcher新背景BoundedSPI提交失败：track=%u ret=%s，降级LVGL",
+                static_cast<unsigned>(current_track),
+                esp_err_to_name(base_ret));
+            player_home_launcher_switch_to_lvgl_fallback();
+            direct_ok = false;
+        }
+        else if (!player_home_launcher_present_work_direct()) {
+            ESP_LOGW(TAG,
+                "R.36.6 Launcher新背景StripFrame提交失败：track=%u，降级LVGL",
+                static_cast<unsigned>(current_track));
+            player_home_launcher_switch_to_lvgl_fallback();
+            direct_ok = false;
+        }
+    }
+
+    // B 已成为唯一 Launcher source 后才释放 A pin。若 Direct 发生有界故障并降级，
+    // R.32 fallback 使用当前状态实时绘制，不再依赖任何整帧 RGB565 Work。
+    cover_surface_cache_release(&old_lease);
+    ESP_LOGI(TAG,
+        "R.36.6 Launcher背景换绑：%u -> %u acquire=%uus gen=%u base=%uus stream=%uus frame=%u direct=%d",
+        static_cast<unsigned>(old_track),
+        static_cast<unsigned>(current_track),
+        static_cast<unsigned>(acquire_us),
+        static_cast<unsigned>(base_stats.generation),
+        static_cast<unsigned>(base_stats.total_us),
+        static_cast<unsigned>(base_stats.stream_us),
+        static_cast<unsigned>(frame_index),
+        direct_ok ? 1 : 0);
 }
 
 static bool player_home_launcher_present_frame_direct(uint8_t frame_index)
@@ -1373,18 +1610,24 @@ static bool player_home_launcher_present_frame_direct(uint8_t frame_index)
 
 static bool player_home_launcher_begin_direct_scene()
 {
-    if (!g_launcher_frame_cache_active || !g_launcher_base_ready || g_launcher_base_buffer == nullptr) {
+    if (!g_launcher_frame_cache_active || !g_launcher_surface_lease_ready || g_launcher_surface_source == nullptr ||
+        !kLauncherBoundedSpiEnabled || !display_launcher_bounded_spi_available()) {
         return false;
     }
 
-    // 先把完整 460x460 半透明背景直接写入 GRAM。此时 Launcher LVGL 根对象仍隐藏，
-    // 不会有随后到来的 backdrop refresh 覆盖 DirectPresent 帧。
-    DisplayDirectPresentStats stats = {};
-    // R.36.2：Launcher show/hide/动画全链路不再调用普通 DirectPresent 的
-    // esp_lcd_panel_io_tx_param(-1) 无超时 barrier。Launcher 从 LVGL Task 的手势事件进入，
-    // 且根对象仍 hidden、主页后台 timer 已暂停，因此首张 Base 与后续帧统一走 owned/no-barrier。
-    const esp_err_t ret = display_present_rgb565_region_direct_owned(
-        g_launcher_base_buffer,
+    const esp_err_t begin_ret = display_launcher_bounded_spi_session_begin();
+    if (begin_ret != ESP_OK) {
+        ESP_LOGW(TAG,
+            "R.36.3 Launcher BoundedSPI Session启动失败：%s，回退LVGL",
+            esp_err_to_name(begin_ret));
+        return false;
+    }
+
+    // Session 只常驻 DMA staging / generation，不长期占用 SPI bus；每个 present 自己有界
+    // 回收 Panel IO pending transaction，再提交完全由本层追踪的 raw SPI descriptor。
+    DisplayBoundedSpiStats stats = {};
+    const esp_err_t ret = display_launcher_bounded_spi_present(
+        g_launcher_surface_source,
         0U,
         0U,
         FAKEPOD_LCD_WIDTH,
@@ -1393,28 +1636,68 @@ static bool player_home_launcher_begin_direct_scene()
         true,
         &stats);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "R.33.2 Launcher DirectScene底图提交失败：%s", esp_err_to_name(ret));
+        ESP_LOGW(TAG,
+            "R.36.3 Launcher BoundedSPI底图提交失败：%s，回退LVGL",
+            esp_err_to_name(ret));
+        display_launcher_bounded_spi_session_end();
         return false;
     }
 
     g_launcher_direct_frame_active = true;
     player_home_launcher_reset_direct_stats();
-    g_launcher_frame_index = 0U; // frame0 就是纯半透明 Base，首帧无需重复局部写入。
-    // R.33.2.2：DirectScene 获得 LCD 所有权后，不再修改 backdrop 样式。
-    // 根对象本身全程保持 hidden，避免任何 style/visibility 变化产生 460x460 LVGL refresh
-    // 把刚刚 DirectPresent 的全屏半透明 Base 擦回普通封面。
-    if (g_launcher_frame_canvas != nullptr) {
-        lv_obj_add_flag(g_launcher_frame_canvas, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (g_launcher_center_overlay != nullptr) {
-        lv_obj_add_flag(g_launcher_center_overlay, LV_OBJ_FLAG_HIDDEN);
-    }
+    g_launcher_frame_index = 0U;
     ESP_LOGI(TAG,
-        "R.33.2.2 LauncherDirectScene：base=%uus fullPresent=%uus stream=%uus owner=direct root=hidden，后续动画仅340x340局部ContinuousGRAM",
-        static_cast<unsigned>(g_launcher_base_prepare_us),
+        "R.36.6.1 LauncherBoundedScene：gen=%u lease=%uus track=%u fullPresent=%uus drain=%uus stream=%uus base=CoverSurface.dimmed owner=bounded-spi root=hidden",
+        static_cast<unsigned>(stats.generation),
+        static_cast<unsigned>(g_launcher_surface_lease_us),
+        static_cast<unsigned>(g_launcher_surface_lease_track),
         static_cast<unsigned>(stats.total_us),
+        static_cast<unsigned>(stats.panel_drain_us),
         static_cast<unsigned>(stats.stream_us));
     return true;
+}
+
+static bool player_home_present_current_cover_bounded(const char *reason)
+{
+    if (!player_state_is_ready() || !display_launcher_bounded_spi_session_active()) {
+        return false;
+    }
+    const uint32_t track_index = static_cast<uint32_t>(player_state_get_index());
+    CoverSurfaceLease lease = {};
+    if (!cover_surface_cache_acquire(track_index, &lease)) {
+        return false;
+    }
+    const uint8_t *source = g_overlay_visible ? lease.dimmed_rgb565 : lease.normal_rgb565;
+    DisplayBoundedSpiStats stats = {};
+    const esp_err_t ret = source == nullptr
+        ? ESP_ERR_INVALID_STATE
+        : display_launcher_bounded_spi_present(
+            source,
+            0U,
+            0U,
+            FAKEPOD_LCD_WIDTH,
+            FAKEPOD_LCD_HEIGHT,
+            false,
+            true,
+            &stats);
+    cover_surface_cache_release(&lease);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG,
+            "R.36.3 Launcher退出封面恢复：reason=%s track=%lu gen=%u total=%uus drain=%uus stream=%uus",
+            reason != nullptr ? reason : "unknown",
+            static_cast<unsigned long>(track_index),
+            static_cast<unsigned>(stats.generation),
+            static_cast<unsigned>(stats.total_us),
+            static_cast<unsigned>(stats.panel_drain_us),
+            static_cast<unsigned>(stats.stream_us));
+        return true;
+    }
+    ESP_LOGW(TAG,
+        "R.36.3 Launcher退出封面恢复失败：reason=%s track=%lu ret=%s，交给LVGL重绘",
+        reason != nullptr ? reason : "unknown",
+        static_cast<unsigned long>(track_index),
+        esp_err_to_name(ret));
+    return false;
 }
 
 static bool player_home_present_current_cover_direct(const char *reason)
@@ -1463,61 +1746,12 @@ static bool player_home_present_current_cover_direct(const char *reason)
     return false;
 }
 
-static void player_home_launcher_center_draw_cb(lv_event_t *event)
-{
-    if (event == nullptr || lv_event_get_code(event) != LV_EVENT_DRAW_MAIN) {
-        return;
-    }
-    lv_layer_t *layer = lv_event_get_layer(event);
-    lv_obj_t *obj = lv_event_get_current_target_obj(event);
-    if (layer == nullptr || obj == nullptr || g_launcher_anim_progress <= 0) {
-        return;
-    }
-
-    const int32_t progress = g_launcher_anim_progress > kLauncherAnimProgressMax
-        ? kLauncherAnimProgressMax
-        : g_launcher_anim_progress;
-    lv_area_t coords = {};
-    lv_obj_get_coords(obj, &coords);
-    const int32_t cx = (coords.x1 + coords.x2) / 2;
-    const int32_t cy = (coords.y1 + coords.y2) / 2;
-    auto lerp_progress = [progress](int32_t from, int32_t to) -> int32_t {
-        return from + ((to - from) * progress + kLauncherAnimProgressMax / 2) /
-            kLauncherAnimProgressMax;
-    };
-
-    const int32_t center_diameter =
-        lerp_progress(kLauncherCollapsedCenterDiameter, kLauncherCenterDiameter);
-    lv_draw_rect_dsc_t center = {};
-    lv_draw_rect_dsc_init(&center);
-    center.bg_color = lv_color_hex(0x05070B);
-    center.bg_opa = 245;
-    center.radius = LV_RADIUS_CIRCLE;
-    center.border_width = progress >= 500 ? 2 : 1;
-    center.border_color = lv_color_hex(0x161B27);
-    center.border_opa = LV_OPA_COVER;
-    const int32_t half = center_diameter / 2;
-    lv_area_t center_area = {cx - half, cy - half, cx + half, cy + half};
-    lv_draw_rect(layer, &center, &center_area);
-
-    const LauncherMenuItemDef &selected = kLauncherItems[g_launcher_selected_index];
-    const int32_t center_icon_scale = 78 + (54 * progress) / kLauncherAnimProgressMax;
-    player_home_launcher_draw_icon(
-        layer,
-        selected.icon,
-        cx + (selected.optical_x * progress) / kLauncherAnimProgressMax,
-        cy + (selected.optical_y * progress) / kLauncherAnimProgressMax,
-        lv_color_hex(kLauncherAccentRgb),
-        center_icon_scale,
-        LV_OPA_COVER);
-}
-
 static void player_home_launcher_panel_draw_cb(lv_event_t *event)
 {
     if (event == nullptr || lv_event_get_code(event) != LV_EVENT_DRAW_MAIN) {
         return;
     }
-    // R.33.1 纯 RGB565 预合成缓存激活时，R.32 实时圆弧只作为备用路径，不重复绘制。
+    // R.36.6 Strip Direct 激活时，R.32 实时圆弧只作为备用路径，不重复绘制。
     if (g_launcher_frame_cache_active) {
         return;
     }
@@ -1637,8 +1871,7 @@ static void player_home_launcher_panel_draw_cb(lv_event_t *event)
 static void player_home_launcher_apply_selection()
 {
     if (g_launcher_frame_cache_active) {
-        // R.33.2：选中项变化只重建当前离散帧。DirectFrame 模式立即局部写 GRAM；
-        // LVGL cache fallback 则由 decode_cached_frame() 正常 invalidate canvas。
+        // R.36.6：选中项变化只更新 LUT 并重新流式提交当前离散帧；fallback 直接 invalidate panel。
         player_home_launcher_update_frame_lut();
         const uint8_t frame = g_launcher_frame_index == kLauncherFrameInvalid
             ? player_home_launcher_frame_for_progress(g_launcher_anim_progress)
@@ -1740,11 +1973,11 @@ static void player_home_launcher_enter_done(lv_anim_t *anim)
         }
     }
     ESP_LOGI(TAG,
-        "R.36.2.1 Launcher动画展开完成：%ums frame=%u/%u base=%uus decode(avg/max)=%u/%uus direct(avg/max)=%u/%uus stream(avg/max)=%u/%uus frames=%u failures=%u direct=%d，径向点击已解锁",
+        "R.36.6.1 Launcher动画展开完成：%ums frame=%u/%u lease=%uus compose(avg/max)=%u/%uus direct(avg/max)=%u/%uus stream(avg/max)=%u/%uus frames=%u failures=%u direct=%d，径向点击已解锁",
         static_cast<unsigned>(elapsed),
         static_cast<unsigned>(g_launcher_frame_index),
         static_cast<unsigned>(kLauncherAnimationAssetFrameCount - 1U),
-        static_cast<unsigned>(g_launcher_base_prepare_us),
+        static_cast<unsigned>(g_launcher_surface_lease_us),
         static_cast<unsigned>(g_launcher_frame_decode_count == 0U ? 0U :
             g_launcher_frame_decode_us / g_launcher_frame_decode_count),
         static_cast<unsigned>(g_launcher_frame_decode_max_us),
@@ -1773,8 +2006,11 @@ static void player_home_launcher_leave_done(lv_anim_t *anim)
     }
     const bool used_direct = g_launcher_direct_frame_active;
     if (used_direct) {
-        // frame0 仍是半透明背景；Launcher 真正隐藏后立刻把 normal 封面恢复到 GRAM。
-        if (!player_home_present_current_cover_direct("launcher-hide")) {
+        // R.36.3：最后一笔仍走同一 BoundedSPI session，把 normal/dimmed current Surface
+        // 恢复到 GRAM；完成后才结束 session 并释放 staging，确保不存在 descriptor UAF。
+        const bool restored = player_home_present_current_cover_bounded("launcher-hide");
+        display_launcher_bounded_spi_session_end();
+        if (!restored) {
             lv_obj_invalidate(lv_screen_active());
         }
     }
@@ -1785,7 +2021,7 @@ static void player_home_launcher_leave_done(lv_anim_t *anim)
     now_playing_artwork_set_direct_present_allowed(true);
     const uint32_t elapsed = static_cast<uint32_t>(lv_tick_get()) - g_launcher_anim_started_ms;
     ESP_LOGI(TAG,
-        "R.36.2.1 Launcher动画收拢完成：%ums frame=%u decode(avg/max)=%u/%uus direct(avg/max)=%u/%uus frames=%u failures=%u direct=%d",
+        "R.36.6.1 Launcher动画收拢完成：%ums frame=%u compose(avg/max)=%u/%uus direct(avg/max)=%u/%uus frames=%u failures=%u direct=%d",
         static_cast<unsigned>(elapsed),
         static_cast<unsigned>(g_launcher_frame_index),
         static_cast<unsigned>(g_launcher_frame_decode_count == 0U ? 0U :
@@ -1798,7 +2034,7 @@ static void player_home_launcher_leave_done(lv_anim_t *anim)
         static_cast<unsigned>(g_launcher_direct_failures),
         used_direct ? 1 : 0);
     g_launcher_frame_cache_active = false;
-    g_launcher_base_ready = false;
+    player_home_launcher_release_surface_lease();
 }
 
 static void player_home_launcher_start_animation(
@@ -1851,43 +2087,33 @@ static void player_home_launcher_show()
         g_launcher_anim_progress = 0;
         g_launcher_frame_cache_active = false;
         g_launcher_direct_frame_active = false;
-        g_launcher_base_ready = false;
+        player_home_launcher_release_surface_lease();
         g_launcher_frame_index = kLauncherFrameInvalid;
         if (g_launcher_backdrop != nullptr) {
             lv_obj_set_style_bg_opa(g_launcher_backdrop, kLauncherBackdropOpa, 0);
         }
 
-        // R.33.2：先把当前 normal CoverSurface 快速预合成为完整 460x460 半透明 Base。
-        // 若局部 DirectPresent 可用，Launcher 根对象仍保持隐藏，先直接提交 Base，再把透明的
-        // 点击层置前；这样 LVGL 不会在第一帧之后又用 backdrop 把 DirectPresent 圆环盖掉。
-        if (g_launcher_frame_cache_ready && player_home_launcher_prepare_precomposited_base()) {
+        // R.36.6：pin 当前 dimmed CoverSurface 后直接启动 BoundedSPI Strip Session。
+        // 若 session 无法安全启动，不再创建 RGB565 Canvas，而是立即回退 R.32 LVGL 实时圆弧。
+        if (g_launcher_frame_cache_ready && player_home_launcher_prepare_surface_lease()) {
             player_home_launcher_update_frame_lut();
             g_launcher_frame_cache_active = true;
             bool direct_scene_started = false;
-            if (kLauncherDirectSceneEnabled) {
+            if (kLauncherBoundedSpiEnabled && display_launcher_bounded_spi_available()) {
                 direct_scene_started = player_home_launcher_begin_direct_scene();
             }
             if (!direct_scene_started) {
                 g_launcher_direct_frame_active = false;
-                g_launcher_frame_cache_active = player_home_launcher_decode_cached_frame(0U);
+                g_launcher_frame_cache_active = false;
             }
         }
 
-        if (g_launcher_frame_canvas != nullptr) {
-            if (g_launcher_frame_cache_active && !g_launcher_direct_frame_active) {
-                lv_obj_remove_flag(g_launcher_frame_canvas, LV_OBJ_FLAG_HIDDEN);
-            }
-            else {
-                lv_obj_add_flag(g_launcher_frame_canvas, LV_OBJ_FLAG_HIDDEN);
-            }
-        }
-        // R.33.2 中心圆/中心功能图标已软件烘入 RGB565 Work；center overlay 常驻隐藏。
-        if (g_launcher_center_overlay != nullptr) {
-            lv_obj_add_flag(g_launcher_center_overlay, LV_OBJ_FLAG_HIDDEN);
-        }
+        // R.36.6 Direct 模式由 Strip Compositor 把中心圆/图标直接合成进 DMA strip；
+        // fallback 则由 R.32 panel DRAW_MAIN 实时绘制，不再维护 Canvas/center overlay。
         if (!g_launcher_frame_cache_active) {
+            player_home_launcher_release_surface_lease();
             ESP_LOGW(TAG,
-                "R.33.2 Launcher缓存/Base不可用：track=%u，当前展开回退R.32实时圆弧",
+                "R.36.6 Launcher Strip/Surface lease不可用：track=%u，当前展开回退R.32实时圆弧",
                 static_cast<unsigned>(player_state_is_ready() ? player_state_get_index() : 0U));
         }
         if (g_launcher_direct_frame_active) {
@@ -2453,6 +2679,10 @@ static void player_home_gesture_timer_cb(lv_timer_t *timer)
     // Launcher 菜单显示时，页面级导航先全部让位；外部轻点由 backdrop 关闭，
     // 若继续滑动任意方向，也直接先收起 Launcher，不在这一版里叠加更多行为。
     if (g_launcher_visible) {
+        // R.36.5.1：自然 EOF/自动随机切歌后，SystemLoop 会继续准备新 current Surface。
+        // 新 dimmed Surface ready 后在同一 Launcher Session 内原子换绑；未 ready 时保持旧背景。
+        player_home_launcher_try_surface_rebind();
+
         UiGestureAction launcher_action = UiGestureAction::None;
         if (gesture_router_take_action(&launcher_action)) {
             player_home_launcher_hide();
@@ -3152,13 +3382,10 @@ void player_home_create(lv_obj_t *screen)
     g_launcher = nullptr;
     g_launcher_backdrop = nullptr;
     g_launcher_panel = nullptr;
-    g_launcher_frame_canvas = nullptr;
-    g_launcher_center_overlay = nullptr;
     g_launcher_frame_cache_ready = false;
     g_launcher_frame_cache_active = false;
-    g_launcher_base_ready = false;
-    g_launcher_base_track = UINT32_MAX;
-    g_launcher_base_prepare_us = 0U;
+    player_home_launcher_release_surface_lease();
+    g_launcher_surface_lease_us = 0U;
     g_launcher_frame_index = kLauncherFrameInvalid;
     g_launcher_frame_decode_count = 0U;
     g_launcher_frame_decode_us = 0U;
@@ -3280,74 +3507,10 @@ void player_home_create(lv_obj_t *screen)
         LV_EVENT_CLICKED,
         nullptr);
 
-    if (g_launcher_frame_buffer == nullptr) {
-        g_launcher_frame_buffer = static_cast<uint8_t *>(heap_caps_malloc(
-            kLauncherFrameBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    }
-    if (g_launcher_base_buffer == nullptr) {
-        g_launcher_base_buffer = static_cast<uint8_t *>(heap_caps_malloc(
-            kLauncherBaseBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    }
-
-    if (g_launcher_frame_buffer != nullptr && g_launcher_base_buffer != nullptr) {
-        memset(g_launcher_frame_buffer, 0, kLauncherFrameBufferBytes);
-        memset(g_launcher_base_buffer, 0, kLauncherBaseBufferBytes);
-        g_launcher_frame_canvas = lv_canvas_create(g_launcher_panel);
-        ui_common_lock_object(g_launcher_frame_canvas);
-        const lv_result_t draw_buf_ret = lv_draw_buf_init(
-            &g_launcher_frame_draw_buf,
-            kLauncherAnimationAssetWidth,
-            kLauncherAnimationAssetHeight,
-            LV_COLOR_FORMAT_RGB565,
-            kLauncherFrameStride,
-            g_launcher_frame_buffer,
-            kLauncherFrameBufferBytes);
-        if (draw_buf_ret == LV_RESULT_OK) {
-            lv_canvas_set_draw_buf(g_launcher_frame_canvas, &g_launcher_frame_draw_buf);
-            lv_obj_set_size(
-                g_launcher_frame_canvas,
-                kLauncherAnimationAssetWidth,
-                kLauncherAnimationAssetHeight);
-        }
-        else {
-            ESP_LOGE(TAG, "R.33.1 Launcher RGB565 draw_buf初始化失败");
-        }
-        lv_obj_set_pos(g_launcher_frame_canvas, 0, 0);
-        lv_obj_remove_flag(g_launcher_frame_canvas, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_flag(g_launcher_frame_canvas, LV_OBJ_FLAG_HIDDEN);
-
-        g_launcher_center_overlay = lv_obj_create(g_launcher_panel);
-        ui_common_lock_object(g_launcher_center_overlay);
-        lv_obj_set_size(
-            g_launcher_center_overlay,
-            kLauncherCenterOverlaySize,
-            kLauncherCenterOverlaySize);
-        lv_obj_align(g_launcher_center_overlay, LV_ALIGN_CENTER, 0, 0);
-        lv_obj_set_style_radius(g_launcher_center_overlay, 0, 0);
-        lv_obj_set_style_bg_opa(g_launcher_center_overlay, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(g_launcher_center_overlay, 0, 0);
-        lv_obj_set_style_shadow_width(g_launcher_center_overlay, 0, 0);
-        lv_obj_set_style_pad_all(g_launcher_center_overlay, 0, 0);
-        lv_obj_remove_flag(g_launcher_center_overlay, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(
-            g_launcher_center_overlay,
-            player_home_launcher_center_draw_cb,
-            LV_EVENT_DRAW_MAIN,
-            nullptr);
-        lv_obj_add_flag(g_launcher_center_overlay, LV_OBJ_FLAG_HIDDEN);
-
-        g_launcher_frame_cache_ready = (draw_buf_ret == LV_RESULT_OK);
-        if (g_launcher_frame_cache_ready) {
-            player_home_launcher_update_frame_lut();
-        }
-    }
-    else {
-        ESP_LOGW(TAG,
-            "R.33.1 Launcher RGB565 Base/Work PSRAM分配失败：need=%uB+%uB free=%u，退回R.32实时圆弧",
-            static_cast<unsigned>(kLauncherBaseBufferBytes),
-            static_cast<unsigned>(kLauncherFrameBufferBytes),
-            static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
-    }
+    // R.36.6：不再分配 340x340 RGB565 PanelWork/Canvas。Flash I4 + 当前 dimmed Surface
+    // 直接按 SPI staging strip 现场合成；LVGL fallback 继续使用 R.32 panel DRAW_MAIN。
+    g_launcher_frame_cache_ready = true;
+    player_home_launcher_update_frame_lut();
 
     // R.33.1 fallback callback 常驻，但缓存激活时开头立即 return；这样某一首封面暂时拿不到
     // CoverSurface 时只回退这一次，不会永久关闭后续歌曲的纯 RGB565 快速动画路径。
@@ -3363,13 +3526,16 @@ void player_home_create(lv_obj_t *screen)
         flash_bytes += g_launcher_animation_frames[i].size;
     }
     ESP_LOGI(TAG,
-        "P1.5.3.2R.33.2.2 DirectSceneOwnership：12帧压缩I4模板 Flash=%uB；RGB565 FullBase=%uB + PanelWork=%uB PSRAM；cache=%d；R.33.1/R.32 fallback保留",
+        "R.36.6.1 Launcher StripCompositor FastPath：12帧压缩I4模板 Flash=%uB；FullBase=0B(saved=%uB)；PanelWork=0B(saved=%uB)；source=CoverSurface.dimmed；lease=pin-until-hide PSRAM_free=%u",
         static_cast<unsigned>(flash_bytes),
-        static_cast<unsigned>(kLauncherBaseBufferBytes),
-        static_cast<unsigned>(kLauncherFrameBufferBytes),
-        g_launcher_frame_cache_ready ? 1 : 0);
-    ESP_LOGW(TAG,
-        "R.36.2.1 Launcher安全传输：DirectScene=%s，动画固定走RGB565 Canvas/LVGL；HomeResume Direct=%s；规避esp_lcd SPI内部portMAX_DELAY队列回收卡死",
+        static_cast<unsigned>(kLauncherFullBaseBytesSaved),
+        static_cast<unsigned>(kLauncherPanelWorkBytesSaved),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+    ESP_LOGI(TAG,
+        "R.36.6.1 Launcher动态封面：SurfaceReuse=enabled rebind=current-ready strip-recompose atomic-lease-swap；旧背景保持到新Surface ready");
+    ESP_LOGI(TAG,
+        "R.36.6.1 显示传输：BoundedSPI=%s Launcher=strip-stream Cover=bounded legacy-PanelIO-Direct=%s LVGL-fallback=R.32 HomeResume-Direct=%s；queue/get全有界",
+        display_launcher_bounded_spi_available() ? "ready" : "unavailable",
         kLauncherDirectSceneEnabled ? "enabled" : "disabled",
         kFullscreenHomeResumeDirectEnabled ? "enabled" : "disabled");
 

@@ -49,9 +49,12 @@ static constexpr TickType_t ARTWORK_SD_LOCK_TRY = 0;
 static constexpr TickType_t ARTWORK_SD_RETRY_DELAY = 1;
 static constexpr TickType_t ARTWORK_POST_SLICE_DELAY = 1;
 static constexpr TickType_t ARTWORK_PROGRESS_LOG_INTERVAL = pdMS_TO_TICKS(1000);
-static constexpr uint32_t ARTWORK_FLAC_PAUSE_PERCENT = 65U;
-static constexpr uint32_t ARTWORK_FLAC_MID_PERCENT = 80U;
-static constexpr uint32_t ARTWORK_FLAC_FAST_PERCENT = 90U;
+// R.36.3.1：Artwork 每个增量 slice 与 system_loop 统一使用 FLAC 高水位窗口。
+// <90% 完全让路；90~91% 仅读 2KB，92~95% 读 4KB，>=96% 才读 8KB。
+// 确保封面 I/O 始终落后于 FLAC 90% Normal / 92% Plenty 恢复窗口。
+static constexpr uint32_t ARTWORK_FLAC_PAUSE_PERCENT = 90U;
+static constexpr uint32_t ARTWORK_FLAC_MID_PERCENT = 92U;
+static constexpr uint32_t ARTWORK_FLAC_FAST_PERCENT = 96U;
 
 struct ArtworkLoadRequest
 {
