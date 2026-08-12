@@ -17,6 +17,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 
+#include "app_diag_config.h"
 #include "board_pins.h"
 
 static const char *TAG = "显示";
@@ -351,13 +352,15 @@ static esp_err_t display_bounded_spi_session_begin(const char *owner)
     g_launcher_bounded_spi.next_sequence = 1U;
     g_launcher_bounded_spi.owner = owner != nullptr ? owner : "unknown";
     g_launcher_bounded_spi.active = true;
+#if APP_DIAG_DISPLAY_TRANSPORT
     ESP_LOGI(TAG,
-        "R.36.4 BoundedSPI Session BEGIN：owner=%s gen=%u staging=%u行×2 total=%uB DMAfree=%u",
+        "BoundedSPI BEGIN：owner=%s gen=%u staging=%u行×2 total=%uB DMAfree=%u",
         g_launcher_bounded_spi.owner,
         static_cast<unsigned>(g_launcher_bounded_spi.generation),
         static_cast<unsigned>(g_launcher_bounded_spi.staging_rows),
         static_cast<unsigned>(g_launcher_bounded_spi.staging_bytes * 2U),
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)));
+#endif
     return ESP_OK;
 }
 
@@ -378,8 +381,10 @@ void display_launcher_bounded_spi_session_end()
         return;
     }
 
+#if APP_DIAG_DISPLAY_TRANSPORT
     const uint32_t generation = g_launcher_bounded_spi.generation;
     const char *owner = g_launcher_bounded_spi.owner != nullptr ? g_launcher_bounded_spi.owner : "none";
+#endif
     g_launcher_bounded_spi.active = false;
     // 能走到 Session END 就意味着本层所有 raw descriptor 已被有界回收；任何未回收路径
     // 都会在 display_launcher_bounded_spi_present() 内直接受控重启，因此这里可以安全释放。
@@ -394,12 +399,14 @@ void display_launcher_bounded_spi_session_end()
     g_launcher_bounded_spi.staging_rows = 0U;
     g_launcher_bounded_spi.staging_bytes = 0U;
     g_launcher_bounded_spi.owner = "none";
+#if APP_DIAG_DISPLAY_TRANSPORT
     ESP_LOGI(TAG,
-        "R.36.4 BoundedSPI Session END：owner=%s gen=%u faulted=%d DMAfree=%u",
+        "BoundedSPI END：owner=%s gen=%u faulted=%d DMAfree=%u",
         owner,
         static_cast<unsigned>(generation),
         g_launcher_bounded_spi.faulted ? 1 : 0,
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)));
+#endif
 }
 
 static esp_err_t display_launcher_bounded_spi_present_internal(

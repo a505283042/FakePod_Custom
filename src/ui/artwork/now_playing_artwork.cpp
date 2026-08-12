@@ -23,7 +23,7 @@ static const char *TAG = "封面界面";
 #if APP_DIAG_ARTWORK_UI
 #define ARTWORK_UI_TRACE(...) ESP_LOGI(TAG, "ARTWORK_UI_TRACE: " __VA_ARGS__)
 #else
-#define ARTWORK_UI_TRACE(...) do { } while (0)
+#define ARTWORK_UI_TRACE(...) APP_DIAG_DISCARDED_LOGI(TAG, "ARTWORK_UI_TRACE: " __VA_ARGS__)
 #endif
 
 // 压缩图直接交给 LVGL 的路径只保留为兼容回退（例如不受 esp_new_jpeg 支持的 JPEG）。
@@ -31,7 +31,7 @@ static const char *TAG = "封面界面";
 // R.22 起跨 Track 替换时保留旧封面直到新 Surface 真正可用，“准备封面/读取封面”不再可见。
 // R.36 取消第三张 wire-order Surface；R.36.4 起封面整屏提交改走 BoundedSPI，
 // 直接消费 native normal/dimmed，并在双 DMA staging 拷贝时在线 byte-swap。
-// 旧 R.29 ContinuousGRAM 不再作为主页换封面的运行时主路径。
+// 主页 Surface 高速提交统一走 BoundedSPI；LVGL 仅保留兼容回退。
 static constexpr size_t kArtworkDecodedBudgetBytes = 3U * 1024U * 1024U;
 static constexpr size_t kArtworkPsramSafetyReserveBytes = 768U * 1024U;
 static constexpr uint32_t kLvImageScaleNone = 256U;
@@ -265,31 +265,29 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
     g_has_surface_source = true;
     if (direct_presented) {
         g_direct_present_event_pending = true;
+#if APP_DIAG_DISPLAY_TRANSPORT
         ESP_LOGI(TAG,
-            "R.36.4 封面BoundedSPI完成：%lu -> %lu gen=%u source=native total=%uus drain=%uus window=%uus te=%uus stream=%uus copy=%uus swap=%uus wait=%uus seq=%u..%u chunks=%u staging=%u行×%u total=%uB dim=%u",
+            "封面BoundedSPI：%lu -> %lu gen=%u total=%uus te=%uus stream=%uus swap=%uus wait=%uus chunks=%u staging=%u行×%u dim=%u",
             static_cast<unsigned long>(previous_track),
             static_cast<unsigned long>(track_index),
             static_cast<unsigned>(direct_stats.generation),
             static_cast<unsigned>(direct_stats.total_us),
-            static_cast<unsigned>(direct_stats.panel_drain_us),
-            static_cast<unsigned>(direct_stats.window_setup_us),
             static_cast<unsigned>(direct_stats.te_wait_us),
             static_cast<unsigned>(direct_stats.stream_us),
-            static_cast<unsigned>(direct_stats.copy_us),
             static_cast<unsigned>(direct_stats.byte_swap_us),
             static_cast<unsigned>(direct_stats.queue_wait_us),
-            static_cast<unsigned>(direct_stats.first_sequence),
-            static_cast<unsigned>(direct_stats.last_sequence),
             static_cast<unsigned>(direct_stats.chunks),
             static_cast<unsigned>(direct_stats.staging_rows),
             static_cast<unsigned>(direct_stats.staging_buffers),
-            static_cast<unsigned>(direct_stats.staging_total_bytes),
             static_cast<unsigned>(g_dimmed_applied));
+#endif
     } else if (replacing_track) {
+#if APP_DIAG_DISPLAY_TRANSPORT
         ESP_LOGI(TAG,
-            "R.36.4 封面BoundedSPI回退请求：%lu -> %lu，旧图保持到新Surface就绪",
+            "封面BoundedSPI回退请求：%lu -> %lu，旧图保持到新Surface就绪",
             static_cast<unsigned long>(previous_track),
             static_cast<unsigned long>(track_index));
+#endif
     }
 
     ARTWORK_UI_TRACE("SURFACE_READY generation=%lu track=%lu %ux%u dim=%u direct=%u",

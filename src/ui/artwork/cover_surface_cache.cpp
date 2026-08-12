@@ -14,11 +14,18 @@
 #include "esp_timer.h"
 #include "png.h"
 
+#include "app_diag_config.h"
 #include "artwork_loader.h"
 #include "board_pins.h"
 #include "media_catalog_v2.h"
 
 static const char *TAG = "封面预处理";
+
+#if APP_DIAG_ARTWORK_UI
+#define COVER_TRACE(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define COVER_TRACE(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
 
 static constexpr uint32_t COVER_TASK_STACK_BYTES = 12288U;
 static constexpr UBaseType_t COVER_TASK_PRIORITY = 1U;
@@ -210,7 +217,7 @@ static void cover_cache_release_unpinned_except(uint32_t generation, uint32_t tr
     }
     xSemaphoreGive(g_cache_mutex);
     if (released > 0U) {
-        ESP_LOGI(TAG, "R.36 提前释放旧Surface：%uB PSRAM_free=%u",
+        COVER_TRACE("提前释放旧Surface：%uB PSRAM_free=%u",
             static_cast<unsigned>(released),
             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
     }
@@ -559,7 +566,7 @@ static void cover_task_main(void *)
 {
     g_ready = true;
     cover_publish(CoverSurfaceState::Idle, nullptr, ESP_OK, false);
-    ESP_LOGI(TAG, "R.36 当前曲Surface服务已启动：%dx%d，normal+dimmed=%uB×2，稳态=%uB；2槽仅用于切歌交换，wire=OFF，任务优先级=%u core=%ld",
+    COVER_TRACE("当前曲Surface服务：%dx%d normal+dimmed=%uB×2 steady=%uB priority=%u core=%ld",
         FAKEPOD_LCD_WIDTH, FAKEPOD_LCD_HEIGHT,
         static_cast<unsigned>(COVER_SURFACE_BYTES),
         static_cast<unsigned>(COVER_SURFACE_BYTES * 2U),
@@ -597,7 +604,9 @@ static void cover_task_main(void *)
         uint16_t source_width = 0U;
         uint16_t source_height = 0U;
         CoverRenderStats render_stats = {};
+#if APP_DIAG_ARTWORK_UI
         const MediaArtworkFormatV2 artwork_format = compressed.format;
+#endif
         const bool rendered = cover_render_surface(
             compressed, &normal, &dimmed,
             &source_width, &source_height, &render_stats);
@@ -629,12 +638,13 @@ static void cover_task_main(void *)
         // Surface 已经独立拥有最终像素，压缩 JPEG/PNG 不再需要长期留在 PSRAM。
         artwork_loader_discard_unpinned();
         cover_publish(CoverSurfaceState::Ready, &request, ESP_OK, false, source_width, source_height, prepare_ms);
+#if APP_DIAG_ARTWORK_UI
         const UBaseType_t stack_hwm = uxTaskGetStackHighWaterMark(nullptr);
         const BaseType_t finish_core = xPortGetCoreID();
         const size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
         const size_t psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
         const char *format_name = artwork_format == MediaArtworkFormatV2::Png ? "PNG" : "JPEG";
-        ESP_LOGI(TAG, "R.36 当前曲封面完成：track=%lu format=%s source=%ux%u -> %dx%d normal+dimmed，总计=%lums 解码=%lums 双Surface采样=%lums core=%ld stack_hwm=%u PSRAM_free=%u largest=%u",
+        COVER_TRACE("当前曲封面完成：track=%lu format=%s source=%ux%u -> %dx%d total=%lums decode=%lums sample=%lums core=%ld stack_hwm=%u PSRAM_free=%u largest=%u",
             static_cast<unsigned long>(request.track_index), format_name,
             static_cast<unsigned>(source_width), static_cast<unsigned>(source_height),
             FAKEPOD_LCD_WIDTH, FAKEPOD_LCD_HEIGHT,
@@ -645,6 +655,7 @@ static void cover_task_main(void *)
             static_cast<unsigned>(stack_hwm),
             static_cast<unsigned>(psram_free),
             static_cast<unsigned>(psram_largest));
+#endif
     }
 }
 

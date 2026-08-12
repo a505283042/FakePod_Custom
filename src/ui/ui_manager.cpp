@@ -9,6 +9,7 @@
 #include "esp_lvgl_port.h"
 #include "esp_lv_decoder.h"
 #include "lvgl.h"
+#include "app_diag_config.h"
 #include "board_pins.h"
 #include "cst820.h"
 #include "display.h"
@@ -22,6 +23,18 @@
 #include "screens/library_view.h"
 
 static const char *TAG = "界面";
+
+#if APP_DIAG_BOOT_VERBOSE
+#define UI_BOOT_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define UI_BOOT_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
+
+#if APP_DIAG_UI_PERFORMANCE
+#define UI_PERF_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define UI_PERF_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
 static lv_display_t *g_display = nullptr;
 static lv_indev_t *g_touch = nullptr;
 static bool g_ready = false;
@@ -312,8 +325,8 @@ static void ui_perf_dump_window(int64_t now_us, bool context_switch)
     const uint32_t max_bbox_pct = static_cast<uint32_t>(
         (static_cast<uint64_t>(g_perf_window.max_invalid_bbox_pixels) * 100ULL) / kPerfScreenPixels);
 
-    ESP_LOGI(TAG,
-        "R.30 LVGL审计[%s] window=%ums refresh=%u hz=%u.%u total(avg/max)=%u/%uus render=%u/%uus flush=%u/%uus wait=%u/%uus TE=%u/%uus gap=%u/%uus late=%u%s",
+    UI_PERF_LOGI(
+        "LVGL审计[%s] window=%ums refresh=%u hz=%u.%u total(avg/max)=%u/%uus render=%u/%uus flush=%u/%uus wait=%u/%uus TE=%u/%uus gap=%u/%uus late=%u%s",
         ui_perf_context_name(g_perf_window.context),
         static_cast<unsigned>(elapsed_ms),
         static_cast<unsigned>(n),
@@ -334,8 +347,8 @@ static void ui_perf_dump_window(int64_t now_us, bool context_switch)
         static_cast<unsigned>(g_perf_window.late_gap_count),
         context_switch ? " switch" : "");
 
-    ESP_LOGI(TAG,
-        "R.30 LVGL失效[%s] inv(avg/max)=%u.%u/%u次 sum(avg/max)=%u/%upx bbox(avg/max)=%u%%/%u%% flushN(avg/max)=%u.%u/%u DMAfree=%u largest=%u PSRAM=%u",
+    UI_PERF_LOGI(
+        "LVGL失效[%s] inv(avg/max)=%u.%u/%u次 sum(avg/max)=%u/%upx bbox(avg/max)=%u%%/%u%% flushN(avg/max)=%u.%u/%u DMAfree=%u largest=%u PSRAM=%u",
         ui_perf_context_name(g_perf_window.context),
         static_cast<unsigned>(avg_inv_count_x10 / 10U),
         static_cast<unsigned>(avg_inv_count_x10 % 10U),
@@ -500,7 +513,9 @@ static void ui_display_align_area_cb(lv_event_t *event)
     if (area->x2 > max_x) area->x2 = max_x;
     if (area->y2 > max_y) area->y2 = max_y;
 
-    ui_perf_note_invalidation(*area);
+    if (APP_DIAG_UI_PERFORMANCE) {
+        ui_perf_note_invalidation(*area);
+    }
 
     if (g_te_sync_runtime_enabled) {
         const int32_t width = area->x2 - area->x1 + 1;
@@ -629,13 +644,15 @@ static void ui_display_refresh_start_cb(lv_event_t *event)
     }
 
     const int64_t refresh_started_us = esp_timer_get_time();
-    ui_perf_begin_refresh(refresh_started_us);
+    if (APP_DIAG_UI_PERFORMANCE) {
+        ui_perf_begin_refresh(refresh_started_us);
+    }
 
     const bool large_refresh = g_te_sync_pending;
     const bool present_requested = display_present_take_hold_request();
     g_te_sync_pending = false;
 
-    if (large_refresh) {
+    if (APP_DIAG_UI_PERFORMANCE && large_refresh) {
         g_large_refresh_profile = {};
         g_large_refresh_profile.active = true;
         g_large_refresh_profile.refr_started_us = esp_timer_get_time();
@@ -646,17 +663,18 @@ static void ui_display_refresh_start_cb(lv_event_t *event)
         if (display_te_wait_next(g_te_sync_timeout_ms)) {
             const uint32_t waited_us = static_cast<uint32_t>(
                 esp_timer_get_time() - wait_started_us);
-            if (g_perf_frame.active) g_perf_frame.te_wait_us = waited_us;
+            if (APP_DIAG_UI_PERFORMANCE && g_perf_frame.active) g_perf_frame.te_wait_us = waited_us;
             ++g_te_sync_success_count;
             g_te_sync_consecutive_timeouts = 0U;
-            if (g_te_sync_success_count <= 3U || (g_te_sync_success_count % 60U) == 0U) {
-                ESP_LOGI(TAG,
-                    "R.21 TE对齐成功：count=%u wait=%uus",
+            if (APP_DIAG_UI_PERFORMANCE &&
+                (g_te_sync_success_count <= 3U || (g_te_sync_success_count % 60U) == 0U)) {
+                UI_PERF_LOGI(
+                    "TE对齐：count=%u wait=%uus",
                     static_cast<unsigned>(g_te_sync_success_count),
                     static_cast<unsigned>(waited_us));
             }
         } else {
-            if (g_perf_frame.active) {
+            if (APP_DIAG_UI_PERFORMANCE && g_perf_frame.active) {
                 g_perf_frame.te_wait_us = static_cast<uint32_t>(
                     esp_timer_get_time() - wait_started_us);
             }
@@ -699,15 +717,17 @@ static void ui_display_refresh_ready_cb(lv_event_t *event)
         return;
     }
 
-    ui_perf_finalize_refresh(esp_timer_get_time());
+    if (APP_DIAG_UI_PERFORMANCE) {
+        ui_perf_finalize_refresh(esp_timer_get_time());
+    }
 
     if (g_large_refresh_profile.active) {
         const uint32_t total_us = static_cast<uint32_t>(
             esp_timer_get_time() - g_large_refresh_profile.refr_started_us);
         ++g_large_refresh_profile_count;
         if (g_large_refresh_profile_count <= 12U || (g_large_refresh_profile_count % 60U) == 0U) {
-            ESP_LOGI(TAG,
-                "R.23 LVGL大刷新画像：count=%u total=%uus render=%uus(%u) flush=%uus(%u) wait=%uus",
+            UI_PERF_LOGI(
+                "LVGL大刷新：count=%u total=%uus render=%uus(%u) flush=%uus(%u) wait=%uus",
                 static_cast<unsigned>(g_large_refresh_profile_count),
                 static_cast<unsigned>(total_us),
                 static_cast<unsigned>(g_large_refresh_profile.render_us),
@@ -843,7 +863,7 @@ esp_err_t ui_manager_init()
         return ESP_ERR_INVALID_STATE;
     }
 
-    ESP_LOGI(TAG, "正在初始化 LVGL 9");
+    UI_BOOT_LOGI("初始化 LVGL 9");
     lvgl_port_cfg_t lvgl_cfg = {};
     // P1.5R.1：Core1 实时优先级阶梯。FLAC 预取固定 P4，LVGL 降为 P3，
     // 保证持续 UI 刷新时只要 FlacPrefetch Ready，就能先获得 CPU。
@@ -858,11 +878,11 @@ esp_err_t ui_manager_init()
         ESP_LOGE(TAG, "LVGL Port 初始化失败：%s", esp_err_to_name(ret));
         return ret;
     }
-    ESP_LOGI(TAG, "LVGL任务配置：core=1 priority=%u stack=%uB",
+    UI_BOOT_LOGI("LVGL task：core=1 priority=%u stack=%uB",
         static_cast<unsigned>(lvgl_cfg.task_priority), static_cast<unsigned>(lvgl_cfg.task_stack));
-    ESP_LOGI(TAG, "P1.5R.1 Core1 Priority Ladder：FlacPrefetch=P4 > LVGL=P3 > Artwork=P2 > Cover/Lyrics=P1");
+    UI_BOOT_LOGI("Core1 priority：FlacPrefetch=P4 > LVGL=P3 > Artwork=P2 > Cover/Lyrics=P1");
 
-    ESP_LOGI(TAG, "正在注册 CO5300 显示设备");
+    UI_BOOT_LOGI("注册 CO5300 显示设备");
     lvgl_port_display_cfg_t disp_cfg = {};
     disp_cfg.io_handle = display_get_panel_io();
     disp_cfg.panel_handle = display_get_panel();
@@ -878,8 +898,10 @@ esp_err_t ui_manager_init()
     disp_cfg.flags.buff_dma = true;
     disp_cfg.flags.swap_bytes = true;
 
+#if APP_DIAG_BOOT_VERBOSE
     const size_t dma_free_before = heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     const size_t dma_largest_before = heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+#endif
     g_display = lvgl_port_add_disp(&disp_cfg);
     if (g_display == nullptr) {
         ESP_LOGE(TAG, "注册 LVGL 显示设备失败");
@@ -894,16 +916,18 @@ esp_err_t ui_manager_init()
         return ret;
     }
 
+#if APP_DIAG_BOOT_VERBOSE
     const size_t dma_free_after = heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     const size_t dma_largest_after = heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    ESP_LOGI(TAG,
-        "R.36.1 LVGL DMA双缓冲：%u行/块，理论总计=%uB；DMA free=%u->%u largest=%u->%u",
+    UI_BOOT_LOGI(
+        "LVGL DMA双缓冲：%u行/块 total=%uB DMAfree=%u->%u largest=%u->%u",
         static_cast<unsigned>(kLvglDmaBufferLines),
         static_cast<unsigned>(FAKEPOD_LCD_WIDTH * kLvglDmaBufferLines * 2U * 2U),
         static_cast<unsigned>(dma_free_before),
         static_cast<unsigned>(dma_free_after),
         static_cast<unsigned>(dma_largest_before),
         static_cast<unsigned>(dma_largest_after));
+#endif
 
     g_te_sync_runtime_enabled = display_te_is_ready();
     g_te_sync_pending = false;
@@ -932,26 +956,28 @@ esp_err_t ui_manager_init()
     lv_display_add_event_cb(g_display, ui_display_align_area_cb, LV_EVENT_INVALIDATE_AREA, nullptr);
     lv_display_add_event_cb(g_display, ui_display_refresh_start_cb, LV_EVENT_REFR_START, nullptr);
     lv_display_add_event_cb(g_display, ui_display_refresh_ready_cb, LV_EVENT_REFR_READY, nullptr);
-    lv_display_add_event_cb(g_display, ui_display_profile_cb, LV_EVENT_RENDER_START, nullptr);
-    lv_display_add_event_cb(g_display, ui_display_profile_cb, LV_EVENT_RENDER_READY, nullptr);
-    lv_display_add_event_cb(g_display, ui_display_profile_cb, LV_EVENT_FLUSH_START, nullptr);
-    lv_display_add_event_cb(g_display, ui_display_profile_cb, LV_EVENT_FLUSH_FINISH, nullptr);
-    lv_display_add_event_cb(g_display, ui_display_profile_cb, LV_EVENT_FLUSH_WAIT_START, nullptr);
-    lv_display_add_event_cb(g_display, ui_display_profile_cb, LV_EVENT_FLUSH_WAIT_FINISH, nullptr);
-    ESP_LOGI(TAG, "R.32.1 LVGL初始化互斥：display callbacks -> indev -> decoder -> screens 全程持锁");
-    ESP_LOGI(TAG, "已启用 CO5300 局部刷新偶数对齐");
+    if (APP_DIAG_UI_PERFORMANCE) {
+        lv_display_add_event_cb(g_display, ui_display_profile_cb, LV_EVENT_RENDER_START, nullptr);
+        lv_display_add_event_cb(g_display, ui_display_profile_cb, LV_EVENT_RENDER_READY, nullptr);
+        lv_display_add_event_cb(g_display, ui_display_profile_cb, LV_EVENT_FLUSH_START, nullptr);
+        lv_display_add_event_cb(g_display, ui_display_profile_cb, LV_EVENT_FLUSH_FINISH, nullptr);
+        lv_display_add_event_cb(g_display, ui_display_profile_cb, LV_EVENT_FLUSH_WAIT_START, nullptr);
+        lv_display_add_event_cb(g_display, ui_display_profile_cb, LV_EVENT_FLUSH_WAIT_FINISH, nullptr);
+    }
+    UI_BOOT_LOGI("LVGL初始化互斥：display callbacks -> indev -> decoder -> screens 全程持锁");
+    UI_BOOT_LOGI("CO5300局部刷新偶数对齐已启用");
     if (g_te_sync_runtime_enabled) {
-        ESP_LOGI(TAG,
-            "R.31 TE策略已启用：静态大刷新阈值=%u像素；连续动画中等刷新绕过TE，>=90%%屏仍同步；timeout=%ums，TE period=%uus",
+        UI_BOOT_LOGI(
+            "TE策略：静态大刷新阈值=%u像素；连续动画中等刷新绕过TE；timeout=%ums period=%uus",
             static_cast<unsigned>(kTeSyncMinPixels),
             static_cast<unsigned>(g_te_sync_timeout_ms),
             static_cast<unsigned>(te_period_us));
     } else {
         ESP_LOGW(TAG, "R.21 LVGL TE同步未启用，保持无TE刷新路径");
     }
-    ESP_LOGI(TAG, "R.23 Direct Surface Present：跨Track优先绕过LVGL整屏image render；R.22 Display Hold仅作失败回退，QSPI=50MHz");
+    UI_BOOT_LOGI("Direct Surface Present：跨Track走BoundedSPI，Display Hold仅作失败回退");
 
-    ESP_LOGI(TAG, "正在注册 CST820 触摸输入");
+    UI_BOOT_LOGI("注册CST820触摸输入");
     gesture_router_reset();
     const esp_err_t touch_fast_ret = ui_touch_input_start();
     if (touch_fast_ret != ESP_OK) {
@@ -1000,16 +1026,19 @@ esp_err_t ui_manager_init()
     lyrics_view_create(lv_screen_active());
     spectrum_view_create(lv_screen_active());
     library_view_create(lv_screen_active());
-    g_perf_audit_timer = lv_timer_create(ui_perf_audit_timer_cb, kPerfAuditWindowMs, nullptr);
-    if (g_perf_audit_timer == nullptr) {
-        ESP_LOGW(TAG, "R.30 性能审计汇总timer创建失败，仅保留逐刷新计数");
+    if (APP_DIAG_UI_PERFORMANCE) {
+        g_perf_audit_timer = lv_timer_create(ui_perf_audit_timer_cb, kPerfAuditWindowMs, nullptr);
+        if (g_perf_audit_timer == nullptr) {
+            ESP_LOGW(TAG, "LVGL性能审计timer创建失败，仅保留逐刷新计数");
+        } else {
+            UI_PERF_LOGI("LVGL性能审计已启用：window=%ums",
+                static_cast<unsigned>(kPerfAuditWindowMs));
+        }
     }
     lvgl_port_unlock();
 
-    ESP_LOGI(TAG,
-        "R.30 全页面LVGL性能审计已启用：2s窗口；主页/Overlay/Launcher动画、歌词静态/缓动/Overlay、三种频谱、曲库列表/惯性/搜索分别统计");
     g_ready = true;
-    ESP_LOGI(TAG, "Stage 6 正式 UI 基础框架初始化成功");
+    ESP_LOGI(TAG, "UI ready：LVGL + Touch + Font/Lyrics services");
     return ESP_OK;
 }
 

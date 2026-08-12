@@ -22,7 +22,7 @@ static const char *TAG = "音频服务";
 #define AUDIO_POP_TRACE_LOG(...) \
     ESP_LOGI(TAG, "POP_TRACE: " __VA_ARGS__)
 #else
-#define AUDIO_POP_TRACE_LOG(...) do { } while (0)
+#define AUDIO_POP_TRACE_LOG(...) APP_DIAG_DISCARDED_LOGI(TAG, "POP_TRACE: " __VA_ARGS__)
 #endif
 
 // 仅在控制路径关键节点采样，不进入 PCM 热循环。

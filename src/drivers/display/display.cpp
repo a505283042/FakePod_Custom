@@ -1,7 +1,6 @@
 #include "display.h"
 
 #include <stdint.h>
-#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -36,9 +35,8 @@ static constexpr spi_host_device_t LCD_HOST =
     SPI2_HOST;
 
 
-// P1.5.3.2R.29：继续保持 50MHz QSPI、40 行 LVGL DMA 与双 staging。
-// DirectPresent 不再对每个 strip 调 panel_draw_bitmap()；改为一次设置完整 GRAM 窗口，
-// 首块 RAMWR、后续 RAMWRC 连续写，并保持两笔 color transaction 常驻队列，减少总线空隙。
+// LVGL 官方刷新保持 50MHz QSPI 与 40 行 DMA 条带。
+// 大面积 Cover/Launcher 快路径已经迁移到 display_bounded_spi.cpp。
 static constexpr int LCD_TRANSFER_HEIGHT =
     40;
 
@@ -51,20 +49,8 @@ static constexpr size_t LCD_TRANSFER_BUFFER_SIZE =
     LCD_TRANSFER_HEIGHT *
     2;
 
-// R.27 双 staging 必须一次拿到两块同尺寸 Internal DMA 内存。优先 16 行双缓冲（29.44KB 总计），
-// 若运行期碎片化导致第二块申请失败，就自动降到 12/8/4 行。
-static constexpr uint16_t DIRECT_PRESENT_PIPELINE_ROWS[] = {16U, 12U, 8U, 4U};
-
-// CO5300 官方 QSPI 驱动的 32-bit command phase 编码：
-// bits31:24=opcode，bits15:8=DCS command。官方驱动写命令使用 0x02，写颜色使用 0x32。
-static constexpr uint32_t CO5300_QSPI_OPCODE_WRITE_CMD = 0x02U;
-static constexpr uint32_t CO5300_QSPI_OPCODE_WRITE_COLOR = 0x32U;
-static constexpr UBaseType_t DIRECT_PRESENT_DONE_QUEUE_DEPTH = 12U;
-
-static constexpr int display_co5300_qspi_command(uint32_t opcode, uint8_t command)
-{
-    return static_cast<int>((opcode << 24U) | (static_cast<uint32_t>(command) << 8U));
-}
+// 启动阶段颜色测试仍使用 Panel IO DMA 完成计数；正常 LVGL 运行后由 flush_ready 桥接接管。
+static constexpr UBaseType_t DISPLAY_DMA_DONE_QUEUE_DEPTH = 12U;
 
 
 // ============================================================
@@ -82,16 +68,9 @@ static esp_lcd_panel_handle_t g_panel =
 static SemaphoreHandle_t g_tx_done =
     nullptr;
 
-// P1.5.3.2R.26：Panel IO color-done 统一桥接。esp_lvgl_port_add_disp() 会覆盖
-// display_init() 阶段注册的 callback，因此 UI 注册完 LVGL display 后再安装此桥。
-// DirectPresent 期间 callback 只释放 g_tx_done；其余时间保持 LVGL 原语义，
-// 对当前 display 调用 lv_display_flush_ready()。
+// esp_lvgl_port_add_disp() 会覆盖 display_init() 阶段的 Panel IO callback。
+// UI 创建 LVGL display 后重新安装本桥，只负责恢复 LVGL flush_ready 语义。
 static lv_display_t *g_lvgl_display = nullptr;
-static volatile bool g_direct_present_active = false;
-// P1.5.3.2R.36.2：DirectPresent 一旦发生 transaction/color-done 异常，本次启动内
-// 立即熔断后续 Direct 快路径，全部回退 LVGL。正确性优先于动画/封面直写性能。
-static bool g_direct_present_faulted = false;
-static bool g_color_done_bridge_installed = false;
 
 
 // P1.5.3.2R.21：CO5300 TE 上升沿同步。
@@ -436,19 +415,10 @@ static bool IRAM_ATTR display_color_done_bridge(
     (void) event_data;
     (void) user_ctx;
 
-    BaseType_t task_woken = pdFALSE;
-
-    if (g_direct_present_active) {
-        if (g_tx_done != nullptr) {
-            xSemaphoreGiveFromISR(g_tx_done, &task_woken);
-        }
-    } else if (g_lvgl_display != nullptr) {
-        // 与 esp_lvgl_port 自带 SPI color-done callback 保持同样语义。
-        // 只有真正的 LVGL flush 才进入这里；DirectPresent 完成通知不会误喂给 LVGL。
+    if (g_lvgl_display != nullptr) {
         lv_display_flush_ready(g_lvgl_display);
     }
-
-    return task_woken == pdTRUE;
+    return false;
 }
 
 
@@ -494,10 +464,9 @@ esp_err_t display_init()
     // 创建 DMA 完成信号量
     // ========================================================
 
-    // R.29：DirectPresent 同时允许两笔 color transaction 在 Panel IO 队列中飞行，
-    // 完成通知不能再用 binary semaphore，否则两个 ISR 回调可能合并丢计数。
+    // 启动阶段颜色测试按条带等待 DMA 完成；保留 counting semaphore，避免 ISR 完成信号丢失。
     g_tx_done =
-        xSemaphoreCreateCounting(DIRECT_PRESENT_DONE_QUEUE_DEPTH, 0U);
+        xSemaphoreCreateCounting(DISPLAY_DMA_DONE_QUEUE_DEPTH, 0U);
 
 
     if (g_tx_done == nullptr) {
@@ -1268,434 +1237,18 @@ esp_err_t display_install_lvgl_color_done_bridge(void *lvgl_display)
         &callbacks,
         nullptr);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "R.26 安装LVGL/DirectPresent color-done桥接失败：%s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "安装LVGL color-done桥接失败：%s", esp_err_to_name(ret));
         g_lvgl_display = nullptr;
-        g_color_done_bridge_installed = false;
         return ret;
     }
-
-    g_color_done_bridge_installed = true;
-    ESP_LOGI(TAG,
-        "R.26 color-done桥接已安装：LVGL flush_ready + DirectPresent DMA semaphore 共用Panel IO callback");
-    ESP_LOGI(TAG,
-        "R.36.2 DirectPresent保护：无-1 barrier；color-done=250ms有界等待；异常=最多1s排空+本次启动熔断Direct");
     return ESP_OK;
 }
 
 
 // ============================================================
-// R.29 封面 Direct Surface Present / Continuous GRAM Stream
+// 全屏封面 Present Hold
 // ============================================================
 
-static esp_err_t display_present_rgb565_region_direct_impl(
-    const uint8_t *rgb565,
-    uint16_t x,
-    uint16_t y,
-    uint16_t width,
-    uint16_t height,
-    bool wire_order,
-    bool wait_for_te,
-    bool skip_io_barrier,
-    bool log_summary,
-    DisplayDirectPresentStats *out_stats)
-{
-    DisplayDirectPresentStats stats = {};
-    stats.wire_order = wire_order;
-    stats.continuous_stream = true;
-    const int64_t total_started_us = esp_timer_get_time();
-
-    if (!g_ready || g_panel == nullptr || g_panel_io == nullptr || g_tx_done == nullptr ||
-        !g_color_done_bridge_installed || g_lvgl_display == nullptr || rgb565 == nullptr) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (g_direct_present_faulted) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (width == 0U || height == 0U ||
-        x >= FAKEPOD_LCD_WIDTH || y >= FAKEPOD_LCD_HEIGHT ||
-        static_cast<uint32_t>(x) + width > FAKEPOD_LCD_WIDTH ||
-        static_cast<uint32_t>(y) + height > FAKEPOD_LCD_HEIGHT) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    // R.36.2：彻底移除 DirectPresent 的 esp_lcd_panel_io_tx_param(-1) queue barrier。
-    // 所有当前调用点都运行在 LVGL Task 的事件/timer 上下文；LVGL 自己的 flush 在进入这些业务
-    // callback 前已经完成等待。旧 barrier 没有 timeout，实机反复 Launcher 时已证明它能永久阻塞
-    // UI Task。现在 DirectPresent 只依赖每笔 color transaction 的 250ms 有界完成等待。
-    // skip_io_barrier 参数暂时保留 ABI/调用结构，R.36.2 后两种入口都统一为 no-barrier。
-    (void) skip_io_barrier;
-    esp_err_t result = ESP_OK;
-    stats.io_barrier_us = 0U;
-
-    // R.36.2：此处先不要切换 color-done 路由。DMA 申请、窗口参数和 TE 等待都不会
-    // 产生 Direct color callback；把 direct-active 窗口压缩到真正的 tx_color 流水阶段，
-    // 可显著降低“上一笔 LVGL color-done 迟到后被误送进 g_tx_done”的机会。
-
-    // 继续沿用 R.27/R.28 的自适应双 Internal DMA staging。R.29 的优化点不是增大 buffer，
-    // 而是让两个 buffer 对应的 color transaction 真正排队连续发送。
-    uint8_t *dma_strip[2] = {nullptr, nullptr};
-    uint16_t staging_rows = 0U;
-    size_t staging_bytes = 0U;
-    const size_t dma_free_before =
-        heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    const size_t dma_largest_before =
-        heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-
-    for (uint16_t candidate_rows : DIRECT_PRESENT_PIPELINE_ROWS) {
-        const size_t candidate_bytes =
-            static_cast<size_t>(width) * static_cast<size_t>(candidate_rows) * 2U;
-        dma_strip[0] = static_cast<uint8_t *>(heap_caps_aligned_alloc(
-            16U,
-            candidate_bytes,
-            MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
-        if (dma_strip[0] == nullptr) {
-            continue;
-        }
-        dma_strip[1] = static_cast<uint8_t *>(heap_caps_aligned_alloc(
-            16U,
-            candidate_bytes,
-            MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
-        if (dma_strip[1] != nullptr) {
-            staging_rows = candidate_rows;
-            staging_bytes = candidate_bytes;
-            break;
-        }
-        heap_caps_free(dma_strip[0]);
-        dma_strip[0] = nullptr;
-    }
-
-    if (dma_strip[0] == nullptr || dma_strip[1] == nullptr || staging_rows == 0U) {
-        if (dma_strip[0] != nullptr) heap_caps_free(dma_strip[0]);
-        if (dma_strip[1] != nullptr) heap_caps_free(dma_strip[1]);
-        g_direct_present_active = false;
-        ESP_LOGW(TAG,
-            "R.29 ContinuousGRAM：双DMA staging申请失败 free=%u largest=%u，已尝试16/12/8/4行×2",
-            static_cast<unsigned>(dma_free_before),
-            static_cast<unsigned>(dma_largest_before));
-        return ESP_ERR_NO_MEM;
-    }
-
-    stats.staging_rows = staging_rows;
-    stats.staging_buffers = 2U;
-    stats.staging_bytes = static_cast<uint32_t>(staging_bytes);
-    stats.staging_total_bytes = static_cast<uint32_t>(staging_bytes * 2U);
-    stats.queue_peak = 2U;
-
-    auto prepare_strip = [&](uint8_t *dst, int y, int rows) {
-        const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(rows) * 2U;
-        const uint8_t *src = rgb565 + static_cast<size_t>(y) * width * 2U;
-        const int64_t started_us = esp_timer_get_time();
-        if (wire_order) {
-            memcpy(dst, src, bytes);
-            stats.copy_us += static_cast<uint32_t>(esp_timer_get_time() - started_us);
-            return;
-        }
-
-        const size_t pixels = bytes / 2U;
-        for (size_t i = 0; i < pixels; ++i) {
-            dst[i * 2U] = src[i * 2U + 1U];
-            dst[i * 2U + 1U] = src[i * 2U];
-        }
-        stats.byte_swap_us += static_cast<uint32_t>(esp_timer_get_time() - started_us);
-    };
-
-    auto tx_color_chunk = [&](uint8_t command, const uint8_t *buffer, size_t bytes) -> esp_err_t {
-        const int qspi_command = display_co5300_qspi_command(
-            CO5300_QSPI_OPCODE_WRITE_COLOR,
-            command);
-        return esp_lcd_panel_io_tx_color(g_panel_io, qspi_command, buffer, bytes);
-    };
-
-    // 在 TE 到来前先设置一次完整 GRAM 窗口。官方 CO5300 draw_bitmap() 每个 strip 都会
-    // CASET + RASET + RAMWR；R.29 将 CASET/RASET 从 N 次缩为 1 次。
-    const uint16_t x_start = static_cast<uint16_t>(FAKEPOD_LCD_X_OFFSET + x);
-    const uint16_t x_end = static_cast<uint16_t>(FAKEPOD_LCD_X_OFFSET + x + width - 1U);
-    const uint16_t y_start = static_cast<uint16_t>(FAKEPOD_LCD_Y_OFFSET + y);
-    const uint16_t y_end = static_cast<uint16_t>(FAKEPOD_LCD_Y_OFFSET + y + height - 1U);
-    const uint8_t caset[4] = {
-        static_cast<uint8_t>(x_start >> 8U),
-        static_cast<uint8_t>(x_start & 0xFFU),
-        static_cast<uint8_t>(x_end >> 8U),
-        static_cast<uint8_t>(x_end & 0xFFU),
-    };
-    const uint8_t raset[4] = {
-        static_cast<uint8_t>(y_start >> 8U),
-        static_cast<uint8_t>(y_start & 0xFFU),
-        static_cast<uint8_t>(y_end >> 8U),
-        static_cast<uint8_t>(y_end & 0xFFU),
-    };
-
-    const int64_t window_started_us = esp_timer_get_time();
-    result = esp_lcd_panel_io_tx_param(
-        g_panel_io,
-        display_co5300_qspi_command(CO5300_QSPI_OPCODE_WRITE_CMD, LCD_CMD_CASET),
-        caset,
-        sizeof(caset));
-    if (result == ESP_OK) {
-        result = esp_lcd_panel_io_tx_param(
-            g_panel_io,
-            display_co5300_qspi_command(CO5300_QSPI_OPCODE_WRITE_CMD, LCD_CMD_RASET),
-            raset,
-            sizeof(raset));
-    }
-    stats.window_setup_us = static_cast<uint32_t>(esp_timer_get_time() - window_started_us);
-    if (result != ESP_OK) {
-        ESP_LOGW(TAG, "R.29 ContinuousGRAM：完整窗口设置失败：%s", esp_err_to_name(result));
-    }
-
-    int next_source_y = 0;
-    int rows_in_buffer[2] = {0, 0};
-    uint8_t queue_buffer_order[2] = {0U, 1U};
-    uint8_t queued_count = 0U;
-    uint8_t completed_count = 0U;
-
-    const int64_t pipeline_started_us = esp_timer_get_time();
-
-    // 首次预填最多两块，在 TE 到来后立即把 RAMWR + RAMWRC 两笔 color transaction 排入队列。
-    if (result == ESP_OK) {
-        for (uint8_t buffer_index = 0U; buffer_index < 2U && next_source_y < height; ++buffer_index) {
-            const int rows = (next_source_y + staging_rows <= height)
-                ? static_cast<int>(staging_rows)
-                : static_cast<int>(height) - next_source_y;
-            prepare_strip(dma_strip[buffer_index], next_source_y, rows);
-            rows_in_buffer[buffer_index] = rows;
-            next_source_y += rows;
-        }
-    }
-
-    if (result == ESP_OK && wait_for_te && display_te_is_ready()) {
-        const uint32_t period_us = display_te_get_period_us();
-        uint32_t timeout_ms = 25U;
-        if (period_us > 0U) {
-            const uint32_t period_ms_ceil = (period_us + 999U) / 1000U;
-            timeout_ms = period_ms_ceil + 8U;
-            if (timeout_ms < 25U) timeout_ms = 25U;
-            if (timeout_ms > 50U) timeout_ms = 50U;
-        }
-        const int64_t te_started_us = esp_timer_get_time();
-        stats.te_aligned = display_te_wait_next(timeout_ms);
-        stats.te_wait_us = static_cast<uint32_t>(esp_timer_get_time() - te_started_us);
-    }
-
-    if (result == ESP_OK) {
-        while (xSemaphoreTake(g_tx_done, 0) == pdTRUE) {
-        }
-        g_direct_present_active = true;
-    }
-
-    int64_t stream_started_us = 0;
-    if (result == ESP_OK) {
-        stream_started_us = esp_timer_get_time();
-        for (uint8_t buffer_index = 0U; buffer_index < 2U; ++buffer_index) {
-            if (rows_in_buffer[buffer_index] <= 0) {
-                continue;
-            }
-            const size_t bytes = static_cast<size_t>(width) *
-                static_cast<size_t>(rows_in_buffer[buffer_index]) * 2U;
-            const uint8_t command = (queued_count == 0U) ? LCD_CMD_RAMWR : LCD_CMD_RAMWRC;
-            result = tx_color_chunk(command, dma_strip[buffer_index], bytes);
-            if (result != ESP_OK) {
-                ESP_LOGW(TAG,
-                    "R.29 ContinuousGRAM：首批tx_color失败 buffer=%u rows=%d：%s",
-                    static_cast<unsigned>(buffer_index),
-                    rows_in_buffer[buffer_index],
-                    esp_err_to_name(result));
-                break;
-            }
-            queue_buffer_order[queued_count] = buffer_index;
-            ++queued_count;
-            ++stats.chunks;
-        }
-    }
-
-    // 两块 buffer 始终保持 FIFO 复用：等最老一块完成 -> 立刻用它准备后续数据 -> RAMWRC 入队。
-    // 当 CPU memcpy/swap 比另一块 DMA 更快时，Panel IO 队列持续有下一笔 transaction，总线无需等 CPU。
-    while (result == ESP_OK && completed_count < stats.chunks) {
-        const int64_t wait_started_us = esp_timer_get_time();
-        if (xSemaphoreTake(g_tx_done, pdMS_TO_TICKS(250)) != pdTRUE) {
-            result = ESP_ERR_TIMEOUT;
-            ESP_LOGW(TAG,
-                "R.29 ContinuousGRAM：等待color-done超时 completed=%u queued=%u next_y=%d",
-                static_cast<unsigned>(completed_count),
-                static_cast<unsigned>(stats.chunks),
-                next_source_y);
-            break;
-        }
-        stats.dma_wait_us += static_cast<uint32_t>(esp_timer_get_time() - wait_started_us);
-
-        const uint8_t completed_buffer = queue_buffer_order[completed_count & 1U];
-        ++completed_count;
-
-        if (next_source_y >= height) {
-            continue;
-        }
-
-        const int rows = (next_source_y + staging_rows <= height)
-            ? static_cast<int>(staging_rows)
-            : static_cast<int>(height) - next_source_y;
-        prepare_strip(dma_strip[completed_buffer], next_source_y, rows);
-        rows_in_buffer[completed_buffer] = rows;
-        next_source_y += rows;
-
-        const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(rows) * 2U;
-        result = tx_color_chunk(LCD_CMD_RAMWRC, dma_strip[completed_buffer], bytes);
-        if (result != ESP_OK) {
-            ESP_LOGW(TAG,
-                "R.29 ContinuousGRAM：RAMWRC续写失败 buffer=%u rows=%d：%s",
-                static_cast<unsigned>(completed_buffer),
-                rows,
-                esp_err_to_name(result));
-            break;
-        }
-        queue_buffer_order[stats.chunks & 1U] = completed_buffer;
-        ++stats.chunks;
-    }
-
-    // 上面的循环条件会随着 stats.chunks 增长。最后确保所有已提交 transaction 均拿到 callback。
-    while (result == ESP_OK && completed_count < stats.chunks) {
-        const int64_t wait_started_us = esp_timer_get_time();
-        if (xSemaphoreTake(g_tx_done, pdMS_TO_TICKS(250)) != pdTRUE) {
-            result = ESP_ERR_TIMEOUT;
-            ESP_LOGW(TAG,
-                "R.29 ContinuousGRAM：尾部color-done超时 completed=%u queued=%u",
-                static_cast<unsigned>(completed_count),
-                static_cast<unsigned>(stats.chunks));
-            break;
-        }
-        stats.dma_wait_us += static_cast<uint32_t>(esp_timer_get_time() - wait_started_us);
-        ++completed_count;
-    }
-
-    if (stream_started_us != 0) {
-        stats.stream_us = static_cast<uint32_t>(esp_timer_get_time() - stream_started_us);
-        stats.dma_us = stats.stream_us;
-    }
-
-    const uint32_t pipeline_elapsed_us =
-        static_cast<uint32_t>(esp_timer_get_time() - pipeline_started_us);
-    stats.pipeline_us = pipeline_elapsed_us > stats.te_wait_us
-        ? pipeline_elapsed_us - stats.te_wait_us
-        : pipeline_elapsed_us;
-
-    // 对 R.29 更有意义的 overlap 是 copy/swap 和连续 stream 的重叠量。
-    const uint64_t serial_estimate_us =
-        static_cast<uint64_t>(stats.byte_swap_us) + static_cast<uint64_t>(stats.copy_us) +
-        static_cast<uint64_t>(stats.stream_us);
-    stats.overlap_saved_us = serial_estimate_us > stats.pipeline_us
-        ? static_cast<uint32_t>(serial_estimate_us - stats.pipeline_us)
-        : 0U;
-
-    // R.36.2：错误恢复路径绝不能再次进入 esp_lcd_panel_io_tx_param(-1) 的无超时
-    // queue barrier，否则本来只是一次 DirectPresent 失败会升级成 LVGL/UI Task 永久卡死。
-    // 已成功提交的 color transaction 数量是确定的；异常时最多再给驱动 1 秒完成剩余 callback。
-    // 若 1 秒仍未收齐，熔断本次启动的 Direct 快路径，后续封面/Launcher 全部回退 LVGL。
-    if (result != ESP_OK) {
-        const uint16_t submitted = stats.chunks;
-        const int64_t recovery_deadline_us = esp_timer_get_time() + 1000000LL;
-        while (completed_count < submitted && esp_timer_get_time() < recovery_deadline_us) {
-            if (xSemaphoreTake(g_tx_done, pdMS_TO_TICKS(20)) == pdTRUE) {
-                ++completed_count;
-            }
-        }
-        if (completed_count < submitted) {
-            ESP_LOGE(TAG,
-                "R.36.2 DirectPresent恢复超时：completed=%u submitted=%u；熔断Direct快路径，后续仅LVGL",
-                static_cast<unsigned>(completed_count),
-                static_cast<unsigned>(submitted));
-        } else {
-            ESP_LOGW(TAG,
-                "R.36.2 DirectPresent异常已有限排空：completed=%u submitted=%u；仍熔断Direct快路径",
-                static_cast<unsigned>(completed_count),
-                static_cast<unsigned>(submitted));
-        }
-        g_direct_present_faulted = true;
-    }
-    while (xSemaphoreTake(g_tx_done, 0) == pdTRUE) {
-    }
-    g_direct_present_active = false;
-
-    heap_caps_free(dma_strip[0]);
-    heap_caps_free(dma_strip[1]);
-    stats.total_us = static_cast<uint32_t>(esp_timer_get_time() - total_started_us);
-    if (out_stats != nullptr) {
-        *out_stats = stats;
-    }
-
-    static uint32_t s_direct_present_count = 0U;
-    if (log_summary) {
-        ++s_direct_present_count;
-        if (s_direct_present_count <= 12U || (s_direct_present_count % 60U) == 0U || result != ESP_OK) {
-            ESP_LOGI(TAG,
-                "R.29 ContinuousGRAM：count=%u result=%s source=%s total=%uus barrier=%uus window=%uus te=%uus pipeline=%uus stream=%uus copy=%uus swap=%uus wait=%uus overlap≈%uus chunks=%u queue_peak=%u staging=%u行×%u total=%uB free=%u largest=%u aligned=%u",
-                static_cast<unsigned>(s_direct_present_count),
-                esp_err_to_name(result),
-                stats.wire_order ? "wire" : "native",
-                static_cast<unsigned>(stats.total_us),
-                static_cast<unsigned>(stats.io_barrier_us),
-                static_cast<unsigned>(stats.window_setup_us),
-                static_cast<unsigned>(stats.te_wait_us),
-                static_cast<unsigned>(stats.pipeline_us),
-                static_cast<unsigned>(stats.stream_us),
-                static_cast<unsigned>(stats.copy_us),
-                static_cast<unsigned>(stats.byte_swap_us),
-                static_cast<unsigned>(stats.dma_wait_us),
-                static_cast<unsigned>(stats.overlap_saved_us),
-                static_cast<unsigned>(stats.chunks),
-                static_cast<unsigned>(stats.queue_peak),
-                static_cast<unsigned>(stats.staging_rows),
-                static_cast<unsigned>(stats.staging_buffers),
-                static_cast<unsigned>(stats.staging_total_bytes),
-                static_cast<unsigned>(dma_free_before),
-                static_cast<unsigned>(dma_largest_before),
-                static_cast<unsigned>(stats.te_aligned));
-        }
-    }
-    return result;
-}
-
-esp_err_t display_present_rgb565_direct(
-    const uint8_t *rgb565,
-    uint16_t width,
-    uint16_t height,
-    bool wire_order,
-    DisplayDirectPresentStats *out_stats)
-{
-    return display_present_rgb565_region_direct_impl(
-        rgb565, 0U, 0U, width, height, wire_order, true, false, true, out_stats);
-}
-
-esp_err_t display_present_rgb565_region_direct(
-    const uint8_t *rgb565,
-    uint16_t x,
-    uint16_t y,
-    uint16_t width,
-    uint16_t height,
-    bool wire_order,
-    bool wait_for_te,
-    DisplayDirectPresentStats *out_stats)
-{
-    return display_present_rgb565_region_direct_impl(
-        rgb565, x, y, width, height, wire_order, wait_for_te, false, false, out_stats);
-}
-
-esp_err_t display_present_rgb565_region_direct_owned(
-    const uint8_t *rgb565,
-    uint16_t x,
-    uint16_t y,
-    uint16_t width,
-    uint16_t height,
-    bool wire_order,
-    bool wait_for_te,
-    DisplayDirectPresentStats *out_stats)
-{
-    return display_present_rgb565_region_direct_impl(
-        rgb565, x, y, width, height, wire_order, wait_for_te, true, false, out_stats);
-}
-
-
-// ============================================================
-// R.22 全屏封面 Present Hold
-// ============================================================
 
 void display_present_request_hold()
 {

@@ -6,6 +6,7 @@
 #include "audio_service.h"
 #include "board_pins.h"
 #include "esp_log.h"
+#include "app_diag_config.h"
 #include "esp_timer.h"
 #include "font/font_manager.h"
 #include "gesture/gesture_router.h"
@@ -19,6 +20,18 @@
 namespace {
 
 static const char *TAG = "歌词界面";
+
+#if APP_DIAG_BOOT_VERBOSE
+#define UI_PAGE_BOOT_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define UI_PAGE_BOOT_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
+
+#if APP_DIAG_UI_INTERACTION
+#define UI_PAGE_INTERACTION_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define UI_PAGE_INTERACTION_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
 
 static constexpr int32_t LYRICS_LINE_X = 22;
 static constexpr int32_t LYRICS_LINE_W = 416;
@@ -681,7 +694,7 @@ static void lyrics_view_overlay_mode_cb(lv_event_t *event)
         lv_obj_invalidate(g_overlay_mode_button);
     }
     lyrics_view_overlay_arm_timeout();
-    ESP_LOGI(TAG, "P1.5.3.2R.12 歌词Overlay播放模式：%s",
+    UI_PAGE_INTERACTION_LOGI("歌词Overlay播放模式：%s",
         player_transport_loop_mode_name(mode));
 }
 
@@ -695,7 +708,7 @@ static void lyrics_view_overlay_volume_mode_cb(lv_event_t *event)
     const bool armed = !g_overlay_volume_adjust_armed;
     lyrics_view_set_volume_adjust_armed(armed);
     lyrics_view_overlay_arm_timeout();
-    ESP_LOGI(TAG, "P1.5.3.2R.12 歌词Overlay音量手势：%s",
+    UI_PAGE_INTERACTION_LOGI("歌词Overlay音量手势：%s",
         armed ? "已进入纵向调节" : "已退出纵向调节");
 }
 
@@ -1325,8 +1338,8 @@ void lyrics_view_create(lv_obj_t *screen)
     if (g_overlay_timer != nullptr) {
         lv_timer_pause(g_overlay_timer);
     }
-    ESP_LOGI(TAG,
-        "P1.5.3.2R.12 歌词Overlay：底部五按钮=模式/上一曲/播放/下一曲/音量；音量图标58px并仍需点击后才启用纵向调节；纯Tap阈值=%dpx",
+    UI_PAGE_BOOT_LOGI(
+        "歌词页：Overlay五按钮，纯Tap阈值=%dpx",
         static_cast<int>(LYRICS_OVERLAY_TAP_MAX_MOVE_PX));
 }
 
@@ -1380,7 +1393,7 @@ void lyrics_view_open()
     const uint32_t track = lyrics_view_current_track();
     lyrics_view_refresh_header(track);
     lyrics_view_request_if_needed(track);
-    ESP_LOGI(TAG, "打开歌词页：track=%lu", static_cast<unsigned long>(track));
+    UI_PAGE_INTERACTION_LOGI("打开歌词页：track=%lu", static_cast<unsigned long>(track));
 }
 
 void lyrics_view_close()
@@ -1396,7 +1409,7 @@ void lyrics_view_close()
     gesture_router_set_vertical_adjust_enabled(false);
     lyrics_view_cancel_motion(false);
     lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
-    ESP_LOGI(TAG, "关闭歌词页，返回封面主页");
+    UI_PAGE_INTERACTION_LOGI("关闭歌词页，返回主页");
 }
 
 bool lyrics_view_is_visible()

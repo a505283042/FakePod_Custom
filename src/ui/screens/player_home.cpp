@@ -10,6 +10,7 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "audio_service.h"
+#include "app_diag_config.h"
 #include "assets/launcher_animation_frames.h"
 #include "artwork/now_playing_artwork.h"
 #include "artwork/cover_surface_cache.h"
@@ -28,6 +29,30 @@
 #include "ui_common.h"
 
 static const char *TAG = "首页";
+
+#if APP_DIAG_BOOT_VERBOSE
+#define HOME_BOOT_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define HOME_BOOT_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
+
+#if APP_DIAG_UI_INTERACTION
+#define HOME_INTERACTION_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define HOME_INTERACTION_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
+
+#if APP_DIAG_LAUNCHER_PERFORMANCE
+#define HOME_LAUNCHER_PERF_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define HOME_LAUNCHER_PERF_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
+
+#if APP_DIAG_DISPLAY_TRANSPORT
+#define HOME_DISPLAY_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define HOME_DISPLAY_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
 
 // R.20：播放器默认显示 normal RGB565；后台同时预处理 dimmed RGB565。
 // Overlay 打开时优先直接切 dimmed Surface，只有压缩图回退路径才使用半透明黑层。
@@ -226,10 +251,6 @@ static uint32_t g_launcher_frame_decode_max_us = 0U;
 #define APP_DISPLAY_LAUNCHER_BOUNDED_SPI 1
 #endif
 static constexpr bool kLauncherBoundedSpiEnabled = APP_DISPLAY_LAUNCHER_BOUNDED_SPI != 0;
-// 旧共享 Panel IO DirectScene 永久保持关闭，作为历史代码/封面 DirectPresent 兼容路径保留。
-static constexpr bool kLauncherDirectSceneEnabled = false;
-// 全屏页面回主页继续保持 R.36.2.1 的 LVGL 安全恢复，不参与 R.36.3 Launcher 专用实验。
-static constexpr bool kFullscreenHomeResumeDirectEnabled = false;
 static bool g_launcher_direct_frame_active = false;
 static uint32_t g_launcher_direct_present_count = 0U;
 static uint32_t g_launcher_direct_present_us = 0U;
@@ -1474,6 +1495,7 @@ static bool player_home_launcher_present_work_direct()
         return false;
     }
 
+#if APP_DIAG_LAUNCHER_PERFORMANCE
     ++g_launcher_frame_decode_count;
     g_launcher_frame_decode_us += stats.producer_us;
     if (stats.producer_us > g_launcher_frame_decode_max_us) {
@@ -1490,8 +1512,8 @@ static bool player_home_launcher_present_work_direct()
     }
     if (g_launcher_direct_present_count <= 3U ||
         g_launcher_frame_index == static_cast<uint8_t>(kLauncherAnimationAssetFrameCount - 1U)) {
-        ESP_LOGI(TAG,
-            "R.36.6.2 LauncherWireStripFrame：gen=%u seq=%u..%u frame=%u total=%uus compose=%uus stream=%uus swap=%uus wait=%uus pairs(skip/fill/lit/blend)=%u/%u/%u/%u chunks=%u staging=%u行×%u PanelWork=0B",
+        HOME_LAUNCHER_PERF_LOGI(
+            "Launcher frame：gen=%u seq=%u..%u frame=%u total=%uus compose=%uus stream=%uus swap=%uus wait=%uus pairs(skip/fill/lit/blend)=%u/%u/%u/%u chunks=%u staging=%u行×%u PanelWork=0B",
             static_cast<unsigned>(stats.generation),
             static_cast<unsigned>(stats.first_sequence),
             static_cast<unsigned>(stats.last_sequence),
@@ -1509,6 +1531,7 @@ static bool player_home_launcher_present_work_direct()
             static_cast<unsigned>(stats.staging_rows),
             static_cast<unsigned>(stats.staging_buffers));
     }
+#endif
     return true;
 }
 
@@ -1529,8 +1552,8 @@ static void player_home_launcher_switch_to_lvgl_fallback()
     if (g_launcher_panel != nullptr) {
         lv_obj_invalidate(g_launcher_panel);
     }
-    // R.33.2.2：DirectScene 正常路径让整个 Launcher LVGL 根对象保持隐藏，
-    // 因此中途降级时必须在这里重新显示根对象，否则 fallback canvas 虽已解隐藏仍不可见。
+    // BoundedSPI 正常路径让 Launcher LVGL 根对象保持隐藏；降级时必须重新显示根对象，
+    // 否则 R.32 fallback 虽已重绘但仍不可见。
     if (g_launcher != nullptr) {
         lv_obj_remove_flag(g_launcher, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(g_launcher);
@@ -1627,8 +1650,8 @@ static void player_home_launcher_try_surface_rebind()
     // B 已成为唯一 Launcher source 后才释放 A pin。若 Direct 发生有界故障并降级，
     // R.32 fallback 使用当前状态实时绘制，不再依赖任何整帧 RGB565 Work。
     cover_surface_cache_release(&old_lease);
-    ESP_LOGI(TAG,
-        "R.36.6 Launcher背景换绑：%u -> %u acquire=%uus gen=%u base=%uus stream=%uus frame=%u direct=%d",
+    HOME_DISPLAY_LOGI(
+        "Launcher封面换绑：%u -> %u acquire=%uus gen=%u base=%uus stream=%uus frame=%u direct=%d",
         static_cast<unsigned>(old_track),
         static_cast<unsigned>(current_track),
         static_cast<unsigned>(acquire_us),
@@ -1693,8 +1716,8 @@ static bool player_home_launcher_begin_direct_scene()
     g_launcher_direct_frame_active = true;
     player_home_launcher_reset_direct_stats();
     g_launcher_frame_index = 0U;
-    ESP_LOGI(TAG,
-        "R.36.6.2 LauncherBoundedScene：gen=%u lease=%uus track=%u fullPresent=%uus drain=%uus stream=%uus base=CoverSurface.dimmed owner=bounded-spi root=hidden",
+    HOME_LAUNCHER_PERF_LOGI(
+        "Launcher scene：gen=%u lease=%uus track=%u fullPresent=%uus drain=%uus stream=%uus base=CoverSurface.dimmed owner=bounded-spi root=hidden",
         static_cast<unsigned>(stats.generation),
         static_cast<unsigned>(g_launcher_surface_lease_us),
         static_cast<unsigned>(g_launcher_surface_lease_track),
@@ -1729,8 +1752,8 @@ static bool player_home_present_current_cover_bounded(const char *reason)
             &stats);
     cover_surface_cache_release(&lease);
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG,
-            "R.36.3 Launcher退出封面恢复：reason=%s track=%lu gen=%u total=%uus drain=%uus stream=%uus",
+        HOME_DISPLAY_LOGI(
+            "Launcher退出封面恢复：reason=%s track=%lu gen=%u total=%uus drain=%uus stream=%uus",
             reason != nullptr ? reason : "unknown",
             static_cast<unsigned long>(track_index),
             static_cast<unsigned>(stats.generation),
@@ -1741,52 +1764,6 @@ static bool player_home_present_current_cover_bounded(const char *reason)
     }
     ESP_LOGW(TAG,
         "R.36.3 Launcher退出封面恢复失败：reason=%s track=%lu ret=%s，交给LVGL重绘",
-        reason != nullptr ? reason : "unknown",
-        static_cast<unsigned long>(track_index),
-        esp_err_to_name(ret));
-    return false;
-}
-
-static bool player_home_present_current_cover_direct(const char *reason)
-{
-    if (!player_state_is_ready()) {
-        return false;
-    }
-    const uint32_t track_index = static_cast<uint32_t>(player_state_get_index());
-    CoverSurfaceLease lease = {};
-    if (!cover_surface_cache_acquire(track_index, &lease)) {
-        return false;
-    }
-
-    // R.36.2：页面恢复/Launcher 退出都只提交已经存在的 current Surface，且走 owned/no-barrier。
-    // Overlay 若仍处于显示状态，物理恢复必须与 LVGL 当前 source 一致，避免先闪亮图再重绘暗图。
-    const uint8_t *source = g_overlay_visible ? lease.dimmed_rgb565 : lease.normal_rgb565;
-    DisplayDirectPresentStats stats = {};
-    const esp_err_t ret = source == nullptr
-        ? ESP_ERR_INVALID_STATE
-        : display_present_rgb565_region_direct_owned(
-            source,
-            0U,
-            0U,
-            FAKEPOD_LCD_WIDTH,
-            FAKEPOD_LCD_HEIGHT,
-            false,
-            true,
-            &stats);
-    cover_surface_cache_release(&lease);
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG,
-            "R.36.2 HomeResume DirectPresent：reason=%s track=%lu source=%s total=%uus barrier=%uus stream=%uus",
-            reason != nullptr ? reason : "unknown",
-            static_cast<unsigned long>(track_index),
-            g_overlay_visible ? "dimmed" : "normal",
-            static_cast<unsigned>(stats.total_us),
-            static_cast<unsigned>(stats.io_barrier_us),
-            static_cast<unsigned>(stats.stream_us));
-        return true;
-    }
-    ESP_LOGW(TAG,
-        "R.36.2 HomeResume DirectPresent跳过/失败：reason=%s track=%lu ret=%s，交给LVGL重绘",
         reason != nullptr ? reason : "unknown",
         static_cast<unsigned long>(track_index),
         esp_err_to_name(ret));
@@ -2007,7 +1984,6 @@ static void player_home_launcher_enter_done(lv_anim_t *anim)
     g_launcher_anim_progress = kLauncherAnimProgressMax;
     g_launcher_motion = LauncherMotionState::Shown;
     now_playing_artwork_set_direct_present_allowed(false);
-    const uint32_t elapsed = static_cast<uint32_t>(lv_tick_get()) - g_launcher_anim_started_ms;
     if (g_launcher_frame_cache_active) {
         const uint8_t final_frame = static_cast<uint8_t>(kLauncherAnimationAssetFrameCount - 1U);
         if (g_launcher_frame_index != final_frame) {
@@ -2019,8 +1995,10 @@ static void player_home_launcher_enter_done(lv_anim_t *anim)
             }
         }
     }
-    ESP_LOGI(TAG,
-        "R.36.6.2 Launcher动画展开完成：%ums frame=%u/%u lease=%uus compose(avg/max)=%u/%uus direct(avg/max)=%u/%uus stream(avg/max)=%u/%uus frames=%u failures=%u direct=%d，径向点击已解锁",
+#if APP_DIAG_LAUNCHER_PERFORMANCE
+    const uint32_t elapsed = static_cast<uint32_t>(lv_tick_get()) - g_launcher_anim_started_ms;
+    HOME_LAUNCHER_PERF_LOGI(
+        "Launcher展开：%ums frame=%u/%u lease=%uus compose(avg/max)=%u/%uus direct(avg/max)=%u/%uus stream(avg/max)=%u/%uus frames=%u failures=%u direct=%d",
         static_cast<unsigned>(elapsed),
         static_cast<unsigned>(g_launcher_frame_index),
         static_cast<unsigned>(kLauncherAnimationAssetFrameCount - 1U),
@@ -2037,6 +2015,7 @@ static void player_home_launcher_enter_done(lv_anim_t *anim)
         static_cast<unsigned>(g_launcher_direct_present_count),
         static_cast<unsigned>(g_launcher_direct_failures),
         g_launcher_direct_frame_active ? 1 : 0);
+#endif
 }
 
 static void player_home_launcher_leave_done(lv_anim_t *anim)
@@ -2066,9 +2045,10 @@ static void player_home_launcher_leave_done(lv_anim_t *anim)
         lv_obj_set_style_bg_opa(g_launcher_backdrop, kLauncherBackdropOpa, 0);
     }
     now_playing_artwork_set_direct_present_allowed(true);
+#if APP_DIAG_LAUNCHER_PERFORMANCE
     const uint32_t elapsed = static_cast<uint32_t>(lv_tick_get()) - g_launcher_anim_started_ms;
-    ESP_LOGI(TAG,
-        "R.36.6.2 Launcher动画收拢完成：%ums frame=%u compose(avg/max)=%u/%uus direct(avg/max)=%u/%uus frames=%u failures=%u direct=%d",
+    HOME_LAUNCHER_PERF_LOGI(
+        "Launcher收拢：%ums frame=%u compose(avg/max)=%u/%uus direct(avg/max)=%u/%uus frames=%u failures=%u direct=%d",
         static_cast<unsigned>(elapsed),
         static_cast<unsigned>(g_launcher_frame_index),
         static_cast<unsigned>(g_launcher_frame_decode_count == 0U ? 0U :
@@ -2080,6 +2060,7 @@ static void player_home_launcher_leave_done(lv_anim_t *anim)
         static_cast<unsigned>(g_launcher_direct_present_count),
         static_cast<unsigned>(g_launcher_direct_failures),
         used_direct ? 1 : 0);
+#endif
     g_launcher_frame_cache_active = false;
     player_home_launcher_release_surface_lease();
 }
@@ -2164,8 +2145,8 @@ static void player_home_launcher_show()
                 static_cast<unsigned>(player_state_is_ready() ? player_state_get_index() : 0U));
         }
         if (g_launcher_direct_frame_active) {
-            // R.33.2.2：正常 DirectScene 下视觉完全由 GRAM DirectPresent 持有。
-            // Launcher LVGL 根对象从进入前就已经 hidden，这里刻意不调用任何 LVGL visibility/style API；
+            // BoundedSPI 模式下视觉由 GRAM strip stream 持有。Launcher LVGL 根对象从进入前
+            // 就保持 hidden，这里刻意不调用任何 LVGL visibility/style API；
             // 点击改由 screen 回调复用同一径向 hit-test。这样全屏 Base 提交后不会再发生一次
             // 460x460 LVGL repaint，也就不会形成“只有中间340x340半透明”的方形边界。
         } else {
@@ -2231,7 +2212,7 @@ static void player_home_launcher_panel_click_cb(lv_event_t *event)
     const uint8_t index = static_cast<uint8_t>(hit);
     g_launcher_selected_index = index;
     player_home_launcher_apply_selection();
-    ESP_LOGI(TAG, "R.18 Launcher径向命中：index=%u name=%s touch=(%ld,%ld)",
+    HOME_INTERACTION_LOGI("Launcher径向命中：index=%u name=%s touch=(%ld,%ld)",
         static_cast<unsigned>(index),
         kLauncherItems[index].name,
         static_cast<long>(point.x),
@@ -2491,8 +2472,8 @@ static bool player_home_volume_gesture_update()
 
     g_volume_dragging = false;
     gesture_router_ack_vertical_adjust_release(drag.sequence);
-    ESP_LOGI(TAG,
-        "Overlay 纵向音量提交：start=%u%% delta_y=%dpx -> %u%%",
+    HOME_INTERACTION_LOGI(
+        "Overlay音量提交：start=%u%% delta_y=%dpx -> %u%%",
         static_cast<unsigned>(g_volume_drag_start_percent),
         static_cast<int>(drag.delta_y),
         static_cast<unsigned>(g_volume_preview_percent));
@@ -2564,8 +2545,8 @@ static void player_home_artwork_fast_rebind(const char *reason)
     player_home_repaint_controls_after_direct_present();
     g_last_artwork_bound_track = track_index;
 
-    ESP_LOGI(TAG,
-        "R.19 封面立即重绑：reason=%s track=%lu cost=%lldus",
+    HOME_INTERACTION_LOGI(
+        "封面立即重绑：reason=%s track=%lu cost=%lldus",
         reason != nullptr ? reason : "track-change",
         static_cast<unsigned long>(track_index),
         static_cast<long long>(esp_timer_get_time() - started_us));
@@ -2614,7 +2595,7 @@ static void player_home_update_background_timer_qos()
             lv_timer_pause(background_timer);
         }
     }
-    ESP_LOGI(TAG, "P1.5R.1.2 主页后台timer：%s", should_run ? "恢复" : "暂停");
+    HOME_INTERACTION_LOGI("主页后台timer：%s", should_run ? "恢复" : "暂停");
 }
 
 static bool player_home_handle_vertical_track_swipe(
@@ -2639,8 +2620,8 @@ static bool player_home_handle_vertical_track_swipe(
     }
 
     const size_t after_track = player_state_get_index();
-    ESP_LOGI(TAG,
-        "R.35.1 %s纵向切歌：%s track=%lu -> %lu",
+    HOME_INTERACTION_LOGI(
+        "%s纵向切歌：%s track=%lu -> %lu",
         surface_name != nullptr ? surface_name : "播放页",
         next ? "上滑下一曲" : "下滑上一曲",
         static_cast<unsigned long>(before_track),
@@ -2686,7 +2667,7 @@ static void player_home_gesture_timer_cb(lv_timer_t *timer)
             return;
         }
 
-        ESP_LOGI(TAG, "R.35.1 歌词页允许手势：%s", gesture_router_action_name(lyrics_action));
+        HOME_INTERACTION_LOGI("歌词页手势：%s", gesture_router_action_name(lyrics_action));
         if (player_home_handle_vertical_track_swipe(lyrics_action, "歌词页", false)) {
             return;
         }
@@ -2708,7 +2689,7 @@ static void player_home_gesture_timer_cb(lv_timer_t *timer)
             return;
         }
 
-        ESP_LOGI(TAG, "R.35.1 频谱页允许手势：%s", gesture_router_action_name(spectrum_action));
+        HOME_INTERACTION_LOGI("频谱页手势：%s", gesture_router_action_name(spectrum_action));
         if (player_home_handle_vertical_track_swipe(spectrum_action, "频谱页", false)) {
             return;
         }
@@ -2759,7 +2740,7 @@ static void player_home_gesture_timer_cb(lv_timer_t *timer)
         return;
     }
 
-    ESP_LOGI(TAG, "R.35.1 主页允许手势：%s", gesture_router_action_name(action));
+    HOME_INTERACTION_LOGI("主页手势：%s", gesture_router_action_name(action));
     if (player_home_handle_vertical_track_swipe(action, "封面页", true)) {
         return;
     }
@@ -2788,8 +2769,8 @@ static void player_home_gesture_timer_cb(lv_timer_t *timer)
 static void player_home_screen_tap_cb(lv_event_t *event)
 {
     if (g_launcher_visible) {
-        // R.33.2.2：DirectScene 时 Launcher LVGL 根对象保持 hidden，所以 Tap 会落到主页 screen。
-        // 这里仅在动画完成后接管点击，继续复用同一个极坐标 hit-test；视觉与输入彻底解耦。
+        // BoundedSPI 模式下 Launcher LVGL 根对象保持 hidden，Tap 会落到主页 screen。
+        // 动画完成后在这里复用同一极坐标 hit-test，使物理显示与输入保持解耦。
         if (g_launcher_direct_frame_active &&
             g_launcher_motion == LauncherMotionState::Shown &&
             lv_event_get_code(event) == LV_EVENT_CLICKED &&
@@ -2805,7 +2786,7 @@ static void player_home_screen_tap_cb(lv_event_t *event)
                     g_launcher_selected_index = index;
                     player_home_launcher_apply_selection();
                     ESP_LOGI(TAG,
-                        "R.33.2.2 Launcher DirectScene径向命中：index=%u name=%s touch=(%ld,%ld)",
+                        "Launcher径向命中：index=%u name=%s touch=(%ld,%ld)",
                         static_cast<unsigned>(index),
                         kLauncherItems[index].name,
                         static_cast<long>(point.x),
@@ -3285,7 +3266,7 @@ static void player_home_prev_cb(lv_event_t *event)
         return;
     }
     player_home_overlay_show();
-    ESP_LOGI(TAG, "P1.2 控件命中：上一曲");
+    HOME_INTERACTION_LOGI("控件命中：上一曲");
     const size_t before_track = player_state_get_index();
     if (player_control_previous()) {
         if (player_state_get_index() != before_track) {
@@ -3304,7 +3285,7 @@ static void player_home_next_cb(lv_event_t *event)
         return;
     }
     player_home_overlay_show();
-    ESP_LOGI(TAG, "P1.2 控件命中：下一曲");
+    HOME_INTERACTION_LOGI("控件命中：下一曲");
     const size_t before_track = player_state_get_index();
     if (player_control_next()) {
         if (player_state_get_index() != before_track) {
@@ -3322,7 +3303,7 @@ static void player_home_play_cb(lv_event_t *event)
         return;
     }
     player_home_overlay_show();
-    ESP_LOGI(TAG, "P1.2 控件命中：播放/暂停");
+    HOME_INTERACTION_LOGI("控件命中：播放/暂停");
     if (!player_control_toggle_play_pause()) {
         ESP_LOGW(TAG, "播放控制请求未能入队");
     }
@@ -3334,7 +3315,7 @@ static void player_home_loop_cb(lv_event_t *event)
         return;
     }
     player_home_overlay_show();
-    ESP_LOGI(TAG, "P1.5.3.2R.8 控件命中：播放模式图标");
+    HOME_INTERACTION_LOGI("控件命中：播放模式");
     player_control_cycle_loop_mode();
     AudioStateSnapshot snapshot = {};
     audio_service_get_snapshot(&snapshot);
@@ -3351,7 +3332,7 @@ static void player_home_volume_mode_cb(lv_event_t *event)
     const bool armed = !g_volume_adjust_armed;
     player_home_set_volume_adjust_armed(armed);
     player_home_overlay_arm_timeout();
-    ESP_LOGI(TAG, "P1.5.3.2R.7 音量手势：%s", armed ? "已进入纵向调节" : "已退出纵向调节");
+    HOME_INTERACTION_LOGI("音量手势：%s", armed ? "已进入纵向调节" : "已退出纵向调节");
 }
 
 static void player_home_mute_cb(lv_event_t *event)
@@ -3360,7 +3341,7 @@ static void player_home_mute_cb(lv_event_t *event)
         return;
     }
     player_home_overlay_show();
-    ESP_LOGI(TAG, "P1.2 控件命中：静音");
+    HOME_INTERACTION_LOGI("控件命中：静音");
     if (!player_control_toggle_mute()) {
         ESP_LOGW(TAG, "静音切换请求未能入队");
     }
@@ -3395,21 +3376,14 @@ void player_home_resume_from_fullscreen_view(const char *reason)
     // 页面调用方必须先隐藏自己的全屏 root；这样 QoS 才会把主页 Artwork/timer 恢复为 active。
     player_home_refresh();
 
-    // R.36.2.1：Surface source 已经重新绑定后，页面恢复固定交给 LVGL 官方 flush 链。
-    // R.36.2 的额外 current-cover DirectPresent 会再次切换共享 Panel IO callback ownership；
-    // 在 Launcher 高频 DirectFrame 已确认能触发 IDF 内部永久等待后，这里也不再冒同一种风险。
-    bool direct_ok = false;
-    if (kFullscreenHomeResumeDirectEnabled) {
-        direct_ok = player_home_present_current_cover_direct(reason);
-    }
+    // 页面恢复固定交给 LVGL 官方 flush 链；大面积高速提交只由 BoundedSPI 路径负责。
     lv_obj_t *screen = lv_screen_active();
     if (screen != nullptr) {
         lv_obj_invalidate(screen);
     }
-    ESP_LOGI(TAG,
-        "R.36.2.1 HomeResume事务完成：reason=%s direct=%u artwork=%u overlay=%u",
+    HOME_INTERACTION_LOGI(
+        "HomeResume：reason=%s artwork=%u overlay=%u",
         reason != nullptr ? reason : "unknown",
-        direct_ok ? 1U : 0U,
         now_playing_artwork_has_fast_surface() ? 1U : 0U,
         g_overlay_visible ? 1U : 0U);
 }
@@ -3568,23 +3542,18 @@ void player_home_create(lv_obj_t *screen)
         nullptr);
 
     lv_obj_add_flag(g_launcher, LV_OBJ_FLAG_HIDDEN);
+#if APP_DIAG_BOOT_VERBOSE
     uint32_t flash_bytes = 0U;
     for (uint8_t i = 0; i < kLauncherAnimationAssetFrameCount; ++i) {
         flash_bytes += g_launcher_animation_frames[i].size;
     }
-    ESP_LOGI(TAG,
-        "R.36.6.2 Launcher WireOrder StripCompositor：12帧压缩I4模板 Flash=%uB；FullBase=0B(saved=%uB)；PanelWork=0B(saved=%uB)；source=CoverSurface.dimmed；producer=wire-order(copy+swap fused)；lease=pin-until-hide PSRAM_free=%u",
-        static_cast<unsigned>(flash_bytes),
-        static_cast<unsigned>(kLauncherFullBaseBytesSaved),
-        static_cast<unsigned>(kLauncherPanelWorkBytesSaved),
-        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
-    ESP_LOGI(TAG,
-        "R.36.6.2 Launcher动态封面：SurfaceReuse=enabled rebind=current-ready strip-recompose atomic-lease-swap；旧背景保持到新Surface ready");
-    ESP_LOGI(TAG,
-        "R.36.6.2 显示传输：BoundedSPI=%s Launcher=wire-strip-stream Cover=bounded legacy-PanelIO-Direct=%s LVGL-fallback=R.32 HomeResume-Direct=%s；queue/get全有界",
-        display_launcher_bounded_spi_available() ? "ready" : "unavailable",
-        kLauncherDirectSceneEnabled ? "enabled" : "disabled",
-        kFullscreenHomeResumeDirectEnabled ? "enabled" : "disabled");
+    HOME_BOOT_LOGI(
+        "Launcher：FlashI4=%uB FullBase=0B PanelWork=0B source=CoverSurface.dimmed producer=wire-order",
+        static_cast<unsigned>(flash_bytes));
+    HOME_BOOT_LOGI(
+        "显示传输：BoundedSPI=%s Launcher=wire-strip Cover=bounded LVGL-fallback=R.32",
+        display_launcher_bounded_spi_available() ? "ready" : "unavailable");
+#endif
 
     // P1.5.3.2R.9：重建 Overlay 为清晰的纵向信息层级：
     // 歌名 -> 歌手 -> 列表位置/格式/采样 -> 大号播放控制 -> 进度 -> 模式/音量。
@@ -3733,12 +3702,13 @@ void player_home_create(lv_obj_t *screen)
     player_home_overlay_set_controls_visible(false);
     player_home_overlay_set_backdrop_clickable(false);
 
+#if APP_DIAG_BOOT_VERBOSE
     char list_label[96] = {};
     if (!player_state_copy_list_label(list_label, sizeof(list_label))) {
         snprintf(list_label, sizeof(list_label), "未知列表");
     }
-    ESP_LOGI(TAG,
-        "P1.5.3.2R.20：封面normal+dimmed双RGB565 Surface，Overlay命中时取消整屏alpha合成；R.19立即重绑保持；列表=%s 位置=%u/%u track=%u loop=%s volume=%u%% mute=%u",
+    HOME_BOOT_LOGI(
+        "主页配置：list=%s pos=%u/%u track=%u loop=%s volume=%u%% mute=%u Cover=normal+dimmed Launcher=wire-strip",
         list_label,
         static_cast<unsigned>(player_state_get_list_count() > 0 ? player_state_get_list_position() + 1 : 0),
         static_cast<unsigned>(player_state_get_list_count()),
@@ -3746,22 +3716,7 @@ void player_home_create(lv_obj_t *screen)
         player_transport_loop_mode_name(player_control_get_loop_mode()),
         static_cast<unsigned>(snapshot.volume_percent),
         static_cast<unsigned>(snapshot.user_muted));
-    ESP_LOGI(TAG,
-        "P1.5.3.2R.7 Overlay：默认仅点击；点击音量图标后才启用纵向滑动调音量，再次点击或隐藏Overlay即退出；其余行为保持");
-    ESP_LOGI(TAG,
-        "P1.5.3.2R.8 收口：播放模式图标+随机模式+分段听感音量曲线保持");
-    ESP_LOGI(TAG,
-        "P1.5.3.2R.34 Overlay收口：无条件LVGL setter已做值变化门控；上一曲/下一曲保持74px触摸区并重绘为实心Track glyph");
-    ESP_LOGI(TAG,
-        "P1.5.3.2R.34.1 DirtyRegionIsolation：Overlay 460x460透明root常驻；只显隐真实控件；normal/dimmed source单一失效所有者");
-    ESP_LOGI(TAG,
-        "P1.5.3.2R.35.1 统一纵向切歌：封面/歌词/频谱中央上滑=下一曲、下滑=上一曲；>=86px且纵向占优；顶部42px/底部43px边缘保留；Overlay锁定");
-    ESP_LOGI(TAG,
-        "P1.5.3.2R.12 收口：R.11首页纯Tap规则保持；歌词Overlay底部增加模式图标并放大音量入口");
-    ESP_LOGI(TAG,
-        "P1.5.3.2R.13 音量曲线重分配：30%=-26dB，50%=-18dB，70%=-10dB，80%=-7dB，90%=-4dB，100%=0dB；默认50%保持接近旧版启动响度");
-    ESP_LOGI(TAG,
-        "P1.3 GestureRouter 已启用：横滑>=72px，顶部/底部边缘=42px，控件优先，滑动后抑制CLICK；顶部下拉=曲库");
+#endif
 }
 
 

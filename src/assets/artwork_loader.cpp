@@ -25,7 +25,7 @@ static const char *TAG = "封面加载";
 #if APP_DIAG_ARTWORK_LOADER
 #define ARTWORK_LOAD_TRACE(...) ESP_LOGI(TAG, "ARTWORK_LOAD_TRACE: " __VA_ARGS__)
 #else
-#define ARTWORK_LOAD_TRACE(...) do { } while (0)
+#define ARTWORK_LOAD_TRACE(...) APP_DIAG_DISCARDED_LOGI(TAG, "ARTWORK_LOAD_TRACE: " __VA_ARGS__)
 #endif
 
 static constexpr uint32_t ARTWORK_TASK_STACK_BYTES = 4096U;

@@ -7,6 +7,9 @@
 #include "esp_log.h"
 #include "esp_psram.h"
 
+#include "app_build_info.h"
+#include "app_diag_config.h"
+
 #include "i2c_bus.h"
 #include "cst820.h"
 #include "qmi8658.h"
@@ -49,29 +52,15 @@ void boot_state_init()
 
     ESP_LOGI(
         TAG,
-        "========================================"
+        "FakePod Custom %s，阶段=%s，诊断=%s",
+        FAKEPOD_FIRMWARE_VERSION,
+        FAKEPOD_FIRMWARE_PHASE,
+        APP_DIAG_PROFILE_NAME
     );
 
-    ESP_LOGI(
-        TAG,
-        "FakePod Custom Firmware"
-    );
-
-    ESP_LOGI(
-        TAG,
-        "开始系统启动"
-    );
-
-    ESP_LOGI(
-        TAG,
-        "========================================"
-    );
-
-
-    ESP_LOGI(
-        TAG,
-        "等待 5 秒，便于连接串口监视器"
-    );
+#if APP_DIAG_BOOT_VERBOSE
+    ESP_LOGI(TAG, "启动保护等待：5000ms（串口监视器窗口）");
+#endif
 }
 
 
@@ -116,10 +105,12 @@ void boot_state_update()
 
         case BootState::CheckPsram:
         {
+#if APP_DIAG_BOOT_VERBOSE
             ESP_LOGI(
                 TAG,
                 "步骤 1/9：检查 PSRAM"
             );
+#endif
 
 
             if (
@@ -138,12 +129,11 @@ void boot_state_update()
             }
 
 
-            size_t free_psram =
+#if APP_DIAG_BOOT_VERBOSE
+            const size_t free_psram =
                 heap_caps_get_free_size(
                     MALLOC_CAP_SPIRAM
                 );
-
-
             ESP_LOGI(
                 TAG,
                 "PSRAM 正常，可用 %u KB",
@@ -151,6 +141,7 @@ void boot_state_update()
                     free_psram / 1024
                 )
             );
+#endif
 
 
             g_state =
@@ -166,10 +157,12 @@ void boot_state_update()
 
         case BootState::InitI2C:
         {
+#if APP_DIAG_BOOT_VERBOSE
             ESP_LOGI(
                 TAG,
                 "步骤 2/9：初始化 I2C"
             );
+#endif
 
 
             if (
@@ -189,7 +182,9 @@ void boot_state_update()
             }
 
 
+#if APP_DIAG_BOOT_VERBOSE
             i2c_bus_scan();
+#endif
 
 
             g_state =
@@ -205,10 +200,12 @@ void boot_state_update()
 
         case BootState::InitTouch:
         {
+#if APP_DIAG_BOOT_VERBOSE
             ESP_LOGI(
                 TAG,
                 "步骤 3/9：初始化触摸"
             );
+#endif
 
 
             if (
@@ -241,10 +238,12 @@ void boot_state_update()
 
         case BootState::InitIMU:
         {
+#if APP_DIAG_BOOT_VERBOSE
             ESP_LOGI(
                 TAG,
                 "步骤 4/9：初始化 IMU"
             );
+#endif
 
 
             if (
@@ -276,7 +275,9 @@ void boot_state_update()
 
         case BootState::InitAudioService:
         {
+#if APP_DIAG_BOOT_VERBOSE
             ESP_LOGI(TAG, "步骤 5/9：启动正式 AudioTask");
+#endif
 
             esp_err_t ret = audio_service_start();
             if (ret != ESP_OK) {
@@ -285,7 +286,9 @@ void boot_state_update()
                 break;
             }
 
+#if APP_DIAG_BOOT_VERBOSE
             ESP_LOGI(TAG, "正式播放器音频服务已就绪；开机不再执行测试音");
+#endif
             g_state = BootState::InitSDCard;
             break;
         }
@@ -296,10 +299,12 @@ void boot_state_update()
 
         case BootState::InitSDCard:
         {
+#if APP_DIAG_BOOT_VERBOSE
             ESP_LOGI(
                 TAG,
                 "步骤 6/9：初始化 TF 卡"
             );
+#endif
 
 
             if (
@@ -319,8 +324,10 @@ void boot_state_update()
             }
 
 
-            // Bring-up 阶段保留目录打印
+#if APP_DIAG_BOOT_VERBOSE
+            // DEBUG/STRESS 才打印根目录，RELEASE 不做额外目录遍历。
             sdcard_debug_list_root();
+#endif
 
 
             g_state =
@@ -335,10 +342,12 @@ void boot_state_update()
 
         case BootState::ScanMediaLibrary:
         {
+#if APP_DIAG_BOOT_VERBOSE
             ESP_LOGI(
                 TAG,
                 "步骤 7/9：扫描音乐库"
             );
+#endif
 
             if (
                 media_library_scan() !=
@@ -392,10 +401,12 @@ void boot_state_update()
 
         case BootState::InitDisplay:
         {
+#if APP_DIAG_BOOT_VERBOSE
             ESP_LOGI(
                 TAG,
                 "步骤 8/9：初始化 AMOLED"
             );
+#endif
 
 
             if (
@@ -428,10 +439,12 @@ void boot_state_update()
 
         case BootState::InitUI:
         {
+#if APP_DIAG_BOOT_VERBOSE
             ESP_LOGI(
                 TAG,
                 "步骤 9/9：初始化 LVGL 用户界面"
             );
+#endif
 
             if (ui_manager_init() != ESP_OK) {
                 ESP_LOGE(
@@ -450,17 +463,9 @@ void boot_state_update()
 
             ESP_LOGI(
                 TAG,
-                "========================================"
-            );
-
-            ESP_LOGI(
-                TAG,
-                "FakePod 基础硬件、AudioTask、音乐库与界面启动完成"
-            );
-
-            ESP_LOGI(
-                TAG,
-                "========================================"
+                "READY：tracks=%u PSRAM_free=%uKB",
+                static_cast<unsigned>(media_library_get_count()),
+                static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U)
             );
 
             break;

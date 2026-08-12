@@ -7,6 +7,7 @@
 #include "audio/audio_service.h"
 #include "audio/audio_types.h"
 #include "esp_log.h"
+#include "app_diag_config.h"
 #include "font/font_manager.h"
 #include "gesture/gesture_router.h"
 #include "media/library/media_catalog_v2.h"
@@ -17,6 +18,18 @@
 namespace
 {
 static const char *TAG = "频谱界面";
+
+#if APP_DIAG_BOOT_VERBOSE
+#define UI_PAGE_BOOT_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define UI_PAGE_BOOT_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
+
+#if APP_DIAG_UI_INTERACTION
+#define UI_PAGE_INTERACTION_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define UI_PAGE_INTERACTION_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
 
 constexpr uint32_t SPECTRUM_FRAME_MS = 50U; // P1.5.2R.3.1：20 FPS，只消费最新16-band FFT Snapshot。
 constexpr uint8_t SPECTRUM_BAR_COUNT = 16U; // FFT 数据 band 数，保持不变。
@@ -1269,7 +1282,7 @@ static void spectrum_root_click_cb(lv_event_t *event)
     spectrum_rebuild_style_geometry_cache();
     spectrum_apply_style_layout();
 
-    ESP_LOGI(TAG, "P1.5.3.2R.35.2 Tap切换频谱样式：style=%u %s",
+    UI_PAGE_INTERACTION_LOGI("Tap切换频谱样式：style=%u %s",
         static_cast<unsigned>(g_style), spectrum_style_name(g_style));
 }
 
@@ -1394,8 +1407,8 @@ void spectrum_view_create(lv_obj_t *screen)
         lv_timer_pause(g_timer);
     }
 
-    ESP_LOGI(TAG,
-        "P1.5.3.2R.31 SpectrumFastPath：三样式视觉保持不变；连续帧TE bypass；16→24/40几何与Neon颜色帧级缓存；时间标签仅跨秒更新；刷新=%ums",
+    UI_PAGE_BOOT_LOGI(
+        "频谱页：3 styles，刷新=%ums，continuous-TE-bypass",
         static_cast<unsigned>(SPECTRUM_FRAME_MS));
 }
 
@@ -1446,7 +1459,7 @@ void spectrum_view_open()
         lv_timer_resume(g_timer);
     }
     audio_service_set_spectrum_enabled(true);
-    ESP_LOGI(TAG, "打开频谱页：P1.5.3.2R.35.2 当前样式=%u %s；样式仅Tap切换；频段视觉增益=低频1.00x→高频1.50x(高频集中)；右滑返回主页",
+    UI_PAGE_INTERACTION_LOGI("打开频谱页：style=%u %s",
         static_cast<unsigned>(g_style), spectrum_style_name(g_style));
 }
 
@@ -1463,7 +1476,7 @@ void spectrum_view_close()
     }
     spectrum_clear_current_lyric(true);
     lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
-    ESP_LOGI(TAG, "关闭频谱页，返回封面主页");
+    UI_PAGE_INTERACTION_LOGI("关闭频谱页，返回主页");
 }
 
 bool spectrum_view_is_visible()

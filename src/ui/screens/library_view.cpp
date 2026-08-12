@@ -4,6 +4,7 @@
 #include <stdio.h>
 
 #include "esp_log.h"
+#include "app_diag_config.h"
 #include "esp_heap_caps.h"
 #include "board_pins.h"
 #include "flac_decoder.h"
@@ -20,6 +21,18 @@
 #include "widgets/quick_index_keyboard.h"
 
 static const char *TAG = "曲库界面";
+
+#if APP_DIAG_BOOT_VERBOSE
+#define UI_PAGE_BOOT_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define UI_PAGE_BOOT_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
+
+#if APP_DIAG_UI_INTERACTION
+#define UI_PAGE_INTERACTION_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define UI_PAGE_INTERACTION_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
 
 // P1.3.5.4.1：460x460 方屏曲库，Direct Touch + 音频感知惯性 + 轻量常驻位置条。
 // 顶部固定标题/搜索/分类指示器，下面恰好保留约五行单行列表。
@@ -1288,7 +1301,7 @@ static void library_search_enter()
     }
     library_search_rebuild_matches();
     library_view_render(false);
-    ESP_LOGI(TAG, "进入多首字母快速搜索：scope=%s source=%lu",
+    UI_PAGE_INTERACTION_LOGI("进入快速搜索：scope=%s source=%lu",
         library_search_scope_name(),
         static_cast<unsigned long>(library_view_source_item_count()));
 }
@@ -1308,7 +1321,7 @@ static void library_search_exit()
     quick_index_keyboard_set_visible(&g_search_keyboard, false);
     g_manual_scroll_y = library_view_clamp_scroll_y(restore_scroll);
     library_view_render(true);
-    ESP_LOGI(TAG, "退出多首字母快速搜索：恢复scroll=%ld", static_cast<long>(restore_scroll));
+    UI_PAGE_INTERACTION_LOGI("退出快速搜索：恢复scroll=%ld", static_cast<long>(restore_scroll));
 }
 
 static void library_search_keyboard_cb(uint8_t key_index, void *user_data)
@@ -1580,7 +1593,7 @@ static void library_view_close_to_home()
     library_view_store_scroll_position();
     lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
     player_home_resume_from_fullscreen_view("library-back");
-    ESP_LOGI(TAG, "曲库返回按钮：返回播放器首页");
+    UI_PAGE_INTERACTION_LOGI("曲库返回主页");
 }
 
 static void library_view_switch_category(int direction)
@@ -1600,7 +1613,7 @@ static void library_view_switch_category(int direction)
     g_state.detail_type = PlayerListType::AllTracks;
     g_state.detail_group_index = UINT32_MAX;
     library_view_render(true);
-    ESP_LOGI(TAG, "曲库横滑切换：mode=%ld", static_cast<long>(index));
+    UI_PAGE_INTERACTION_LOGI("曲库横滑切换：mode=%ld", static_cast<long>(index));
 }
 
 static void library_view_apply_pending_gesture_async(void *user_data)
@@ -1919,9 +1932,7 @@ void library_view_create(lv_obj_t *screen)
     lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
     library_view_render(false);
 
-    ESP_LOGI(TAG, "Build=P1.5.3.2R.33.2.3 TouchFastPathBackpressure");
-    ESP_LOGI(TAG,
-        "P1.5.3.2R.6：18列分段小矩形调整为默认第一样式（每列至少1格+暗倒影+同宽3px窄Peak落点），HorizontalMirror第二，Neon Ridge第三；歌词仍短句单行/超长两行；FFT/手势/Adaptive Prefetch保持；右侧%dpx位置条保持",
+    UI_PAGE_BOOT_LOGI("曲库页：TouchFastPathBackpressure，scrollbar=%dpx",
         static_cast<int>(LIBRARY_SCROLLBAR_W));
 }
 
@@ -1972,7 +1983,7 @@ void library_view_open()
     library_view_render(true);
     lv_obj_remove_flag(g_root, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(g_root);
-    ESP_LOGI(TAG, "打开曲库：generation=%lu 当前列表=%s scroll=%ld",
+    UI_PAGE_INTERACTION_LOGI("打开曲库：generation=%lu list=%s scroll=%ld",
         static_cast<unsigned long>(media_catalog_v2_generation()),
         player_playlist_type_name(player_state_get_list_type()),
         static_cast<long>(library_view_saved_scroll_position()));
