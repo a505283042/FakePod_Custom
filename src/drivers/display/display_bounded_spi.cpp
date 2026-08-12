@@ -25,13 +25,13 @@
 static const char *TAG = "显示";
 
 // ============================================================
-// P1.5.3.2R.36.4 Bounded SPI Transport
+// Bounded SPI Transport
 // ============================================================
 //
-// 旧 Launcher PanelIO DirectScene 与 R.29 Cover ContinuousGRAM 都通过 esp_lcd_panel_io_tx_param()/
+// 旧 Launcher PanelIO DirectScene 与 Cover ContinuousGRAM 都通过 esp_lcd_panel_io_tx_param()/
 // tx_color() 与 LVGL 共享 Panel IO。ESP-IDF 5.5 的 SPI Panel IO 在这些入口内部存在
-// portMAX_DELAY 的 bus acquire/result recycle：Launcher 已由 R.36.3 迁移后通过压力测试；
-// R.36.4 继续迁移 Cover，彻底移除主页换封面对旧 ContinuousGRAM 的运行时依赖。
+// portMAX_DELAY 的 bus acquire/result recycle；Launcher 已迁移并通过压力测试；
+// 主页 Cover 也已迁入同一传输层，彻底移除对旧 ContinuousGRAM 的运行时依赖。
 //
 // 本模块不再调用上述 Panel IO 发送入口。项目固定 ESP-IDF 5.5，因此使用官方源中可验证的
 // esp_lcd_panel_io_spi_t 前缀布局取得其唯一 spi_device_handle_t 和 num_trans_inflight：
@@ -75,7 +75,7 @@ struct DisplayBoundedRawSpiTransaction
 };
 
 static_assert(offsetof(DisplayBoundedRawSpiTransaction, command_bits) == sizeof(spi_transaction_t),
-    "R.36.3 raw SPI descriptor tail must immediately follow spi_transaction_t");
+    "raw SPI descriptor tail must immediately follow spi_transaction_t");
 
 struct DisplayBoundedSpiState
 {

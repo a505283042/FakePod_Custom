@@ -1,7 +1,7 @@
 #pragma once
 
 // FakePod 运行期生成文件统一放在 /sdcard/System。
-// Stage 10.2 起曲库持久化文件集中到 /System/library；V1 路径仅保留作一次性迁移源。
+// 曲库持久化文件统一集中到 /System/library；V1 路径仅保留作一次性迁移源。
 namespace SystemPaths
 {
 static constexpr const char *kSystemDirectory = "/sdcard/System";

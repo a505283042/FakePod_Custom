@@ -549,7 +549,7 @@ static void boot_state_update()
                 break;
             }
 
-            // R.38.4.2：CST820 初始化成功只代表硬件可访问；真正的用户输入能力还要求
+            // CST820 初始化成功只代表硬件可访问；真正的用户输入能力还要求
             // LVGL indev 建立成功。Touch Fast Path 失败但同步读取仍可用时不会误报降级。
             if (!ui_manager_touch_available() && !boot_issue_recorded(BootIssue::TouchUnavailable)) {
                 boot_record_issue(

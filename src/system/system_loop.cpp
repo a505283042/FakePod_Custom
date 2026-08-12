@@ -23,7 +23,7 @@
 static const char *TAG =
     "系统";
 
-// R.36.2.2：AudioTask 进入 Error 后每15秒重报最近一次故障快照。
+// AudioTask 进入 Error 后每15秒重报最近一次故障快照。
 // 平时完全无开销；这样偶发停播时即使当时没开串口，随后连接监视器仍能看到现场。
 static constexpr TickType_t AUDIO_FAULT_REMINDER_INTERVAL = pdMS_TO_TICKS(15000);
 static TickType_t g_last_audio_fault_reminder_tick = 0;
@@ -42,7 +42,7 @@ static uint32_t g_last_mp3_perf_sequence =
     0;
 #endif
 
-// R.36：封面资源编排改为 Current-Only。system_loop 只负责当前曲：
+// 封面资源采用 Current-Only 编排；system_loop 只负责当前曲：
 // 读取当前 JPEG/PNG 压缩原图 -> CoverTask 生成 normal+dimmed -> 压缩原图释放。
 // 不再计算/读取/预热下一曲，避免 PSRAM 中长期保存无效 next 资源。
 enum class ArtworkCurrentStage : uint8_t
@@ -64,8 +64,8 @@ static constexpr TickType_t ARTWORK_RETRY_MAX_DELAY = pdMS_TO_TICKS(5000);
 static TickType_t g_artwork_retry_due_tick = 0;
 static uint8_t g_artwork_current_retry_count = 0U;
 
-// R.36.2.2 音频不断流优先：FLAC ring >=90% 后 ArtworkTask 才继续抢短 SD 窗口。
-// R.36 取消 next 后所有可用窗口都只服务当前曲，不再有后台预热竞争。
+// 音频不断流优先：FLAC ring >=90% 后 ArtworkTask 才继续抢短 SD 窗口。
+// 不预热 next；所有可用窗口都只服务当前曲，避免后台预热竞争。
 static constexpr uint32_t ARTWORK_CURRENT_FLAC_RING_MIN_PERCENT = 90U;
 static constexpr TickType_t ARTWORK_STORAGE_WINDOW_LOG_INTERVAL = pdMS_TO_TICKS(1000);
 static TickType_t g_artwork_storage_wait_last_log_tick = 0;
@@ -314,7 +314,7 @@ void system_loop_update()
         g_last_audio_fault_reminder_tick = 0;
     }
 
-    // R.36：只编排当前曲封面；不再读取/预热 next。压缩原图成功转成 Surface 后立即释放。
+    // 只编排当前曲封面；不读取/预热 next。压缩原图成功转成 Surface 后立即释放。
     system_artwork_current_update();
 
 

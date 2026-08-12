@@ -7,8 +7,8 @@
 #include "esp_err.h"
 
 // 仅供 UI 大面积物理提交快路径使用；普通显示/LVGL 模块只应依赖 display.h。
-// P1.5.3.2R.36.4：统一 Bounded SPI 传输。
-// R.36.3 先由 Launcher 实机验证；R.36.4 将主页 Cover Present 也迁入同一有界底层。
+// 统一 Bounded SPI 传输。
+// Launcher 与主页 Cover Present 共用同一有界传输底层。
 // 不经过 esp_lcd_panel_io_tx_param()/tx_color()，因此不触发其内部 portMAX_DELAY
 // acquire/recycle；直接复用 Panel IO 已创建的 SPI device，在同一 LVGL Task 中先有界回收
 // Panel IO 已提交事务，再以 transaction address phase 发送 CO5300 32-bit QSPI header。
@@ -72,7 +72,7 @@ esp_err_t display_launcher_bounded_spi_present(
     bool wait_for_te,
     DisplayBoundedSpiStats *out_stats = nullptr);
 
-// R.36.4：主页封面一次性 Bounded Present。
+// 主页封面一次性 Bounded Present。
 // 内部严格执行 session begin -> full-screen present -> session end；若 Launcher 已持有 session、
 // staging 内存不足或 BoundedSPI 已熔断，立即返回错误，由上层保持旧图/回退 LVGL。
 esp_err_t display_cover_bounded_spi_present(

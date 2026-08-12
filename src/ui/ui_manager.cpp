@@ -53,7 +53,7 @@ static int16_t g_touch_last_y = 0;
 static uint32_t g_touch_last_dispatch_sequence = 0U;
 static bool g_touch_dispatch_sequence_valid = false;
 
-// P1.5.3.2R.21：大面积刷新才等待 TE。
+// 大面积刷新才等待 TE。
 // 小型进度条/按钮局部更新继续立即刷新，避免所有 UI 交互都额外等待一帧。
 static bool g_te_sync_pending = false;
 static bool g_te_sync_runtime_enabled = false;
@@ -62,13 +62,13 @@ static uint32_t g_te_sync_success_count = 0U;
 static uint32_t g_te_sync_timeout_count = 0U;
 static uint32_t g_te_sync_timeout_ms = 25U;
 
-// R.22：只有 Artwork 明确请求“另一首封面整帧提交”时才临时关闭面板输出。
+// 只有 Artwork 明确请求“另一首封面整帧提交”时才临时关闭面板输出。
 // 这不是全局大刷新策略，歌词/频谱/Launcher 不会因此黑屏。
 static bool g_present_hold_active = false;
 static uint32_t g_present_hold_count = 0U;
 static int64_t g_present_hold_started_us = 0;
 
-// P1.5.3.2R.23：把 R.22 观测到的约70ms整屏周期拆成 render / flush / flush-wait。
+// 把整屏刷新周期拆成 render / flush / flush-wait，便于定位耗时来源。
 // 只对 >=25% 屏的大刷新采样，避免进度条等小刷新刷日志。
 struct UiLargeRefreshProfile
 {
@@ -86,7 +86,7 @@ struct UiLargeRefreshProfile
 static UiLargeRefreshProfile g_large_refresh_profile = {};
 static uint32_t g_large_refresh_profile_count = 0U;
 
-// P1.5.3.2R.30：全页面 LVGL 性能审计。
+// 全页面 LVGL 性能审计。
 // 不改变任何页面绘制策略，只在 display event 上做轻量计数/计时，并每2秒汇总一次。
 // inv_sum 是所有 invalidation 面积之和（可能重叠）；bbox 是这些 invalidation 的包围盒，
 // 两者一起看可以区分“很多小对象反复失效”和“单个大对象整块失效”。
@@ -182,14 +182,14 @@ static constexpr uint32_t kPerfScreenPixels = FAKEPOD_LCD_WIDTH * FAKEPOD_LCD_HE
 static constexpr uint32_t kTeSyncDisableAfterTimeouts = 3U;
 static constexpr uint32_t kTeSyncMinPixels =
     (FAKEPOD_LCD_WIDTH * FAKEPOD_LCD_HEIGHT) / 4U;
-// R.31：连续动画不能每帧都支付 0~16.7ms 的 TE 等待；但真正接近整屏的
+// 连续动画不能每帧都支付 0~16.7ms 的 TE 等待；但真正接近整屏的
 // 页面切换仍保留 TE，因此用 90% 屏作为“强制同步”门槛。
 static constexpr uint32_t kTeSyncForceFullFramePixels =
     (FAKEPOD_LCD_WIDTH * FAKEPOD_LCD_HEIGHT * 9U) / 10U;
 static uint32_t g_te_animation_bypass_count = 0U;
 
-// P1.5.3.2R.36.1：LVGL RGB565 DMA 条带从 40 行收紧到 24 行，为 BoundedSPI 和音频留出更多内部 DMA headroom。
-// 双缓冲总像素 RAM = 460 * 24 * 2B * 2 = 44,160B，比 R.18 回收 29,440B。
+// LVGL RGB565 DMA 条带固定为 24 行，为 BoundedSPI 和音频留出更多内部 DMA headroom。
+// 双缓冲总像素 RAM = 460 * 24 * 2B * 2 = 44,160B，相比 40 行配置回收 29,440B。
 static constexpr uint32_t kLvglDmaBufferLines = 24U;
 
 static const char *ui_perf_context_name(UiPerfContext context)
@@ -536,7 +536,7 @@ static void ui_display_align_area_cb(lv_event_t *event)
                 const UiPerfContext context = ui_perf_resolve_context();
                 const bool continuous_animation =
                     ui_te_context_is_continuous_animation(context);
-                // R.31：频谱 / Launcher / 歌词缓动 / 惯性滚动的中等面积动画帧
+                // 频谱 / Launcher / 歌词缓动 / 惯性滚动的中等面积动画帧
                 // 直接刷新；>=90% 屏的真正页面切换仍同步 TE。
                 if (!continuous_animation || pixels >= kTeSyncForceFullFramePixels) {
                     g_te_sync_pending = true;
@@ -557,7 +557,7 @@ static void ui_display_profile_cb(lv_event_t *event)
     const int64_t now_us = esp_timer_get_time();
     const lv_event_code_t code = lv_event_get_code(event);
 
-    // R.30：所有刷新都记录，供页面级2秒窗口汇总。
+    // 所有刷新都记录，供页面级2秒窗口汇总。
     if (g_perf_frame.active) {
         switch (code) {
             case LV_EVENT_RENDER_START:
@@ -594,7 +594,7 @@ static void ui_display_profile_cb(lv_event_t *event)
         }
     }
 
-    // 保留 R.23 的大刷新逐帧诊断，便于和历史日志直接对比。
+    // 保留大刷新逐帧诊断，便于分析 render / flush / wait 的耗时分布。
     if (!g_large_refresh_profile.active) {
         return;
     }
@@ -643,7 +643,7 @@ static void ui_display_profile_cb(lv_event_t *event)
 }
 
 
-// R.22：刷新周期开始时先完成 R.21 TE 对齐，再按需暂停面板输出。
+// 刷新周期开始时先完成 TE 对齐，再按需暂停面板输出。
 // display_present_take_hold_request() 只会被“跨 Track 封面 Source 替换”触发，
 // 因此普通大面积页面切换继续只做 TE 同步，不会产生额外黑场。
 static void ui_display_refresh_start_cb(lv_event_t *event)
@@ -765,7 +765,7 @@ static void ui_display_refresh_ready_cb(lv_event_t *event)
     const uint32_t held_us = static_cast<uint32_t>(
         esp_timer_get_time() - g_present_hold_started_us);
 
-    // R.23 正常跨Track应优先走 BoundedSPI；这里只保留 R.22 兼容回退。
+    // 正常跨 Track 应优先走 BoundedSPI；这里只保留面板输出恢复的兼容回退。
     const bool restored = display_present_set_output(true);
     g_present_hold_active = false;
     g_present_hold_started_us = 0;
@@ -800,8 +800,8 @@ static uint16_t ui_clamp_coord(uint16_t value, uint16_t max_value)
     return value > max_value ? max_value : value;
 }
 
-// P1.5R.1.2：LVGL 输入回调只消费 TouchInputTask 发布的边沿队列/最新坐标快照。
-// DOWN/UP 走边沿队列；R.33.2.3 在生产端做 RELEASE debounce + 满队列背压合并；MOVE 只按最新 snapshot 分发。
+// LVGL 输入回调只消费 TouchInputTask 发布的边沿队列/最新坐标快照。
+// DOWN/UP 走边沿队列；生产端做 RELEASE debounce + 满队列背压合并；MOVE 只按最新 snapshot 分发。
 static void ui_touch_dispatch_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick_ms)
 {
     if (!library_view_is_visible()) {
@@ -884,7 +884,7 @@ esp_err_t ui_manager_bootstrap_init()
 
     UI_BOOT_LOGI("初始化 LVGL 9 启动核心");
     lvgl_port_cfg_t lvgl_cfg = {};
-    // P1.5R.1：Core1 实时优先级阶梯。FLAC 预取固定 P4，LVGL 保持 P3。
+    // Core1 实时优先级阶梯：FLAC 预取固定 P4，LVGL 保持 P3。
     lvgl_cfg.task_priority = 3;
     lvgl_cfg.task_stack = 6144;
     lvgl_cfg.task_affinity = 1;
@@ -954,8 +954,8 @@ esp_err_t ui_manager_bootstrap_init()
         g_te_sync_timeout_ms = timeout_ms;
     }
 
-    // R.32.1：LVGL task 已经启动，所有直接 lv_* 调用必须使用同一把 port mutex。
-    // R.38.3 同时取消历史无限等待；启动阶段 1000ms 内拿不到锁直接报告故障。
+    // LVGL task 已经启动，所有直接 lv_* 调用必须使用同一把 port mutex。
+    // 启动阶段禁止无限等待；1000ms 内拿不到锁直接报告故障。
     if (!lvgl_port_lock(1000)) {
         ESP_LOGE(TAG, "获取 LVGL 启动核心互斥锁超时");
         return ESP_ERR_TIMEOUT;
@@ -1036,7 +1036,7 @@ esp_err_t ui_manager_init()
         return ESP_ERR_INVALID_STATE;
     }
 
-    // R.38.3：完整 UI 只补齐触摸、图片解码器、TF 字体和业务页面，不重新初始化 LVGL/Display。
+    // 完整 UI 只补齐触摸、图片解码器、TF 字体和业务页面，不重新初始化 LVGL/Display。
     if (!lvgl_port_lock(1000)) {
         ESP_LOGE(TAG, "获取完整 UI 初始化互斥锁超时");
         return ESP_ERR_TIMEOUT;

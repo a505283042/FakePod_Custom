@@ -72,7 +72,7 @@ static esp_lcd_panel_handle_t g_panel =
     nullptr;
 
 
-// P1.5.3.2R.21：CO5300 TE 上升沿同步。
+// CO5300 TE 上升沿同步。
 // TE 只负责给刷新起点提供垂直时序基准；像素数据仍由现有 QSPI + SPI DMA 发送。
 static SemaphoreHandle_t g_te_edge =
     nullptr;
@@ -84,7 +84,7 @@ static uint32_t g_te_period_us =
     0U;
 
 
-// R.22：封面整帧 present hold。请求由 LVGL 线程发起并在同一 LVGL 刷新事件线程消费，
+// 封面整帧 present hold：请求由 LVGL 线程发起并在同一 LVGL 刷新事件线程消费，
 // 因此这里只需要轻量状态，不引入额外任务/队列。
 static bool g_present_hold_requested =
     false;
@@ -102,7 +102,7 @@ static bool g_ready =
 
 
 // ============================================================
-// 鱼鹰 AM200Q460460LK 初始化序列（R.38.3 启动阶段仅将亮度改为 0）
+// 鱼鹰 AM200Q460460LK 初始化序列（启动阶段保持亮度为 0）
 // ============================================================
 //
 // 厂家原始初始化代码：
@@ -112,7 +112,7 @@ static bool g_ready =
 // 3A 55
 // 35 00
 // 53 20
-// 51 00   （R.38.3：启动阶段保持暗屏，首帧完成后再恢复 60%）
+// 51 00   （启动阶段保持暗屏，首帧完成后再恢复 60%）
 // 63 FF
 // 2A 00 0A 01 D5
 // 2B 00 00 01 CB
@@ -512,7 +512,7 @@ esp_err_t display_init()
             0;
 
 
-        // R.22：50MHz QSPI 实验；其余 SPI mode / Quad / DMA 参数保持不变。
+        // QSPI 固定为 50MHz；其余 SPI mode / Quad / DMA 参数保持不变。
         io_config.pclk_hz =
             LCD_PIXEL_CLOCK_HZ;
 
@@ -729,7 +729,7 @@ esp_err_t display_init()
 
 
     // ========================================================
-    // R.38.3：硬件初始化完成后保持不可见
+    // 硬件初始化完成后保持不可见
     // ========================================================
     // 厂家序列仍负责退出 Sleep，但 0x51 已固定为 0。这里再次确认亮度为 0，
     // 并关闭显示输出。直到 LVGL 第一帧完成，用户都不应看到未写入有效内容的 GRAM。
@@ -749,7 +749,7 @@ esp_err_t display_init()
     g_present_output_enabled = false;
 
 
-    // P1.5.3.2R.21：厂家初始化序列已经发送 0x35 00 (TEON)，
+    // 厂家初始化序列已经发送 0x35 00 (TEON)，
     // 此处把屏幕 TE 输出 GPIO6 真正接入 ESP32-S3。失败只降级为原刷新路径。
     const esp_err_t te_ret = display_te_init();
     if (te_ret != ESP_OK) {
