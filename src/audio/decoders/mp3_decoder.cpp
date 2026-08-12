@@ -681,16 +681,16 @@ static esp_err_t mp3_verify_runtime_info(Mp3Decoder *decoder)
 
     if ((info.sample_rate != 44100U && info.sample_rate != 48000U) ||
         !audio_rate_profile_get(info.sample_rate, nullptr)) {
-        ESP_LOGE(TAG, "Stage 9.5 暂不支持该 MP3 采样率：%luHz（当前仅44.1/48kHz）",
+        ESP_LOGE(TAG, "暂不支持该 MP3 采样率：%luHz（当前仅44.1/48kHz）",
             static_cast<unsigned long>(info.sample_rate));
         return ESP_ERR_NOT_SUPPORTED;
     }
     if (info.channel != 1U && info.channel != 2U) {
-        ESP_LOGE(TAG, "Stage 9.5 暂不支持该 MP3 声道数：%u", static_cast<unsigned>(info.channel));
+        ESP_LOGE(TAG, "暂不支持该 MP3 声道数：%u", static_cast<unsigned>(info.channel));
         return ESP_ERR_NOT_SUPPORTED;
     }
     if (info.bits_per_sample != 16U) {
-        ESP_LOGE(TAG, "Stage 9.5 暂不支持该 MP3 PCM 位深：%u", static_cast<unsigned>(info.bits_per_sample));
+        ESP_LOGE(TAG, "暂不支持该 MP3 PCM 位深：%u", static_cast<unsigned>(info.bits_per_sample));
         return ESP_ERR_NOT_SUPPORTED;
     }
 
@@ -1083,7 +1083,9 @@ esp_err_t mp3_decoder_register_backend()
     }
 
     g_mp3_backend_registered = true;
+#if APP_DIAG_BOOT_VERBOSE
     ESP_LOGI(TAG, "乐鑫 MP3 解码后端注册成功");
+#endif
     return ESP_OK;
 }
 

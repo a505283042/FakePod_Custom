@@ -5,6 +5,7 @@
 
 #include "board_pins.h"
 #include "i2c_bus.h"
+#include "app_diag_config.h"
 
 
 static const char *TAG = "IMU";
@@ -35,10 +36,12 @@ static constexpr uint8_t REG_REVISION_ID =
 
 esp_err_t qmi8658_init()
 {
+#if APP_DIAG_BOOT_VERBOSE
     ESP_LOGI(
         TAG,
         "正在初始化 QMI8658"
     );
+#endif
 
 
     esp_err_t ret =
@@ -50,7 +53,7 @@ esp_err_t qmi8658_init()
 
     if (ret != ESP_OK) {
 
-        ESP_LOGE(
+        ESP_LOGW(
             TAG,
             "注册 QMI8658 失败：%s",
             esp_err_to_name(ret)
@@ -70,7 +73,7 @@ esp_err_t qmi8658_init()
 
     if (ret != ESP_OK) {
 
-        ESP_LOGE(
+        ESP_LOGW(
             TAG,
             "读取 WHO_AM_I 失败：%s",
             esp_err_to_name(ret)
@@ -90,7 +93,7 @@ esp_err_t qmi8658_init()
 
     if (ret != ESP_OK) {
 
-        ESP_LOGE(
+        ESP_LOGW(
             TAG,
             "读取 REVISION_ID 失败：%s",
             esp_err_to_name(ret)
@@ -100,18 +103,22 @@ esp_err_t qmi8658_init()
     }
 
 
+#if APP_DIAG_BOOT_VERBOSE
     ESP_LOGI(
         TAG,
         "设备 ID：0x%02X",
         g_device_id
     );
+#endif
 
 
+#if APP_DIAG_BOOT_VERBOSE
     ESP_LOGI(
         TAG,
         "芯片版本：0x%02X",
         g_revision
     );
+#endif
 
 
     if (g_device_id != 0x05) {
@@ -126,10 +133,12 @@ esp_err_t qmi8658_init()
     g_ready = true;
 
 
+#if APP_DIAG_BOOT_VERBOSE
     ESP_LOGI(
         TAG,
         "QMI8658 初始化成功"
     );
+#endif
 
 
     return ESP_OK;

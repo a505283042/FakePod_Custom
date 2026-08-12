@@ -11,6 +11,12 @@
 #include "../../audio/audio_rate_profile.h"
 
 static const char *TAG = "DAC";
+
+#if APP_DIAG_BOOT_VERBOSE
+#define DAC_BOOT_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define DAC_BOOT_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
 static i2c_master_dev_handle_t g_device = nullptr;
 static bool g_ready = false;
 static uint8_t g_revision = 0;
@@ -73,11 +79,20 @@ static esp_err_t cs43131_hardware_reset()
         return ret;
     }
 
-    // RESET 为低有效。先保持复位，再释放并等待控制口完成上电。
+    // RESET 为低有效。启动时 RTOS=100Hz，短于 10ms 的 pdMS_TO_TICKS() 会变成 0 tick，
+    // 不能让 DAC 复位时序依赖日志输出的偶然耗时。这里强制至少阻塞 1 tick，让复位和释放后稳定等待成为显式硬件约束。
+    auto delay_ms_at_least_one_tick = [](uint32_t delay_ms) {
+        TickType_t ticks = pdMS_TO_TICKS(delay_ms);
+        if (ticks == 0) {
+            ticks = 1;
+        }
+        vTaskDelay(ticks);
+    };
+
     gpio_set_level(static_cast<gpio_num_t>(FAKEPOD_DAC_RST), 0);
-    vTaskDelay(pdMS_TO_TICKS(2));
+    delay_ms_at_least_one_tick(2);
     gpio_set_level(static_cast<gpio_num_t>(FAKEPOD_DAC_RST), 1);
-    vTaskDelay(pdMS_TO_TICKS(3));
+    delay_ms_at_least_one_tick(3);
     return ESP_OK;
 }
 
@@ -132,9 +147,9 @@ esp_err_t cs43131_init()
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "正在初始化 CS43131 控制口");
-    ESP_LOGI(TAG, "RESET=GPIO%d，I2C地址=0x%02X", FAKEPOD_DAC_RST, FAKEPOD_ADDR_CS43131);
-    ESP_LOGI(TAG, "音频引脚：BCLK=GPIO%d LRCK=GPIO%d SDIN=GPIO%d，MCLK=板载24.576MHz晶振",
+    DAC_BOOT_LOGI("正在初始化 CS43131 控制口");
+    DAC_BOOT_LOGI("RESET=GPIO%d，I2C地址=0x%02X", FAKEPOD_DAC_RST, FAKEPOD_ADDR_CS43131);
+    DAC_BOOT_LOGI("音频引脚：BCLK=GPIO%d LRCK=GPIO%d SDIN=GPIO%d，MCLK=板载24.576MHz晶振",
         FAKEPOD_I2S_BCLK, FAKEPOD_I2S_LRCK, FAKEPOD_I2S_DOUT);
 
     esp_err_t ret = cs43131_hardware_reset();
@@ -145,12 +160,12 @@ esp_err_t cs43131_init()
 
     // ADR 电阻决定地址低两位，CS43131 的合法地址范围为 0x30~0x33。
     // Bring-up 阶段不再假定地址，复位后直接探测真实响应地址。
-    ESP_LOGI(TAG, "正在探测 CS43131 I2C 地址：0x30~0x33");
+    DAC_BOOT_LOGI("正在探测 CS43131 I2C 地址：0x30~0x33");
     for (uint8_t address = 0x30; address <= 0x33; ++address) {
         esp_err_t probe_ret = i2c_bus_probe_address(address, 20);
         if (probe_ret == ESP_OK) {
             g_i2c_address = address;
-            ESP_LOGI(TAG, "发现 CS43131 候选地址：0x%02X", address);
+            DAC_BOOT_LOGI("发现 CS43131 候选地址：0x%02X", address);
             break;
         }
     }
@@ -167,7 +182,7 @@ esp_err_t cs43131_init()
         return ret;
     }
 
-    ESP_LOGI(TAG, "CS43131 控制口使用地址=0x%02X，速率=100kHz", g_i2c_address);
+    DAC_BOOT_LOGI("CS43131 控制口使用地址=0x%02X，速率=100kHz", g_i2c_address);
 
     uint8_t id_ab = 0;
     uint8_t id_cd = 0;
@@ -180,7 +195,7 @@ esp_err_t cs43131_init()
         return ret;
     }
 
-    ESP_LOGI(TAG, "设备 ID：0x%02X 0x%02X 0x%02X", id_ab, id_cd, id_e);
+    DAC_BOOT_LOGI("设备 ID：0x%02X 0x%02X 0x%02X", id_ab, id_cd, id_e);
     if (id_ab != 0x43 || id_cd != 0x13 || id_e != 0x10) {
         ESP_LOGE(TAG, "设备 ID 与 CS43131 预期值 43 13 10 不一致");
         return ESP_ERR_NOT_FOUND;
@@ -198,12 +213,12 @@ esp_err_t cs43131_init()
     esp_err_t clock_ret = cs43131_read_reg(REG_SYSTEM_CLOCKING, &system_clocking);
     esp_err_t power_ret = cs43131_read_reg(REG_POWER_DOWN, &power_down);
 
-    ESP_LOGI(TAG, "修订号：0x%02X，子修订号：0x%02X", g_revision, g_subrevision);
+    DAC_BOOT_LOGI("修订号：0x%02X，子修订号：0x%02X", g_revision, g_subrevision);
     if (clock_ret == ESP_OK) {
-        ESP_LOGI(TAG, "系统时钟控制复位值：0x%02X", system_clocking);
+        DAC_BOOT_LOGI("系统时钟控制复位值：0x%02X", system_clocking);
     }
     if (power_ret == ESP_OK) {
-        ESP_LOGI(TAG, "电源控制复位值：0x%02X（保持全部音频模块关闭）", power_down);
+        DAC_BOOT_LOGI("电源控制复位值：0x%02X（保持全部音频模块关闭）", power_down);
     }
 
     g_ready = true;
@@ -365,11 +380,6 @@ esp_err_t cs43131_prepare_pcm_playback_32bit(uint32_t sample_rate_hz)
         static_cast<unsigned>(sample_rate_reg));
 #endif
     return ESP_OK;
-}
-
-esp_err_t cs43131_prepare_pcm_test_48k_32bit()
-{
-    return cs43131_prepare_pcm_playback_32bit(48000);
 }
 
 esp_err_t cs43131_enable_asp_input()
@@ -637,27 +647,6 @@ esp_err_t cs43131_finish_pcm_playback()
     ESP_LOGI(TAG, "PCM播放链路已关闭：ASP和XTAL已关闭，当前POWER_DOWN=0x%02X", power);
 #endif
     return ESP_OK;
-}
-
-// Stage 8.x 旧接口保留为兼容别名，后续可供系统诊断页面继续复用。
-esp_err_t cs43131_prepare_headphone_test_low_volume()
-{
-    return cs43131_prepare_headphone_playback_low_volume();
-}
-
-esp_err_t cs43131_set_pcm_test_mute(bool mute)
-{
-    return cs43131_set_pcm_mute(mute);
-}
-
-esp_err_t cs43131_power_down_headphone_test()
-{
-    return cs43131_power_down_headphone_playback();
-}
-
-esp_err_t cs43131_finish_pcm_test()
-{
-    return cs43131_finish_pcm_playback();
 }
 
 bool cs43131_is_ready()

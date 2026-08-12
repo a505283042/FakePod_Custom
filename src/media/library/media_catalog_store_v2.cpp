@@ -12,8 +12,15 @@
 #include "esp_log.h"
 #include "media_index_store.h"
 #include "system_paths.h"
+#include "app_diag_config.h"
 
 static const char *TAG = "曲库索引V2";
+
+#if APP_DIAG_BOOT_VERBOSE
+#define CATALOG_STORE_BOOT_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define CATALOG_STORE_BOOT_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
 // Stage 12.0 扩展 V2 Catalog 的磁盘 schema：加入 artwork refs。旧 version=2 会自动失效并一次性重建。
 static constexpr uint16_t CATALOG_VERSION_V2 = 3;
 static constexpr uint16_t MANIFEST_VERSION_V2 = 2;
@@ -1151,7 +1158,7 @@ esp_err_t media_catalog_store_v2_load(MediaCatalogSnapshotV2 *snapshot)
         );
         if (ret == ESP_OK) {
             *snapshot = loaded;
-            ESP_LOGI(TAG, "已加载 V2 Catalog：来源=%s tracks=%lu artists=%lu albums=%lu artist_refs=%lu lyrics_refs=%lu artwork_refs=%lu strings=%luB CRC=0x%08lX",
+            CATALOG_STORE_BOOT_LOGI("已加载 V2 Catalog：来源=%s tracks=%lu artists=%lu albums=%lu artist_refs=%lu lyrics_refs=%lu artwork_refs=%lu strings=%luB CRC=0x%08lX",
                 candidate.name,
                 static_cast<unsigned long>(snapshot->catalog.track_count),
                 static_cast<unsigned long>(snapshot->catalog.artist_count),

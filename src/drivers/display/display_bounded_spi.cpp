@@ -170,14 +170,14 @@ static esp_err_t display_bounded_spi_drain_panel(
             }
             if (ret != ESP_OK) {
                 ESP_LOGE(TAG,
-                    "R.36.4 BoundedSPI：Panel IO事务%ums内未回收 pending=%u done=%u；受控重启避免回到无界Panel IO",
+                    "BoundedSPI：Panel IO事务%ums内未回收 pending=%u done=%u；受控重启避免回到无界Panel IO",
                     static_cast<unsigned>(BOUNDED_SPI_PANEL_DRAIN_TIMEOUT_MS + BOUNDED_SPI_RECOVERY_TIMEOUT_MS),
                     static_cast<unsigned>(pending),
                     static_cast<unsigned>(i));
                 esp_restart();
             }
             ESP_LOGW(TAG,
-                "R.36.4 BoundedSPI：Panel IO事务在恢复窗口完成 pending=%u done=%u；本帧继续",
+                "BoundedSPI：Panel IO事务在恢复窗口完成 pending=%u done=%u；本帧继续",
                 static_cast<unsigned>(pending),
                 static_cast<unsigned>(i + 1U));
         }
@@ -238,7 +238,7 @@ static esp_err_t display_bounded_spi_queue_wait_single(
     if (ret == ESP_OK) {
         if (completed != &tx->base) {
             ESP_LOGE(TAG,
-                "R.36.4 BoundedSPI：事务身份错位 expected=%p actual=%p；结果队列已失配，受控重启",
+                "BoundedSPI：事务身份错位 expected=%p actual=%p；结果队列已失配，受控重启",
                 static_cast<void *>(&tx->base),
                 static_cast<void *>(completed));
             esp_restart();
@@ -257,7 +257,7 @@ static esp_err_t display_bounded_spi_queue_wait_single(
         if (recovery_ret == ESP_OK) {
             if (completed != &tx->base) {
                 ESP_LOGE(TAG,
-                    "R.36.4 BoundedSPI：恢复阶段事务身份错位 expected=%p actual=%p，受控重启",
+                    "BoundedSPI：恢复阶段事务身份错位 expected=%p actual=%p，受控重启",
                     static_cast<void *>(&tx->base),
                     static_cast<void *>(completed));
                 esp_restart();
@@ -267,7 +267,7 @@ static esp_err_t display_bounded_spi_queue_wait_single(
     }
 
     ESP_LOGE(TAG,
-        "R.36.4 BoundedSPI：control transaction %ums内未回收，受控重启避免Panel IO结果队列污染",
+        "BoundedSPI：control transaction %ums内未回收，受控重启避免Panel IO结果队列污染",
         static_cast<unsigned>(BOUNDED_SPI_RESULT_TIMEOUT_MS + BOUNDED_SPI_RECOVERY_TIMEOUT_MS));
     esp_restart();
     return ESP_ERR_TIMEOUT;
@@ -296,7 +296,7 @@ static void display_bounded_spi_poison(const char *reason)
 {
     if (!g_bounded_spi.faulted) {
         ESP_LOGE(TAG,
-            "R.36.4 BoundedSPI熔断：owner=%s reason=%s；本次启动后续BoundedSPI固定回退LVGL",
+            "BoundedSPI 熔断：owner=%s reason=%s；本次启动后续BoundedSPI固定回退LVGL",
             g_bounded_spi.owner != nullptr ? g_bounded_spi.owner : "none",
             reason != nullptr ? reason : "unknown");
     }
@@ -608,7 +608,7 @@ static esp_err_t display_bounded_spi_present_internal(
         const uint8_t buffer_index = queued_order[completed & 1U];
         if (returned != &g_bounded_spi.color_tx[buffer_index].base) {
             ESP_LOGE(TAG,
-                "R.36.4 BoundedSPI：color事务身份错位 gen=%u seq=%u expected=%p actual=%p；受控重启",
+                "BoundedSPI：color事务身份错位 gen=%u seq=%u expected=%p actual=%p；受控重启",
                 static_cast<unsigned>(g_bounded_spi.generation),
                 static_cast<unsigned>(g_bounded_spi.color_sequence[buffer_index]),
                 static_cast<void *>(&g_bounded_spi.color_tx[buffer_index].base),
@@ -650,7 +650,7 @@ static esp_err_t display_bounded_spi_present_internal(
         const uint8_t buffer_index = queued_order[completed & 1U];
         if (returned != &g_bounded_spi.color_tx[buffer_index].base) {
             ESP_LOGE(TAG,
-                "R.36.4 BoundedSPI：尾部color事务身份错位 gen=%u expected=%p actual=%p；受控重启",
+                "BoundedSPI：尾部color事务身份错位 gen=%u expected=%p actual=%p；受控重启",
                 static_cast<unsigned>(g_bounded_spi.generation),
                 static_cast<void *>(&g_bounded_spi.color_tx[buffer_index].base),
                 static_cast<void *>(returned));
@@ -671,7 +671,7 @@ static esp_err_t display_bounded_spi_present_internal(
                 const uint8_t buffer_index = queued_order[completed & 1U];
                 if (returned != &g_bounded_spi.color_tx[buffer_index].base) {
                     ESP_LOGE(TAG,
-                        "R.36.4 BoundedSPI恢复阶段color身份错位 gen=%u expected=%p actual=%p；受控重启",
+                        "BoundedSPI 恢复阶段color身份错位 gen=%u expected=%p actual=%p；受控重启",
                         static_cast<unsigned>(g_bounded_spi.generation),
                         static_cast<void *>(&g_bounded_spi.color_tx[buffer_index].base),
                         static_cast<void *>(returned));
@@ -682,7 +682,7 @@ static esp_err_t display_bounded_spi_present_internal(
         }
         if (completed < submitted) {
             ESP_LOGE(TAG,
-                "R.36.4 BoundedSPI恢复未排空：gen=%u completed=%u submitted=%u；受控重启避免DMA descriptor/UAF与Panel IO结果队列污染",
+                "BoundedSPI 恢复未排空：gen=%u completed=%u submitted=%u；受控重启避免DMA descriptor/UAF与Panel IO结果队列污染",
                 static_cast<unsigned>(g_bounded_spi.generation),
                 static_cast<unsigned>(completed),
                 static_cast<unsigned>(submitted));

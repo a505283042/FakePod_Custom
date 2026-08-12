@@ -6,12 +6,19 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "app_diag_config.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 namespace
 {
 static const char *TAG = "音频频谱";
+
+#if APP_DIAG_BOOT_VERBOSE
+#define SPECTRUM_BOOT_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define SPECTRUM_BOOT_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
 
 // P1.5.2R.3.1：256 点 FFT 配合约 14.7~16kHz 的分析采样率，
 // 第一有效 bin 约 57~63Hz，优先保留底鼓/贝斯瞬态；有效视觉频段约覆盖到 7~8kHz。
@@ -363,8 +370,8 @@ static void spectrum_fft_task_main(void *)
 
                 if (logged_generation != generation) {
                     logged_generation = generation;
-                    ESP_LOGI(TAG,
-                        "P1.5.2R.3.1 FFT首帧：source=%luHz analysis=%luHz N=%u bands=%u fft=%luus core=%d priority=%u stack_hwm=%u",
+                    SPECTRUM_BOOT_LOGI(
+                        "FFT 首帧：source=%luHz analysis=%luHz N=%u bands=%u fft=%luus core=%d priority=%u stack_hwm=%u",
                         static_cast<unsigned long>(frame.source_sample_rate_hz),
                         static_cast<unsigned long>(frame.analysis_sample_rate_hz),
                         static_cast<unsigned>(FFT_SIZE),
@@ -402,8 +409,8 @@ esp_err_t audio_spectrum_snapshot_start()
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG,
-        "P1.5.2R.3.1 SpectrumFFT任务已启动：core=%d priority=%u stack=%uB N=%u capture=%uHz target=%uHz floor=-45dB",
+    SPECTRUM_BOOT_LOGI(
+        "SpectrumFFT 任务已启动：core=%d priority=%u stack=%uB N=%u capture=%uHz target=%uHz floor=-45dB",
         static_cast<int>(FFT_TASK_CORE),
         static_cast<unsigned>(FFT_TASK_PRIORITY),
         static_cast<unsigned>(FFT_TASK_STACK_BYTES),

@@ -22,6 +22,12 @@
 #include "app_diag_config.h"
 
 static const char *TAG = "音乐库";
+
+#if APP_DIAG_BOOT_VERBOSE
+#define LIB_BOOT_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define LIB_BOOT_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
 static constexpr const char *MUSIC_ROOT = "/sdcard/MUSIC";
 static constexpr size_t INITIAL_ENTRY_CAPACITY = 128;
 static constexpr size_t INITIAL_PATH_CAPACITY = 16 * 1024;
@@ -309,7 +315,7 @@ static void media_library_sort_entries()
         return;
     }
     qsort(g_entries, g_entry_count, sizeof(MediaEntry), media_library_compare_entries);
-    ESP_LOGI(TAG, "排序完成：按完整 UTF-8 路径排序，共 %u 首", static_cast<unsigned>(g_entry_count));
+    LIB_BOOT_LOGI("排序完成：按完整 UTF-8 路径排序，共 %u 首", static_cast<unsigned>(g_entry_count));
 }
 
 static bool media_library_repack_sorted_path_pool()
@@ -356,7 +362,7 @@ static esp_err_t media_library_scan_with_scratch(MediaLibraryScanScratch *scratc
         return ESP_ERR_INVALID_ARG;
     }
     media_library_reset();
-    ESP_LOGI(TAG, "开始递归扫描：%s", MUSIC_ROOT);
+    LIB_BOOT_LOGI("开始递归扫描：%s", MUSIC_ROOT);
     const int64_t start_us = esp_timer_get_time();
 
     // Stage 10.2 优先加载正式 V2 Catalog/Manifest。第一次从 Stage 10.0 升级时，
@@ -372,7 +378,7 @@ static esp_err_t media_library_scan_with_scratch(MediaLibraryScanScratch *scratc
     const bool have_previous_v2 = media_catalog_store_v2_load(&previous_v2) == ESP_OK;
     const bool have_previous_v1 = !have_previous_v2 && media_index_store_load(&previous_v1) == ESP_OK;
     if (have_previous_v1) {
-        ESP_LOGI(TAG, "检测到 Stage 10.0 V1 索引，本次迁移复用技术信息并生成 V2 Catalog");
+        ESP_LOGI(TAG, "检测到旧 V1 索引，本次迁移复用技术信息并生成 V2 Catalog");
     } else if (!have_previous_v2) {
         ESP_LOGI(TAG, "未找到可复用索引，本次将首次建立 MusicCatalogV2");
     }
@@ -844,7 +850,7 @@ static esp_err_t media_library_scan_with_scratch(MediaLibraryScanScratch *scratc
             media_library_reset();
             return publish_ret;
         }
-        ESP_LOGI(TAG, "V2 Catalog 全量命中 Manifest，直接复用已校验运行时目录，不重建、不写盘");
+        LIB_BOOT_LOGI("V2 Catalog 全量命中 Manifest，直接复用已校验运行时目录，不重建、不写盘");
         media_catalog_store_v2_release(&previous_v2);
         media_index_store_release(&previous_v1);
         media_library_release_build_buffers();
@@ -858,11 +864,11 @@ static esp_err_t media_library_scan_with_scratch(MediaLibraryScanScratch *scratc
             static_cast<unsigned>(reused_count),
             static_cast<unsigned>(probed_count),
             static_cast<unsigned>(probe_failed_count));
-        ESP_LOGI(TAG, "Metadata统计：复用=%u，新解析=%u，失败=%u",
+        LIB_BOOT_LOGI("Metadata统计：复用=%u，新解析=%u，失败=%u",
             static_cast<unsigned>(metadata_reused_count),
             static_cast<unsigned>(metadata_scanned_count),
             static_cast<unsigned>(metadata_failed_count));
-        ESP_LOGI(TAG, "封面统计：复用=%u，目录刷新=%u，新扫描=%u，内嵌=%u，目录fallback=%u，无封面=%u，失败=%u",
+        LIB_BOOT_LOGI("封面统计：复用=%u，目录刷新=%u，新扫描=%u，内嵌=%u，目录fallback=%u，无封面=%u，失败=%u",
             static_cast<unsigned>(artwork_reused_count),
             static_cast<unsigned>(artwork_refreshed_count),
             static_cast<unsigned>(artwork_scanned_count),
@@ -870,14 +876,14 @@ static esp_err_t media_library_scan_with_scratch(MediaLibraryScanScratch *scratc
             static_cast<unsigned>(artwork_external_count),
             static_cast<unsigned>(artwork_none_count),
             static_cast<unsigned>(artwork_failed_count));
-        ESP_LOGI(TAG, "格式统计：MP3=%u，FLAC=%u，WAV=%u，NSF=%u，NSFE=%u",
+        LIB_BOOT_LOGI("格式统计：MP3=%u，FLAC=%u，WAV=%u，NSF=%u，NSFE=%u",
             static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::MP3)]),
             static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::FLAC)]),
             static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::WAV)]),
             static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::NSF)]),
             static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::NSFE)]));
         const MusicCatalogV2 *published = media_catalog_v2_current();
-        ESP_LOGI(TAG, "MusicCatalogV2 PSRAM：tracks=%luB artists=%luB albums=%luB artist_refs=%luB lyrics_refs=%luB artwork_refs=%luB strings=%luB groups=%uB generation=%lu",
+        LIB_BOOT_LOGI("MusicCatalogV2 PSRAM：tracks=%luB artists=%luB albums=%luB artist_refs=%luB lyrics_refs=%luB artwork_refs=%luB strings=%luB groups=%uB generation=%lu",
             static_cast<unsigned long>(final_track_bytes),
             static_cast<unsigned long>(final_artist_bytes),
             static_cast<unsigned long>(final_album_bytes),
@@ -945,11 +951,11 @@ static esp_err_t media_library_scan_with_scratch(MediaLibraryScanScratch *scratc
         static_cast<unsigned>(reused_count),
         static_cast<unsigned>(probed_count),
         static_cast<unsigned>(probe_failed_count));
-    ESP_LOGI(TAG, "Metadata统计：复用=%u，新解析=%u，失败=%u",
+    LIB_BOOT_LOGI("Metadata统计：复用=%u，新解析=%u，失败=%u",
         static_cast<unsigned>(metadata_reused_count),
         static_cast<unsigned>(metadata_scanned_count),
         static_cast<unsigned>(metadata_failed_count));
-    ESP_LOGI(TAG, "封面统计：复用=%u，目录刷新=%u，新扫描=%u，内嵌=%u，目录fallback=%u，无封面=%u，失败=%u",
+    LIB_BOOT_LOGI("封面统计：复用=%u，目录刷新=%u，新扫描=%u，内嵌=%u，目录fallback=%u，无封面=%u，失败=%u",
         static_cast<unsigned>(artwork_reused_count),
         static_cast<unsigned>(artwork_refreshed_count),
         static_cast<unsigned>(artwork_scanned_count),
@@ -957,14 +963,14 @@ static esp_err_t media_library_scan_with_scratch(MediaLibraryScanScratch *scratc
         static_cast<unsigned>(artwork_external_count),
         static_cast<unsigned>(artwork_none_count),
         static_cast<unsigned>(artwork_failed_count));
-    ESP_LOGI(TAG, "格式统计：MP3=%u，FLAC=%u，WAV=%u，NSF=%u，NSFE=%u",
+    LIB_BOOT_LOGI("格式统计：MP3=%u，FLAC=%u，WAV=%u，NSF=%u，NSFE=%u",
         static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::MP3)]),
         static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::FLAC)]),
         static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::WAV)]),
         static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::NSF)]),
         static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::NSFE)]));
     const MusicCatalogV2 *published = media_catalog_v2_current();
-    ESP_LOGI(TAG, "MusicCatalogV2 PSRAM：tracks=%luB artists=%luB albums=%luB artist_refs=%luB lyrics_refs=%luB artwork_refs=%luB strings=%luB groups=%uB generation=%lu",
+    LIB_BOOT_LOGI("MusicCatalogV2 PSRAM：tracks=%luB artists=%luB albums=%luB artist_refs=%luB lyrics_refs=%luB artwork_refs=%luB strings=%luB groups=%uB generation=%lu",
         static_cast<unsigned long>(final_track_bytes),
         static_cast<unsigned long>(final_artist_bytes),
         static_cast<unsigned long>(final_album_bytes),

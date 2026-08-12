@@ -10,8 +10,15 @@
 #include "media_groups_v2.h"
 #include "media_metadata.h"
 #include "media_artwork.h"
+#include "app_diag_config.h"
 
 static const char *TAG = "曲库V2";
+
+#if APP_DIAG_BOOT_VERBOSE
+#define CATALOG_BOOT_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define CATALOG_BOOT_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
 static MusicCatalogV2 s_catalog = {};
 static uint32_t s_generation_seq = 0;
 static bool s_ready = false;
@@ -852,7 +859,7 @@ esp_err_t media_catalog_v2_publish(MusicCatalogV2 *catalog, uint32_t source_crc3
     }
     s_ready = true;
 
-    ESP_LOGI(TAG, "Catalog 已发布：generation=%lu tracks=%lu artists=%lu albums=%lu artist_refs=%lu lyrics_refs=%lu artwork_refs=%lu groups(A/AL/D)=%lu/%lu/%lu strings=%luB crc=0x%08lX",
+    CATALOG_BOOT_LOGI("Catalog 已发布：generation=%lu tracks=%lu artists=%lu albums=%lu artist_refs=%lu lyrics_refs=%lu artwork_refs=%lu groups(A/AL/D)=%lu/%lu/%lu strings=%luB crc=0x%08lX",
         static_cast<unsigned long>(s_catalog.generation),
         static_cast<unsigned long>(s_catalog.track_count),
         static_cast<unsigned long>(s_catalog.artist_count),

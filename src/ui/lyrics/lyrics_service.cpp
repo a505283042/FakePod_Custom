@@ -8,6 +8,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "app_diag_config.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -675,7 +676,7 @@ static void lyrics_task(void *arg)
         ret = lyrics_parse_lrc(file_data, file_size, &parsed);
         heap_caps_free(file_data);
         if (ret == ESP_ERR_NOT_SUPPORTED) {
-            ESP_LOGW(TAG, "LRC 编码暂不支持：track=%lu；P1.4.1 仅支持 UTF-8/UTF-8 BOM",
+            ESP_LOGW(TAG, "LRC 编码暂不支持：track=%lu；仅支持 UTF-8/UTF-8 BOM",
                 static_cast<unsigned long>(request.track_index));
             lyrics_publish_state(request, LyricsLoadState::Unsupported, ret, nullptr);
             continue;
@@ -747,13 +748,15 @@ esp_err_t lyrics_service_start()
     }
 
     g_ready = true;
+#if APP_DIAG_BOOT_VERBOSE
     ESP_LOGI(TAG,
-        "LyricsTask 已启动：core=%d priority=%u stack=%uB chunk=%uB FLAC安全水位=%u%%；P1.4.1=External UTF-8 LRC",
+        "LyricsTask 已启动：core=%d priority=%u stack=%uB chunk=%uB FLAC安全水位=%u%%，格式=External UTF-8 LRC",
         static_cast<int>(LYRICS_TASK_CORE),
         static_cast<unsigned>(LYRICS_TASK_PRIORITY),
         static_cast<unsigned>(LYRICS_TASK_STACK),
         static_cast<unsigned>(LYRICS_READ_CHUNK_BYTES),
         static_cast<unsigned>(LYRICS_FLAC_SAFE_PERCENT));
+#endif
     return ESP_OK;
 }
 

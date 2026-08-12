@@ -87,8 +87,8 @@ static bool system_artwork_storage_window_open(uint32_t track_index)
     if (g_artwork_storage_wait_last_log_tick == 0 ||
         now - g_artwork_storage_wait_last_log_tick >= ARTWORK_STORAGE_WINDOW_LOG_INTERVAL) {
         g_artwork_storage_wait_last_log_tick = now;
-        ESP_LOGI(TAG,
-            "R.36 当前曲封面等待 FLAC 安全I/O窗口：track=%lu rate=%luHz ring=%lu/%luB threshold=%lu%%",
+        if (APP_DIAG_ARTWORK_UI) ESP_LOGI(TAG,
+            "当前曲封面等待 FLAC 安全 I/O 窗口：track=%lu rate=%luHz ring=%lu/%luB threshold=%lu%%",
             static_cast<unsigned long>(track_index),
             static_cast<unsigned long>(window.sample_rate_hz),
             static_cast<unsigned long>(window.buffered_bytes),
@@ -118,7 +118,7 @@ static void system_artwork_schedule_retry(uint32_t track_index)
     const TickType_t delay = system_artwork_retry_delay(g_artwork_current_retry_count);
     g_artwork_retry_due_tick = xTaskGetTickCount() + delay;
     g_artwork_stage = ArtworkCurrentStage::RetryCompressed;
-    ESP_LOGW(TAG, "R.36 当前曲封面暂未完成：track=%lu，第%u次退避%lums后重试",
+    ESP_LOGW(TAG, "当前曲封面暂未完成：track=%lu，第%u次退避%lums后重试",
         static_cast<unsigned long>(track_index),
         static_cast<unsigned>(g_artwork_current_retry_count),
         static_cast<unsigned long>(delay * portTICK_PERIOD_MS));
@@ -182,7 +182,7 @@ static void system_artwork_begin_context(uint32_t generation, uint32_t current_t
         }
     }
 
-    ESP_LOGI(TAG, "R.36 封面资源编排：current=%lu next=disabled generation=%lu stage=%u",
+    if (APP_DIAG_ARTWORK_UI) ESP_LOGI(TAG, "封面资源编排：current=%lu next=disabled generation=%lu stage=%u",
         static_cast<unsigned long>(current_track),
         static_cast<unsigned long>(generation),
         static_cast<unsigned>(g_artwork_stage));
@@ -233,7 +233,7 @@ static void system_artwork_current_update()
             } else if (!system_artwork_storage_window_open(current_track)) {
                 // 只等安全窗口，不累计 timeout/backoff。
             } else if (artwork_loader_request_track(current_track, nullptr)) {
-                ESP_LOGI(TAG, "R.36 重试当前曲压缩封面：track=%lu",
+                if (APP_DIAG_ARTWORK_UI) ESP_LOGI(TAG, "重试当前曲压缩封面：track=%lu",
                     static_cast<unsigned long>(current_track));
                 g_artwork_stage = ArtworkCurrentStage::WaitCompressed;
             } else {

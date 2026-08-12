@@ -27,6 +27,104 @@ static const char *TAG =
 static BootState g_state =
     BootState::CheckPsram;
 
+// 启动故障分级属于 Boot Orchestrator 私有实现，不泄漏到公共头文件。
+enum class BootFailureLevel : uint8_t
+{
+    None = 0,
+    Optional,
+    Degraded,
+    Fatal
+};
+
+static void boot_state_update();
+static bool boot_state_is_degraded();
+static bool boot_state_has_error();
+
+static uint32_t g_degraded_issues = 0U;
+static uint32_t g_optional_issues = 0U;
+static BootIssue g_fatal_issue = BootIssue::None;
+static esp_err_t g_fatal_error = ESP_OK;
+
+static uint32_t boot_issue_mask(BootIssue issue)
+{
+    return static_cast<uint32_t>(issue);
+}
+
+static const char *boot_fatal_ui_reason(BootIssue issue)
+{
+    switch (issue) {
+        case BootIssue::PsramUnavailable:
+            return "PSRAM unavailable";
+        case BootIssue::I2cUnavailable:
+            return "I2C unavailable";
+        case BootIssue::DisplayUnavailable:
+            return "Display unavailable";
+        case BootIssue::UiBootstrapUnavailable:
+            return "LVGL unavailable";
+        case BootIssue::AudioUnavailable:
+            return "Audio unavailable";
+        case BootIssue::UiUnavailable:
+            return "UI unavailable";
+        default:
+            return "Core startup failure";
+    }
+}
+
+static bool boot_issue_recorded(BootIssue issue)
+{
+    const uint32_t mask = boot_issue_mask(issue);
+    return (g_degraded_issues & mask) != 0U ||
+        (g_optional_issues & mask) != 0U ||
+        g_fatal_issue == issue;
+}
+
+static void boot_record_issue(
+    BootFailureLevel level,
+    BootIssue issue,
+    esp_err_t error,
+    const char *message
+)
+{
+    const char *text = message != nullptr ? message : "未知启动故障";
+
+    switch (level) {
+        case BootFailureLevel::Optional:
+            g_optional_issues |= boot_issue_mask(issue);
+            ESP_LOGW(TAG, "可选功能不可用：%s：%s", text, esp_err_to_name(error));
+            break;
+
+        case BootFailureLevel::Degraded:
+            g_degraded_issues |= boot_issue_mask(issue);
+            ESP_LOGW(TAG, "降级启动：%s：%s", text, esp_err_to_name(error));
+            break;
+
+        case BootFailureLevel::Fatal:
+        {
+            g_fatal_issue = issue;
+            g_fatal_error = error;
+            ESP_LOGE(TAG, "致命启动故障：%s：%s", text, esp_err_to_name(error));
+            g_state = BootState::Error;
+
+            // 只有 LVGL 启动核心已经建立时才显示错误页；更早的硬件故障只保留串口诊断。
+            // 无论错误页是否可用，顶层都会停止 Boot 和 system_loop，保持安全终态。
+            const bool error_page_visible = ui_manager_show_boot_fatal(
+                boot_fatal_ui_reason(issue),
+                error
+            );
+            ESP_LOGE(
+                TAG,
+                "启动进入致命终态：issue=0x%08lX ui=%s",
+                static_cast<unsigned long>(boot_issue_mask(issue)),
+                error_page_visible ? "ERROR_PAGE" : "SERIAL_ONLY"
+            );
+            break;
+        }
+
+        case BootFailureLevel::None:
+            break;
+    }
+}
+
 
 // ============================================================
 // 初始化启动状态机
@@ -36,6 +134,10 @@ void boot_state_init()
 {
     g_state =
         BootState::CheckPsram;
+    g_degraded_issues = 0U;
+    g_optional_issues = 0U;
+    g_fatal_issue = BootIssue::None;
+    g_fatal_error = ESP_OK;
 
 
     ESP_LOGI(
@@ -56,7 +158,9 @@ BootRunResult boot_run()
         return BootRunResult::Fatal;
     }
     if (boot_state_is_ready()) {
-        return BootRunResult::Ready;
+        return boot_state_is_degraded()
+            ? BootRunResult::ReadyDegraded
+            : BootRunResult::Ready;
     }
 
     boot_state_update();
@@ -64,9 +168,12 @@ BootRunResult boot_run()
     if (boot_state_has_error()) {
         return BootRunResult::Fatal;
     }
-    return boot_state_is_ready()
-        ? BootRunResult::Ready
-        : BootRunResult::Running;
+    if (!boot_state_is_ready()) {
+        return BootRunResult::Running;
+    }
+    return boot_state_is_degraded()
+        ? BootRunResult::ReadyDegraded
+        : BootRunResult::Ready;
 }
 
 
@@ -74,7 +181,7 @@ BootRunResult boot_run()
 // 更新启动状态机
 // ============================================================
 
-void boot_state_update()
+static void boot_state_update()
 {
     switch (g_state) {
 
@@ -96,14 +203,12 @@ void boot_state_update()
                 !esp_psram_is_initialized()
             ) {
 
-                ESP_LOGE(
-                    TAG,
+                boot_record_issue(
+                    BootFailureLevel::Fatal,
+                    BootIssue::PsramUnavailable,
+                    ESP_FAIL,
                     "PSRAM 初始化失败"
                 );
-
-                g_state =
-                    BootState::Error;
-
                 break;
             }
 
@@ -144,19 +249,14 @@ void boot_state_update()
 #endif
 
 
-            if (
-                i2c_bus_init() !=
-                ESP_OK
-            ) {
-
-                ESP_LOGE(
-                    TAG,
-                    "I2C 初始化失败"
+            const esp_err_t i2c_ret = i2c_bus_init();
+            if (i2c_ret != ESP_OK) {
+                boot_record_issue(
+                    BootFailureLevel::Fatal,
+                    BootIssue::I2cUnavailable,
+                    i2c_ret,
+                    "I2C 总线初始化失败"
                 );
-
-                g_state =
-                    BootState::Error;
-
                 break;
             }
 
@@ -187,22 +287,15 @@ void boot_state_update()
 #endif
 
 
-            if (
-                cst820_init() !=
-                ESP_OK
-            ) {
-
-                ESP_LOGE(
-                    TAG,
-                    "触摸初始化失败"
+            const esp_err_t touch_ret = cst820_init();
+            if (touch_ret != ESP_OK) {
+                boot_record_issue(
+                    BootFailureLevel::Degraded,
+                    BootIssue::TouchUnavailable,
+                    touch_ret,
+                    "CST820 触摸不可用，继续无触摸运行"
                 );
-
-                g_state =
-                    BootState::Error;
-
-                break;
             }
-
 
             g_state =
                 BootState::InitIMU;
@@ -225,22 +318,15 @@ void boot_state_update()
 #endif
 
 
-            if (
-                qmi8658_init() !=
-                ESP_OK
-            ) {
-
-                ESP_LOGE(
-                    TAG,
-                    "IMU 初始化失败"
+            const esp_err_t imu_ret = qmi8658_init();
+            if (imu_ret != ESP_OK) {
+                boot_record_issue(
+                    BootFailureLevel::Optional,
+                    BootIssue::ImuUnavailable,
+                    imu_ret,
+                    "QMI8658 不可用，关闭姿态附加能力"
                 );
-
-                g_state =
-                    BootState::Error;
-
-                break;
             }
-
 
             g_state =
                 BootState::InitAudioService;
@@ -258,15 +344,19 @@ void boot_state_update()
             ESP_LOGI(TAG, "启动阶段：启动正式 AudioTask");
 #endif
 
-            esp_err_t ret = audio_service_start();
+            const esp_err_t ret = audio_service_start();
             if (ret != ESP_OK) {
-                ESP_LOGE(TAG, "AudioTask 启动失败：%s", esp_err_to_name(ret));
-                g_state = BootState::Error;
+                boot_record_issue(
+                    BootFailureLevel::Fatal,
+                    BootIssue::AudioUnavailable,
+                    ret,
+                    "AudioTask / CS43131 音频核心启动失败"
+                );
                 break;
             }
 
 #if APP_DIAG_BOOT_VERBOSE
-            ESP_LOGI(TAG, "正式播放器音频服务已就绪；开机不再执行测试音");
+            ESP_LOGI(TAG, "正式播放器音频服务已就绪");
 #endif
             g_state = BootState::InitSDCard;
             break;
@@ -286,19 +376,15 @@ void boot_state_update()
 #endif
 
 
-            if (
-                sdcard_init() !=
-                ESP_OK
-            ) {
-
-                ESP_LOGE(
-                    TAG,
-                    "TF 卡初始化失败"
+            const esp_err_t storage_ret = sdcard_init();
+            if (storage_ret != ESP_OK) {
+                boot_record_issue(
+                    BootFailureLevel::Degraded,
+                    BootIssue::StorageUnavailable,
+                    storage_ret,
+                    "TF 卡不可用，跳过音乐库并进入无存储运行"
                 );
-
-                g_state =
-                    BootState::Error;
-
+                g_state = BootState::InitPlayer;
                 break;
             }
 
@@ -328,34 +414,54 @@ void boot_state_update()
             );
 #endif
 
-            if (
-                media_library_scan() !=
-                ESP_OK
-            ) {
-                ESP_LOGE(
-                    TAG,
-                    "音乐库扫描失败"
+            const esp_err_t library_ret = media_library_scan();
+            if (library_ret != ESP_OK) {
+                boot_record_issue(
+                    BootFailureLevel::Degraded,
+                    BootIssue::LibraryUnavailable,
+                    library_ret,
+                    "音乐库不可用，继续保留基础界面"
                 );
-
-                g_state =
-                    BootState::Error;
-
-                break;
             }
 
-            if (player_state_init() != ESP_OK) {
-                ESP_LOGE(TAG, "播放器选择状态初始化失败");
-                g_state = BootState::Error;
-                break;
-            }
-            if (player_control_init() != ESP_OK) {
-                ESP_LOGE(TAG, "播放器控制初始化失败");
-                g_state = BootState::Error;
-                break;
+            g_state = BootState::InitPlayer;
+
+            break;
+        }
+
+        // ====================================================
+        // Player 顶层状态 / 控制
+        // ====================================================
+
+        case BootState::InitPlayer:
+        {
+#if APP_DIAG_BOOT_VERBOSE
+            ESP_LOGI(TAG, "启动阶段：建立播放器顶层状态");
+#endif
+
+            if (media_library_is_ready()) {
+                const esp_err_t state_ret = player_state_init();
+                if (state_ret != ESP_OK) {
+                    boot_record_issue(
+                        BootFailureLevel::Degraded,
+                        BootIssue::PlayerStateUnavailable,
+                        state_ret,
+                        "播放器选择状态不可用"
+                    );
+                }
             }
 
-            g_state =
-                BootState::InitUI;
+            const esp_err_t control_ret = player_control_init();
+            if (control_ret != ESP_OK) {
+                boot_record_issue(
+                    BootFailureLevel::Degraded,
+                    BootIssue::PlayerControlUnavailable,
+                    control_ret,
+                    "播放器控制不可用"
+                );
+            }
+
+            g_state = BootState::InitUI;
 
             break;
         }
@@ -374,19 +480,14 @@ void boot_state_update()
 #endif
 
 
-            if (
-                display_init() !=
-                ESP_OK
-            ) {
-
-                ESP_LOGE(
-                    TAG,
-                    "AMOLED 初始化失败"
+            const esp_err_t display_ret = display_init();
+            if (display_ret != ESP_OK) {
+                boot_record_issue(
+                    BootFailureLevel::Fatal,
+                    BootIssue::DisplayUnavailable,
+                    display_ret,
+                    "AMOLED 显示核心初始化失败"
                 );
-
-                g_state =
-                    BootState::Error;
-
                 break;
             }
 
@@ -408,9 +509,14 @@ void boot_state_update()
             ESP_LOGI(TAG, "启动阶段：建立 LVGL 启动页并等待首帧揭屏");
 #endif
 
-            if (ui_manager_bootstrap_init() != ESP_OK) {
-                ESP_LOGE(TAG, "LVGL 启动核心初始化失败");
-                g_state = BootState::Error;
+            const esp_err_t ui_bootstrap_ret = ui_manager_bootstrap_init();
+            if (ui_bootstrap_ret != ESP_OK) {
+                boot_record_issue(
+                    BootFailureLevel::Fatal,
+                    BootIssue::UiBootstrapUnavailable,
+                    ui_bootstrap_ret,
+                    "LVGL 启动核心初始化失败"
+                );
                 break;
             }
 
@@ -432,16 +538,26 @@ void boot_state_update()
             );
 #endif
 
-            if (ui_manager_init() != ESP_OK) {
-                ESP_LOGE(
-                    TAG,
+            const esp_err_t ui_ret = ui_manager_init();
+            if (ui_ret != ESP_OK) {
+                boot_record_issue(
+                    BootFailureLevel::Fatal,
+                    BootIssue::UiUnavailable,
+                    ui_ret,
                     "LVGL 用户界面初始化失败"
                 );
-
-                g_state =
-                    BootState::Error;
-
                 break;
+            }
+
+            // R.38.4.2：CST820 初始化成功只代表硬件可访问；真正的用户输入能力还要求
+            // LVGL indev 建立成功。Touch Fast Path 失败但同步读取仍可用时不会误报降级。
+            if (!ui_manager_touch_available() && !boot_issue_recorded(BootIssue::TouchUnavailable)) {
+                boot_record_issue(
+                    BootFailureLevel::Degraded,
+                    BootIssue::TouchUnavailable,
+                    ui_manager_touch_error(),
+                    "LVGL 触摸输入不可用，继续无触摸运行"
+                );
             }
 
             // UI 与全部核心依赖已经建立。先发布唯一 READY 边界；
@@ -452,8 +568,11 @@ void boot_state_update()
 
             ESP_LOGI(
                 TAG,
-                "READY：tracks=%u PSRAM_free=%uKB",
+                "READY：mode=%s tracks=%u degraded=0x%08lX optional=0x%08lX PSRAM_free=%uKB",
+                boot_state_is_degraded() ? "DEGRADED" : "NORMAL",
                 static_cast<unsigned>(media_library_get_count()),
+                static_cast<unsigned long>(g_degraded_issues),
+                static_cast<unsigned long>(g_optional_issues),
                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U)
             );
 
@@ -487,23 +606,31 @@ bool boot_state_is_ready()
 }
 
 
+static bool boot_state_is_degraded()
+{
+    return g_degraded_issues != 0U;
+}
+
+bool boot_state_get_status(BootStatusSnapshot *out_status)
+{
+    if (out_status == nullptr) {
+        return false;
+    }
+    out_status->state = g_state;
+    out_status->degraded_issues = g_degraded_issues;
+    out_status->optional_issues = g_optional_issues;
+    out_status->fatal_issue = g_fatal_issue;
+    out_status->fatal_error = g_fatal_error;
+    return true;
+}
+
 // ============================================================
 // 是否启动失败
 // ============================================================
 
-bool boot_state_has_error()
+static bool boot_state_has_error()
 {
     return
         g_state ==
         BootState::Error;
-}
-
-
-// ============================================================
-// 获取当前启动状态
-// ============================================================
-
-BootState boot_state_get()
-{
-    return g_state;
 }

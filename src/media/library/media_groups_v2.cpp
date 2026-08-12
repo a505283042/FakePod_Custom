@@ -7,8 +7,15 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "media_catalog_v2.h"
+#include "app_diag_config.h"
 
 static const char *TAG = "曲库分组V2";
+
+#if APP_DIAG_BOOT_VERBOSE
+#define GROUPS_BOOT_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define GROUPS_BOOT_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
 static const MusicCatalogV2 *s_sort_catalog = nullptr;
 
 static_assert(sizeof(MediaEntityTrackGroupV2) == 12, "MediaEntityTrackGroupV2 layout changed");
@@ -534,7 +541,7 @@ esp_err_t media_groups_v2_build(MusicCatalogV2 *catalog)
         return ret;
     }
 
-    ESP_LOGI(TAG,
+    GROUPS_BOOT_LOGI(
         "分组构建完成：artists=%lu memberships=%lu albums=%lu memberships=%lu decades=%lu memberships=%lu PSRAM=%uB",
         static_cast<unsigned long>(catalog->artist_group_count),
         static_cast<unsigned long>(catalog->artist_group_track_count),

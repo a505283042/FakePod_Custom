@@ -2,9 +2,6 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/semphr.h"
 #include "driver/i2s_std.h"
 #include "esp_log.h"
 #include "board_pins.h"
@@ -13,11 +10,6 @@
 
 static const char *TAG = "I2S";
 static i2s_chan_handle_t g_tx = NULL;
-static TaskHandle_t g_stream_task = NULL;
-static SemaphoreHandle_t g_stream_task_done = NULL;
-static volatile bool g_streaming = false;
-static volatile bool g_test_tone_enabled = false;
-static volatile esp_err_t g_stream_error = ESP_OK;
 static bool g_started = false;
 static uint32_t g_sample_rate_hz = 0;
 
@@ -27,33 +19,10 @@ static uint32_t g_sample_rate_hz = 0;
 // 176.4/192kHz 当前处于受控实机验证，临时使用更长 DMA runway；
 // 最终仍以 FLAC refill 实测预算为依据回收内部 DMA RAM，不把堆 DMA 当作 Hi-Res 最终方案。
 #define I2S_DMA_FRAME_NUM I2S_FRAMES_PER_BLOCK
-#define I2S_WRITE_TIMEOUT_MS 100
 #define I2S_MAX_ZERO_PROGRESS_TIMEOUTS 3
-#define I2S_TASK_STOP_TIMEOUT_MS 500
 
-// 每帧两个 32bit 声道。
+// 每帧两个 32bit 声道；正式播放和软切换统一复用这块静音缓冲。
 static uint32_t g_silence[I2S_FRAMES_PER_BLOCK * 2] = {0};
-static int32_t g_test_tone[I2S_FRAMES_PER_BLOCK * 2] = {0};
-
-// 48kHz 下 1kHz 正好每周期 48 个采样。Q15 正弦表再缩小到约 1/8 满幅，
-// 仅供 Stage 8.x 硬件诊断接口使用。
-static const int16_t g_sine_q15[48] = {
-    0, 4277, 8481, 12539, 16384, 19947, 23170, 25996,
-    28378, 30273, 31650, 32487, 32767, 32487, 31650, 30273,
-    28378, 25996, 23170, 19947, 16384, 12539, 8481, 4277,
-    0, -4277, -8481, -12539, -16384, -19947, -23170, -25996,
-    -28378, -30273, -31650, -32487, -32767, -32487, -31650, -30273,
-    -28378, -25996, -23170, -19947, -16384, -12539, -8481, -4277
-};
-
-static void i2s_build_test_tone(void)
-{
-    for (int frame = 0; frame < I2S_FRAMES_PER_BLOCK; ++frame) {
-        int32_t sample = (int32_t)g_sine_q15[frame % 48] * 8192;
-        g_test_tone[frame * 2] = sample;
-        g_test_tone[frame * 2 + 1] = sample;
-    }
-}
 
 static esp_err_t i2s_output_create_channel(uint32_t sample_rate_hz)
 {
@@ -195,10 +164,6 @@ static esp_err_t i2s_output_write_all(const void *data, size_t bytes, uint32_t t
 
 esp_err_t i2s_output_stream_start_32bit(uint32_t sample_rate_hz)
 {
-    if (g_stream_task != NULL || g_streaming) {
-        ESP_LOGE(TAG, "旧硬件自检发送任务仍在运行，不能启动正式 PCM 流");
-        return ESP_ERR_INVALID_STATE;
-    }
     return i2s_output_create_channel(sample_rate_hz);
 }
 
@@ -241,161 +206,12 @@ esp_err_t i2s_output_stream_write_silence(size_t frames, uint32_t timeout_ms)
     return ESP_OK;
 }
 
-static void i2s_silence_task(void *arg)
-{
-    (void)arg;
-    const size_t block_size = sizeof(g_silence);
-
-    while (g_streaming) {
-        const void *active_block = g_test_tone_enabled ? (const void *)g_test_tone : (const void *)g_silence;
-        const uint8_t *cursor = (const uint8_t *)active_block;
-        size_t remaining = block_size;
-        int zero_progress_timeouts = 0;
-
-        while (g_streaming && remaining > 0) {
-            size_t bytes_written = 0;
-            esp_err_t ret = i2s_channel_write(
-                g_tx,
-                cursor,
-                remaining,
-                &bytes_written,
-                I2S_WRITE_TIMEOUT_MS
-            );
-
-            if (bytes_written > 0) {
-                cursor += bytes_written;
-                remaining -= bytes_written;
-                zero_progress_timeouts = 0;
-            }
-            if (ret == ESP_OK) {
-                continue;
-            }
-            if (ret == ESP_ERR_TIMEOUT && bytes_written > 0) {
-                continue;
-            }
-            if (ret == ESP_ERR_TIMEOUT) {
-                zero_progress_timeouts++;
-                if (zero_progress_timeouts < I2S_MAX_ZERO_PROGRESS_TIMEOUTS) {
-                    continue;
-                }
-            }
-
-            g_stream_error = ret != ESP_OK ? ret : ESP_FAIL;
-            ESP_LOGE(TAG, "后台自检 PCM 发送失败：ret=%s，剩余=%u/%u，连续无进度超时=%d",
-                esp_err_to_name(ret),
-                (unsigned)remaining,
-                (unsigned)block_size,
-                zero_progress_timeouts);
-            g_streaming = false;
-            break;
-        }
-    }
-
-    g_streaming = false;
-    g_stream_task = NULL;
-    if (g_stream_task_done != NULL) {
-        xSemaphoreGive(g_stream_task_done);
-    }
-    vTaskDelete(NULL);
-}
-
-esp_err_t i2s_output_start_48k_32bit(void)
-{
-    esp_err_t ret = i2s_output_create_channel(48000);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    i2s_build_test_tone();
-    g_test_tone_enabled = false;
-    g_stream_error = ESP_OK;
-    g_streaming = true;
-
-    if (g_stream_task_done != NULL) {
-        vSemaphoreDelete(g_stream_task_done);
-        g_stream_task_done = NULL;
-    }
-    g_stream_task_done = xSemaphoreCreateBinary();
-    if (g_stream_task_done == NULL) {
-        ESP_LOGE(TAG, "创建 I2S 自检任务退出信号量失败");
-        g_streaming = false;
-        i2s_output_stop();
-        return ESP_ERR_NO_MEM;
-    }
-
-    BaseType_t task_ret = xTaskCreate(
-        i2s_silence_task,
-        "i2s_silence",
-        3072,
-        NULL,
-        5,
-        &g_stream_task
-    );
-    if (task_ret != pdPASS) {
-        ESP_LOGE(TAG, "创建 I2S 自检发送任务失败");
-        g_streaming = false;
-        vSemaphoreDelete(g_stream_task_done);
-        g_stream_task_done = NULL;
-        i2s_output_stop();
-        return ESP_ERR_NO_MEM;
-    }
-    return ESP_OK;
-}
-
-esp_err_t i2s_output_wait_silence_ms(uint32_t duration_ms)
-{
-    if (!g_started || g_tx == NULL || !g_streaming) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    TickType_t start = xTaskGetTickCount();
-    TickType_t duration = pdMS_TO_TICKS(duration_ms);
-    while ((xTaskGetTickCount() - start) < duration) {
-        if (g_stream_error != ESP_OK || !g_streaming) {
-            return g_stream_error != ESP_OK ? g_stream_error : ESP_FAIL;
-        }
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-    return g_stream_error;
-}
-
-void i2s_output_set_test_tone(bool enabled)
-{
-    g_test_tone_enabled = enabled;
-    ESP_LOGI(TAG, "1kHz低电平测试音：%s", enabled ? "开启" : "关闭");
-}
-
 esp_err_t i2s_output_stop(void)
 {
-    g_test_tone_enabled = false;
-    g_streaming = false;
-
     if (g_tx == NULL) {
         g_started = false;
         g_sample_rate_hz = 0;
-        g_stream_task = NULL;
-        if (g_stream_task_done != NULL) {
-            vSemaphoreDelete(g_stream_task_done);
-            g_stream_task_done = NULL;
-        }
         return ESP_OK;
-    }
-
-    // 旧自检模式如果存在后台任务，必须让任务主动退出后才能释放 channel。
-    if (g_stream_task_done != NULL) {
-        if (xSemaphoreTake(
-                g_stream_task_done,
-                pdMS_TO_TICKS(I2S_TASK_STOP_TIMEOUT_MS)
-            ) != pdTRUE) {
-            ESP_LOGE(TAG, "等待 I2S 发送任务自行退出超时：%dms；不强制删除任务或通道",
-                I2S_TASK_STOP_TIMEOUT_MS);
-            return ESP_ERR_TIMEOUT;
-        }
-#if APP_DIAG_AUDIO_POP
-        ESP_LOGI(TAG, "I2S 发送任务已正常退出");
-#endif
-        vSemaphoreDelete(g_stream_task_done);
-        g_stream_task_done = NULL;
     }
 
     esp_err_t ret = i2s_channel_disable(g_tx);
@@ -411,7 +227,6 @@ esp_err_t i2s_output_stop(void)
     }
 
     g_tx = NULL;
-    g_stream_task = NULL;
     g_started = false;
     g_sample_rate_hz = 0;
 #if APP_DIAG_AUDIO_POP

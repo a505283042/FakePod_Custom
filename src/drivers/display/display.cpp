@@ -19,9 +19,22 @@
 #include "esp_lcd_co5300.h"
 
 #include "board_pins.h"
+#include "app_diag_config.h"
 
 
 static const char *TAG = "显示";
+
+#if APP_DIAG_BOOT_VERBOSE
+#define DISPLAY_BOOT_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define DISPLAY_BOOT_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
+
+#if APP_DIAG_DISPLAY_TRANSPORT
+#define DISPLAY_TRANSPORT_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define DISPLAY_TRANSPORT_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
 
 
 // ============================================================
@@ -277,7 +290,7 @@ static esp_err_t display_te_init()
 
     g_te_edge = xSemaphoreCreateBinary();
     if (g_te_edge == nullptr) {
-        ESP_LOGW(TAG, "R.21 TE：创建同步信号量失败，继续无TE模式");
+        ESP_LOGW(TAG, "TE：创建同步信号量失败，继续无TE模式");
         return ESP_ERR_NO_MEM;
     }
 
@@ -290,7 +303,7 @@ static esp_err_t display_te_init()
 
     esp_err_t ret = gpio_config(&te_config);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "R.21 TE：GPIO%d 输入配置失败：%s",
+        ESP_LOGW(TAG, "TE：GPIO%d 输入配置失败：%s",
             FAKEPOD_LCD_TE, esp_err_to_name(ret));
         return ret;
     }
@@ -298,7 +311,7 @@ static esp_err_t display_te_init()
     // GPIO ISR service 可能已由其他驱动安装；ESP_ERR_INVALID_STATE 表示可直接复用。
     ret = gpio_install_isr_service(0);
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "R.21 TE：安装GPIO ISR service失败：%s", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "TE：安装GPIO ISR service失败：%s", esp_err_to_name(ret));
         return ret;
     }
 
@@ -307,7 +320,7 @@ static esp_err_t display_te_init()
         display_te_isr,
         nullptr);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "R.21 TE：GPIO%d ISR注册失败：%s",
+        ESP_LOGW(TAG, "TE：GPIO%d ISR注册失败：%s",
             FAKEPOD_LCD_TE, esp_err_to_name(ret));
         return ret;
     }
@@ -317,14 +330,14 @@ static esp_err_t display_te_init()
     }
 
     if (!display_te_take_edge(pdMS_TO_TICKS(100))) {
-        ESP_LOGW(TAG, "R.21 TE：GPIO%d 100ms内未检测到首个TE上升沿，自动降级",
+        ESP_LOGW(TAG, "TE：GPIO%d 100ms内未检测到首个TE上升沿，自动降级",
             FAKEPOD_LCD_TE);
         return ESP_ERR_TIMEOUT;
     }
 
     const int64_t first_us = esp_timer_get_time();
     if (!display_te_take_edge(pdMS_TO_TICKS(100))) {
-        ESP_LOGW(TAG, "R.21 TE：GPIO%d 未检测到第二个TE上升沿，自动降级",
+        ESP_LOGW(TAG, "TE：GPIO%d 未检测到第二个TE上升沿，自动降级",
             FAKEPOD_LCD_TE);
         return ESP_ERR_TIMEOUT;
     }
@@ -332,7 +345,7 @@ static esp_err_t display_te_init()
     const int64_t second_us = esp_timer_get_time();
     const int64_t measured_us = second_us - first_us;
     if (measured_us <= 0 || measured_us > 100000) {
-        ESP_LOGW(TAG, "R.21 TE：测得周期异常=%lldus，自动降级",
+        ESP_LOGW(TAG, "TE：测得周期异常=%lldus，自动降级",
             static_cast<long long>(measured_us));
         return ESP_FAIL;
     }
@@ -342,8 +355,8 @@ static esp_err_t display_te_init()
 
     const uint32_t refresh_x100 =
         g_te_period_us > 0U ? 100000000U / g_te_period_us : 0U;
-    ESP_LOGI(TAG,
-        "R.21 TE同步就绪：GPIO=%d 上升沿，period=%uus (~%u.%02uHz)",
+    DISPLAY_BOOT_LOGI(
+        "TE 同步就绪：GPIO=%d 上升沿，period=%uus (~%u.%02uHz)",
         FAKEPOD_LCD_TE,
         static_cast<unsigned>(g_te_period_us),
         static_cast<unsigned>(refresh_x100 / 100U),
@@ -364,22 +377,17 @@ esp_err_t display_init()
     }
 
 
-    ESP_LOGI(
-        TAG,
-        "正在初始化 CO5300 AMOLED"
-    );
+    DISPLAY_BOOT_LOGI("正在初始化 CO5300 AMOLED");
 
 
-    ESP_LOGI(
-        TAG,
+    DISPLAY_BOOT_LOGI(
         "分辨率：%d × %d",
         FAKEPOD_LCD_WIDTH,
         FAKEPOD_LCD_HEIGHT
     );
 
 
-    ESP_LOGI(
-        TAG,
+    DISPLAY_BOOT_LOGI(
         "QSPI：CLK=%d CS=%d D0=%d D1=%d D2=%d D3=%d RST=%d",
         FAKEPOD_LCD_CLK,
         FAKEPOD_LCD_CS,
@@ -395,10 +403,7 @@ esp_err_t display_init()
     // 初始化 QSPI 总线
     // ========================================================
 
-    ESP_LOGI(
-        TAG,
-        "正在初始化 QSPI 总线"
-    );
+    DISPLAY_BOOT_LOGI("正在初始化 QSPI 总线");
 
 
     // ========================================================
@@ -469,9 +474,8 @@ esp_err_t display_init()
     }
 
 
-    ESP_LOGI(
-        TAG,
-        "R.22 QSPI 总线初始化成功：50MHz / Quad / SPI_DMA_CH_AUTO / max_transfer=%uB",
+    DISPLAY_BOOT_LOGI(
+        "QSPI 总线初始化成功：50MHz / Quad / SPI_DMA_CH_AUTO / max_transfer=%uB",
         static_cast<unsigned>(LCD_TRANSFER_BUFFER_SIZE)
     );
 
@@ -480,10 +484,7 @@ esp_err_t display_init()
     // 创建 LCD Panel IO
     // ========================================================
 
-    ESP_LOGI(
-        TAG,
-        "正在创建 CO5300 Panel IO"
-    );
+    DISPLAY_BOOT_LOGI("正在创建 CO5300 Panel IO");
 
 
     // ========================================================
@@ -615,10 +616,7 @@ esp_err_t display_init()
     // 创建 CO5300 面板
     // ========================================================
 
-    ESP_LOGI(
-        TAG,
-        "正在创建 CO5300 面板驱动"
-    );
+    DISPLAY_BOOT_LOGI("正在创建 CO5300 面板驱动");
 
 
     ret =
@@ -645,10 +643,7 @@ esp_err_t display_init()
     // 硬件复位
     // ========================================================
 
-    ESP_LOGI(
-        TAG,
-        "正在复位显示屏"
-    );
+    DISPLAY_BOOT_LOGI("正在复位显示屏");
 
 
     ret =
@@ -673,10 +668,7 @@ esp_err_t display_init()
     // 执行厂家初始化序列
     // ========================================================
 
-    ESP_LOGI(
-        TAG,
-        "正在发送厂家初始化命令"
-    );
+    DISPLAY_BOOT_LOGI("正在发送厂家初始化命令");
 
 
     ret =
@@ -761,7 +753,7 @@ esp_err_t display_init()
     // 此处把屏幕 TE 输出 GPIO6 真正接入 ESP32-S3。失败只降级为原刷新路径。
     const esp_err_t te_ret = display_te_init();
     if (te_ret != ESP_OK) {
-        ESP_LOGW(TAG, "R.21 TE同步未启用：%s；显示继续使用原QSPI DMA路径",
+        ESP_LOGW(TAG, "TE 同步未启用：%s；显示继续使用原QSPI DMA路径",
             esp_err_to_name(te_ret));
     }
 
@@ -859,7 +851,7 @@ esp_err_t display_reveal_after_first_frame()
     }
 
     g_present_output_enabled = true;
-    ESP_LOGI(TAG, "R.38.3 首帧揭屏完成：输出=ON 亮度=60%%");
+    ESP_LOGI(TAG, "首帧揭屏完成：输出=ON 亮度=60%%");
     return ESP_OK;
 }
 
@@ -894,7 +886,7 @@ bool display_present_set_output(bool enabled)
 
     const esp_err_t ret = esp_lcd_panel_disp_on_off(g_panel, enabled);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "R.22 PresentHold：%s显示输出失败：%s",
+        ESP_LOGW(TAG, "PresentHold：%s显示输出失败：%s",
             enabled ? "恢复" : "暂停", esp_err_to_name(ret));
         return false;
     }
@@ -902,7 +894,7 @@ bool display_present_set_output(bool enabled)
     g_present_output_enabled = enabled;
     ++g_present_output_toggle_count;
     if (g_present_output_toggle_count <= 8U || (g_present_output_toggle_count % 60U) == 0U) {
-        ESP_LOGI(TAG, "R.22 PresentHold：输出=%s toggle=%u",
+        DISPLAY_TRANSPORT_LOGI("PresentHold：输出=%s toggle=%u",
             enabled ? "ON" : "OFF",
             static_cast<unsigned>(g_present_output_toggle_count));
     }

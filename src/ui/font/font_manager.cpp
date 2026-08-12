@@ -9,8 +9,15 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "sdcard.h"
+#include "app_diag_config.h"
 
 static const char *TAG = "字体";
+
+#if APP_DIAG_BOOT_VERBOSE
+#define FONT_BOOT_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define FONT_BOOT_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
 
 // ============================================================
 // FakePod 原厂字体格式
@@ -271,7 +278,7 @@ static esp_err_t font_manager_analyze_metrics()
     g_context.base_line = static_cast<int32_t>(base_line);
     g_context.baseline_y = g_context.line_height - g_context.base_line;
 
-    ESP_LOGI(TAG,
+    FONT_BOOT_LOGI(
         "字体度量分析：有效字形=%lu，行高=%ld，base_line=%ld，baseline_y=%ld，ASCII锚点=%u票/%u",
         static_cast<unsigned long>(valid_glyphs),
         static_cast<long>(g_context.line_height),
@@ -318,11 +325,11 @@ static esp_err_t font_manager_validate_format()
         return ESP_ERR_INVALID_SIZE;
     }
 
-    ESP_LOGI(TAG, "原厂字体格式确认：Unicode U+%04X~U+%04X，%lu bpp",
+    FONT_BOOT_LOGI("原厂字体格式确认：Unicode U+%04X~U+%04X，%lu bpp",
         static_cast<unsigned>(g_context.lower_exclusive + 1),
         static_cast<unsigned>(g_context.upper_inclusive),
         static_cast<unsigned long>(g_context.bpp));
-    ESP_LOGI(TAG, "Unicode 索引表：%u 项，缺字字形偏移=0x%08lX",
+    FONT_BOOT_LOGI("Unicode 索引表：%u 项，缺字字形偏移=0x%08lX",
         static_cast<unsigned>(table_count),
         static_cast<unsigned long>(g_context.missing_glyph_offset));
 
@@ -375,7 +382,7 @@ esp_err_t font_manager_init()
             return ESP_FAIL;
         }
 
-        ESP_LOGI(TAG, "正在将中文字体载入 PSRAM：%s", FONT_PATH);
+        FONT_BOOT_LOGI("正在将中文字体载入 PSRAM：%s", FONT_PATH);
         read_count = fread(font_data, 1, font_size, file);
         fclose(file);
     }
@@ -425,7 +432,7 @@ esp_err_t font_manager_init()
         static_cast<unsigned>(font_size / 1024),
         static_cast<long>(g_context.line_height),
         static_cast<long>(g_context.base_line));
-    ESP_LOGI(TAG, "字体占用 PSRAM：%u KB，剩余=%u KB",
+    FONT_BOOT_LOGI("字体占用 PSRAM：%u KB，剩余=%u KB",
         static_cast<unsigned>((psram_before - psram_after) / 1024),
         static_cast<unsigned>(psram_after / 1024));
 

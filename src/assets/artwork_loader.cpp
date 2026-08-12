@@ -817,13 +817,15 @@ esp_err_t artwork_loader_start()
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "R.36 ArtworkTask：核心=%ld，优先级=%u，栈=%uB，增量切片=2/4/8KB，压缩原图=2交换槽/%uKB硬上限/Surface成功即释放",
+#if APP_DIAG_BOOT_VERBOSE
+    ESP_LOGI(TAG, "ArtworkTask：核心=%ld，优先级=%u，栈=%uB，增量切片=2/4/8KB，压缩原图=2交换槽/%uKB硬上限/Surface成功即释放",
         static_cast<long>(ARTWORK_TASK_CORE),
         static_cast<unsigned>(ARTWORK_TASK_PRIORITY),
         static_cast<unsigned>(ARTWORK_TASK_STACK_BYTES),
         static_cast<unsigned>(ARTWORK_CACHE_BUDGET_BYTES / 1024U));
-    ESP_LOGI(TAG, "P1.5R.1 Tick Hygiene：SD锁=non-blocking，竞争重试=1tick，slice后让步=1tick，RTOS=%uHz",
+    ESP_LOGI(TAG, "Artwork I/O 调度：SD锁=non-blocking，竞争重试=1tick，slice后让步=1tick，RTOS=%uHz",
         static_cast<unsigned>(configTICK_RATE_HZ));
+#endif
     return ESP_OK;
 }
 
@@ -1011,8 +1013,10 @@ void artwork_loader_discard_unpinned()
     }
     xSemaphoreGive(g_cache_mutex);
     if (released > 0U) {
-        ESP_LOGI(TAG, "R.36 压缩原图已释放：%uB PSRAM_free=%u",
+#if APP_DIAG_ARTWORK_LOADER
+        ESP_LOGI(TAG, "压缩原图已释放：%uB PSRAM_free=%u",
             static_cast<unsigned>(released),
             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+#endif
     }
 }

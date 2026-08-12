@@ -12,7 +12,7 @@ esp_err_t cs43131_read_reg(uint32_t address, uint8_t *value);
 esp_err_t cs43131_write_reg(uint32_t address, uint8_t value);
 
 // 正式 PCM 播放接口：配置板载 24.576MHz XTAL 与 ASP。
-// Stage 9.2 支持 44.1kHz / 48kHz，I2S 使用 32bit slot，CS43131 为 Slave。
+// 当前 Rate Profile 覆盖 44.1~192kHz；I2S 使用 32bit slot，CS43131 为 Slave。
 esp_err_t cs43131_prepare_pcm_playback_32bit(uint32_t sample_rate_hz);
 
 // 只启动 ASP 数字输入路径，耳放保持关闭。
@@ -37,13 +37,6 @@ esp_err_t cs43131_power_down_headphone_playback();
 
 // 关闭 ASP/XTAL 并恢复控制口待机状态。
 esp_err_t cs43131_finish_pcm_playback();
-
-// Stage 8.x 兼容自检接口，正常启动流程不再调用。
-esp_err_t cs43131_prepare_pcm_test_48k_32bit();
-esp_err_t cs43131_prepare_headphone_test_low_volume();
-esp_err_t cs43131_set_pcm_test_mute(bool mute);
-esp_err_t cs43131_power_down_headphone_test();
-esp_err_t cs43131_finish_pcm_test();
 
 bool cs43131_is_ready();
 uint8_t cs43131_get_revision();

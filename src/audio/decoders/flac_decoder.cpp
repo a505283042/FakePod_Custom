@@ -341,7 +341,7 @@ static FlacPrefetchQosState flac_prefetch_qos_observe(
         context->qos_pressure_active = true;
         context->qos_emergency_entries = context->qos_emergency_entries + 1U;
         ESP_LOGW(TAG,
-            "R.36.2.2 FLAC预取进入Emergency：ring=%u/%uB (%u%%)，切换到最多%u次连续读取",
+            "FLAC 预取进入 Emergency：ring=%u/%uB (%u%%)，切换到最多%u次连续读取",
             static_cast<unsigned>(buffered_bytes),
             static_cast<unsigned>(context->ring_bytes),
             static_cast<unsigned>(flac_prefetch_qos_percent(buffered_bytes, context->ring_bytes)),
@@ -353,7 +353,7 @@ static FlacPrefetchQosState flac_prefetch_qos_observe(
         context->qos_pressure_active = false;
         context->qos_recovered_count = context->qos_recovered_count + 1U;
         ESP_LOGI(TAG,
-            "R.36.2.2 FLAC预取已恢复Normal：ring=%u/%uB (%u%%)",
+            "FLAC 预取已恢复 Normal：ring=%u/%uB (%u%%)",
             static_cast<unsigned>(buffered_bytes),
             static_cast<unsigned>(context->ring_bytes),
             static_cast<unsigned>(flac_prefetch_qos_percent(buffered_bytes, context->ring_bytes)));
@@ -773,7 +773,7 @@ static void flac_prefetch_destroy(FlacDecoder *decoder)
 
     if (context->adaptive_qos_active && context->qos_tracking_started) {
         ESP_LOGI(TAG,
-            "P1.5R.2 FLAC预取QoS汇总：min=%u/%uB (%u%%) emergency=%u recovered=%u max_batch=%u blocks=%u",
+            "FLAC 预取 QoS 汇总：min=%u/%uB (%u%%) emergency=%u recovered=%u max_batch=%u blocks=%u",
             static_cast<unsigned>(context->qos_min_buffered_bytes),
             static_cast<unsigned>(context->ring_bytes),
             static_cast<unsigned>(flac_prefetch_qos_percent(
@@ -911,7 +911,7 @@ static esp_err_t flac_prefetch_start(FlacDecoder *decoder)
     context->qos_cooperative_blocks = 0;
     context->adaptive_qos_active = true;
     ESP_LOGI(TAG,
-        "R.36.2.2 Adaptive Prefetch QoS已启用：ring=%uKB，起始=%uB (%u%%)，阈值=<%u/%u/%u%%，batch=%u/%u/%u/%u",
+        "Adaptive Prefetch QoS 已启用：ring=%uKB，起始=%uB (%u%%)，阈值=<%u/%u/%u%%，batch=%u/%u/%u/%u",
         static_cast<unsigned>(context->ring_bytes / 1024U),
         static_cast<unsigned>(primed),
         static_cast<unsigned>(flac_prefetch_qos_percent(primed, context->ring_bytes)),
@@ -2013,13 +2013,17 @@ esp_err_t flac_decoder_register_backend()
     }
 
     g_flac_backend_registered = true;
+#if APP_DIAG_BOOT_VERBOSE
     ESP_LOGI(TAG, "乐鑫 FLAC 解码后端注册成功");
+#endif
+#if APP_DIAG_BOOT_VERBOSE
     ESP_LOGI(TAG,
-        "P1.2.15 Cooperative Tick：RTOS=%uHz tick=%ums pdMS_TO_TICKS(1)=%u，每%u个SD块主动阻塞1tick",
+        "Cooperative Tick：RTOS=%uHz tick=%ums pdMS_TO_TICKS(1)=%u，每%u个SD块主动阻塞1tick",
         static_cast<unsigned>(configTICK_RATE_HZ),
         static_cast<unsigned>(portTICK_PERIOD_MS),
         static_cast<unsigned>(pdMS_TO_TICKS(1)),
         static_cast<unsigned>(FLAC_PREFETCH_COOPERATIVE_READ_BATCH));
+#endif
     return ESP_OK;
 }
 

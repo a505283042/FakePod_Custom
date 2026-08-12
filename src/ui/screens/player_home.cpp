@@ -1330,7 +1330,7 @@ static esp_err_t player_home_launcher_compose_strip(
         static_cast<uint32_t>(source_y) * static_cast<uint32_t>(width / 2U);
     if (context->pair_index != expected_pair) {
         ESP_LOGE(TAG,
-            "R.36.6.1 Launcher Strip顺序异常：expected_pair=%u actual=%u y=%u rows=%u",
+            "Launcher Strip 顺序异常：expected_pair=%u actual=%u y=%u rows=%u",
             static_cast<unsigned>(expected_pair),
             static_cast<unsigned>(context->pair_index),
             static_cast<unsigned>(source_y),
@@ -1372,7 +1372,7 @@ static esp_err_t player_home_launcher_compose_strip(
     while (local_pair < strip_pairs) {
         if (!player_home_launcher_strip_load_run(context)) {
             ESP_LOGE(TAG,
-                "R.36.6.1 Launcher I4流提前结束：frame_progress=%d pair=%u/%u",
+                "Launcher I4 流提前结束：frame_progress=%d pair=%u/%u",
                 static_cast<int>(context->asset->progress),
                 static_cast<unsigned>(context->pair_index),
                 static_cast<unsigned>(kLauncherAnimationAssetPixelBytes));
@@ -1428,7 +1428,7 @@ static esp_err_t player_home_launcher_compose_strip(
         if (context->pair_index != kLauncherAnimationAssetPixelBytes ||
             context->run_remaining != 0U || context->src != context->src_end) {
             ESP_LOGE(TAG,
-                "R.36.6.1 Launcher I4流长度异常：pairs=%u/%u src=%u/%u remain=%u",
+                "Launcher I4 流长度异常：pairs=%u/%u src=%u/%u remain=%u",
                 static_cast<unsigned>(context->pair_index),
                 static_cast<unsigned>(kLauncherAnimationAssetPixelBytes),
                 static_cast<unsigned>(context->src - context->asset->data),
@@ -1492,7 +1492,7 @@ static bool player_home_launcher_present_work_bounded()
     if (ret != ESP_OK) {
         ++g_launcher_bounded_failures;
         ESP_LOGW(TAG,
-            "R.36.6.2 Launcher WireStripFrame失败：gen=%u frame=%u ret=%s failures=%u",
+            "Launcher WireStripFrame 失败：gen=%u frame=%u ret=%s failures=%u",
             static_cast<unsigned>(stats.generation),
             static_cast<unsigned>(g_launcher_frame_index),
             esp_err_to_name(ret),
@@ -1564,7 +1564,7 @@ static void player_home_launcher_switch_to_lvgl_fallback()
         lv_obj_move_foreground(g_launcher);
         lv_obj_invalidate(g_launcher);
     }
-    ESP_LOGW(TAG, "R.36.6 Launcher BoundedSPI已降级到R.32 LVGL实时圆弧安全路径");
+    ESP_LOGW(TAG, "Launcher BoundedSPI 已降级到 LVGL 实时圆弧安全路径");
 }
 
 static void player_home_launcher_try_surface_rebind()
@@ -1617,7 +1617,7 @@ static void player_home_launcher_try_surface_rebind()
         cover_surface_cache_release(&new_lease);
         (void) player_home_launcher_decode_cached_frame(frame_index);
         ESP_LOGW(TAG,
-            "R.36.6 Launcher背景换绑取消：%u -> %u，新Surface/帧身份校验失败，继续旧背景",
+            "Launcher 背景换绑取消：%u -> %u，新Surface/帧身份校验失败，继续旧背景",
             static_cast<unsigned>(old_track),
             static_cast<unsigned>(current_track));
         return;
@@ -1637,7 +1637,7 @@ static void player_home_launcher_try_surface_rebind()
             &base_stats);
         if (base_ret != ESP_OK) {
             ESP_LOGW(TAG,
-                "R.36.6 Launcher新背景BoundedSPI提交失败：track=%u ret=%s，降级LVGL",
+                "Launcher 新背景 BoundedSPI 提交失败：track=%u ret=%s，降级LVGL",
                 static_cast<unsigned>(current_track),
                 esp_err_to_name(base_ret));
             player_home_launcher_switch_to_lvgl_fallback();
@@ -1645,7 +1645,7 @@ static void player_home_launcher_try_surface_rebind()
         }
         else if (!player_home_launcher_present_work_bounded()) {
             ESP_LOGW(TAG,
-                "R.36.6 Launcher新背景StripFrame提交失败：track=%u，降级LVGL",
+                "Launcher 新背景 StripFrame 提交失败：track=%u，降级LVGL",
                 static_cast<unsigned>(current_track));
             player_home_launcher_switch_to_lvgl_fallback();
             bounded_ok = false;
@@ -1693,7 +1693,7 @@ static bool player_home_launcher_begin_bounded_scene()
     const esp_err_t begin_ret = display_launcher_bounded_spi_session_begin();
     if (begin_ret != ESP_OK) {
         ESP_LOGW(TAG,
-            "R.36.3 Launcher BoundedSPI Session启动失败：%s，回退LVGL",
+            "Launcher BoundedSPI Session 启动失败：%s，回退LVGL",
             esp_err_to_name(begin_ret));
         return false;
     }
@@ -1712,7 +1712,7 @@ static bool player_home_launcher_begin_bounded_scene()
         &stats);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG,
-            "R.36.3 Launcher BoundedSPI底图提交失败：%s，回退LVGL",
+            "Launcher BoundedSPI 底图提交失败：%s，回退LVGL",
             esp_err_to_name(ret));
         display_launcher_bounded_spi_session_end();
         return false;
@@ -1768,7 +1768,7 @@ static bool player_home_present_current_cover_bounded(const char *reason)
         return true;
     }
     ESP_LOGW(TAG,
-        "R.36.3 Launcher退出封面恢复失败：reason=%s track=%lu ret=%s，交给LVGL重绘",
+        "Launcher 退出封面恢复失败：reason=%s track=%lu ret=%s，交给LVGL重绘",
         reason != nullptr ? reason : "unknown",
         static_cast<unsigned long>(track_index),
         esp_err_to_name(ret));
@@ -2166,7 +2166,7 @@ static void player_home_launcher_show()
         if (!g_launcher_frame_cache_active) {
             player_home_launcher_release_surface_lease();
             ESP_LOGW(TAG,
-                "R.36.6 Launcher Strip/Surface lease不可用：track=%u，当前展开回退R.32实时圆弧",
+                "Launcher Strip/Surface lease 不可用：track=%u，当前展开回退 LVGL 实时圆弧",
                 static_cast<unsigned>(player_state_is_ready() ? player_state_get_index() : 0U));
         }
         if (g_launcher_bounded_session_active) {
@@ -2643,7 +2643,7 @@ static bool player_home_handle_vertical_track_swipe(
     const bool ok = next ? player_control_next() : player_control_previous();
     if (!ok) {
         ESP_LOGW(TAG,
-            "R.35.1 %s纵向切歌请求失败：%s",
+            "%s纵向切歌请求失败：%s",
             surface_name != nullptr ? surface_name : "播放页",
             next ? "上滑下一曲" : "下滑上一曲");
         return true;
@@ -3582,7 +3582,7 @@ void player_home_create(lv_obj_t *screen)
         "Launcher：FlashI4=%uB FullBase=0B PanelWork=0B source=CoverSurface.dimmed producer=wire-order",
         static_cast<unsigned>(flash_bytes));
     HOME_BOOT_LOGI(
-        "显示传输：BoundedSPI=%s Launcher=wire-strip Cover=bounded LVGL-fallback=R.32",
+        "显示传输：BoundedSPI=%s Launcher=wire-strip Cover=bounded LVGL-fallback=enabled",
         display_launcher_bounded_spi_available() ? "ready" : "unavailable");
 #endif
 

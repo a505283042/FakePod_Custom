@@ -4,6 +4,8 @@
 #include "esp_log.h"
 
 #include "audio_spectrum_snapshot.h"
+#include "sdcard.h"
+#include "media_catalog_v2.h"
 #include "artwork_loader.h"
 #include "cover_surface_cache.h"
 #include "lyrics/lyrics_service.h"
@@ -20,11 +22,6 @@ void system_ready_publish()
     g_ready_published = true;
 }
 
-bool system_ready_is_published()
-{
-    return g_ready_published;
-}
-
 void system_runtime_update()
 {
     if (!g_ready_published || g_background_start_attempted) {
@@ -39,29 +36,35 @@ void system_runtime_update()
         ESP_LOGW(TAG, "SpectrumFFTTask 启动失败，频谱功能降级：%s", esp_err_to_name(spectrum_ret));
     }
 
-    const esp_err_t artwork_ret = artwork_loader_start();
+    esp_err_t artwork_ret = ESP_ERR_INVALID_STATE;
     esp_err_t surface_ret = ESP_ERR_INVALID_STATE;
-    if (artwork_ret == ESP_OK) {
-        surface_ret = cover_surface_cache_start();
-    } else {
-        ESP_LOGW(TAG, "ArtworkTask 启动失败，继续无封面运行：%s", esp_err_to_name(artwork_ret));
-    }
+    esp_err_t lyrics_ret = ESP_ERR_INVALID_STATE;
+    const bool storage_services_available = sdcard_is_mounted() && media_catalog_v2_ready();
 
-    if (artwork_ret == ESP_OK && surface_ret != ESP_OK) {
-        ESP_LOGW(TAG, "CoverSurfaceTask 启动失败，保留压缩图回退：%s", esp_err_to_name(surface_ret));
-    }
+    if (storage_services_available) {
+        artwork_ret = artwork_loader_start();
+        if (artwork_ret == ESP_OK) {
+            surface_ret = cover_surface_cache_start();
+        } else {
+            ESP_LOGW(TAG, "ArtworkTask 启动失败，继续无封面运行：%s", esp_err_to_name(artwork_ret));
+        }
 
-    const esp_err_t lyrics_ret = lyrics_service_start();
-    if (lyrics_ret != ESP_OK) {
-        ESP_LOGW(TAG, "LyricsTask 启动失败，歌词功能降级：%s", esp_err_to_name(lyrics_ret));
+        if (artwork_ret == ESP_OK && surface_ret != ESP_OK) {
+            ESP_LOGW(TAG, "CoverSurfaceTask 启动失败，保留压缩图回退：%s", esp_err_to_name(surface_ret));
+        }
+
+        lyrics_ret = lyrics_service_start();
+        if (lyrics_ret != ESP_OK) {
+            ESP_LOGW(TAG, "LyricsTask 启动失败，歌词功能降级：%s", esp_err_to_name(lyrics_ret));
+        }
     }
 
     ESP_LOGI(
         TAG,
         "READY 后台服务：Spectrum=%s Artwork=%s CoverSurface=%s Lyrics=%s",
         esp_err_to_name(spectrum_ret),
-        esp_err_to_name(artwork_ret),
-        artwork_ret == ESP_OK ? esp_err_to_name(surface_ret) : "SKIPPED",
-        esp_err_to_name(lyrics_ret)
+        storage_services_available ? esp_err_to_name(artwork_ret) : "SKIPPED",
+        storage_services_available && artwork_ret == ESP_OK ? esp_err_to_name(surface_ret) : "SKIPPED",
+        storage_services_available ? esp_err_to_name(lyrics_ret) : "SKIPPED"
     );
 }

@@ -3,9 +3,16 @@
 #include "esp_log.h"
 
 #include "board_pins.h"
+#include "app_diag_config.h"
 
 
 static const char *TAG = "I2C";
+
+#if APP_DIAG_BOOT_VERBOSE
+#define I2C_BOOT_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define I2C_BOOT_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
 
 
 // I2C 主总线句柄
@@ -23,17 +30,12 @@ esp_err_t i2c_bus_init()
     }
 
 
-    ESP_LOGI(
-        TAG,
-        "正在初始化 I2C 总线"
-    );
+    I2C_BOOT_LOGI("正在初始化 I2C 总线");
 
-    ESP_LOGI(
-        TAG,
+    I2C_BOOT_LOGI(
         "SCL = GPIO%d，SDA = GPIO%d",
         FAKEPOD_I2C_SCL,
-        FAKEPOD_I2C_SDA
-    );
+        FAKEPOD_I2C_SDA);
 
 
     i2c_master_bus_config_t config = {};

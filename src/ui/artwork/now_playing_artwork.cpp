@@ -199,7 +199,7 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
             // R.27：双 staging 临时拿不到时不要黑屏、不要切换 LVGL source。
             // 释放刚 acquire 的新 lease，继续保持旧封面；下一次 Artwork update 会自动重试。
             ESP_LOGW(TAG,
-                "R.36.4 封面BoundedSPI暂缓：%lu -> %lu 双staging内存不足，保持旧封面并重试",
+                "封面 BoundedSPI 暂缓：%lu -> %lu 双staging内存不足，保持旧封面并重试",
                 static_cast<unsigned long>(previous_track),
                 static_cast<unsigned long>(track_index));
             cover_surface_cache_release(&lease);
@@ -207,7 +207,7 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
         }
         if (!bounded_presented) {
             ESP_LOGW(TAG,
-                "R.36.4 封面BoundedSPI失败：%lu -> %lu ret=%s，退回R.22 LVGL PresentHold",
+                "封面 BoundedSPI 失败：%lu -> %lu ret=%s，退回 LVGL PresentHold",
                 static_cast<unsigned long>(previous_track),
                 static_cast<unsigned long>(track_index),
                 esp_err_to_name(bounded_ret));

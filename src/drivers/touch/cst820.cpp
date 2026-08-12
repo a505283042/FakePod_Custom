@@ -5,6 +5,7 @@
 
 #include "board_pins.h"
 #include "i2c_bus.h"
+#include "app_diag_config.h"
 
 
 static const char *TAG = "触摸";
@@ -34,10 +35,12 @@ static constexpr uint8_t REG_FINGER_NUM = 0x02;
 
 esp_err_t cst820_init()
 {
+#if APP_DIAG_BOOT_VERBOSE
     ESP_LOGI(
         TAG,
         "正在初始化 CST820"
     );
+#endif
 
 
     esp_err_t ret =
@@ -49,7 +52,7 @@ esp_err_t cst820_init()
 
     if (ret != ESP_OK) {
 
-        ESP_LOGE(
+        ESP_LOGW(
             TAG,
             "注册 CST820 失败：%s",
             esp_err_to_name(ret)
@@ -69,7 +72,7 @@ esp_err_t cst820_init()
 
     if (ret != ESP_OK) {
 
-        ESP_LOGE(
+        ESP_LOGW(
             TAG,
             "读取 CST820 芯片 ID 失败：%s",
             esp_err_to_name(ret)
@@ -79,11 +82,13 @@ esp_err_t cst820_init()
     }
 
 
+#if APP_DIAG_BOOT_VERBOSE
     ESP_LOGI(
         TAG,
         "CST820 芯片 ID：0x%02X",
         g_chip_id
     );
+#endif
 
 
     if (g_chip_id != 0xB7) {
@@ -98,10 +103,12 @@ esp_err_t cst820_init()
     g_ready = true;
 
 
+#if APP_DIAG_BOOT_VERBOSE
     ESP_LOGI(
         TAG,
         "CST820 初始化成功"
     );
+#endif
 
 
     return ESP_OK;

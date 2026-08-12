@@ -12,9 +12,16 @@
 
 #include "board_pins.h"
 #include "storage_io.h"
+#include "app_diag_config.h"
 
 
 static const char *TAG = "TF卡";
+
+#if APP_DIAG_BOOT_VERBOSE
+#define SDCARD_BOOT_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define SDCARD_BOOT_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
 
 
 static sdmmc_card_t *g_card =
@@ -57,14 +64,10 @@ esp_err_t sdcard_init()
     }
 
 
-    ESP_LOGI(
-        TAG,
-        "正在初始化 TF 卡"
-    );
+    SDCARD_BOOT_LOGI("正在初始化 TF 卡");
 
 
-    ESP_LOGI(
-        TAG,
+    SDCARD_BOOT_LOGI(
         "SDMMC：CLK=%d CMD=%d D0=%d D1=%d D2=%d D3=%d",
         FAKEPOD_SD_CLK,
         FAKEPOD_SD_CMD,
@@ -158,10 +161,7 @@ esp_err_t sdcard_init()
         16 * 1024;
 
 
-    ESP_LOGI(
-        TAG,
-        "正在挂载 FAT 文件系统"
-    );
+    SDCARD_BOOT_LOGI("正在挂载 FAT 文件系统");
 
 
     esp_err_t ret =
@@ -176,7 +176,7 @@ esp_err_t sdcard_init()
 
     if (ret != ESP_OK) {
 
-        ESP_LOGE(
+        ESP_LOGW(
             TAG,
             "TF 卡挂载失败：%s",
             esp_err_to_name(ret)
@@ -210,15 +210,13 @@ esp_err_t sdcard_init()
     );
 
 
-    ESP_LOGI(
-        TAG,
+    SDCARD_BOOT_LOGI(
         "名称：%s",
         g_card->cid.name
     );
 
 
-    ESP_LOGI(
-        TAG,
+    SDCARD_BOOT_LOGI(
         "容量：%lu MB",
         static_cast<unsigned long>(
             g_capacity_mb
@@ -226,16 +224,10 @@ esp_err_t sdcard_init()
     );
 
 
-    ESP_LOGI(
-        TAG,
-        "总线宽度：4-bit"
-    );
+    SDCARD_BOOT_LOGI("总线宽度：4-bit");
 
 
-    ESP_LOGI(
-        TAG,
-        "当前速度：20 MHz"
-    );
+    SDCARD_BOOT_LOGI("当前速度：20 MHz");
 
 
     return ESP_OK;

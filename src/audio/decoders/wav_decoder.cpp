@@ -133,7 +133,7 @@ esp_err_t wav_decoder_open(WavDecoder *decoder, AudioSource *source)
             decoder->bits_per_sample = wav_read_le16(fmt + 14);
 
             if (audio_format != 1) {
-                ESP_LOGE(TAG, "暂不支持该 WAV 编码：format=0x%04X（Stage 9.2 仅支持 PCM=1）", audio_format);
+                ESP_LOGE(TAG, "暂不支持该 WAV 编码：format=0x%04X（仅支持 PCM=1）", audio_format);
                 wav_decoder_close(decoder);
                 return ESP_ERR_NOT_SUPPORTED;
             }
@@ -175,7 +175,7 @@ esp_err_t wav_decoder_open(WavDecoder *decoder, AudioSource *source)
 
         if (memcmp(chunk_header, "data", 4) == 0) {
             if (!fmt_found) {
-                ESP_LOGE(TAG, "WAV data chunk 出现在 fmt chunk 之前，Stage 9.2 拒绝该异常布局");
+                ESP_LOGE(TAG, "WAV data chunk 出现在 fmt chunk 之前，拒绝该异常布局");
                 wav_decoder_close(decoder);
                 return ESP_ERR_INVALID_RESPONSE;
             }

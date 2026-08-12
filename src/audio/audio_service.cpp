@@ -1153,7 +1153,7 @@ static void audio_task_capture_fault(esp_err_t error, const char *stage)
 
     // 真实故障只打印一次短快照；若当时未开串口，system_loop 会在 Error 状态低频重报。
     ESP_LOGE(TAG,
-        "R.36.2.2 AUDIO_FAULT：count=%lu stage=%s err=%s track=%lu rev=%lu rate=%luHz pos=%lluf ring=%lu/%luB min=%luB qos=%u pressure=%u ioerr=%u emergency=%lu/%lu RAM(internal/dma/psram)=%lu/%lu/%lu",
+        "AUDIO_FAULT：count=%lu stage=%s err=%s track=%lu rev=%lu rate=%luHz pos=%lluf ring=%lu/%luB min=%luB qos=%u pressure=%u ioerr=%u emergency=%lu/%lu RAM(internal/dma/psram)=%lu/%lu/%lu",
         static_cast<unsigned long>(snapshot.fault_count),
         audio_fault_stage_name(snapshot.stage),
         esp_err_to_name(snapshot.error),
@@ -1435,7 +1435,7 @@ static void audio_task_handle_play(AudioRequest *request)
 
     const PcmDecoderType decoder_type = audio_decoder_type_for_format(request->format);
     if (decoder_type == PcmDecoderType::None) {
-        ESP_LOGW(TAG, "Stage 9.5.1 当前统一PCM Core 已接入 WAV/FLAC/MP3；%s 解码器尚未接入",
+        ESP_LOGW(TAG, "统一 PCM Core 已接入 WAV/FLAC/MP3；%s 解码器尚未接入",
             media_format_name(request->format));
         audio_task_set_state(AudioPlaybackState::Error, ESP_ERR_NOT_SUPPORTED);
         audio_request_complete(request, false, ESP_ERR_NOT_SUPPORTED);
@@ -1856,10 +1856,12 @@ static void audio_task_main(void *arg)
     esp_log_level_set("ESP_ES_PARSER", ESP_LOG_WARN);
     esp_log_level_set("AUD_Dec_Parse", ESP_LOG_WARN);
 #endif
+#if APP_DIAG_BOOT_VERBOSE
     ESP_LOGI(TAG, "AudioTask 已启动：核心=%d，优先级=%u，栈=%u字节",
         static_cast<int>(current_core),
         static_cast<unsigned>(uxTaskPriorityGet(nullptr)),
         static_cast<unsigned>(AUDIO_TASK_STACK_BYTES));
+#endif
 
     // 高采样率播放依赖双核流水线：AudioTask 固定 Core 0，SD/FLAC 预取固定 Core 1。
     // 如果运行环境没有遵守绑核约束，宁可拒绝初始化，也不让音频实时任务和阻塞 I/O 混在同一核心。
@@ -2176,7 +2178,7 @@ void audio_service_log_last_fault()
         return;
     }
     ESP_LOGE(TAG,
-        "R.36.2.2 AUDIO_FAULT_SNAPSHOT：count=%lu stage=%s err=%s track=%lu rev=%lu rate=%luHz pos=%lluf ring=%lu/%luB min=%luB qos=%u pressure=%u ioerr=%u eof=%u emergency=%lu recovered=%lu maxread=%lu RAM(internal/min/largest/dma/psram)=%lu/%lu/%lu/%lu/%lu",
+        "AUDIO_FAULT_SNAPSHOT：count=%lu stage=%s err=%s track=%lu rev=%lu rate=%luHz pos=%lluf ring=%lu/%luB min=%luB qos=%u pressure=%u ioerr=%u eof=%u emergency=%lu recovered=%lu maxread=%lu RAM(internal/min/largest/dma/psram)=%lu/%lu/%lu/%lu/%lu",
         static_cast<unsigned long>(snapshot.fault_count),
         audio_fault_stage_name(snapshot.stage),
         esp_err_to_name(snapshot.error),

@@ -1,4 +1,5 @@
 #include "ui_manager.h"
+#include "ui_common.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -12,6 +13,8 @@
 #include "app_diag_config.h"
 #include "board_pins.h"
 #include "cst820.h"
+#include "sdcard.h"
+#include "media_library.h"
 #include "display.h"
 #include "display_backend.h"
 #include "font/font_manager.h"
@@ -37,7 +40,10 @@ static const char *TAG = "界面";
 #endif
 static lv_display_t *g_display = nullptr;
 static lv_indev_t *g_touch = nullptr;
+static esp_err_t g_touch_error = ESP_ERR_INVALID_STATE;
 static lv_obj_t *g_boot_root = nullptr;
+static lv_obj_t *g_boot_title = nullptr;
+static lv_obj_t *g_boot_status = nullptr;
 static bool g_bootstrap_ready = false;
 static bool g_boot_reveal_pending = false;
 static bool g_ready = false;
@@ -684,7 +690,7 @@ static void ui_display_refresh_start_cb(lv_event_t *event)
             ++g_te_sync_timeout_count;
             ++g_te_sync_consecutive_timeouts;
             ESP_LOGW(TAG,
-                "R.21 TE等待超时：%ums，连续=%u success=%u timeout=%u",
+                "TE 等待超时：%ums，连续=%u success=%u timeout=%u",
                 static_cast<unsigned>(g_te_sync_timeout_ms),
                 static_cast<unsigned>(g_te_sync_consecutive_timeouts),
                 static_cast<unsigned>(g_te_sync_success_count),
@@ -692,7 +698,7 @@ static void ui_display_refresh_start_cb(lv_event_t *event)
 
             if (g_te_sync_consecutive_timeouts >= kTeSyncDisableAfterTimeouts) {
                 g_te_sync_runtime_enabled = false;
-                ESP_LOGW(TAG, "R.21 TE运行期自动降级：连续%u次超时，后续刷新不再等待TE",
+                ESP_LOGW(TAG, "TE 运行期自动降级：连续%u次超时，后续刷新不再等待TE",
                     static_cast<unsigned>(kTeSyncDisableAfterTimeouts));
             }
         }
@@ -705,7 +711,7 @@ static void ui_display_refresh_start_cb(lv_event_t *event)
     // 请求是在 lv_image_set_src() 之前发出；正常情况下这一轮会包含 460x460 封面 invalidation。
     // 即便区域合并方式发生变化，也宁可只 hold 一轮刷新，不把请求泄漏到下一次 UI 更新。
     if (!display_present_set_output(false)) {
-        ESP_LOGW(TAG, "R.23 PresentHold回退：无法暂停面板输出，本轮退回可见刷新");
+        ESP_LOGW(TAG, "PresentHold 回退：无法暂停面板输出，本轮退回可见刷新");
         return;
     }
 
@@ -724,9 +730,9 @@ static void ui_display_refresh_ready_cb(lv_event_t *event)
         g_boot_reveal_pending = false;
         const esp_err_t reveal_ret = display_reveal_after_first_frame();
         if (reveal_ret != ESP_OK) {
-            ESP_LOGE(TAG, "R.38.3 启动页首帧揭屏失败：%s", esp_err_to_name(reveal_ret));
+            ESP_LOGE(TAG, "启动页首帧揭屏失败：%s", esp_err_to_name(reveal_ret));
         } else {
-            ESP_LOGI(TAG, "R.38.3 启动页首帧已完成并揭屏");
+            ESP_LOGI(TAG, "启动页首帧已完成并揭屏");
         }
     }
 
@@ -767,7 +773,7 @@ static void ui_display_refresh_ready_cb(lv_event_t *event)
 
     if (g_present_hold_count <= 8U || (g_present_hold_count % 30U) == 0U || !restored) {
         ESP_LOGI(TAG,
-            "R.23 PresentHold回退完成：count=%u hidden=%uus restored=%u",
+            "PresentHold 回退完成：count=%u hidden=%uus restored=%u",
             static_cast<unsigned>(g_present_hold_count),
             static_cast<unsigned>(held_us),
             static_cast<unsigned>(restored));
@@ -951,7 +957,7 @@ esp_err_t ui_manager_bootstrap_init()
     // R.32.1：LVGL task 已经启动，所有直接 lv_* 调用必须使用同一把 port mutex。
     // R.38.3 同时取消历史无限等待；启动阶段 1000ms 内拿不到锁直接报告故障。
     if (!lvgl_port_lock(1000)) {
-        ESP_LOGE(TAG, "R.38.3 获取 LVGL 启动核心互斥锁超时");
+        ESP_LOGE(TAG, "获取 LVGL 启动核心互斥锁超时");
         return ESP_ERR_TIMEOUT;
     }
 
@@ -975,7 +981,7 @@ esp_err_t ui_manager_bootstrap_init()
             static_cast<unsigned>(g_te_sync_timeout_ms),
             static_cast<unsigned>(te_period_us));
     } else {
-        ESP_LOGW(TAG, "R.21 LVGL TE同步未启用，保持无TE刷新路径");
+        ESP_LOGW(TAG, "LVGL TE 同步未启用，保持无 TE 刷新路径");
     }
     UI_BOOT_LOGI("Bounded Surface Present：跨Track走BoundedSPI，Display Hold仅作失败回退");
 
@@ -996,15 +1002,17 @@ esp_err_t ui_manager_bootstrap_init()
     lv_obj_set_style_bg_color(g_boot_root, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_opa(g_boot_root, LV_OPA_COVER, 0);
 
-    lv_obj_t *title = lv_label_create(g_boot_root);
-    lv_label_set_text(title, "FakePod");
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_align(title, LV_ALIGN_CENTER, 0, -14);
+    g_boot_title = lv_label_create(g_boot_root);
+    lv_label_set_text(g_boot_title, "FakePod");
+    lv_obj_set_style_text_color(g_boot_title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(g_boot_title, LV_ALIGN_CENTER, 0, -14);
 
-    lv_obj_t *status = lv_label_create(g_boot_root);
-    lv_label_set_text(status, "Starting...");
-    lv_obj_set_style_text_color(status, lv_color_hex(0xB0B0B0), 0);
-    lv_obj_align(status, LV_ALIGN_CENTER, 0, 18);
+    g_boot_status = lv_label_create(g_boot_root);
+    lv_label_set_text(g_boot_status, "Starting...");
+    lv_obj_set_style_text_color(g_boot_status, lv_color_hex(0xB0B0B0), 0);
+    lv_obj_set_style_text_align(g_boot_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(g_boot_status, 360);
+    lv_obj_align(g_boot_status, LV_ALIGN_CENTER, 0, 18);
 
     // 创建对象期间已经产生 invalidation；显式标记整屏，首轮 REFR_READY 才执行物理揭屏。
     g_boot_reveal_pending = true;
@@ -1012,7 +1020,7 @@ esp_err_t ui_manager_bootstrap_init()
     lvgl_port_unlock();
 
     g_bootstrap_ready = true;
-    ESP_LOGI(TAG, "R.38.3 LVGL 启动核心就绪：黑色启动页等待首帧揭屏");
+    ESP_LOGI(TAG, "LVGL 启动核心就绪：黑色启动页等待首帧揭屏");
     return ESP_OK;
 }
 
@@ -1023,38 +1031,43 @@ esp_err_t ui_manager_init()
         return ESP_OK;
     }
 
-    if (!g_bootstrap_ready || g_display == nullptr || !cst820_is_ready()) {
-        ESP_LOGE(TAG, "LVGL 启动核心或触摸尚未初始化");
+    if (!g_bootstrap_ready || g_display == nullptr) {
+        ESP_LOGE(TAG, "LVGL 启动核心尚未初始化");
         return ESP_ERR_INVALID_STATE;
     }
 
     // R.38.3：完整 UI 只补齐触摸、图片解码器、TF 字体和业务页面，不重新初始化 LVGL/Display。
     if (!lvgl_port_lock(1000)) {
-        ESP_LOGE(TAG, "R.38.3 获取完整 UI 初始化互斥锁超时");
+        ESP_LOGE(TAG, "获取完整 UI 初始化互斥锁超时");
         return ESP_ERR_TIMEOUT;
     }
 
-    UI_BOOT_LOGI("注册CST820触摸输入");
     gesture_router_reset();
-    const esp_err_t touch_fast_ret = ui_touch_input_start();
-    if (touch_fast_ret != ESP_OK) {
-        ESP_LOGW(TAG, "Touch Fast Path 启动失败，将降级为 LVGL 同步读取 CST820：%s",
-            esp_err_to_name(touch_fast_ret));
-    }
+    if (cst820_is_ready()) {
+        UI_BOOT_LOGI("注册CST820触摸输入");
+        const esp_err_t touch_fast_ret = ui_touch_input_start();
+        if (touch_fast_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Touch Fast Path 启动失败，将降级为 LVGL 同步读取 CST820：%s",
+                esp_err_to_name(touch_fast_ret));
+        }
 
-    g_touch = lv_indev_create();
-    if (g_touch == nullptr) {
-        lvgl_port_unlock();
-        ESP_LOGE(TAG, "创建 LVGL 触摸输入失败");
-        return ESP_ERR_NO_MEM;
+        g_touch = lv_indev_create();
+        if (g_touch == nullptr) {
+            g_touch_error = ESP_ERR_NO_MEM;
+            ESP_LOGW(TAG, "创建 LVGL 触摸输入失败，继续无触摸运行");
+        } else {
+            g_touch_error = ESP_OK;
+            lv_indev_set_type(g_touch, LV_INDEV_TYPE_POINTER);
+            lv_indev_set_read_cb(g_touch, ui_touch_read_cb);
+            lv_indev_set_display(g_touch, g_display);
+            lv_indev_set_scroll_limit(g_touch, 8);
+            lv_indev_add_event_cb(g_touch, ui_touch_block_scroll_cb, LV_EVENT_SCROLL_BEGIN, nullptr);
+            lv_indev_add_event_cb(g_touch, ui_touch_block_scroll_cb, LV_EVENT_SCROLL, nullptr);
+        }
+    } else {
+        g_touch_error = ESP_ERR_INVALID_STATE;
+        UI_BOOT_LOGI("CST820 不可用，完整 UI 继续以无触摸模式运行");
     }
-
-    lv_indev_set_type(g_touch, LV_INDEV_TYPE_POINTER);
-    lv_indev_set_read_cb(g_touch, ui_touch_read_cb);
-    lv_indev_set_display(g_touch, g_display);
-    lv_indev_set_scroll_limit(g_touch, 8);
-    lv_indev_add_event_cb(g_touch, ui_touch_block_scroll_cb, LV_EVENT_SCROLL_BEGIN, nullptr);
-    lv_indev_add_event_cb(g_touch, ui_touch_block_scroll_cb, LV_EVENT_SCROLL, nullptr);
 
     // ArtworkLoader 已把压缩图放入 PSRAM，LVGL 只消费内存变量，不再访问 SD。
     const esp_err_t decoder_ret = esp_lv_decoder_init(&g_image_decoder);
@@ -1065,20 +1078,44 @@ esp_err_t ui_manager_init()
         lv_image_cache_resize(512U * 1024U, true);
     }
 
-    const esp_err_t font_ret = font_manager_init();
-    if (font_ret != ESP_OK) {
-        ESP_LOGW(TAG, "原厂中文字体初始化失败，将使用 LVGL 默认字体：%s", esp_err_to_name(font_ret));
+    if (sdcard_is_mounted()) {
+        const esp_err_t font_ret = font_manager_init();
+        if (font_ret != ESP_OK) {
+            ESP_LOGW(TAG, "原厂中文字体初始化失败，将使用 LVGL 默认字体：%s", esp_err_to_name(font_ret));
+        }
+    } else {
+        UI_BOOT_LOGI("TF 卡不可用，跳过中文字体加载并使用 LVGL 默认字体");
     }
 
     if (g_boot_root != nullptr) {
         lv_obj_delete(g_boot_root);
         g_boot_root = nullptr;
+        g_boot_title = nullptr;
+        g_boot_status = nullptr;
     }
 
     player_home_create(lv_screen_active());
     lyrics_view_create(lv_screen_active());
     spectrum_view_create(lv_screen_active());
     library_view_create(lv_screen_active());
+
+    // 存储/曲库降级时仍进入正式 LVGL，但用内置 ASCII 字体给出明确状态。
+    // 这里不依赖 TF 字体，因此“无卡启动”不会再次被资源文件反向阻塞。
+    if (!sdcard_is_mounted() || !media_library_is_ready()) {
+        lv_obj_t *status = lv_label_create(lv_screen_active());
+        if (status != nullptr) {
+            ui_common_lock_object(status);
+            lv_label_set_text(status, !sdcard_is_mounted()
+                ? "TF card unavailable\nInsert card and restart"
+                : "Music library unavailable\nRestart to retry");
+            lv_obj_set_style_text_font(status, lv_font_default(), 0);
+            lv_obj_set_style_text_color(status, lv_color_hex(0xFFFFFF), 0);
+            lv_obj_set_style_text_align(status, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_set_width(status, 360);
+            lv_obj_center(status);
+        }
+    }
+
     if (APP_DIAG_UI_PERFORMANCE) {
         g_perf_audit_timer = lv_timer_create(ui_perf_audit_timer_cb, kPerfAuditWindowMs, nullptr);
         if (g_perf_audit_timer == nullptr) {
@@ -1091,11 +1128,56 @@ esp_err_t ui_manager_init()
     lvgl_port_unlock();
 
     g_ready = true;
-    ESP_LOGI(TAG, "UI ready：复用启动核心 + Touch + Font；后台服务等待系统 READY");
+    ESP_LOGI(
+        TAG,
+        "UI ready：启动核心复用，Touch=%s Storage=%s Library=%s；后台服务等待系统 READY",
+        g_touch != nullptr ? "READY" : "DISABLED",
+        sdcard_is_mounted() ? "READY" : "UNAVAILABLE",
+        media_library_is_ready() ? "READY" : "UNAVAILABLE"
+    );
     return ESP_OK;
 }
 
 bool ui_manager_is_ready()
 {
     return g_ready;
+}
+
+bool ui_manager_show_boot_fatal(const char *reason, esp_err_t error)
+{
+    if (!g_bootstrap_ready || g_display == nullptr || g_boot_root == nullptr ||
+        g_boot_title == nullptr || g_boot_status == nullptr) {
+        return false;
+    }
+
+    // 这里只复用已经建立并经过首帧验证的 LVGL 启动核心，不创建第二条显示路径。
+    if (!lvgl_port_lock(1000)) {
+        ESP_LOGW(TAG, "致命错误页获取 LVGL 互斥锁超时，仅保留串口错误");
+        return false;
+    }
+
+    lv_label_set_text(g_boot_title, "FakePod");
+    lv_label_set_text_fmt(
+        g_boot_status,
+        "Startup failed\n%s\n%s",
+        reason != nullptr ? reason : "Core startup failure",
+        esp_err_to_name(error)
+    );
+    lv_obj_set_style_text_color(g_boot_status, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_align(g_boot_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(g_boot_status, 360);
+    lv_obj_align(g_boot_status, LV_ALIGN_CENTER, 0, 22);
+    lv_obj_invalidate(g_boot_root);
+    lvgl_port_unlock();
+    return true;
+}
+
+bool ui_manager_touch_available()
+{
+    return g_touch != nullptr;
+}
+
+esp_err_t ui_manager_touch_error()
+{
+    return ui_manager_touch_available() ? ESP_OK : g_touch_error;
 }

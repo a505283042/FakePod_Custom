@@ -3,6 +3,7 @@
 #include "cst820.h"
 #include "board_pins.h"
 #include "esp_log.h"
+#include "app_diag_config.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -75,7 +76,7 @@ static bool touch_enqueue_edge_with_backpressure(const UiTouchEdgeEvent &event)
 
     if (g_edge_coalesce_count == 1U || (g_edge_coalesce_count % 8U) == 0U || !queued) {
         ESP_LOGW(TAG,
-            "R.33.2.3 触摸边沿背压：coalesce=%lu stale_total=%lu drained=%u latest=%s keep_down=%u queued=%u",
+            "触摸边沿背压：coalesce=%lu stale_total=%lu drained=%u latest=%s keep_down=%u queued=%u",
             static_cast<unsigned long>(g_edge_coalesce_count),
             static_cast<unsigned long>(g_edge_coalesced_events),
             static_cast<unsigned>(stale_count),
@@ -90,7 +91,7 @@ static bool touch_enqueue_edge_with_backpressure(const UiTouchEdgeEvent &event)
 
     ++g_edge_drop_count;
     ESP_LOGE(TAG,
-        "R.33.2.3 触摸边沿背压最终入队失败：drop=%lu state=%s",
+        "触摸边沿背压最终入队失败：drop=%lu state=%s",
         static_cast<unsigned long>(g_edge_drop_count),
         event.pressed ? "DOWN" : "UP");
     return false;
@@ -177,7 +178,7 @@ static void touch_input_task(void *argument)
                     if (g_release_glitch_suppressed_count == 1U ||
                         (g_release_glitch_suppressed_count % 32U) == 0U) {
                         ESP_LOGI(TAG,
-                            "R.33.2.3 RELEASE毛刺已抑制：count=%lu candidate_samples=%u",
+                            "触摸 RELEASE 毛刺已抑制：count=%lu candidate_samples=%u",
                             static_cast<unsigned long>(g_release_glitch_suppressed_count),
                             static_cast<unsigned>(release_candidate_samples));
                     }
@@ -261,14 +262,16 @@ esp_err_t ui_touch_input_start()
     }
 
     g_ready = true;
+#if APP_DIAG_BOOT_VERBOSE
     ESP_LOGI(TAG,
-        "R.33.2.3 Touch Fast Path Backpressure：core=%ld priority=%u poll=%ums/%utick edge_queue=%u release_debounce=%u samples；MOVE仅latest snapshot；队列满时合并旧边沿并优先保留最新DOWN/UP",
+        "Touch Fast Path：core=%ld priority=%u poll=%ums/%utick edge_queue=%u release_debounce=%u samples；MOVE仅latest snapshot；队列满时合并旧边沿并优先保留最新DOWN/UP",
         static_cast<long>(TOUCH_INPUT_TASK_CORE),
         static_cast<unsigned>(TOUCH_INPUT_TASK_PRIORITY),
         static_cast<unsigned>(TOUCH_SAMPLE_PERIOD_MS),
         static_cast<unsigned>(TOUCH_SAMPLE_PERIOD_TICKS),
         static_cast<unsigned>(TOUCH_EDGE_QUEUE_LENGTH),
         static_cast<unsigned>(TOUCH_RELEASE_DEBOUNCE_SAMPLES));
+#endif
     return ESP_OK;
 }
 

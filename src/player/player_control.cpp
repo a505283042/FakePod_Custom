@@ -1,6 +1,7 @@
 #include "player_control.h"
 
 #include "esp_log.h"
+#include "app_diag_config.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "audio_service.h"
@@ -19,7 +20,9 @@ esp_err_t player_control_init()
         ESP_LOGE(TAG, "创建 Player transport 串行锁失败");
         return ESP_ERR_NO_MEM;
     }
+#if APP_DIAG_BOOT_VERBOSE
     ESP_LOGI(TAG, "Player transport 串行锁已就绪");
+#endif
     return ESP_OK;
 }
 
