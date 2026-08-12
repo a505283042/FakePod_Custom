@@ -7,6 +7,7 @@
 #include "esp_log.h"
 
 #include "boot_state.h"
+#include "system_runtime.h"
 #include "player_control.h"
 #include "player_state.h"
 #include "media_catalog_v2.h"
@@ -289,6 +290,10 @@ void system_loop_update()
 
         return;
     }
+
+    // READY 之后第一轮业务循环统一启动可选后台服务。
+    // 启动失败只进入降级运行，不反向破坏已经发布的系统 READY。
+    system_runtime_update();
 
 
     // Player transport 只观察 AudioTask POD Snapshot；自然 EOF 的续播决策在 loopTask 执行，

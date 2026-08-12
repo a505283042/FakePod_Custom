@@ -2084,12 +2084,6 @@ esp_err_t audio_service_start()
         return ESP_OK;
     }
 
-    // P1.5.2R.3：FFT 是低优先级旁路观察者。即使创建失败也不能阻止核心音频服务启动。
-    const esp_err_t spectrum_ret = audio_spectrum_snapshot_start();
-    if (spectrum_ret != ESP_OK) {
-        ESP_LOGW(TAG, "SpectrumFFT旁路启动失败，继续无频谱运行：%s", esp_err_to_name(spectrum_ret));
-    }
-
     if (g_command_queue == nullptr) {
         g_command_queue = xQueueCreate(AUDIO_COMMAND_QUEUE_LENGTH, sizeof(AudioRequest *));
         if (g_command_queue == nullptr) {

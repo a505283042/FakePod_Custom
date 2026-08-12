@@ -5,6 +5,7 @@ idf_component_register(
         "boot/boot_state.cpp"
 
         "system/system_loop.cpp"
+        "system/system_runtime.cpp"
 
         "drivers/i2c/i2c_bus.cpp"
 

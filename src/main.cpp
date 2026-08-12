@@ -12,7 +12,8 @@ extern "C" void app_main(void)
     // 主循环只负责顶层调度
     while (true) {
 
-        boot_state_update();
+        // Boot Orchestrator 是唯一启动推进入口；业务循环只在 READY 后工作。
+        (void)boot_run();
 
         system_loop_update();
 

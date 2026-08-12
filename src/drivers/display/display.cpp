@@ -11,14 +11,11 @@
 #include "driver/gpio.h"
 
 #include "esp_err.h"
-#include "esp_heap_caps.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
-#include "esp_lcd_panel_commands.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 
-#include "lvgl.h"
 #include "esp_lcd_co5300.h"
 
 #include "board_pins.h"
@@ -50,10 +47,6 @@ static constexpr size_t LCD_TRANSFER_BUFFER_SIZE =
     LCD_TRANSFER_HEIGHT *
     2;
 
-// 启动阶段颜色测试仍使用 Panel IO DMA 完成计数；正常 LVGL 运行后由 flush_ready 桥接接管。
-static constexpr UBaseType_t DISPLAY_DMA_DONE_QUEUE_DEPTH = 12U;
-
-
 // ============================================================
 // 全局状态
 // ============================================================
@@ -64,14 +57,6 @@ static esp_lcd_panel_io_handle_t g_panel_io =
 
 static esp_lcd_panel_handle_t g_panel =
     nullptr;
-
-
-static SemaphoreHandle_t g_tx_done =
-    nullptr;
-
-// esp_lvgl_port_add_disp() 会覆盖 display_init() 阶段的 Panel IO callback。
-// UI 创建 LVGL display 后重新安装本桥，只负责恢复 LVGL flush_ready 语义。
-static lv_display_t *g_lvgl_display = nullptr;
 
 
 // P1.5.3.2R.21：CO5300 TE 上升沿同步。
@@ -104,7 +89,7 @@ static bool g_ready =
 
 
 // ============================================================
-// 鱼鹰 AM200Q460460LK 官方初始化序列
+// 鱼鹰 AM200Q460460LK 初始化序列（R.38.3 启动阶段仅将亮度改为 0）
 // ============================================================
 //
 // 厂家原始初始化代码：
@@ -114,7 +99,7 @@ static bool g_ready =
 // 3A 55
 // 35 00
 // 53 20
-// 51 FF
+// 51 00   （R.38.3：启动阶段保持暗屏，首帧完成后再恢复 60%）
 // 63 FF
 // 2A 00 0A 01 D5
 // 2B 00 00 01 CB
@@ -152,7 +137,7 @@ static const uint8_t INIT_53[] =
     {0x20};
 
 static const uint8_t INIT_51[] =
-    {0xFF};
+    {0x00};
 
 static const uint8_t INIT_63[] =
     {0xFF};
@@ -369,61 +354,6 @@ static esp_err_t display_te_init()
 
 
 // ============================================================
-// QSPI DMA 完成回调
-// ============================================================
-
-static bool IRAM_ATTR display_on_color_done(
-    esp_lcd_panel_io_handle_t panel_io,
-    esp_lcd_panel_io_event_data_t *event_data,
-    void *user_ctx
-)
-{
-    (void) panel_io;
-    (void) event_data;
-
-
-    SemaphoreHandle_t semaphore =
-        static_cast<SemaphoreHandle_t>(
-            user_ctx
-        );
-
-
-    BaseType_t task_woken =
-        pdFALSE;
-
-
-    xSemaphoreGiveFromISR(
-        semaphore,
-        &task_woken
-    );
-
-
-    return
-        task_woken == pdTRUE;
-}
-
-
-// ============================================================
-// R.26 Panel IO color-done 统一桥接
-// ============================================================
-
-static bool IRAM_ATTR display_color_done_bridge(
-    esp_lcd_panel_io_handle_t panel_io,
-    esp_lcd_panel_io_event_data_t *event_data,
-    void *user_ctx)
-{
-    (void) panel_io;
-    (void) event_data;
-    (void) user_ctx;
-
-    if (g_lvgl_display != nullptr) {
-        lv_display_flush_ready(g_lvgl_display);
-    }
-    return false;
-}
-
-
-// ============================================================
 // 初始化 CO5300
 // ============================================================
 
@@ -459,30 +389,6 @@ esp_err_t display_init()
         FAKEPOD_LCD_D3,
         FAKEPOD_LCD_RST
     );
-
-
-    // ========================================================
-    // 创建 DMA 完成信号量
-    // ========================================================
-
-    // 启动阶段颜色测试按条带等待 DMA 完成；保留 counting semaphore，避免 ISR 完成信号丢失。
-    g_tx_done =
-        xSemaphoreCreateCounting(DISPLAY_DMA_DONE_QUEUE_DEPTH, 0U);
-
-
-    if (g_tx_done == nullptr) {
-
-        ESP_LOGE(
-            TAG,
-            "创建屏幕 DMA 信号量失败"
-        );
-
-        return ESP_ERR_NO_MEM;
-    }
-
-
-    // 颜色测试路径已移除；Panel IO max transfer 仍按 LVGL 40行 DMA 条带配置。
-    // 颜色测试若真的被调用，会临时申请 40 行 buffer，测试结束立即释放。
 
 
     // ========================================================
@@ -615,14 +521,14 @@ esp_err_t display_init()
             10;
 
 
-        // DMA 像素传输完成回调
+        // Panel IO 的 color-done callback 由 esp_lvgl_port 在注册显示设备时唯一拥有。
+        // BoundedSPI 直接复用底层 SPI device，但 raw descriptor 会显式禁止触发该回调。
         io_config.on_color_trans_done =
-            display_on_color_done;
+            nullptr;
 
 
-        // 回调参数
         io_config.user_ctx =
-            g_tx_done;
+            nullptr;
 
 
         // CO5300 QSPI 命令使用 32bit command phase
@@ -831,49 +737,24 @@ esp_err_t display_init()
 
 
     // ========================================================
-    // 开启显示
+    // R.38.3：硬件初始化完成后保持不可见
     // ========================================================
+    // 厂家序列仍负责退出 Sleep，但 0x51 已固定为 0。这里再次确认亮度为 0，
+    // 并关闭显示输出。直到 LVGL 第一帧完成，用户都不应看到未写入有效内容的 GRAM。
 
-    ret =
-        esp_lcd_panel_disp_on_off(
-            g_panel,
-            true
-        );
-
-
+    ret = esp_lcd_panel_co5300_set_brightness(g_panel, 0);
     if (ret != ESP_OK) {
-
-        ESP_LOGE(
-            TAG,
-            "开启显示失败：%s",
-            esp_err_to_name(ret)
-        );
-
+        ESP_LOGE(TAG, "启动暗屏亮度设置失败：%s", esp_err_to_name(ret));
         return ret;
     }
 
-    g_present_output_enabled = true;
-
-
-    // ========================================================
-    // Bring-up 阶段降低 AMOLED 亮度
-    // ========================================================
-
-    ret =
-        esp_lcd_panel_co5300_set_brightness(
-            g_panel,
-            60
-        );
-
-
+    ret = esp_lcd_panel_disp_on_off(g_panel, false);
     if (ret != ESP_OK) {
-
-        ESP_LOGW(
-            TAG,
-            "设置亮度失败：%s",
-            esp_err_to_name(ret)
-        );
+        ESP_LOGE(TAG, "关闭启动显示输出失败：%s", esp_err_to_name(ret));
+        return ret;
     }
+
+    g_present_output_enabled = false;
 
 
     // P1.5.3.2R.21：厂家初始化序列已经发送 0x35 00 (TEON)，
@@ -891,7 +772,7 @@ esp_err_t display_init()
 
     ESP_LOGI(
         TAG,
-        "CO5300 AMOLED 初始化成功"
+        "CO5300 AMOLED 初始化成功：启动阶段保持暗屏，等待 LVGL 首帧揭屏"
     );
 
 
@@ -954,25 +835,31 @@ esp_lcd_panel_handle_t display_get_panel()
 }
 
 
-esp_err_t display_install_lvgl_color_done_bridge(void *lvgl_display)
+esp_err_t display_reveal_after_first_frame()
 {
-    if (!g_ready || g_panel_io == nullptr || lvgl_display == nullptr) {
+    if (!g_ready || g_panel == nullptr) {
         return ESP_ERR_INVALID_STATE;
     }
+    if (g_present_output_enabled) {
+        return ESP_OK;
+    }
 
-    g_lvgl_display = static_cast<lv_display_t *>(lvgl_display);
-
-    esp_lcd_panel_io_callbacks_t callbacks = {};
-    callbacks.on_color_trans_done = display_color_done_bridge;
-    const esp_err_t ret = esp_lcd_panel_io_register_event_callbacks(
-        g_panel_io,
-        &callbacks,
-        nullptr);
+    // 首帧已经完成，此时再恢复目标亮度并开启输出，避免任何默认 GRAM 白屏暴露。
+    esp_err_t ret = esp_lcd_panel_co5300_set_brightness(g_panel, 60);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "安装LVGL color-done桥接失败：%s", esp_err_to_name(ret));
-        g_lvgl_display = nullptr;
+        ESP_LOGE(TAG, "首帧揭屏亮度设置失败：%s", esp_err_to_name(ret));
         return ret;
     }
+
+    ret = esp_lcd_panel_disp_on_off(g_panel, true);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "首帧揭屏开启输出失败：%s", esp_err_to_name(ret));
+        (void)esp_lcd_panel_co5300_set_brightness(g_panel, 0);
+        return ret;
+    }
+
+    g_present_output_enabled = true;
+    ESP_LOGI(TAG, "R.38.3 首帧揭屏完成：输出=ON 亮度=60%%");
     return ESP_OK;
 }
 

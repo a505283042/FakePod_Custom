@@ -17,7 +17,6 @@
 #include "font/font_manager.h"
 #include "gesture/gesture_router.h"
 #include "input/touch_input.h"
-#include "lyrics/lyrics_service.h"
 #include "lyrics/lyrics_view.h"
 #include "spectrum/spectrum_view.h"
 #include "screens/player_home.h"
@@ -38,6 +37,9 @@ static const char *TAG = "界面";
 #endif
 static lv_display_t *g_display = nullptr;
 static lv_indev_t *g_touch = nullptr;
+static lv_obj_t *g_boot_root = nullptr;
+static bool g_bootstrap_ready = false;
+static bool g_boot_reveal_pending = false;
 static bool g_ready = false;
 static esp_lv_decoder_handle_t g_image_decoder = nullptr;
 static int16_t g_touch_last_x = 0;
@@ -718,6 +720,16 @@ static void ui_display_refresh_ready_cb(lv_event_t *event)
         return;
     }
 
+    if (g_boot_reveal_pending) {
+        g_boot_reveal_pending = false;
+        const esp_err_t reveal_ret = display_reveal_after_first_frame();
+        if (reveal_ret != ESP_OK) {
+            ESP_LOGE(TAG, "R.38.3 启动页首帧揭屏失败：%s", esp_err_to_name(reveal_ret));
+        } else {
+            ESP_LOGI(TAG, "R.38.3 启动页首帧已完成并揭屏");
+        }
+    }
+
     if (APP_DIAG_UI_PERFORMANCE) {
         ui_perf_finalize_refresh(esp_timer_get_time());
     }
@@ -853,21 +865,20 @@ static void ui_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
         false, g_touch_last_x, g_touch_last_y, static_cast<uint32_t>(lv_tick_get()));
 }
 
-esp_err_t ui_manager_init()
+esp_err_t ui_manager_bootstrap_init()
 {
-    if (g_ready) {
+    if (g_bootstrap_ready) {
         return ESP_OK;
     }
 
-    if (!display_is_ready() || !cst820_is_ready()) {
-        ESP_LOGE(TAG, "显示屏或触摸尚未初始化");
+    if (!display_is_ready()) {
+        ESP_LOGE(TAG, "显示屏尚未初始化，无法建立 LVGL 启动核心");
         return ESP_ERR_INVALID_STATE;
     }
 
-    UI_BOOT_LOGI("初始化 LVGL 9");
+    UI_BOOT_LOGI("初始化 LVGL 9 启动核心");
     lvgl_port_cfg_t lvgl_cfg = {};
-    // P1.5R.1：Core1 实时优先级阶梯。FLAC 预取固定 P4，LVGL 降为 P3，
-    // 保证持续 UI 刷新时只要 FlacPrefetch Ready，就能先获得 CPU。
+    // P1.5R.1：Core1 实时优先级阶梯。FLAC 预取固定 P4，LVGL 保持 P3。
     lvgl_cfg.task_priority = 3;
     lvgl_cfg.task_stack = 6144;
     lvgl_cfg.task_affinity = 1;
@@ -909,14 +920,6 @@ esp_err_t ui_manager_init()
         return ESP_FAIL;
     }
 
-    // R.26：esp_lvgl_port_add_disp() 会覆盖 Panel IO 的 color-done callback。
-    // 立即换成统一桥接，保持 LVGL flush_ready，同时保持底层 BoundedSPI 可复用同一 Panel IO device。
-    ret = display_install_lvgl_color_done_bridge(g_display);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "R.26 安装显示color-done桥接失败：%s", esp_err_to_name(ret));
-        return ret;
-    }
-
 #if APP_DIAG_BOOT_VERBOSE
     const size_t dma_free_after = heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     const size_t dma_largest_after = heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
@@ -945,13 +948,11 @@ esp_err_t ui_manager_init()
         g_te_sync_timeout_ms = timeout_ms;
     }
 
-    // P1.5.3.2R.32.1：lvgl_port_init() 启动独立 LVGL task 后，所有直接 lv_* 调用都必须
-    // 与 lv_timer_handler() 共用同一把 port mutex。此前 display event callback 注册发生在锁外，
-    // 启动时若恰好与 Core1 LVGL task 并发修改 event/TLSF 链表，会卡在 lv_tlsf_malloc()。
-    // 初始化阶段不需要抢占式失败，因此使用 -1 永久等待，并一直持锁到全部 UI 对象创建完成。
-    if (!lvgl_port_lock(-1)) {
-        ESP_LOGE(TAG, "R.32.1 获取 LVGL 初始化互斥锁失败");
-        return ESP_FAIL;
+    // R.32.1：LVGL task 已经启动，所有直接 lv_* 调用必须使用同一把 port mutex。
+    // R.38.3 同时取消历史无限等待；启动阶段 1000ms 内拿不到锁直接报告故障。
+    if (!lvgl_port_lock(1000)) {
+        ESP_LOGE(TAG, "R.38.3 获取 LVGL 启动核心互斥锁超时");
+        return ESP_ERR_TIMEOUT;
     }
 
     lv_display_add_event_cb(g_display, ui_display_align_area_cb, LV_EVENT_INVALIDATE_AREA, nullptr);
@@ -965,7 +966,7 @@ esp_err_t ui_manager_init()
         lv_display_add_event_cb(g_display, ui_display_profile_cb, LV_EVENT_FLUSH_WAIT_START, nullptr);
         lv_display_add_event_cb(g_display, ui_display_profile_cb, LV_EVENT_FLUSH_WAIT_FINISH, nullptr);
     }
-    UI_BOOT_LOGI("LVGL初始化互斥：display callbacks -> indev -> decoder -> screens 全程持锁");
+
     UI_BOOT_LOGI("CO5300局部刷新偶数对齐已启用");
     if (g_te_sync_runtime_enabled) {
         UI_BOOT_LOGI(
@@ -978,6 +979,61 @@ esp_err_t ui_manager_init()
     }
     UI_BOOT_LOGI("Bounded Surface Present：跨Track走BoundedSPI，Display Hold仅作失败回退");
 
+    lv_obj_t *screen = lv_screen_active();
+    lv_obj_set_style_bg_color(screen, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+
+    g_boot_root = lv_obj_create(screen);
+    if (g_boot_root == nullptr) {
+        lvgl_port_unlock();
+        ESP_LOGE(TAG, "创建启动页根对象失败");
+        return ESP_ERR_NO_MEM;
+    }
+    lv_obj_remove_style_all(g_boot_root);
+    lv_obj_set_size(g_boot_root, LV_PCT(100), LV_PCT(100));
+    lv_obj_center(g_boot_root);
+    lv_obj_set_style_bg_color(g_boot_root, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(g_boot_root, LV_OPA_COVER, 0);
+
+    lv_obj_t *title = lv_label_create(g_boot_root);
+    lv_label_set_text(title, "FakePod");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(title, LV_ALIGN_CENTER, 0, -14);
+
+    lv_obj_t *status = lv_label_create(g_boot_root);
+    lv_label_set_text(status, "Starting...");
+    lv_obj_set_style_text_color(status, lv_color_hex(0xB0B0B0), 0);
+    lv_obj_align(status, LV_ALIGN_CENTER, 0, 18);
+
+    // 创建对象期间已经产生 invalidation；显式标记整屏，首轮 REFR_READY 才执行物理揭屏。
+    g_boot_reveal_pending = true;
+    lv_obj_invalidate(screen);
+    lvgl_port_unlock();
+
+    g_bootstrap_ready = true;
+    ESP_LOGI(TAG, "R.38.3 LVGL 启动核心就绪：黑色启动页等待首帧揭屏");
+    return ESP_OK;
+}
+
+
+esp_err_t ui_manager_init()
+{
+    if (g_ready) {
+        return ESP_OK;
+    }
+
+    if (!g_bootstrap_ready || g_display == nullptr || !cst820_is_ready()) {
+        ESP_LOGE(TAG, "LVGL 启动核心或触摸尚未初始化");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // R.38.3：完整 UI 只补齐触摸、图片解码器、TF 字体和业务页面，不重新初始化 LVGL/Display。
+    if (!lvgl_port_lock(1000)) {
+        ESP_LOGE(TAG, "R.38.3 获取完整 UI 初始化互斥锁超时");
+        return ESP_ERR_TIMEOUT;
+    }
+
     UI_BOOT_LOGI("注册CST820触摸输入");
     gesture_router_reset();
     const esp_err_t touch_fast_ret = ui_touch_input_start();
@@ -985,7 +1041,7 @@ esp_err_t ui_manager_init()
         ESP_LOGW(TAG, "Touch Fast Path 启动失败，将降级为 LVGL 同步读取 CST820：%s",
             esp_err_to_name(touch_fast_ret));
     }
-    // R.32.1：这里已经持有初始化互斥锁，不再二次 lock。
+
     g_touch = lv_indev_create();
     if (g_touch == nullptr) {
         lvgl_port_unlock();
@@ -996,22 +1052,16 @@ esp_err_t ui_manager_init()
     lv_indev_set_type(g_touch, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(g_touch, ui_touch_read_cb);
     lv_indev_set_display(g_touch, g_display);
-    // P1.3.4.2：所有页面都不依赖 LVGL 原生滚动手势；曲库由 CST820 原始坐标直驱虚拟列表。
-    // 这里保留 8px 仅用于 LVGL 自身的 click/drag 判定，真正滚动不再受它影响。
     lv_indev_set_scroll_limit(g_touch, 8);
     lv_indev_add_event_cb(g_touch, ui_touch_block_scroll_cb, LV_EVENT_SCROLL_BEGIN, nullptr);
     lv_indev_add_event_cb(g_touch, ui_touch_block_scroll_cb, LV_EVENT_SCROLL, nullptr);
 
-    // Stage 12.2：注册 Espressif LVGL JPEG/PNG 内存解码器。
     // ArtworkLoader 已把压缩图放入 PSRAM，LVGL 只消费内存变量，不再访问 SD。
     const esp_err_t decoder_ret = esp_lv_decoder_init(&g_image_decoder);
     if (decoder_ret != ESP_OK) {
         ESP_LOGW(TAG, "JPEG/PNG 图片解码器初始化失败，首页将使用默认封面：%s", esp_err_to_name(decoder_ret));
         g_image_decoder = nullptr;
     } else {
-        // P1.2 正常播放器封面已由 CoverSurfaceTask 预处理成 RGB565，不再依赖 LVGL decoded cache。
-        // 这里只给 progressive JPEG 等兼容回退和后续普通图片控件保留小缓存，避免与两张 460x460
-        // cover surface 同时长期占用数 MB PSRAM。
         lv_image_cache_resize(512U * 1024U, true);
     }
 
@@ -1019,10 +1069,12 @@ esp_err_t ui_manager_init()
     if (font_ret != ESP_OK) {
         ESP_LOGW(TAG, "原厂中文字体初始化失败，将使用 LVGL 默认字体：%s", esp_err_to_name(font_ret));
     }
-    const esp_err_t lyrics_ret = lyrics_service_start();
-    if (lyrics_ret != ESP_OK) {
-        ESP_LOGW(TAG, "LyricsTask 启动失败，歌词页将显示不可用：%s", esp_err_to_name(lyrics_ret));
+
+    if (g_boot_root != nullptr) {
+        lv_obj_delete(g_boot_root);
+        g_boot_root = nullptr;
     }
+
     player_home_create(lv_screen_active());
     lyrics_view_create(lv_screen_active());
     spectrum_view_create(lv_screen_active());
@@ -1039,7 +1091,7 @@ esp_err_t ui_manager_init()
     lvgl_port_unlock();
 
     g_ready = true;
-    ESP_LOGI(TAG, "UI ready：LVGL + Touch + Font/Lyrics services");
+    ESP_LOGI(TAG, "UI ready：复用启动核心 + Touch + Font；后台服务等待系统 READY");
     return ESP_OK;
 }
 

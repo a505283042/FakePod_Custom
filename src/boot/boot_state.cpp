@@ -1,8 +1,5 @@
 #include "boot_state.h"
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_psram.h"
@@ -14,14 +11,13 @@
 #include "cst820.h"
 #include "qmi8658.h"
 #include "audio_service.h"
-#include "artwork_loader.h"
-#include "cover_surface_cache.h"
 #include "sdcard.h"
 #include "display.h"
 #include "media_library.h"
 #include "player_state.h"
 #include "player_control.h"
 #include "ui_manager.h"
+#include "system_runtime.h"
 
 
 static const char *TAG =
@@ -29,11 +25,7 @@ static const char *TAG =
 
 
 static BootState g_state =
-    BootState::WaitStart;
-
-
-static TickType_t g_start_tick =
-    0;
+    BootState::CheckPsram;
 
 
 // ============================================================
@@ -43,11 +35,7 @@ static TickType_t g_start_tick =
 void boot_state_init()
 {
     g_state =
-        BootState::WaitStart;
-
-
-    g_start_tick =
-        xTaskGetTickCount();
+        BootState::CheckPsram;
 
 
     ESP_LOGI(
@@ -58,9 +46,27 @@ void boot_state_init()
         APP_DIAG_PROFILE_NAME
     );
 
-#if APP_DIAG_BOOT_VERBOSE
-    ESP_LOGI(TAG, "启动保护等待：5000ms（串口监视器窗口）");
-#endif
+    // 正式启动从第一个真实阶段直接开始，不再保留历史串口等待状态。
+}
+
+
+BootRunResult boot_run()
+{
+    if (boot_state_has_error()) {
+        return BootRunResult::Fatal;
+    }
+    if (boot_state_is_ready()) {
+        return BootRunResult::Ready;
+    }
+
+    boot_state_update();
+
+    if (boot_state_has_error()) {
+        return BootRunResult::Fatal;
+    }
+    return boot_state_is_ready()
+        ? BootRunResult::Ready
+        : BootRunResult::Running;
 }
 
 
@@ -73,34 +79,7 @@ void boot_state_update()
     switch (g_state) {
 
         // ====================================================
-        // 等待串口监视器
-        // ====================================================
-
-        case BootState::WaitStart:
-        {
-            TickType_t elapsed =
-                xTaskGetTickCount() -
-                g_start_tick;
-
-
-            if (
-                elapsed <
-                pdMS_TO_TICKS(5000)
-            ) {
-
-                return;
-            }
-
-
-            g_state =
-                BootState::CheckPsram;
-
-            break;
-        }
-
-
-        // ====================================================
-        // 1. PSRAM
+        // PSRAM
         // ====================================================
 
         case BootState::CheckPsram:
@@ -108,7 +87,7 @@ void boot_state_update()
 #if APP_DIAG_BOOT_VERBOSE
             ESP_LOGI(
                 TAG,
-                "步骤 1/9：检查 PSRAM"
+                "启动阶段：检查 PSRAM"
             );
 #endif
 
@@ -152,7 +131,7 @@ void boot_state_update()
 
 
         // ====================================================
-        // 2. I2C
+        // I2C
         // ====================================================
 
         case BootState::InitI2C:
@@ -160,7 +139,7 @@ void boot_state_update()
 #if APP_DIAG_BOOT_VERBOSE
             ESP_LOGI(
                 TAG,
-                "步骤 2/9：初始化 I2C"
+                "启动阶段：初始化 I2C"
             );
 #endif
 
@@ -188,14 +167,14 @@ void boot_state_update()
 
 
             g_state =
-                BootState::InitTouch;
+                BootState::InitDisplay;
 
             break;
         }
 
 
         // ====================================================
-        // 3. CST820
+        // CST820
         // ====================================================
 
         case BootState::InitTouch:
@@ -203,7 +182,7 @@ void boot_state_update()
 #if APP_DIAG_BOOT_VERBOSE
             ESP_LOGI(
                 TAG,
-                "步骤 3/9：初始化触摸"
+                "启动阶段：初始化触摸"
             );
 #endif
 
@@ -233,7 +212,7 @@ void boot_state_update()
 
 
         // ====================================================
-        // 4. QMI8658
+        // QMI8658
         // ====================================================
 
         case BootState::InitIMU:
@@ -241,7 +220,7 @@ void boot_state_update()
 #if APP_DIAG_BOOT_VERBOSE
             ESP_LOGI(
                 TAG,
-                "步骤 4/9：初始化 IMU"
+                "启动阶段：初始化 IMU"
             );
 #endif
 
@@ -270,13 +249,13 @@ void boot_state_update()
         }
 
         // ====================================================
-        // 5. AudioTask + CS43131
+        // AudioTask + CS43131
         // ====================================================
 
         case BootState::InitAudioService:
         {
 #if APP_DIAG_BOOT_VERBOSE
-            ESP_LOGI(TAG, "步骤 5/9：启动正式 AudioTask");
+            ESP_LOGI(TAG, "启动阶段：启动正式 AudioTask");
 #endif
 
             esp_err_t ret = audio_service_start();
@@ -294,7 +273,7 @@ void boot_state_update()
         }
 
         // ====================================================
-        // 6. TF 卡
+        // TF 卡
         // ====================================================
 
         case BootState::InitSDCard:
@@ -302,7 +281,7 @@ void boot_state_update()
 #if APP_DIAG_BOOT_VERBOSE
             ESP_LOGI(
                 TAG,
-                "步骤 6/9：初始化 TF 卡"
+                "启动阶段：初始化 TF 卡"
             );
 #endif
 
@@ -337,7 +316,7 @@ void boot_state_update()
         }
 
         // ====================================================
-        // 7. 音乐库
+        // 音乐库
         // ====================================================
 
         case BootState::ScanMediaLibrary:
@@ -345,7 +324,7 @@ void boot_state_update()
 #if APP_DIAG_BOOT_VERBOSE
             ESP_LOGI(
                 TAG,
-                "步骤 7/9：扫描音乐库"
+                "启动阶段：扫描音乐库"
             );
 #endif
 
@@ -375,28 +354,14 @@ void boot_state_update()
                 break;
             }
 
-            // 封面是可选资产服务：失败时不阻断播放器启动，Stage 12.2 UI 会回退默认封面。
-            const esp_err_t artwork_ret = artwork_loader_start();
-            if (artwork_ret != ESP_OK) {
-                ESP_LOGW(TAG, "异步封面加载服务启动失败，继续无封面运行：%s", esp_err_to_name(artwork_ret));
-            } else {
-                // R.36：CoverTask 只消费当前曲临时压缩原图，不访问 SD；
-                // 生成 normal + dimmed 两张 460x460 RGB565，成功后压缩原图立即释放。
-                const esp_err_t surface_ret = cover_surface_cache_start();
-                if (surface_ret != ESP_OK) {
-                    ESP_LOGW(TAG, "封面最终表面服务启动失败，将使用 LVGL decoder 回退：%s",
-                        esp_err_to_name(surface_ret));
-                }
-            }
-
             g_state =
-                BootState::InitDisplay;
+                BootState::InitUI;
 
             break;
         }
 
         // ====================================================
-        // 8. CO5300 AMOLED
+        // CO5300 AMOLED
         // ====================================================
 
         case BootState::InitDisplay:
@@ -404,7 +369,7 @@ void boot_state_update()
 #if APP_DIAG_BOOT_VERBOSE
             ESP_LOGI(
                 TAG,
-                "步骤 8/9：初始化 AMOLED"
+                "启动阶段：初始化 AMOLED"
             );
 #endif
 
@@ -427,14 +392,35 @@ void boot_state_update()
 
 
             g_state =
-                BootState::InitUI;
+                BootState::InitUIBootstrap;
 
             break;
         }
 
 
         // ====================================================
-        // 9. LVGL 用户界面
+        // LVGL 启动核心 / 首帧
+        // ====================================================
+
+        case BootState::InitUIBootstrap:
+        {
+#if APP_DIAG_BOOT_VERBOSE
+            ESP_LOGI(TAG, "启动阶段：建立 LVGL 启动页并等待首帧揭屏");
+#endif
+
+            if (ui_manager_bootstrap_init() != ESP_OK) {
+                ESP_LOGE(TAG, "LVGL 启动核心初始化失败");
+                g_state = BootState::Error;
+                break;
+            }
+
+            g_state = BootState::InitTouch;
+            break;
+        }
+
+
+        // ====================================================
+        // LVGL 用户界面
         // ====================================================
 
         case BootState::InitUI:
@@ -442,7 +428,7 @@ void boot_state_update()
 #if APP_DIAG_BOOT_VERBOSE
             ESP_LOGI(
                 TAG,
-                "步骤 9/9：初始化 LVGL 用户界面"
+                "启动阶段：初始化 LVGL 用户界面"
             );
 #endif
 
@@ -458,8 +444,11 @@ void boot_state_update()
                 break;
             }
 
+            // UI 与全部核心依赖已经建立。先发布唯一 READY 边界；
+            // Artwork/Cover/Lyrics 等后台服务由 system_loop 在 READY 之后统一启动。
             g_state =
                 BootState::Ready;
+            system_ready_publish();
 
             ESP_LOGI(
                 TAG,

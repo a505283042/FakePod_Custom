@@ -5,7 +5,6 @@
 // ============================================================
 enum class BootState
 {
-    WaitStart,
     CheckPsram,
     InitI2C,
     InitTouch,
@@ -14,10 +13,23 @@ enum class BootState
     InitSDCard,
     ScanMediaLibrary,
     InitDisplay,
+    InitUIBootstrap,
     InitUI,
     Ready,
     Error
 };
+
+// 启动编排器的顶层推进结果。
+// 本阶段先建立统一入口；后续再扩展降级/可选模块结果。
+enum class BootRunResult
+{
+    Running,
+    Ready,
+    Fatal
+};
+
+// 启动编排器顶层入口：每次调用推进一个既有启动阶段，并返回统一结果。
+BootRunResult boot_run();
 
 // 初始化启动状态机
 void boot_state_init();
