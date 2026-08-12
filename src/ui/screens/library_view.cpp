@@ -1579,7 +1579,7 @@ static void library_view_close_to_home()
     }
     library_view_store_scroll_position();
     lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
-    player_home_refresh();
+    player_home_resume_from_fullscreen_view("library-back");
     ESP_LOGI(TAG, "曲库返回按钮：返回播放器首页");
 }
 
@@ -1719,10 +1719,12 @@ static void library_view_row_clicked_cb(lv_event_t *event)
     if (!player_control_play_current()) {
         ESP_LOGW(TAG, "曲库选歌后播放请求未能入队");
     }
-    player_home_refresh();
+    // R.36.2：必须先隐藏曲库再恢复主页；旧顺序先 refresh 时 QoS 仍看到曲库 visible，
+    // 会让 Artwork 保持 inactive，切歌返回后存在黑屏/延迟恢复窗口。
     if (g_root != nullptr) {
         lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
     }
+    player_home_resume_from_fullscreen_view("library-select");
 }
 
 static void library_view_back_cb(lv_event_t *event)

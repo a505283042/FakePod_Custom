@@ -148,9 +148,9 @@ static constexpr LauncherMenuItemDef kLauncherItems[kLauncherItemCount] = {
     {LauncherIconKind::Settings,    "设置",     231, 0x354B77,  0,  0, -7771,  -6293},
 };
 
-// P1.5.2R.4.2：播放页页面级手势统一用白名单过滤。
-// TouchInput / GestureRouter 仍识别所有动作；页面层只执行当前上下文允许的动作。
-// 这样“禁止歌词下拉曲库”和“频谱只允许右滑返回”共享同一条规则。
+// R.35.1：播放页页面级手势继续统一用白名单过滤。
+// 封面/歌词/频谱都允许中央纵向 Flick 切歌；各页原有横向导航保持不变。
+// Overlay/Launcher 仍锁住页面切歌，顶部/底部边缘继续保留给曲库与 Launcher。
 enum class PlaybackGestureScope : uint8_t
 {
     Home = 0,
@@ -169,12 +169,18 @@ static bool player_home_page_allows_gesture(
         case PlaybackGestureScope::Home:
             return action == UiGestureAction::SwipeLeft ||
                 action == UiGestureAction::SwipeRight ||
+                action == UiGestureAction::SwipeUpTrack ||
+                action == UiGestureAction::SwipeDownTrack ||
                 action == UiGestureAction::PullDownFromTop ||
                 action == UiGestureAction::PullUpFromBottom;
         case PlaybackGestureScope::Lyrics:
-            return action == UiGestureAction::SwipeLeft;
+            return action == UiGestureAction::SwipeLeft ||
+                action == UiGestureAction::SwipeUpTrack ||
+                action == UiGestureAction::SwipeDownTrack;
         case PlaybackGestureScope::Spectrum:
-            return action == UiGestureAction::SwipeRight;
+            return action == UiGestureAction::SwipeRight ||
+                action == UiGestureAction::SwipeUpTrack ||
+                action == UiGestureAction::SwipeDownTrack;
         case PlaybackGestureScope::HomeOverlay:
         case PlaybackGestureScope::HomeLauncher:
         case PlaybackGestureScope::LyricsOverlay:
@@ -210,7 +216,15 @@ static uint8_t g_launcher_frame_index = kLauncherFrameInvalid;
 static uint32_t g_launcher_frame_decode_count = 0U;
 static uint32_t g_launcher_frame_decode_us = 0U;
 static uint32_t g_launcher_frame_decode_max_us = 0U;
-// R.33.2：Launcher 动画帧最终像素直接走局部 Continuous GRAM，不再交给 LVGL 图片渲染。
+// R.33.2：Launcher 动画帧原先可走局部 Continuous GRAM。
+// R.36.2.1：实机证明 esp_lcd SPI Panel IO 的 tx_param/tx_color 内部仍含 portMAX_DELAY
+// 队列回收；Launcher 高频 DirectFrame 反复切换 LVGL/Direct callback ownership 后，下一帧可能
+// 永久阻塞在驱动内部，应用层 250ms timeout 根本没有机会执行。先强制 Launcher 回到已经存在的
+// R.33.1 RGB565 Canvas/LVGL 官方 flush 路径，保持 Flash 12帧/预合成 Work 外观不变，优先保证 UI 不死。
+static constexpr bool kLauncherDirectSceneEnabled = false;
+// 同理，全屏页面回主页不再额外插入一次 DirectPresent；重新绑定 current Surface 后交给 LVGL
+// 完成物理刷新，避免页面恢复再次跨越同一套共享 Panel IO callback ownership。
+static constexpr bool kFullscreenHomeResumeDirectEnabled = false;
 static bool g_launcher_direct_frame_active = false;
 static uint32_t g_launcher_direct_present_count = 0U;
 static uint32_t g_launcher_direct_present_us = 0U;
@@ -271,6 +285,7 @@ static uint32_t g_last_artwork_bound_track = UINT32_MAX;
 // Overlay / Launcher 内部 helper 先行声明，供后续多个回调交叉调用。
 static void player_home_cancel_progress_interaction();
 static void player_home_progress_sync(const AudioStateSnapshot &snapshot);
+static void player_home_apply_audio_snapshot(const AudioStateSnapshot &snapshot);
 static void player_home_overlay_hide();
 
 static void player_home_control_capture_cb(lv_event_t *event)
@@ -442,7 +457,8 @@ static void player_home_mode_icon_draw_cb(lv_event_t *event)
     lv_draw_line_dsc_t line = {};
     lv_draw_line_dsc_init(&line);
     line.color = lv_color_hex(0xF5F7FA);
-    line.width = 2;
+    // R.35.3：播放模式图标线宽与音量图标统一，避免顺序/循环/随机显得过细。
+    line.width = 3;
     line.opa = LV_OPA_COVER;
     line.round_start = 1U;
     line.round_end = 1U;
@@ -681,12 +697,12 @@ static void player_home_launcher_draw_icon(
 
     switch (icon) {
         case LauncherIconKind::Music:
-            // 双音符：中心圆里的默认选中图标会略放大。
-            draw(4, -17, 4, 9);
-            draw(4, -17, 16, -20);
-            draw(16, -20, 16, 4);
-            dot(-2, 10, 10);
-            dot(10, 5, 10);
+            // R.35.3.2：与 Flash 生成器/DirectFrame 中心图标共用同一套 19px 间距双音符几何。
+            draw(-4, -16, -4, 7);
+            draw(-4, -16, 15, -20);
+            draw(15, -20, 15, 2);
+            dot(-11, 10, 10);
+            dot(8, 4, 10);
             break;
 
         case LauncherIconKind::Nsf:
@@ -1043,8 +1059,9 @@ static void player_home_launcher_raster_icon(
 
     switch (icon) {
         case LauncherIconKind::Music:
-            line(4, -17, 4, 9); line(4, -17, 16, -20); line(16, -20, 16, 4);
-            dot(-2, 10, 10); dot(10, 5, 10);
+            // R.35.3.2：中心 DirectFrame 与 Flash/LVGL fallback 同源几何。
+            line(-4, -16, -4, 7); line(-4, -16, 15, -20); line(15, -20, 15, 2);
+            dot(-11, 10, 10); dot(8, 4, 10);
             break;
         case LauncherIconKind::Nsf:
             line(-13,-13,13,-13); line(13,-13,13,13); line(13,13,-13,13); line(-13,13,-13,-13);
@@ -1268,7 +1285,7 @@ static bool player_home_launcher_present_work_direct()
         return false;
     }
     DisplayDirectPresentStats stats = {};
-    const esp_err_t ret = display_present_rgb565_region_direct(
+    const esp_err_t ret = display_present_rgb565_region_direct_owned(
         g_launcher_frame_buffer,
         static_cast<uint16_t>(kLauncherPanelX),
         static_cast<uint16_t>(kLauncherPanelShownY),
@@ -1299,9 +1316,10 @@ static bool player_home_launcher_present_work_direct()
     if (g_launcher_direct_present_count <= 3U ||
         g_launcher_frame_index == static_cast<uint8_t>(kLauncherAnimationAssetFrameCount - 1U)) {
         ESP_LOGI(TAG,
-            "R.33.2 LauncherDirectFrame：frame=%u total=%uus stream=%uus pipeline=%uus swap=%uus copy=%uus wait=%uus chunks=%u staging=%u行×%u",
+            "R.35.3.3 LauncherDirectFrame：frame=%u total=%uus barrier=%uus stream=%uus pipeline=%uus swap=%uus copy=%uus wait=%uus chunks=%u staging=%u行×%u",
             static_cast<unsigned>(g_launcher_frame_index),
             static_cast<unsigned>(stats.total_us),
+            static_cast<unsigned>(stats.io_barrier_us),
             static_cast<unsigned>(stats.stream_us),
             static_cast<unsigned>(stats.pipeline_us),
             static_cast<unsigned>(stats.byte_swap_us),
@@ -1362,11 +1380,17 @@ static bool player_home_launcher_begin_direct_scene()
     // 先把完整 460x460 半透明背景直接写入 GRAM。此时 Launcher LVGL 根对象仍隐藏，
     // 不会有随后到来的 backdrop refresh 覆盖 DirectPresent 帧。
     DisplayDirectPresentStats stats = {};
-    const esp_err_t ret = display_present_rgb565_direct(
+    // R.36.2：Launcher show/hide/动画全链路不再调用普通 DirectPresent 的
+    // esp_lcd_panel_io_tx_param(-1) 无超时 barrier。Launcher 从 LVGL Task 的手势事件进入，
+    // 且根对象仍 hidden、主页后台 timer 已暂停，因此首张 Base 与后续帧统一走 owned/no-barrier。
+    const esp_err_t ret = display_present_rgb565_region_direct_owned(
         g_launcher_base_buffer,
+        0U,
+        0U,
         FAKEPOD_LCD_WIDTH,
         FAKEPOD_LCD_HEIGHT,
         false,
+        true,
         &stats);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "R.33.2 Launcher DirectScene底图提交失败：%s", esp_err_to_name(ret));
@@ -1393,7 +1417,7 @@ static bool player_home_launcher_begin_direct_scene()
     return true;
 }
 
-static bool player_home_launcher_restore_home_direct()
+static bool player_home_present_current_cover_direct(const char *reason)
 {
     if (!player_state_is_ready()) {
         return false;
@@ -1404,31 +1428,38 @@ static bool player_home_launcher_restore_home_direct()
         return false;
     }
 
-    const uint8_t *source = lease.normal_rgb565;
-    bool wire_order = false;
-    if (lease.wire_rgb565 != nullptr && !lease.wire_dimmed) {
-        source = lease.wire_rgb565;
-        wire_order = true;
-    }
+    // R.36.2：页面恢复/Launcher 退出都只提交已经存在的 current Surface，且走 owned/no-barrier。
+    // Overlay 若仍处于显示状态，物理恢复必须与 LVGL 当前 source 一致，避免先闪亮图再重绘暗图。
+    const uint8_t *source = g_overlay_visible ? lease.dimmed_rgb565 : lease.normal_rgb565;
     DisplayDirectPresentStats stats = {};
     const esp_err_t ret = source == nullptr
         ? ESP_ERR_INVALID_STATE
-        : display_present_rgb565_direct(
+        : display_present_rgb565_region_direct_owned(
             source,
+            0U,
+            0U,
             FAKEPOD_LCD_WIDTH,
             FAKEPOD_LCD_HEIGHT,
-            wire_order,
+            false,
+            true,
             &stats);
     cover_surface_cache_release(&lease);
     if (ret == ESP_OK) {
         ESP_LOGI(TAG,
-            "R.33.2 Launcher退出恢复主页DirectPresent：source=%s total=%uus stream=%uus",
-            wire_order ? "wire" : "native",
+            "R.36.2 HomeResume DirectPresent：reason=%s track=%lu source=%s total=%uus barrier=%uus stream=%uus",
+            reason != nullptr ? reason : "unknown",
+            static_cast<unsigned long>(track_index),
+            g_overlay_visible ? "dimmed" : "normal",
             static_cast<unsigned>(stats.total_us),
+            static_cast<unsigned>(stats.io_barrier_us),
             static_cast<unsigned>(stats.stream_us));
         return true;
     }
-    ESP_LOGW(TAG, "R.33.2 Launcher退出恢复主页DirectPresent失败：%s", esp_err_to_name(ret));
+    ESP_LOGW(TAG,
+        "R.36.2 HomeResume DirectPresent跳过/失败：reason=%s track=%lu ret=%s，交给LVGL重绘",
+        reason != nullptr ? reason : "unknown",
+        static_cast<unsigned long>(track_index),
+        esp_err_to_name(ret));
     return false;
 }
 
@@ -1709,7 +1740,7 @@ static void player_home_launcher_enter_done(lv_anim_t *anim)
         }
     }
     ESP_LOGI(TAG,
-        "R.33.2 LauncherDirectFrame展开完成：%ums frame=%u/%u base=%uus decode(avg/max)=%u/%uus direct(avg/max)=%u/%uus stream(avg/max)=%u/%uus frames=%u failures=%u direct=%d，径向点击已解锁",
+        "R.36.2.1 Launcher动画展开完成：%ums frame=%u/%u base=%uus decode(avg/max)=%u/%uus direct(avg/max)=%u/%uus stream(avg/max)=%u/%uus frames=%u failures=%u direct=%d，径向点击已解锁",
         static_cast<unsigned>(elapsed),
         static_cast<unsigned>(g_launcher_frame_index),
         static_cast<unsigned>(kLauncherAnimationAssetFrameCount - 1U),
@@ -1743,7 +1774,7 @@ static void player_home_launcher_leave_done(lv_anim_t *anim)
     const bool used_direct = g_launcher_direct_frame_active;
     if (used_direct) {
         // frame0 仍是半透明背景；Launcher 真正隐藏后立刻把 normal 封面恢复到 GRAM。
-        if (!player_home_launcher_restore_home_direct()) {
+        if (!player_home_present_current_cover_direct("launcher-hide")) {
             lv_obj_invalidate(lv_screen_active());
         }
     }
@@ -1754,7 +1785,7 @@ static void player_home_launcher_leave_done(lv_anim_t *anim)
     now_playing_artwork_set_direct_present_allowed(true);
     const uint32_t elapsed = static_cast<uint32_t>(lv_tick_get()) - g_launcher_anim_started_ms;
     ESP_LOGI(TAG,
-        "R.33.2 LauncherDirectFrame收拢完成：%ums frame=%u decode(avg/max)=%u/%uus direct(avg/max)=%u/%uus frames=%u failures=%u direct=%d",
+        "R.36.2.1 Launcher动画收拢完成：%ums frame=%u decode(avg/max)=%u/%uus direct(avg/max)=%u/%uus frames=%u failures=%u direct=%d",
         static_cast<unsigned>(elapsed),
         static_cast<unsigned>(g_launcher_frame_index),
         static_cast<unsigned>(g_launcher_frame_decode_count == 0U ? 0U :
@@ -1832,7 +1863,11 @@ static void player_home_launcher_show()
         if (g_launcher_frame_cache_ready && player_home_launcher_prepare_precomposited_base()) {
             player_home_launcher_update_frame_lut();
             g_launcher_frame_cache_active = true;
-            if (!player_home_launcher_begin_direct_scene()) {
+            bool direct_scene_started = false;
+            if (kLauncherDirectSceneEnabled) {
+                direct_scene_started = player_home_launcher_begin_direct_scene();
+            }
+            if (!direct_scene_started) {
                 g_launcher_direct_frame_active = false;
                 g_launcher_frame_cache_active = player_home_launcher_decode_cached_frame(0U);
             }
@@ -2290,9 +2325,8 @@ static void player_home_update_background_timer_qos()
 
     g_background_timers_running = should_run;
 
-    // P1.5R.1.2.2：主页被完整覆盖时必须释放 Artwork UI lease。
-    // CoverSurface cache 只有两槽，隐藏主页继续 pin 旧曲会迫使下一曲预热淘汰“当前曲”。
-    // 恢复主页时 set_active(true) 会按当前 Player context 重新绑定 cache。
+    // R.36：主页被完整覆盖时释放 Artwork UI lease，让交换槽可立即回收旧 Surface。
+    // 恢复主页时 set_active(true) 会按当前 Player context 重新绑定当前曲。
     now_playing_artwork_set_active(should_run);
 
     lv_timer_t *timers[] = {g_audio_timer, g_artwork_timer};
@@ -2308,6 +2342,49 @@ static void player_home_update_background_timer_qos()
         }
     }
     ESP_LOGI(TAG, "P1.5R.1.2 主页后台timer：%s", should_run ? "恢复" : "暂停");
+}
+
+static bool player_home_handle_vertical_track_swipe(
+    UiGestureAction action,
+    const char *surface_name,
+    bool home_visible)
+{
+    if (action != UiGestureAction::SwipeUpTrack &&
+        action != UiGestureAction::SwipeDownTrack) {
+        return false;
+    }
+
+    const bool next = action == UiGestureAction::SwipeUpTrack;
+    const size_t before_track = player_state_get_index();
+    const bool ok = next ? player_control_next() : player_control_previous();
+    if (!ok) {
+        ESP_LOGW(TAG,
+            "R.35.1 %s纵向切歌请求失败：%s",
+            surface_name != nullptr ? surface_name : "播放页",
+            next ? "上滑下一曲" : "下滑上一曲");
+        return true;
+    }
+
+    const size_t after_track = player_state_get_index();
+    ESP_LOGI(TAG,
+        "R.35.1 %s纵向切歌：%s track=%lu -> %lu",
+        surface_name != nullptr ? surface_name : "播放页",
+        next ? "上滑下一曲" : "下滑上一曲",
+        static_cast<unsigned long>(before_track),
+        static_cast<unsigned long>(after_track));
+
+    if (home_visible) {
+        // 主页沿用按钮的 R.19 快速重绑路径。上一曲若因“已播放>3秒”只 Seek(0)，
+        // Playlist track 不变，因此不重复刷封面。
+        if (after_track != before_track) {
+            player_home_artwork_fast_rebind(next ? "swipe-next" : "swipe-prev");
+        }
+        AudioStateSnapshot snapshot = {};
+        if (audio_service_get_snapshot(&snapshot)) {
+            player_home_apply_audio_snapshot(snapshot);
+        }
+    }
+    return true;
 }
 
 static void player_home_gesture_timer_cb(lv_timer_t *timer)
@@ -2336,16 +2413,19 @@ static void player_home_gesture_timer_cb(lv_timer_t *timer)
             return;
         }
 
-        ESP_LOGI(TAG, "P1.5.2R.4.2 歌词页允许手势：%s", gesture_router_action_name(lyrics_action));
+        ESP_LOGI(TAG, "R.35.1 歌词页允许手势：%s", gesture_router_action_name(lyrics_action));
+        if (player_home_handle_vertical_track_swipe(lyrics_action, "歌词页", false)) {
+            return;
+        }
         if (lyrics_action == UiGestureAction::SwipeLeft) {
             lyrics_view_close();
-            player_home_refresh();
+            player_home_resume_from_fullscreen_view("lyrics");
         }
         return;
     }
 
-    // P1.5.2R.4.2：频谱页是纯观赏页。触摸照常采集/识别，但页面级业务只允许右滑返回主页。
-    // Tap 暂时保持空操作，后续可直接复用为“切换频谱显示样式”。
+    // R.35.1：频谱页保留右滑返回主页，同时允许中央纵向 Flick 切歌。
+    // Tap 仍由 SpectrumView 自己用于切换显示样式，互不冲突。
     if (spectrum_view_is_visible()) {
         UiGestureAction spectrum_action = UiGestureAction::None;
         if (!gesture_router_take_action(&spectrum_action)) {
@@ -2355,9 +2435,14 @@ static void player_home_gesture_timer_cb(lv_timer_t *timer)
             return;
         }
 
-        ESP_LOGI(TAG, "P1.5.2R.4.2 频谱页允许手势：%s", gesture_router_action_name(spectrum_action));
-        spectrum_view_close();
-        player_home_refresh();
+        ESP_LOGI(TAG, "R.35.1 频谱页允许手势：%s", gesture_router_action_name(spectrum_action));
+        if (player_home_handle_vertical_track_swipe(spectrum_action, "频谱页", false)) {
+            return;
+        }
+        if (spectrum_action == UiGestureAction::SwipeRight) {
+            spectrum_view_close();
+            player_home_resume_from_fullscreen_view("spectrum");
+        }
         return;
     }
 
@@ -2397,7 +2482,10 @@ static void player_home_gesture_timer_cb(lv_timer_t *timer)
         return;
     }
 
-    ESP_LOGI(TAG, "P1.5.2R.4.2 主页允许手势：%s", gesture_router_action_name(action));
+    ESP_LOGI(TAG, "R.35.1 主页允许手势：%s", gesture_router_action_name(action));
+    if (player_home_handle_vertical_track_swipe(action, "封面页", true)) {
+        return;
+    }
     switch (action) {
         case UiGestureAction::PullDownFromTop:
             player_home_overlay_hide();
@@ -2924,7 +3012,7 @@ static void player_home_prev_cb(lv_event_t *event)
     const size_t before_track = player_state_get_index();
     if (player_control_previous()) {
         if (player_state_get_index() != before_track) {
-            // R.19：真正跨 Track 后立刻绑定预热 Surface；>3s 的“上一曲=回到曲首”不重复刷封面。
+            // R.36：真正跨 Track 后立即刷新封面 context；新 Surface 未完成时继续保持旧 GRAM。
             player_home_artwork_fast_rebind("manual-prev");
         }
         AudioStateSnapshot snapshot = {};
@@ -3023,6 +3111,30 @@ void player_home_refresh()
         player_home_overlay_apply_dim_path();
     }
     g_last_audio_state_revision = snapshot.state_revision;
+}
+
+void player_home_resume_from_fullscreen_view(const char *reason)
+{
+    // 页面调用方必须先隐藏自己的全屏 root；这样 QoS 才会把主页 Artwork/timer 恢复为 active。
+    player_home_refresh();
+
+    // R.36.2.1：Surface source 已经重新绑定后，页面恢复固定交给 LVGL 官方 flush 链。
+    // R.36.2 的额外 current-cover DirectPresent 会再次切换共享 Panel IO callback ownership；
+    // 在 Launcher 高频 DirectFrame 已确认能触发 IDF 内部永久等待后，这里也不再冒同一种风险。
+    bool direct_ok = false;
+    if (kFullscreenHomeResumeDirectEnabled) {
+        direct_ok = player_home_present_current_cover_direct(reason);
+    }
+    lv_obj_t *screen = lv_screen_active();
+    if (screen != nullptr) {
+        lv_obj_invalidate(screen);
+    }
+    ESP_LOGI(TAG,
+        "R.36.2.1 HomeResume事务完成：reason=%s direct=%u artwork=%u overlay=%u",
+        reason != nullptr ? reason : "unknown",
+        direct_ok ? 1U : 0U,
+        now_playing_artwork_has_fast_surface() ? 1U : 0U,
+        g_overlay_visible ? 1U : 0U);
 }
 
 void player_home_create(lv_obj_t *screen)
@@ -3251,11 +3363,15 @@ void player_home_create(lv_obj_t *screen)
         flash_bytes += g_launcher_animation_frames[i].size;
     }
     ESP_LOGI(TAG,
-        "P1.5.3.2R.33.2.2 DirectSceneOwnership：12帧压缩I4模板 Flash=%uB；RGB565 FullBase=%uB + PanelWork=%uB PSRAM；cache=%d；动画帧绕过LVGL走340x340 ContinuousGRAM；R.33.1/R.32保留fallback",
+        "P1.5.3.2R.33.2.2 DirectSceneOwnership：12帧压缩I4模板 Flash=%uB；RGB565 FullBase=%uB + PanelWork=%uB PSRAM；cache=%d；R.33.1/R.32 fallback保留",
         static_cast<unsigned>(flash_bytes),
         static_cast<unsigned>(kLauncherBaseBufferBytes),
         static_cast<unsigned>(kLauncherFrameBufferBytes),
         g_launcher_frame_cache_ready ? 1 : 0);
+    ESP_LOGW(TAG,
+        "R.36.2.1 Launcher安全传输：DirectScene=%s，动画固定走RGB565 Canvas/LVGL；HomeResume Direct=%s；规避esp_lcd SPI内部portMAX_DELAY队列回收卡死",
+        kLauncherDirectSceneEnabled ? "enabled" : "disabled",
+        kFullscreenHomeResumeDirectEnabled ? "enabled" : "disabled");
 
     // P1.5.3.2R.9：重建 Overlay 为清晰的纵向信息层级：
     // 歌名 -> 歌手 -> 列表位置/格式/采样 -> 大号播放控制 -> 进度 -> 模式/音量。
@@ -3425,6 +3541,8 @@ void player_home_create(lv_obj_t *screen)
         "P1.5.3.2R.34 Overlay收口：无条件LVGL setter已做值变化门控；上一曲/下一曲保持74px触摸区并重绘为实心Track glyph");
     ESP_LOGI(TAG,
         "P1.5.3.2R.34.1 DirtyRegionIsolation：Overlay 460x460透明root常驻；只显隐真实控件；normal/dimmed source单一失效所有者");
+    ESP_LOGI(TAG,
+        "P1.5.3.2R.35.1 统一纵向切歌：封面/歌词/频谱中央上滑=下一曲、下滑=上一曲；>=86px且纵向占优；顶部42px/底部43px边缘保留；Overlay锁定");
     ESP_LOGI(TAG,
         "P1.5.3.2R.12 收口：R.11首页纯Tap规则保持；歌词Overlay底部增加模式图标并放大音量入口");
     ESP_LOGI(TAG,

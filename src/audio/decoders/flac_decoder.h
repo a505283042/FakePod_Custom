@@ -167,6 +167,32 @@ struct FlacStorageWindowSnapshot
 // 只读获取最近一次预取/消费更新后的 ring 水位。无活动 FLAC 时 active=false。
 bool flac_decoder_get_storage_window(FlacStorageWindowSnapshot *out_snapshot);
 
+// R.36.2.2：真实故障发生时给 AudioTask 留下 FLAC 预取运行快照。
+// 这是常驻轻量 POD，不依赖 APP_DIAG_FLAC_PERFORMANCE，也不在热循环打印日志。
+struct FlacPrefetchRuntimeSnapshot
+{
+    bool active = false;
+    bool adaptive_qos_active = false;
+    bool pressure_active = false;
+    bool io_error = false;
+    bool eof = false;
+    uint8_t qos_level = 2;  // 0=Emergency,1=Recovery,2=Normal,3=Plenty
+    uint32_t sample_rate_hz = 0;
+    uint32_t buffered_bytes = 0;
+    uint32_t capacity_bytes = 0;
+    uint32_t min_buffered_bytes = 0;
+    uint32_t emergency_entries = 0;
+    uint32_t recovered_count = 0;
+    uint32_t max_consecutive_reads = 0;
+    uint32_t cooperative_blocks = 0;
+};
+
+// 仅供 AudioTask 在 shutdown 前抓取当前 decoder 的预取状态。
+bool flac_decoder_get_prefetch_runtime(
+    const FlacDecoder *decoder,
+    FlacPrefetchRuntimeSnapshot *out_snapshot
+);
+
 // AudioTask 启动时调用一次，只注册 FLAC 后端，不注册无关编解码器。
 esp_err_t flac_decoder_register_backend();
 

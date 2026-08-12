@@ -9,6 +9,10 @@ enum class UiGestureAction : uint8_t
     None = 0,
     SwipeLeft,
     SwipeRight,
+    // R.35.1：非顶部/底部边缘起手的明确纵向 Flick。
+    // 页面层决定是否将其映射为上一曲/下一曲；Router 本身不直接操作 Player。
+    SwipeUpTrack,
+    SwipeDownTrack,
     PullDownFromTop,
     PullUpFromBottom,
 };

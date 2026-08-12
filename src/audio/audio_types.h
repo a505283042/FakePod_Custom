@@ -59,6 +59,59 @@ struct AudioStateSnapshot
     bool user_muted = false;
 };
 
+// R.36.2.2：偶发音频停止的持久 RAM 快照。
+// 仅在 AudioTask 真实进入错误状态前写入一次；不依赖高频诊断开关。
+enum class AudioFaultStage : uint8_t
+{
+    None = 0,
+    ReadPcm,
+    PcmNoProgress,
+    FirstPcmUnmute,
+    I2sWrite,
+    PauseMute,
+    ResumePlayback,
+    EofDrain,
+    Unknown,
+};
+
+struct AudioFaultSnapshot
+{
+    bool valid = false;
+    uint32_t sequence = 0;
+    uint32_t fault_count = 0;
+    AudioFaultStage stage = AudioFaultStage::None;
+    esp_err_t error = ESP_OK;
+
+    uint32_t playback_revision = 0;
+    uint32_t track_index = UINT32_MAX;
+    MediaFormat format = MediaFormat::Unknown;
+    uint32_t sample_rate_hz = 0;
+    uint16_t channels = 0;
+    uint16_t bits_per_sample = 0;
+    uint64_t position_frames = 0;
+    uint64_t decoder_position_frames = 0;
+
+    // FLAC 专用预取现场；非 FLAC 故障时 flac_prefetch_active=false。
+    bool flac_prefetch_active = false;
+    bool flac_prefetch_io_error = false;
+    bool flac_prefetch_eof = false;
+    bool flac_prefetch_pressure = false;
+    uint8_t flac_qos_level = 2;  // 0=Emergency,1=Recovery,2=Normal,3=Plenty
+    uint32_t flac_ring_buffered_bytes = 0;
+    uint32_t flac_ring_capacity_bytes = 0;
+    uint32_t flac_ring_min_buffered_bytes = 0;
+    uint32_t flac_emergency_entries = 0;
+    uint32_t flac_recovered_count = 0;
+    uint32_t flac_max_consecutive_reads = 0;
+
+    // 故障发生瞬间的 heap 现场。
+    uint32_t internal_free_bytes = 0;
+    uint32_t internal_min_bytes = 0;
+    uint32_t internal_largest_bytes = 0;
+    uint32_t dma_free_bytes = 0;
+    uint32_t psram_free_bytes = 0;
+};
+
 // P1.5.2R.3：AudioTask 只旁路抽取真实 PCM；低优先级 SpectrumFFT 任务
 // 计算 256 点 FFT 并发布 16 个低频→高频 band。UI 只消费 POD 快照，
 // 不接触 decoder、PCM 工作区或 I2S。

@@ -41,8 +41,6 @@ struct CoverCacheEntry
 {
     uint8_t *normal = nullptr;
     uint8_t *dimmed = nullptr;
-    uint8_t *wire = nullptr;
-    bool wire_dimmed = false;
     size_t size = 0;
     uint32_t catalog_generation = 0;
     uint32_t track_index = UINT32_MAX;
@@ -94,18 +92,7 @@ static CoverCacheEntry g_cache[COVER_CACHE_SLOT_COUNT] = {};
 static uint32_t g_lru_counter = 1U;
 static uint32_t g_next_slot_revision = 1U;
 
-// R.28：wire-order Surface 的目标明暗状态由播放器 Overlay 通知。
-// 这里只保存最新偏好；真正 423KB byte-swap 固定在 CoverSurfaceTask(Core1) 后台执行。
-static portMUX_TYPE g_wire_pref_mux = portMUX_INITIALIZER_UNLOCKED;
-static bool g_wire_dimmed_preference = false;
-
-static bool cover_wire_dimmed_preference()
-{
-    portENTER_CRITICAL(&g_wire_pref_mux);
-    const bool dimmed = g_wire_dimmed_preference;
-    portEXIT_CRITICAL(&g_wire_pref_mux);
-    return dimmed;
-}
+// R.36：取消第三张 wire-order Surface。DirectPresent 统一从 native RGB565 在线 byte-swap。
 
 static uint32_t cover_next_request_id()
 {
@@ -168,7 +155,6 @@ static void cover_release_entry_locked(CoverCacheEntry *entry)
     if (entry == nullptr || !entry->valid || entry->pin_count != 0U) return;
     heap_caps_free(entry->normal);
     heap_caps_free(entry->dimmed);
-    heap_caps_free(entry->wire);
     *entry = {};
 }
 
@@ -211,14 +197,31 @@ static bool cover_cache_has(uint32_t generation, uint32_t track_index)
     return index >= 0;
 }
 
+static void cover_cache_release_unpinned_except(uint32_t generation, uint32_t track_index)
+{
+    if (g_cache_mutex == nullptr || xSemaphoreTake(g_cache_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
+    size_t released = 0U;
+    for (size_t i = 0; i < COVER_CACHE_SLOT_COUNT; ++i) {
+        CoverCacheEntry &entry = g_cache[i];
+        if (!entry.valid || entry.pin_count != 0U) continue;
+        if (entry.catalog_generation == generation && entry.track_index == track_index) continue;
+        released += COVER_SURFACE_BYTES * 2U;
+        cover_release_entry_locked(&entry);
+    }
+    xSemaphoreGive(g_cache_mutex);
+    if (released > 0U) {
+        ESP_LOGI(TAG, "R.36 提前释放旧Surface：%uB PSRAM_free=%u",
+            static_cast<unsigned>(released),
+            static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+    }
+}
+
 static bool cover_cache_insert(
     const CoverRequest &request,
     uint8_t *normal,
-    uint8_t *dimmed,
-    uint8_t *wire,
-    bool wire_dimmed)
+    uint8_t *dimmed)
 {
-    if (normal == nullptr || dimmed == nullptr || wire == nullptr || g_cache_mutex == nullptr ||
+    if (normal == nullptr || dimmed == nullptr || g_cache_mutex == nullptr ||
         xSemaphoreTake(g_cache_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
         return false;
     }
@@ -245,8 +248,6 @@ static bool cover_cache_insert(
     CoverCacheEntry &entry = g_cache[slot];
     entry.normal = normal;
     entry.dimmed = dimmed;
-    entry.wire = wire;
-    entry.wire_dimmed = wire_dimmed;
     entry.size = COVER_SURFACE_BYTES;
     entry.catalog_generation = request.catalog_generation;
     entry.track_index = request.track_index;
@@ -264,7 +265,7 @@ static bool cover_cache_insert(
 static bool cover_psram_budget_ok(size_t source_bytes)
 {
     const size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    const size_t need = source_bytes + COVER_SURFACE_BYTES * 3U + COVER_PSRAM_SAFETY_RESERVE_BYTES;
+    const size_t need = source_bytes + COVER_SURFACE_BYTES * 2U + COVER_PSRAM_SAFETY_RESERVE_BYTES;
     return free_psram > need;
 }
 
@@ -274,94 +275,6 @@ static uint8_t *cover_alloc_surface()
         16U,
         COVER_SURFACE_BYTES,
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-}
-
-static inline uint16_t cover_wire_rgb565(uint16_t pixel)
-{
-    return static_cast<uint16_t>((pixel << 8U) | (pixel >> 8U));
-}
-
-static uint32_t cover_build_wire_surface(
-    const uint8_t *native_rgb565,
-    uint8_t *wire_rgb565)
-{
-    if (native_rgb565 == nullptr || wire_rgb565 == nullptr) return 0U;
-    const int64_t started_us = esp_timer_get_time();
-    const uint16_t *src = reinterpret_cast<const uint16_t *>(native_rgb565);
-    uint16_t *dst = reinterpret_cast<uint16_t *>(wire_rgb565);
-    const size_t row_pixels = static_cast<size_t>(FAKEPOD_LCD_WIDTH);
-    for (uint32_t y = 0; y < FAKEPOD_LCD_HEIGHT; ++y) {
-        const size_t base = static_cast<size_t>(y) * row_pixels;
-        for (uint32_t x = 0; x < FAKEPOD_LCD_WIDTH; ++x) {
-            dst[base + x] = cover_wire_rgb565(src[base + x]);
-        }
-        if (((y + 1U) % COVER_COOPERATIVE_ROW_INTERVAL) == 0U) {
-            vTaskDelay(1);
-        }
-    }
-    return static_cast<uint32_t>((esp_timer_get_time() - started_us) / 1000LL);
-}
-
-// 只刷新未被 UI 持有的槽。生成新 wire 时先用内部 pin 防止槽被淘汰；
-// 若生成期间 UI 恰好 acquire 了该槽，则本轮不替换旧 wire，避免悬空 lease 指针。
-static void cover_refresh_cached_wire_mode(bool dimmed)
-{
-    if (g_cache_mutex == nullptr) return;
-
-    for (size_t slot = 0; slot < COVER_CACHE_SLOT_COUNT; ++slot) {
-        const uint8_t *native = nullptr;
-        uint32_t slot_revision = 0U;
-        uint32_t track_index = UINT32_MAX;
-
-        if (xSemaphoreTake(g_cache_mutex, pdMS_TO_TICKS(50)) != pdTRUE) continue;
-        CoverCacheEntry &entry = g_cache[slot];
-        if (!entry.valid || entry.pin_count != 0U ||
-            (entry.wire != nullptr && entry.wire_dimmed == dimmed)) {
-            xSemaphoreGive(g_cache_mutex);
-            continue;
-        }
-        native = dimmed ? entry.dimmed : entry.normal;
-        slot_revision = entry.slot_revision;
-        track_index = entry.track_index;
-        ++entry.pin_count;
-        xSemaphoreGive(g_cache_mutex);
-
-        uint8_t *new_wire = cover_alloc_surface();
-        uint32_t wire_ms = 0U;
-        if (new_wire != nullptr) {
-            wire_ms = cover_build_wire_surface(native, new_wire);
-        }
-
-        uint8_t *old_wire = nullptr;
-        bool installed = false;
-        if (xSemaphoreTake(g_cache_mutex, portMAX_DELAY) == pdTRUE) {
-            CoverCacheEntry &current = g_cache[slot];
-            if (current.valid && current.slot_revision == slot_revision) {
-                // pin_count==1 表示只有后台刷新自己的保护 pin，没有新的 UI lease。
-                if (new_wire != nullptr && current.pin_count == 1U) {
-                    old_wire = current.wire;
-                    current.wire = new_wire;
-                    current.wire_dimmed = dimmed;
-                    new_wire = nullptr;
-                    installed = true;
-                }
-                if (current.pin_count > 0U) --current.pin_count;
-            }
-            xSemaphoreGive(g_cache_mutex);
-        }
-        heap_caps_free(old_wire);
-        heap_caps_free(new_wire);
-
-        if (installed) {
-            ESP_LOGI(TAG,
-                "R.28 wire后台刷新完成：track=%lu slot=%u mode=%s cost=%lums PSRAM_free=%u",
-                static_cast<unsigned long>(track_index),
-                static_cast<unsigned>(slot),
-                dimmed ? "dimmed" : "normal",
-                static_cast<unsigned long>(wire_ms),
-                static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
-        }
-    }
 }
 
 static bool cover_decode_jpeg(const ArtworkCacheLease &lease, Rgb565Source *out)
@@ -513,19 +426,16 @@ static bool cover_render_surface(
     const ArtworkCacheLease &lease,
     uint8_t **out_normal,
     uint8_t **out_dimmed,
-    uint8_t **out_wire,
-    bool wire_dimmed,
     uint16_t *out_source_width,
     uint16_t *out_source_height,
     CoverRenderStats *out_stats)
 {
-    if (out_normal == nullptr || out_dimmed == nullptr || out_wire == nullptr ||
+    if (out_normal == nullptr || out_dimmed == nullptr ||
         out_source_width == nullptr || out_source_height == nullptr) {
         return false;
     }
     *out_normal = nullptr;
     *out_dimmed = nullptr;
-    *out_wire = nullptr;
     *out_source_width = 0U;
     *out_source_height = 0U;
     if (out_stats != nullptr) *out_stats = {};
@@ -555,11 +465,9 @@ static bool cover_render_surface(
 
     uint8_t *normal = cover_alloc_surface();
     uint8_t *dimmed = cover_alloc_surface();
-    uint8_t *wire = cover_alloc_surface();
-    if (normal == nullptr || dimmed == nullptr || wire == nullptr) {
+    if (normal == nullptr || dimmed == nullptr) {
         heap_caps_free(normal);
         heap_caps_free(dimmed);
-        heap_caps_free(wire);
         heap_caps_free(is_jpeg ? static_cast<void *>(jpeg.data) : static_cast<void *>(png.data));
         return false;
     }
@@ -574,7 +482,6 @@ static bool cover_render_surface(
         heap_caps_free(ymap);
         heap_caps_free(normal);
         heap_caps_free(dimmed);
-        heap_caps_free(wire);
         heap_caps_free(is_jpeg ? static_cast<void *>(jpeg.data) : static_cast<void *>(png.data));
         return false;
     }
@@ -599,20 +506,17 @@ static bool cover_render_surface(
     const int64_t resample_started_us = esp_timer_get_time();
     uint16_t *normal16 = reinterpret_cast<uint16_t *>(normal);
     uint16_t *dimmed16 = reinterpret_cast<uint16_t *>(dimmed);
-    uint16_t *wire16 = reinterpret_cast<uint16_t *>(wire);
 
     if (is_jpeg) {
         for (uint32_t y = 0; y < FAKEPOD_LCD_HEIGHT; ++y) {
             const uint16_t *src_row = jpeg.data + static_cast<size_t>(ymap[y]) * sw;
             uint16_t *normal_row = normal16 + static_cast<size_t>(y) * FAKEPOD_LCD_WIDTH;
             uint16_t *dimmed_row = dimmed16 + static_cast<size_t>(y) * FAKEPOD_LCD_WIDTH;
-            uint16_t *wire_row = wire16 + static_cast<size_t>(y) * FAKEPOD_LCD_WIDTH;
             for (uint32_t x = 0; x < FAKEPOD_LCD_WIDTH; ++x) {
                 const uint16_t pixel = src_row[xmap[x]];
                 const uint16_t dimmed_pixel = cover_dim_rgb565(pixel);
                 normal_row[x] = pixel;
                 dimmed_row[x] = dimmed_pixel;
-                wire_row[x] = cover_wire_rgb565(wire_dimmed ? dimmed_pixel : pixel);
             }
             if (((y + 1U) % COVER_COOPERATIVE_ROW_INTERVAL) == 0U) {
                 // taskYIELD() 不会让优先级 0 的 IDLE1 运行；真正阻塞 1 tick，
@@ -625,13 +529,11 @@ static bool cover_render_surface(
             const uint8_t *src_row = png.data + static_cast<size_t>(ymap[y]) * sw * 3U;
             uint16_t *normal_row = normal16 + static_cast<size_t>(y) * FAKEPOD_LCD_WIDTH;
             uint16_t *dimmed_row = dimmed16 + static_cast<size_t>(y) * FAKEPOD_LCD_WIDTH;
-            uint16_t *wire_row = wire16 + static_cast<size_t>(y) * FAKEPOD_LCD_WIDTH;
             for (uint32_t x = 0; x < FAKEPOD_LCD_WIDTH; ++x) {
                 const uint16_t pixel = cover_rgb888_to_rgb565(src_row + static_cast<size_t>(xmap[x]) * 3U);
                 const uint16_t dimmed_pixel = cover_dim_rgb565(pixel);
                 normal_row[x] = pixel;
                 dimmed_row[x] = dimmed_pixel;
-                wire_row[x] = cover_wire_rgb565(wire_dimmed ? dimmed_pixel : pixel);
             }
             if (((y + 1U) % COVER_COOPERATIVE_ROW_INTERVAL) == 0U) {
                 vTaskDelay(1);
@@ -648,7 +550,6 @@ static bool cover_render_surface(
     heap_caps_free(is_jpeg ? static_cast<void *>(jpeg.data) : static_cast<void *>(png.data));
     *out_normal = normal;
     *out_dimmed = dimmed;
-    *out_wire = wire;
     *out_source_width = static_cast<uint16_t>(sw);
     *out_source_height = static_cast<uint16_t>(sh);
     return true;
@@ -658,19 +559,16 @@ static void cover_task_main(void *)
 {
     g_ready = true;
     cover_publish(CoverSurfaceState::Idle, nullptr, ESP_OK, false);
-    ESP_LOGI(TAG, "R.28 封面最终表面服务已启动：%dx%d，每槽 native normal+dimmed + 单wire=%uB×3，两槽总计约=%uB，任务优先级=%u core=%ld",
+    ESP_LOGI(TAG, "R.36 当前曲Surface服务已启动：%dx%d，normal+dimmed=%uB×2，稳态=%uB；2槽仅用于切歌交换，wire=OFF，任务优先级=%u core=%ld",
         FAKEPOD_LCD_WIDTH, FAKEPOD_LCD_HEIGHT,
         static_cast<unsigned>(COVER_SURFACE_BYTES),
-        static_cast<unsigned>(COVER_SURFACE_BYTES * 3U * COVER_CACHE_SLOT_COUNT),
+        static_cast<unsigned>(COVER_SURFACE_BYTES * 2U),
         static_cast<unsigned>(COVER_TASK_PRIORITY), static_cast<long>(COVER_TASK_CORE));
 
     CoverRequest request = {};
     while (true) {
-        // R.28：Track 请求和 wire 偏好变化共用 Task Notification 唤醒，不轮询、不额外占 QueueSet。
+        // R.36：只有当前曲 Surface 请求会唤醒任务，不再处理 wire 偏好或下一曲预热。
         (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        // 先把已经缓存且未 pin 的“下一曲”wire 调整到最新 Overlay 模式。
-        // 即使偏好通知和 Track 请求合并成一次唤醒，也不会漏掉 wire 刷新。
-        cover_refresh_cached_wire_mode(cover_wire_dimmed_preference());
         if (xQueueReceive(g_queue, &request, 0) != pdTRUE) continue;
 
         // 队列长度为 1；如果等待期间又来了更新请求，直接取最新一份。
@@ -683,6 +581,8 @@ static void cover_task_main(void *)
             continue;
         }
 
+        // 若旧 Surface 已经没有 UI lease，先释放再解码，避免无意义的双份峰值。
+        cover_cache_release_unpinned_except(request.catalog_generation, request.track_index);
         cover_publish(CoverSurfaceState::Preparing, &request, ESP_OK, false);
         const int64_t started_us = esp_timer_get_time();
 
@@ -694,14 +594,12 @@ static void cover_task_main(void *)
 
         uint8_t *normal = nullptr;
         uint8_t *dimmed = nullptr;
-        uint8_t *wire = nullptr;
-        const bool wire_dimmed = cover_wire_dimmed_preference();
         uint16_t source_width = 0U;
         uint16_t source_height = 0U;
         CoverRenderStats render_stats = {};
         const MediaArtworkFormatV2 artwork_format = compressed.format;
         const bool rendered = cover_render_surface(
-            compressed, &normal, &dimmed, &wire, wire_dimmed,
+            compressed, &normal, &dimmed,
             &source_width, &source_height, &render_stats);
         artwork_loader_release_cached(&compressed);
 
@@ -709,7 +607,6 @@ static void cover_task_main(void *)
         if (!rendered) {
             heap_caps_free(normal);
             heap_caps_free(dimmed);
-            heap_caps_free(wire);
             cover_publish(CoverSurfaceState::Failed, &request, ESP_FAIL, false, source_width, source_height, prepare_ms);
             ESP_LOGW(TAG, "封面预处理失败：track=%lu，保留 LVGL 压缩图回退路径",
                 static_cast<unsigned long>(request.track_index));
@@ -719,29 +616,28 @@ static void cover_task_main(void *)
         if (!cover_request_is_latest(request)) {
             heap_caps_free(normal);
             heap_caps_free(dimmed);
-            heap_caps_free(wire);
             continue;
         }
 
-        if (!cover_cache_insert(request, normal, dimmed, wire, wire_dimmed)) {
+        if (!cover_cache_insert(request, normal, dimmed)) {
             heap_caps_free(normal);
             heap_caps_free(dimmed);
-            heap_caps_free(wire);
             cover_publish(CoverSurfaceState::Failed, &request, ESP_ERR_NO_MEM, false, source_width, source_height, prepare_ms);
             continue;
         }
 
+        // Surface 已经独立拥有最终像素，压缩 JPEG/PNG 不再需要长期留在 PSRAM。
+        artwork_loader_discard_unpinned();
         cover_publish(CoverSurfaceState::Ready, &request, ESP_OK, false, source_width, source_height, prepare_ms);
         const UBaseType_t stack_hwm = uxTaskGetStackHighWaterMark(nullptr);
         const BaseType_t finish_core = xPortGetCoreID();
         const size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
         const size_t psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
         const char *format_name = artwork_format == MediaArtworkFormatV2::Png ? "PNG" : "JPEG";
-        ESP_LOGI(TAG, "R.28 封面预处理完成：track=%lu format=%s source=%ux%u -> %dx%d native(normal+dimmed)+wire(%s)，总计=%lums 解码=%lums 三Surface采样=%lums core=%ld stack_hwm=%u PSRAM_free=%u largest=%u",
+        ESP_LOGI(TAG, "R.36 当前曲封面完成：track=%lu format=%s source=%ux%u -> %dx%d normal+dimmed，总计=%lums 解码=%lums 双Surface采样=%lums core=%ld stack_hwm=%u PSRAM_free=%u largest=%u",
             static_cast<unsigned long>(request.track_index), format_name,
             static_cast<unsigned>(source_width), static_cast<unsigned>(source_height),
             FAKEPOD_LCD_WIDTH, FAKEPOD_LCD_HEIGHT,
-            wire_dimmed ? "dimmed" : "normal",
             static_cast<unsigned long>(prepare_ms),
             static_cast<unsigned long>(render_stats.decode_ms),
             static_cast<unsigned long>(render_stats.resample_ms),
@@ -778,23 +674,6 @@ esp_err_t cover_surface_cache_start()
 bool cover_surface_cache_is_ready()
 {
     return g_ready;
-}
-
-void cover_surface_cache_set_wire_dimmed_preference(bool dimmed)
-{
-    bool changed = false;
-    portENTER_CRITICAL(&g_wire_pref_mux);
-    if (g_wire_dimmed_preference != dimmed) {
-        g_wire_dimmed_preference = dimmed;
-        changed = true;
-    }
-    portEXIT_CRITICAL(&g_wire_pref_mux);
-
-    if (changed && g_task != nullptr) {
-        xTaskNotifyGive(g_task);
-        ESP_LOGI(TAG, "R.28 wire偏好切换：%s，后台刷新未pin缓存槽",
-            dimmed ? "dimmed" : "normal");
-    }
 }
 
 bool cover_surface_cache_request_track(uint32_t track_index, uint32_t *out_request_id)
@@ -847,8 +726,6 @@ bool cover_surface_cache_acquire(uint32_t track_index, CoverSurfaceLease *out_le
 
     out_lease->normal_rgb565 = entry.normal;
     out_lease->dimmed_rgb565 = entry.dimmed;
-    out_lease->wire_rgb565 = entry.wire;
-    out_lease->wire_dimmed = entry.wire_dimmed;
     out_lease->data_size = entry.size;
     out_lease->width = FAKEPOD_LCD_WIDTH;
     out_lease->height = FAKEPOD_LCD_HEIGHT;
@@ -874,4 +751,10 @@ void cover_surface_cache_release(CoverSurfaceLease *lease)
         xSemaphoreGive(g_cache_mutex);
     }
     *lease = {};
+}
+
+void cover_surface_cache_retain_track(uint32_t track_index)
+{
+    if (track_index == UINT32_MAX) return;
+    cover_cache_release_unpinned_except(media_catalog_v2_generation(), track_index);
 }

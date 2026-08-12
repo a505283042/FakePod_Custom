@@ -371,8 +371,8 @@ void boot_state_update()
             if (artwork_ret != ESP_OK) {
                 ESP_LOGW(TAG, "异步封面加载服务启动失败，继续无封面运行：%s", esp_err_to_name(artwork_ret));
             } else {
-                // P1.2.5：低优先级封面预处理只消费 ArtworkLoader 的 PSRAM 压缩缓存，
-                // 不访问 SD；只生成一张 normal 460x460 RGB565 surface。Overlay 压暗由 LVGL alpha 完成。
+                // R.36：CoverTask 只消费当前曲临时压缩原图，不访问 SD；
+                // 生成 normal + dimmed 两张 460x460 RGB565，成功后压缩原图立即释放。
                 const esp_err_t surface_ret = cover_surface_cache_start();
                 if (surface_ret != ESP_OK) {
                     ESP_LOGW(TAG, "封面最终表面服务启动失败，将使用 LVGL decoder 回退：%s",

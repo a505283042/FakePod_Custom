@@ -12,9 +12,9 @@ esp_err_t now_playing_artwork_create(lv_obj_t *parent, int32_t size_px, lv_obj_t
 void now_playing_artwork_update();
 void now_playing_artwork_refresh_context();
 
-// P1.5R.1.2.2：主页被歌词/频谱/曲库完整覆盖时释放 UI 持有的封面 lease，
-// 避免两槽 Surface cache 被“隐藏的旧封面 + 下一曲”占满，从而淘汰当前曲。
-// 再次激活时会强制按当前 Player context 重新 acquire/cache bind。
+// R.36：主页被歌词/频谱/曲库完整覆盖时释放 UI 持有的封面 lease。
+// 两个 Surface 槽只用于切歌瞬时交换；再次激活时按当前 Player context 重新 acquire/bind，
+// 绑定完成后会清理其它未 pin 槽，稳态只保留当前曲 normal+dimmed。
 void now_playing_artwork_set_active(bool active);
 
 // Overlay 明暗接口。R.20 若命中最终 Surface，则直接切 normal/dimmed 并返回 true；

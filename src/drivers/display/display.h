@@ -90,3 +90,16 @@ esp_err_t display_present_rgb565_region_direct(
     bool wire_order,
     bool wait_for_te,
     DisplayDirectPresentStats *out_stats = nullptr);
+
+// P1.5.3.2R.36.2：DirectPresent 全路径已移除 esp_lcd_panel_io_tx_param(-1) 无超时 barrier。
+// owned 入口继续表示 Launcher/HomeResume 这类同一 LVGL Task 内的连续/恢复提交；底层与普通入口
+// 都只依赖有界 color-done 等待，任何异常都会熔断本次启动的 Direct 快路径并回退 LVGL。
+esp_err_t display_present_rgb565_region_direct_owned(
+    const uint8_t *rgb565,
+    uint16_t x,
+    uint16_t y,
+    uint16_t width,
+    uint16_t height,
+    bool wire_order,
+    bool wait_for_te,
+    DisplayDirectPresentStats *out_stats = nullptr);

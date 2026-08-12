@@ -166,9 +166,9 @@ static constexpr uint32_t kTeSyncForceFullFramePixels =
     (FAKEPOD_LCD_WIDTH * FAKEPOD_LCD_HEIGHT * 9U) / 10U;
 static uint32_t g_te_animation_bypass_count = 0U;
 
-// P1.5.3.2R.18：LVGL RGB565 DMA 条带由 20 行提升到 40 行。
-// 双缓冲总像素 RAM = 460 * 40 * 2B * 2 = 73,600B。
-static constexpr uint32_t kLvglDmaBufferLines = 40U;
+// P1.5.3.2R.36.1：LVGL RGB565 DMA 条带从 40 行收紧到 24 行，为 DirectPresent 和音频留出更多内部 DMA headroom。
+// 双缓冲总像素 RAM = 460 * 24 * 2B * 2 = 44,160B，比 R.18 回收 29,440B。
+static constexpr uint32_t kLvglDmaBufferLines = 24U;
 
 static const char *ui_perf_context_name(UiPerfContext context)
 {
@@ -897,7 +897,7 @@ esp_err_t ui_manager_init()
     const size_t dma_free_after = heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     const size_t dma_largest_after = heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     ESP_LOGI(TAG,
-        "R.18 LVGL DMA双缓冲：%u行/块，理论总计=%uB；DMA free=%u->%u largest=%u->%u",
+        "R.36.1 LVGL DMA双缓冲：%u行/块，理论总计=%uB；DMA free=%u->%u largest=%u->%u",
         static_cast<unsigned>(kLvglDmaBufferLines),
         static_cast<unsigned>(FAKEPOD_LCD_WIDTH * kLvglDmaBufferLines * 2U * 2U),
         static_cast<unsigned>(dma_free_before),

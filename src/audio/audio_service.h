@@ -13,6 +13,11 @@ bool audio_service_is_ready();
 // 获取 AudioTask 发布的只读状态快照。
 bool audio_service_get_snapshot(AudioStateSnapshot *out_snapshot);
 
+// R.36.2.2：获取最近一次真实播放故障的 RAM 快照。
+// 快照会保留到下一次故障或重启，便于偶发停播后再接串口读取。
+bool audio_service_get_last_fault(AudioFaultSnapshot *out_snapshot);
+void audio_service_log_last_fault();
+
 // P1.5.2R.3：获取低优先级 SpectrumFFT 任务发布的 16 路真实频率 band。
 // UI 只能读取快照，不能直接访问 PCM/decoder/I2S。
 bool audio_service_get_spectrum_snapshot(AudioSpectrumSnapshot *out_snapshot);

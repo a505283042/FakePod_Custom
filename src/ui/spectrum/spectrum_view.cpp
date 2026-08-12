@@ -36,6 +36,22 @@ constexpr int16_t SPECTRUM_PEAK_DOT_H = 3;
 constexpr int16_t SPECTRUM_PEAK_DOT_GAP = 4;
 constexpr uint16_t SPECTRUM_PEAK_FALL_PX = 3U; // 20 FPS 下约 60px/s 的独立下落速度。
 
+// P1.5.3.2R.35.2：频谱样式只接受真正轻点。
+// 页面纵向切歌阈值较大，因此这里额外限制整次触摸生命周期最大位移；
+// 任何明显拖动即使没有形成 Swipe，也不能在 RELEASE 后误触发样式切换。
+constexpr int16_t SPECTRUM_STYLE_TAP_MAX_MOVE_PX = 10;
+
+// P1.5.3.2R.35.2：仅调整“显示频谱”的频段视觉增益，不修改 FFT Snapshot，
+// 更不会影响 PCM / I2S 音频输出。AudioSpectrumSnapshot 的 16 band 顺序为低频→高频。
+// 低频保持约 1.00x，中频只轻微抬升，主要从中高频开始补偿，最高频达到 1.50x。
+// 使用 Q8 定点倍率，避免 20 FPS UI 热路径引入浮点运算。
+constexpr uint16_t SPECTRUM_BAND_GAIN_Q8[SPECTRUM_BAR_COUNT] = {
+    256, 256, 256, 256, // 1.00, 1.00, 1.00, 1.00
+    261, 266, 271, 279, // 1.02, 1.04, 1.06, 1.09
+    289, 302, 317, 335, // 1.13, 1.18, 1.24, 1.31
+    353, 366, 376, 384, // 1.38, 1.43, 1.47, 1.50
+};
+
 // P1.5.2R.4.4：频谱下方固定预留两行高度，只显示“当前这一句歌词”。
 // 短句保持单行；需要两行时按实际 glyph 像素宽度寻找更均衡的断点，而不是贪心塞满第一行。
 constexpr int16_t SPECTRUM_LYRIC_X = 22;
@@ -659,7 +675,14 @@ static bool spectrum_snapshot_matches(
 static void spectrum_apply_pcm_snapshot(const AudioSpectrumSnapshot &spectrum)
 {
     for (uint8_t i = 0U; i < SPECTRUM_BAR_COUNT; ++i) {
-        const uint32_t level = spectrum.levels[i];
+        // R.35.2：低频 1.00x → 高频 1.50x，且增益主要集中在高频区。
+        // 先对 0~255 的显示 level 做饱和增益，再映射为像素高度；这样三种频谱样式
+        // 共享完全一致的频响视觉补偿，同时保持 AudioSpectrumSnapshot 原始数据不变。
+        uint32_t level =
+            (static_cast<uint32_t>(spectrum.levels[i]) * SPECTRUM_BAND_GAIN_Q8[i] + 128U) >> 8U;
+        if (level > 255U) {
+            level = 255U;
+        }
         const uint32_t height = SPECTRUM_MIN_H +
             (level * static_cast<uint32_t>(SPECTRUM_MAX_H - SPECTRUM_MIN_H)) / 255U;
         g_bar_target[i] = static_cast<uint16_t>(height);
@@ -1232,8 +1255,10 @@ static void spectrum_root_click_cb(lv_event_t *event)
     if (event == nullptr || lv_event_get_code(event) != LV_EVENT_CLICKED || !g_visible) {
         return;
     }
-    // 页面 Swipe 成立后 LVGL 仍可能补发 CLICKED；只允许真正轻点切换样式。
-    if (gesture_router_should_suppress_click()) {
+    // R.35.2：样式切换只认真正 Tap。除了已成立的 Swipe 会 suppress 外，
+    // 未达到页面手势阈值的普通拖动也必须拒绝，避免“拖了一下频谱却换样式”。
+    if (gesture_router_should_suppress_click() ||
+        !gesture_router_press_was_tap(SPECTRUM_STYLE_TAP_MAX_MOVE_PX)) {
         return;
     }
 
@@ -1244,7 +1269,7 @@ static void spectrum_root_click_cb(lv_event_t *event)
     spectrum_rebuild_style_geometry_cache();
     spectrum_apply_style_layout();
 
-    ESP_LOGI(TAG, "P1.5.3.2R.31 Tap切换频谱样式：style=%u %s",
+    ESP_LOGI(TAG, "P1.5.3.2R.35.2 Tap切换频谱样式：style=%u %s",
         static_cast<unsigned>(g_style), spectrum_style_name(g_style));
 }
 
@@ -1421,7 +1446,7 @@ void spectrum_view_open()
         lv_timer_resume(g_timer);
     }
     audio_service_set_spectrum_enabled(true);
-    ESP_LOGI(TAG, "打开频谱页：P1.5.3.2R.31 当前样式=%u %s；连续帧TE bypass + draw cache；Tap三态切换；右滑返回主页",
+    ESP_LOGI(TAG, "打开频谱页：P1.5.3.2R.35.2 当前样式=%u %s；样式仅Tap切换；频段视觉增益=低频1.00x→高频1.50x(高频集中)；右滑返回主页",
         static_cast<unsigned>(g_style), spectrum_style_name(g_style));
 }
 

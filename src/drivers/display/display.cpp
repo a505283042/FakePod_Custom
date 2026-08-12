@@ -88,6 +88,9 @@ static SemaphoreHandle_t g_tx_done =
 // 对当前 display 调用 lv_display_flush_ready()。
 static lv_display_t *g_lvgl_display = nullptr;
 static volatile bool g_direct_present_active = false;
+// P1.5.3.2R.36.2：DirectPresent 一旦发生 transaction/color-done 异常，本次启动内
+// 立即熔断后续 Direct 快路径，全部回退 LVGL。正确性优先于动画/封面直写性能。
+static bool g_direct_present_faulted = false;
 static bool g_color_done_bridge_installed = false;
 
 
@@ -1274,6 +1277,8 @@ esp_err_t display_install_lvgl_color_done_bridge(void *lvgl_display)
     g_color_done_bridge_installed = true;
     ESP_LOGI(TAG,
         "R.26 color-done桥接已安装：LVGL flush_ready + DirectPresent DMA semaphore 共用Panel IO callback");
+    ESP_LOGI(TAG,
+        "R.36.2 DirectPresent保护：无-1 barrier；color-done=250ms有界等待；异常=最多1s排空+本次启动熔断Direct");
     return ESP_OK;
 }
 
@@ -1290,6 +1295,7 @@ static esp_err_t display_present_rgb565_region_direct_impl(
     uint16_t height,
     bool wire_order,
     bool wait_for_te,
+    bool skip_io_barrier,
     bool log_summary,
     DisplayDirectPresentStats *out_stats)
 {
@@ -1302,6 +1308,9 @@ static esp_err_t display_present_rgb565_region_direct_impl(
         !g_color_done_bridge_installed || g_lvgl_display == nullptr || rgb565 == nullptr) {
         return ESP_ERR_INVALID_STATE;
     }
+    if (g_direct_present_faulted) {
+        return ESP_ERR_INVALID_STATE;
+    }
     if (width == 0U || height == 0U ||
         x >= FAKEPOD_LCD_WIDTH || y >= FAKEPOD_LCD_HEIGHT ||
         static_cast<uint32_t>(x) + width > FAKEPOD_LCD_WIDTH ||
@@ -1309,19 +1318,18 @@ static esp_err_t display_present_rgb565_region_direct_impl(
         return ESP_ERR_INVALID_ARG;
     }
 
-    // 先让 LVGL 已排队的 color transaction 完成。tx_param(-1) 是既有 queue barrier；
-    // barrier 返回后才切到 DirectPresent callback 路由，避免迟到的 LVGL callback 串台。
-    const int64_t barrier_started_us = esp_timer_get_time();
-    esp_err_t result = esp_lcd_panel_io_tx_param(g_panel_io, -1, nullptr, 0);
-    if (result != ESP_OK) {
-        ESP_LOGW(TAG, "R.29 ContinuousGRAM：Panel IO queue barrier失败：%s", esp_err_to_name(result));
-        return result;
-    }
-    stats.io_barrier_us = static_cast<uint32_t>(esp_timer_get_time() - barrier_started_us);
+    // R.36.2：彻底移除 DirectPresent 的 esp_lcd_panel_io_tx_param(-1) queue barrier。
+    // 所有当前调用点都运行在 LVGL Task 的事件/timer 上下文；LVGL 自己的 flush 在进入这些业务
+    // callback 前已经完成等待。旧 barrier 没有 timeout，实机反复 Launcher 时已证明它能永久阻塞
+    // UI Task。现在 DirectPresent 只依赖每笔 color transaction 的 250ms 有界完成等待。
+    // skip_io_barrier 参数暂时保留 ABI/调用结构，R.36.2 后两种入口都统一为 no-barrier。
+    (void) skip_io_barrier;
+    esp_err_t result = ESP_OK;
+    stats.io_barrier_us = 0U;
 
-    while (xSemaphoreTake(g_tx_done, 0) == pdTRUE) {
-    }
-    g_direct_present_active = true;
+    // R.36.2：此处先不要切换 color-done 路由。DMA 申请、窗口参数和 TE 等待都不会
+    // 产生 Direct color callback；把 direct-active 窗口压缩到真正的 tx_color 流水阶段，
+    // 可显著降低“上一笔 LVGL color-done 迟到后被误送进 g_tx_done”的机会。
 
     // 继续沿用 R.27/R.28 的自适应双 Internal DMA staging。R.29 的优化点不是增大 buffer，
     // 而是让两个 buffer 对应的 color transaction 真正排队连续发送。
@@ -1469,7 +1477,10 @@ static esp_err_t display_present_rgb565_region_direct_impl(
         stats.te_wait_us = static_cast<uint32_t>(esp_timer_get_time() - te_started_us);
     }
 
-    while (xSemaphoreTake(g_tx_done, 0) == pdTRUE) {
+    if (result == ESP_OK) {
+        while (xSemaphoreTake(g_tx_done, 0) == pdTRUE) {
+        }
+        g_direct_present_active = true;
     }
 
     int64_t stream_started_us = 0;
@@ -1574,10 +1585,30 @@ static esp_err_t display_present_rgb565_region_direct_impl(
         ? static_cast<uint32_t>(serial_estimate_us - stats.pipeline_us)
         : 0U;
 
-    // 异常路径强制 queue barrier，正常路径理论上所有 color-done 已消费；无论哪种情况都清理
-    // 多余计数后才恢复 LVGL callback 路由。
+    // R.36.2：错误恢复路径绝不能再次进入 esp_lcd_panel_io_tx_param(-1) 的无超时
+    // queue barrier，否则本来只是一次 DirectPresent 失败会升级成 LVGL/UI Task 永久卡死。
+    // 已成功提交的 color transaction 数量是确定的；异常时最多再给驱动 1 秒完成剩余 callback。
+    // 若 1 秒仍未收齐，熔断本次启动的 Direct 快路径，后续封面/Launcher 全部回退 LVGL。
     if (result != ESP_OK) {
-        (void) esp_lcd_panel_io_tx_param(g_panel_io, -1, nullptr, 0);
+        const uint16_t submitted = stats.chunks;
+        const int64_t recovery_deadline_us = esp_timer_get_time() + 1000000LL;
+        while (completed_count < submitted && esp_timer_get_time() < recovery_deadline_us) {
+            if (xSemaphoreTake(g_tx_done, pdMS_TO_TICKS(20)) == pdTRUE) {
+                ++completed_count;
+            }
+        }
+        if (completed_count < submitted) {
+            ESP_LOGE(TAG,
+                "R.36.2 DirectPresent恢复超时：completed=%u submitted=%u；熔断Direct快路径，后续仅LVGL",
+                static_cast<unsigned>(completed_count),
+                static_cast<unsigned>(submitted));
+        } else {
+            ESP_LOGW(TAG,
+                "R.36.2 DirectPresent异常已有限排空：completed=%u submitted=%u；仍熔断Direct快路径",
+                static_cast<unsigned>(completed_count),
+                static_cast<unsigned>(submitted));
+        }
+        g_direct_present_faulted = true;
     }
     while (xSemaphoreTake(g_tx_done, 0) == pdTRUE) {
     }
@@ -1630,7 +1661,7 @@ esp_err_t display_present_rgb565_direct(
     DisplayDirectPresentStats *out_stats)
 {
     return display_present_rgb565_region_direct_impl(
-        rgb565, 0U, 0U, width, height, wire_order, true, true, out_stats);
+        rgb565, 0U, 0U, width, height, wire_order, true, false, true, out_stats);
 }
 
 esp_err_t display_present_rgb565_region_direct(
@@ -1644,7 +1675,21 @@ esp_err_t display_present_rgb565_region_direct(
     DisplayDirectPresentStats *out_stats)
 {
     return display_present_rgb565_region_direct_impl(
-        rgb565, x, y, width, height, wire_order, wait_for_te, false, out_stats);
+        rgb565, x, y, width, height, wire_order, wait_for_te, false, false, out_stats);
+}
+
+esp_err_t display_present_rgb565_region_direct_owned(
+    const uint8_t *rgb565,
+    uint16_t x,
+    uint16_t y,
+    uint16_t width,
+    uint16_t height,
+    bool wire_order,
+    bool wait_for_te,
+    DisplayDirectPresentStats *out_stats)
+{
+    return display_present_rgb565_region_direct_impl(
+        rgb565, x, y, width, height, wire_order, wait_for_te, true, false, out_stats);
 }
 
 

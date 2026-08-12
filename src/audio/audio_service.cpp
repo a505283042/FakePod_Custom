@@ -132,6 +132,12 @@ static uint32_t g_latest_transport_intent_revision = 0;
 static portMUX_TYPE g_snapshot_mux = portMUX_INITIALIZER_UNLOCKED;
 static AudioStateSnapshot g_snapshot = {};
 
+// R.36.2.2：最近一次真实播放故障保留在独立 POD 快照中。
+// 即使关闭高频诊断，故障现场也不会随着 pipeline shutdown 丢失。
+static portMUX_TYPE g_fault_snapshot_mux = portMUX_INITIALIZER_UNLOCKED;
+static AudioFaultSnapshot g_fault_snapshot = {};
+static uint32_t g_fault_count = 0;
+
 // 以下状态只允许 AudioTask 自己写。
 static bool g_task_ready = false;
 static AudioPlaybackState g_task_state = AudioPlaybackState::Starting;
@@ -1068,8 +1074,109 @@ static esp_err_t audio_task_start_pcm_pipeline(
     return ESP_OK;
 }
 
+static AudioFaultStage audio_fault_stage_from_name(const char *stage)
+{
+    if (stage == nullptr) return AudioFaultStage::Unknown;
+    if (strcmp(stage, "读取PCM") == 0) return AudioFaultStage::ReadPcm;
+    if (strcmp(stage, "PCM无进度") == 0) return AudioFaultStage::PcmNoProgress;
+    if (strcmp(stage, "首PCM解除静音") == 0) return AudioFaultStage::FirstPcmUnmute;
+    if (strcmp(stage, "I2S发送") == 0) return AudioFaultStage::I2sWrite;
+    if (strcmp(stage, "暂停静音") == 0) return AudioFaultStage::PauseMute;
+    if (strcmp(stage, "恢复播放") == 0) return AudioFaultStage::ResumePlayback;
+    return AudioFaultStage::Unknown;
+}
+
+static const char *audio_fault_stage_name(AudioFaultStage stage)
+{
+    switch (stage) {
+        case AudioFaultStage::ReadPcm: return "读取PCM";
+        case AudioFaultStage::PcmNoProgress: return "PCM无进度";
+        case AudioFaultStage::FirstPcmUnmute: return "首PCM解除静音";
+        case AudioFaultStage::I2sWrite: return "I2S发送";
+        case AudioFaultStage::PauseMute: return "暂停静音";
+        case AudioFaultStage::ResumePlayback: return "恢复播放";
+        case AudioFaultStage::EofDrain: return "EOF排空";
+        case AudioFaultStage::None: return "无";
+        case AudioFaultStage::Unknown:
+        default: return "未知";
+    }
+}
+
+static void audio_task_capture_fault(esp_err_t error, const char *stage)
+{
+    AudioFaultSnapshot snapshot = {};
+    snapshot.valid = true;
+    snapshot.stage = audio_fault_stage_from_name(stage);
+    snapshot.error = error;
+    snapshot.playback_revision = g_task_playback_revision;
+    snapshot.track_index = g_task_track_index;
+    snapshot.format = g_task_format;
+    snapshot.sample_rate_hz = g_task_sample_rate_hz;
+    snapshot.channels = g_task_channels;
+    snapshot.bits_per_sample = g_task_bits_per_sample;
+    snapshot.position_frames = g_playback_clock.submitted_frames;
+    snapshot.decoder_position_frames = g_playback_clock.decoder_frames;
+
+    if (g_task_format == MediaFormat::FLAC && flac_decoder_is_open(&g_decoder.flac)) {
+        FlacPrefetchRuntimeSnapshot flac = {};
+        if (flac_decoder_get_prefetch_runtime(&g_decoder.flac, &flac)) {
+            snapshot.flac_prefetch_active = flac.active;
+            snapshot.flac_prefetch_io_error = flac.io_error;
+            snapshot.flac_prefetch_eof = flac.eof;
+            snapshot.flac_prefetch_pressure = flac.pressure_active;
+            snapshot.flac_qos_level = static_cast<uint8_t>(flac.qos_level);
+            snapshot.flac_ring_buffered_bytes = flac.buffered_bytes;
+            snapshot.flac_ring_capacity_bytes = flac.capacity_bytes;
+            snapshot.flac_ring_min_buffered_bytes = flac.min_buffered_bytes;
+            snapshot.flac_emergency_entries = flac.emergency_entries;
+            snapshot.flac_recovered_count = flac.recovered_count;
+            snapshot.flac_max_consecutive_reads = flac.max_consecutive_reads;
+        }
+    }
+
+    snapshot.internal_free_bytes = static_cast<uint32_t>(
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    snapshot.internal_min_bytes = static_cast<uint32_t>(
+        heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    snapshot.internal_largest_bytes = static_cast<uint32_t>(
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    snapshot.dma_free_bytes = static_cast<uint32_t>(
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+    snapshot.psram_free_bytes = static_cast<uint32_t>(
+        heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+
+    portENTER_CRITICAL(&g_fault_snapshot_mux);
+    snapshot.sequence = g_fault_snapshot.sequence + 1U;
+    snapshot.fault_count = ++g_fault_count;
+    g_fault_snapshot = snapshot;
+    portEXIT_CRITICAL(&g_fault_snapshot_mux);
+
+    // 真实故障只打印一次短快照；若当时未开串口，system_loop 会在 Error 状态低频重报。
+    ESP_LOGE(TAG,
+        "R.36.2.2 AUDIO_FAULT：count=%lu stage=%s err=%s track=%lu rev=%lu rate=%luHz pos=%lluf ring=%lu/%luB min=%luB qos=%u pressure=%u ioerr=%u emergency=%lu/%lu RAM(internal/dma/psram)=%lu/%lu/%lu",
+        static_cast<unsigned long>(snapshot.fault_count),
+        audio_fault_stage_name(snapshot.stage),
+        esp_err_to_name(snapshot.error),
+        static_cast<unsigned long>(snapshot.track_index),
+        static_cast<unsigned long>(snapshot.playback_revision),
+        static_cast<unsigned long>(snapshot.sample_rate_hz),
+        static_cast<unsigned long long>(snapshot.position_frames),
+        static_cast<unsigned long>(snapshot.flac_ring_buffered_bytes),
+        static_cast<unsigned long>(snapshot.flac_ring_capacity_bytes),
+        static_cast<unsigned long>(snapshot.flac_ring_min_buffered_bytes),
+        static_cast<unsigned>(snapshot.flac_qos_level),
+        static_cast<unsigned>(snapshot.flac_prefetch_pressure),
+        static_cast<unsigned>(snapshot.flac_prefetch_io_error),
+        static_cast<unsigned long>(snapshot.flac_emergency_entries),
+        static_cast<unsigned long>(snapshot.flac_recovered_count),
+        static_cast<unsigned long>(snapshot.internal_free_bytes),
+        static_cast<unsigned long>(snapshot.dma_free_bytes),
+        static_cast<unsigned long>(snapshot.psram_free_bytes));
+}
+
 static void audio_task_fail_stream(esp_err_t error, const char *stage)
 {
+    audio_task_capture_fault(error, stage);
     ESP_LOGE(TAG, "%s播放失败：阶段=%s，错误=%s",
         media_format_name(g_task_format),
         stage != nullptr ? stage : "未知",
@@ -2055,6 +2162,49 @@ bool audio_service_get_snapshot(AudioStateSnapshot *out_snapshot)
     *out_snapshot = g_snapshot;
     portEXIT_CRITICAL(&g_snapshot_mux);
     return true;
+}
+
+bool audio_service_get_last_fault(AudioFaultSnapshot *out_snapshot)
+{
+    if (out_snapshot == nullptr) {
+        return false;
+    }
+    portENTER_CRITICAL(&g_fault_snapshot_mux);
+    *out_snapshot = g_fault_snapshot;
+    portEXIT_CRITICAL(&g_fault_snapshot_mux);
+    return out_snapshot->valid;
+}
+
+void audio_service_log_last_fault()
+{
+    AudioFaultSnapshot snapshot = {};
+    if (!audio_service_get_last_fault(&snapshot)) {
+        return;
+    }
+    ESP_LOGE(TAG,
+        "R.36.2.2 AUDIO_FAULT_SNAPSHOT：count=%lu stage=%s err=%s track=%lu rev=%lu rate=%luHz pos=%lluf ring=%lu/%luB min=%luB qos=%u pressure=%u ioerr=%u eof=%u emergency=%lu recovered=%lu maxread=%lu RAM(internal/min/largest/dma/psram)=%lu/%lu/%lu/%lu/%lu",
+        static_cast<unsigned long>(snapshot.fault_count),
+        audio_fault_stage_name(snapshot.stage),
+        esp_err_to_name(snapshot.error),
+        static_cast<unsigned long>(snapshot.track_index),
+        static_cast<unsigned long>(snapshot.playback_revision),
+        static_cast<unsigned long>(snapshot.sample_rate_hz),
+        static_cast<unsigned long long>(snapshot.position_frames),
+        static_cast<unsigned long>(snapshot.flac_ring_buffered_bytes),
+        static_cast<unsigned long>(snapshot.flac_ring_capacity_bytes),
+        static_cast<unsigned long>(snapshot.flac_ring_min_buffered_bytes),
+        static_cast<unsigned>(snapshot.flac_qos_level),
+        static_cast<unsigned>(snapshot.flac_prefetch_pressure),
+        static_cast<unsigned>(snapshot.flac_prefetch_io_error),
+        static_cast<unsigned>(snapshot.flac_prefetch_eof),
+        static_cast<unsigned long>(snapshot.flac_emergency_entries),
+        static_cast<unsigned long>(snapshot.flac_recovered_count),
+        static_cast<unsigned long>(snapshot.flac_max_consecutive_reads),
+        static_cast<unsigned long>(snapshot.internal_free_bytes),
+        static_cast<unsigned long>(snapshot.internal_min_bytes),
+        static_cast<unsigned long>(snapshot.internal_largest_bytes),
+        static_cast<unsigned long>(snapshot.dma_free_bytes),
+        static_cast<unsigned long>(snapshot.psram_free_bytes));
 }
 
 bool audio_service_get_spectrum_snapshot(AudioSpectrumSnapshot *out_snapshot)

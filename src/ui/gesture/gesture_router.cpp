@@ -9,6 +9,11 @@ constexpr int16_t kHorizontalTriggerPx = 72;
 constexpr int16_t kEdgeTriggerPx = 72;
 constexpr int16_t kTopEdgePx = 42;
 constexpr int16_t kBottomEdgePx = 417; // 460 - 43
+// R.35.1：中央纵向切歌必须比边缘导航更“明确”，避免普通轻拖/歌词阅读误切歌。
+// 起点严格排除顶部42px与底部43px；边缘手势仍拥有最高优先级。
+constexpr int16_t kTrackVerticalTriggerPx = 86;
+constexpr int16_t kTrackVerticalDominancePercent = 135;
+constexpr uint32_t kTrackVerticalMinSpeedPxPerSec = 110U;
 constexpr uint32_t kHorizontalMinSpeedPxPerSec = 45U;
 constexpr uint32_t kEdgeMinSpeedPxPerSec = 40U;
 constexpr int16_t kVerticalAdjustTriggerPx = 12;
@@ -116,15 +121,28 @@ static UiGestureAction gesture_classify(uint32_t tick_ms)
     const uint32_t elapsed_ms = tick_ms - g_state.start_tick_ms;
 
     if (g_state.axis == GestureAxis::Vertical) {
-        if (g_state.start_y <= kTopEdgePx && dy >= kEdgeTriggerPx &&
-            ay * 100 >= ax * 125 &&
-            gesture_speed_ok(ay, elapsed_ms, kEdgeMinSpeedPxPerSec)) {
-            return UiGestureAction::PullDownFromTop;
+        // 顶部/底部边缘永久保留给全局导航；即使反方向拖动，也不下放成切歌。
+        if (g_state.start_y <= kTopEdgePx) {
+            if (dy >= kEdgeTriggerPx && ay * 100 >= ax * 125 &&
+                gesture_speed_ok(ay, elapsed_ms, kEdgeMinSpeedPxPerSec)) {
+                return UiGestureAction::PullDownFromTop;
+            }
+            return UiGestureAction::None;
         }
-        if (g_state.start_y >= kBottomEdgePx && dy <= -kEdgeTriggerPx &&
-            ay * 100 >= ax * 125 &&
-            gesture_speed_ok(ay, elapsed_ms, kEdgeMinSpeedPxPerSec)) {
-            return UiGestureAction::PullUpFromBottom;
+        if (g_state.start_y >= kBottomEdgePx) {
+            if (dy <= -kEdgeTriggerPx && ay * 100 >= ax * 125 &&
+                gesture_speed_ok(ay, elapsed_ms, kEdgeMinSpeedPxPerSec)) {
+                return UiGestureAction::PullUpFromBottom;
+            }
+            return UiGestureAction::None;
+        }
+
+        // R.35.1：中央区域明确纵向 Flick 才发布切歌动作。动作只在 RELEASE
+        // 分类一次，因此一次完整触摸生命周期最多提交一次上一曲/下一曲。
+        if (ay >= kTrackVerticalTriggerPx &&
+            ay * 100 >= ax * kTrackVerticalDominancePercent &&
+            gesture_speed_ok(ay, elapsed_ms, kTrackVerticalMinSpeedPxPerSec)) {
+            return dy < 0 ? UiGestureAction::SwipeUpTrack : UiGestureAction::SwipeDownTrack;
         }
         return UiGestureAction::None;
     }
@@ -308,6 +326,8 @@ const char *gesture_router_action_name(UiGestureAction action)
     switch (action) {
         case UiGestureAction::SwipeLeft: return "左滑";
         case UiGestureAction::SwipeRight: return "右滑";
+        case UiGestureAction::SwipeUpTrack: return "上滑切下一曲";
+        case UiGestureAction::SwipeDownTrack: return "下滑切上一曲";
         case UiGestureAction::PullDownFromTop: return "顶部下拉";
         case UiGestureAction::PullUpFromBottom: return "底部上滑";
         default: return "无";

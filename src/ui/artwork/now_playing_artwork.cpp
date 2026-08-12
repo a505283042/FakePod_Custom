@@ -29,8 +29,8 @@ static const char *TAG = "封面界面";
 // 压缩图直接交给 LVGL 的路径只保留为兼容回退（例如不受 esp_new_jpeg 支持的 JPEG）。
 // R.20 正常路径由 CoverSurfaceTask 同时预处理 normal + dimmed 两张 460x460 RGB565。
 // R.22 起跨 Track 替换时保留旧封面直到新 Surface 真正可用，“准备封面/读取封面”不再可见。
-// R.29 优先使用 R.28 wire-order Surface，并通过 Continuous GRAM Stream 提交 CO5300；
-// wire 明暗模式未及时跟上时才回退 R.27 native 在线 swap，不改变 LVGL image source 仍使用 native Surface。
+// R.36 取消第三张 wire-order Surface；Continuous GRAM 直接消费 native normal/dimmed，
+// 在双 DMA staging 拷贝时在线 byte-swap。用少量切歌 CPU 时间换回 423KB 稳态 PSRAM。
 static constexpr size_t kArtworkDecodedBudgetBytes = 3U * 1024U * 1024U;
 static constexpr size_t kArtworkPsramSafetyReserveBytes = 768U * 1024U;
 static constexpr uint32_t kLvImageScaleNone = 256U;
@@ -180,11 +180,7 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
     const uint8_t *present_surface = g_dimmed_requested
         ? lease.dimmed_rgb565
         : lease.normal_rgb565;
-    const bool wire_match = lease.wire_rgb565 != nullptr &&
-        lease.wire_dimmed == g_dimmed_requested;
-    const uint8_t *direct_surface = wire_match
-        ? lease.wire_rgb565
-        : present_surface;
+    const uint8_t *direct_surface = present_surface;
 
     bool direct_presented = false;
     DisplayDirectPresentStats direct_stats = {};
@@ -194,7 +190,7 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
             direct_surface,
             lease.width,
             lease.height,
-            wire_match,
+            false,
             &direct_stats);
         direct_presented = direct_ret == ESP_OK;
         if (!direct_presented && direct_ret == ESP_ERR_NO_MEM) {
@@ -224,6 +220,10 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
     // 新 lease 已经到手后才释放旧 lease；等待阶段旧图一直可见。
     artwork_ui_release_all_sources(false);
     g_surface_lease = lease;
+    // R.36：新 Surface 已 pin、旧 lease 已释放。此时清理交换槽中的旧曲，
+    // 并释放所有未被 fallback 固定的压缩原图，稳态只留下当前 normal+dimmed。
+    cover_surface_cache_retain_track(track_index);
+    artwork_loader_discard_unpinned();
     artwork_ui_init_rgb565_dsc(
         &g_surface_normal_dsc,
         g_surface_lease.normal_rgb565,
@@ -268,7 +268,7 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
             "R.29 封面ContinuousGRAM完成：%lu -> %lu source=%s total=%uus barrier=%uus window=%uus te=%uus pipeline=%uus stream=%uus copy=%uus swap=%uus wait=%uus overlap≈%uus chunks=%u queue_peak=%u staging=%u行×%u total=%uB dim=%u",
             static_cast<unsigned long>(previous_track),
             static_cast<unsigned long>(track_index),
-            direct_stats.wire_order ? "wire" : "native-fallback",
+            "native",
             static_cast<unsigned>(direct_stats.total_us),
             static_cast<unsigned>(direct_stats.io_barrier_us),
             static_cast<unsigned>(direct_stats.window_setup_us),
@@ -576,8 +576,8 @@ void now_playing_artwork_set_active(bool active)
 
     if (!g_active) {
         g_direct_present_event_pending = false;
-        // 页面被完整覆盖后，LVGL 不会再绘制这张图。立即释放 UI lease，
-        // 让两槽 cache 可以稳定保存 current + next，而不是 hidden-old + next。
+        // 页面被完整覆盖后，LVGL 不会再绘制这张图。立即释放 UI lease；
+        // R.36 的交换槽因此可在下一次 current 请求前提前回收旧 Surface。
         artwork_ui_release_all_sources();
         if (g_placeholder_icon != nullptr) lv_obj_add_flag(g_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
         if (g_status != nullptr) lv_obj_add_flag(g_status, LV_OBJ_FLAG_HIDDEN);
@@ -586,8 +586,8 @@ void now_playing_artwork_set_active(bool active)
         return;
     }
 
-    // 恢复时强制重新读取 Player context。即便切歌期间 UI timer 一直暂停，
-    // 也能直接 acquire 已预热好的当前曲 Surface；未命中时保持纯黑，不显示“准备封面”。
+    // 恢复时强制重新读取 Player context。当前曲 Surface 已完成则直接 acquire；
+    // 尚未完成时保持 LCD/纯黑，不显示“准备封面”。
     artwork_ui_sync_context(true);
     ARTWORK_UI_TRACE("RESUME rebind context_track=%lu",
         static_cast<unsigned long>(g_context_track));
@@ -600,8 +600,8 @@ void now_playing_artwork_update()
     artwork_ui_sync_context(false);
     if (g_context_track == UINT32_MAX) return;
 
-    // 先直接查最终 RGB565 cache。预热任务可能在 UI 消费 Ready 事件前就开始处理下一首，
-    // 因此显示正确性以 cache 命中为准，不依赖“必须看到某一次 Ready Snapshot”。
+    // 先直接查当前曲最终 RGB565 Surface。显示正确性以 cache 命中为准，
+    // 不依赖 UI 必须消费某一次 Ready Snapshot。
     if (cover_surface_cache_is_ready() && !artwork_ui_source_matches_context()) {
         (void)artwork_ui_apply_surface(g_context_track);
     }
@@ -645,8 +645,8 @@ void now_playing_artwork_update()
             break;
 
         case ArtworkLoadState::Ready:
-            // P1.2.6：Surface 请求统一由 system_loop 的资源编排器发出，UI 只消费缓存。
-            // 这样当前曲与下一曲预热不会在两个线程里重复提交 latest-wins 请求。
+            // R.36：Surface 请求统一由 system_loop 发出，UI 只消费当前曲缓存。
+            // ArtworkLoader Ready 只表示压缩原图已到 PSRAM，随后由 CoverTask 后台解码。
             if (cover_surface_cache_is_ready()) {
                 if (!artwork_ui_source_matches_context()) {
                     artwork_ui_show_waiting_without_placeholder();
@@ -680,10 +680,7 @@ void now_playing_artwork_update()
 bool now_playing_artwork_set_dimmed(bool dimmed)
 {
     g_dimmed_requested = dimmed;
-    // R.28：仅通知后台 CoverSurfaceTask 刷新下一曲 wire-order Surface；
-    // UI 线程不做 423KB byte-swap，因此 Overlay 开关本身不会增加一帧级卡顿。
-    cover_surface_cache_set_wire_dimmed_preference(dimmed);
-
+    // R.36：Overlay 只切 normal/dimmed native Surface；不再分配/刷新第三张 wire。
     // R.20：最终 Surface 命中时直接在 normal / dimmed 两张 RGB565 之间切换。
     // 没有 alpha blend、JPEG/PNG decode 或 resize；调用方可把全屏黑色 backdrop 设为透明。
     if (!g_has_surface_source || g_image == nullptr ||

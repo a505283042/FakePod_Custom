@@ -23,7 +23,7 @@ static constexpr size_t FLAC_INPUT_BUFFER_BYTES = 32768;
 // 在 Simple Decoder parser 模式下，尽量让下一完整 FLAC 压缩帧连续落在同一个输入窗口中。
 // STREAMINFO 的 max_frame_size 再留少量保护字节，避免窗口边界导致一次 PCM refill 需要两轮 process。
 static constexpr size_t FLAC_INPUT_FRAME_GUARD_BYTES = 64;
-static constexpr size_t FLAC_PREFETCH_RING_48K_BYTES = 128 * 1024;
+static constexpr size_t FLAC_PREFETCH_RING_48K_BYTES = 192 * 1024;
 static constexpr size_t FLAC_PREFETCH_RING_96K_BYTES = 192 * 1024;
 static constexpr size_t FLAC_PREFETCH_RING_192K_BYTES = 256 * 1024;
 static constexpr size_t FLAC_PREFETCH_READ_48K_BYTES = 8192;
@@ -45,8 +45,8 @@ static constexpr TickType_t FLAC_PREFETCH_COOPERATIVE_BLOCK_TICKS = 1;
 // ring 水位越低，允许连续补充的读取次数越多；但 Emergency 也保留硬上限，
 // 最迟连续8次真实 SD 读取后必须阻塞1 tick，避免重新引入 P1.2.9 的 IDLE1 WDT。
 static constexpr uint32_t FLAC_PREFETCH_COOPERATIVE_READ_BATCH = 4;  // 起播阶段保持 P1.2.15 行为
-static constexpr uint32_t FLAC_PREFETCH_QOS_EMERGENCY_PERCENT = 60;
-static constexpr uint32_t FLAC_PREFETCH_QOS_RECOVERY_PERCENT = 80;
+static constexpr uint32_t FLAC_PREFETCH_QOS_EMERGENCY_PERCENT = 70;
+static constexpr uint32_t FLAC_PREFETCH_QOS_RECOVERY_PERCENT = 90;
 static constexpr uint32_t FLAC_PREFETCH_QOS_PLENTY_PERCENT = 92;
 static constexpr uint32_t FLAC_PREFETCH_QOS_BATCH_EMERGENCY = 8;
 static constexpr uint32_t FLAC_PREFETCH_QOS_BATCH_RECOVERY = 6;
@@ -153,14 +153,14 @@ struct FlacPrefetchContext
     // P1.5R.2 Adaptive Prefetch QoS。起播预充完成前保持 P1.2.15 固定批次，
     // 正式播放后才按 ring 水位动态决定下一次 cooperative block 的批次。
     volatile bool adaptive_qos_active = false;
-    bool qos_tracking_started = false;
-    bool qos_pressure_active = false;
-    FlacPrefetchQosState qos_state = FlacPrefetchQosState::Normal;
-    size_t qos_min_buffered_bytes = 0;
-    uint32_t qos_emergency_entries = 0;
-    uint32_t qos_recovered_count = 0;
-    uint32_t qos_max_consecutive_reads = 0;
-    uint32_t qos_cooperative_blocks = 0;
+    volatile bool qos_tracking_started = false;
+    volatile bool qos_pressure_active = false;
+    volatile FlacPrefetchQosState qos_state = FlacPrefetchQosState::Normal;
+    volatile size_t qos_min_buffered_bytes = 0;
+    volatile uint32_t qos_emergency_entries = 0;
+    volatile uint32_t qos_recovered_count = 0;
+    volatile uint32_t qos_max_consecutive_reads = 0;
+    volatile uint32_t qos_cooperative_blocks = 0;
 #if APP_DIAG_FLAC_PERFORMANCE
     volatile UBaseType_t stack_hwm = 0;
     uint64_t perf_read_total_us = 0;
@@ -201,6 +201,41 @@ bool flac_decoder_get_storage_window(FlacStorageWindowSnapshot *out_snapshot)
     portENTER_CRITICAL(&g_flac_storage_window_mux);
     *out_snapshot = g_flac_storage_window;
     portEXIT_CRITICAL(&g_flac_storage_window_mux);
+    return true;
+}
+
+
+bool flac_decoder_get_prefetch_runtime(
+    const FlacDecoder *decoder,
+    FlacPrefetchRuntimeSnapshot *out_snapshot)
+{
+    if (out_snapshot == nullptr) {
+        return false;
+    }
+    *out_snapshot = {};
+    if (decoder == nullptr) {
+        return false;
+    }
+
+    const FlacPrefetchContext *context = static_cast<const FlacPrefetchContext *>(decoder->prefetch_context);
+    if (context == nullptr || context->stream == nullptr) {
+        return false;
+    }
+
+    out_snapshot->active = true;
+    out_snapshot->adaptive_qos_active = context->adaptive_qos_active;
+    out_snapshot->pressure_active = context->qos_pressure_active;
+    out_snapshot->io_error = context->io_error;
+    out_snapshot->eof = context->eof;
+    out_snapshot->qos_level = static_cast<uint8_t>(context->qos_state);
+    out_snapshot->sample_rate_hz = context->sample_rate_hz;
+    out_snapshot->buffered_bytes = static_cast<uint32_t>(xStreamBufferBytesAvailable(context->stream));
+    out_snapshot->capacity_bytes = static_cast<uint32_t>(context->ring_bytes);
+    out_snapshot->min_buffered_bytes = static_cast<uint32_t>(context->qos_min_buffered_bytes);
+    out_snapshot->emergency_entries = context->qos_emergency_entries;
+    out_snapshot->recovered_count = context->qos_recovered_count;
+    out_snapshot->max_consecutive_reads = context->qos_max_consecutive_reads;
+    out_snapshot->cooperative_blocks = context->qos_cooperative_blocks;
     return true;
 }
 
@@ -283,7 +318,7 @@ static FlacPrefetchQosState flac_prefetch_qos_observe(
 
     if (!context->qos_tracking_started) {
         // 起播目标本来就可能只有 ring 的25%/50%，不能把这段“有意的低水位”
-        // 计入稳态最小值。首次恢复到 >=80% 后再开始记录运行期 QoS。
+        // 计入稳态最小值。首次恢复到 >=90% 后再开始记录运行期 QoS。
         context->qos_state = state;
         if (state == FlacPrefetchQosState::Normal || state == FlacPrefetchQosState::Plenty) {
             context->qos_tracking_started = true;
@@ -296,7 +331,8 @@ static FlacPrefetchQosState flac_prefetch_qos_observe(
         context->qos_min_buffered_bytes = buffered_bytes;
     }
 
-    // Emergency 进入阈值与恢复阈值分离（<60% / >=80%），避免水位在边界附近抖动时刷日志。
+    // R.36.2.2：Emergency 提前到 <70%，恢复提高到 >=90%，给 LVGL 大刷新留出更大的预取余量；
+    // 进入/恢复阈值继续分离，避免水位在边界附近抖动时刷日志。
     if (
         state == FlacPrefetchQosState::Emergency &&
         context->qos_state != FlacPrefetchQosState::Emergency &&
@@ -305,7 +341,7 @@ static FlacPrefetchQosState flac_prefetch_qos_observe(
         context->qos_pressure_active = true;
         ++context->qos_emergency_entries;
         ESP_LOGW(TAG,
-            "P1.5R.2 FLAC预取进入Emergency：ring=%u/%uB (%u%%)，切换到最多%u次连续读取",
+            "R.36.2.2 FLAC预取进入Emergency：ring=%u/%uB (%u%%)，切换到最多%u次连续读取",
             static_cast<unsigned>(buffered_bytes),
             static_cast<unsigned>(context->ring_bytes),
             static_cast<unsigned>(flac_prefetch_qos_percent(buffered_bytes, context->ring_bytes)),
@@ -317,7 +353,7 @@ static FlacPrefetchQosState flac_prefetch_qos_observe(
         context->qos_pressure_active = false;
         ++context->qos_recovered_count;
         ESP_LOGI(TAG,
-            "P1.5R.2 FLAC预取已恢复Normal：ring=%u/%uB (%u%%)",
+            "R.36.2.2 FLAC预取已恢复Normal：ring=%u/%uB (%u%%)",
             static_cast<unsigned>(buffered_bytes),
             static_cast<unsigned>(context->ring_bytes),
             static_cast<unsigned>(flac_prefetch_qos_percent(buffered_bytes, context->ring_bytes)));
@@ -875,7 +911,7 @@ static esp_err_t flac_prefetch_start(FlacDecoder *decoder)
     context->qos_cooperative_blocks = 0;
     context->adaptive_qos_active = true;
     ESP_LOGI(TAG,
-        "P1.5R.2 Adaptive Prefetch QoS已启用：ring=%uKB，起始=%uB (%u%%)，阈值=<%u/%u/%u%%，batch=%u/%u/%u/%u",
+        "R.36.2.2 Adaptive Prefetch QoS已启用：ring=%uKB，起始=%uB (%u%%)，阈值=<%u/%u/%u%%，batch=%u/%u/%u/%u",
         static_cast<unsigned>(context->ring_bytes / 1024U),
         static_cast<unsigned>(primed),
         static_cast<unsigned>(flac_prefetch_qos_percent(primed, context->ring_bytes)),

@@ -69,7 +69,8 @@ def draw_icon(mask, kind, cx, cy, scale_percent):
         ccx=(cx+s(x))*SS; ccy=(cy+s(y))*SS; rr=(dd*SS)/2
         d.ellipse((ccx-rr,ccy-rr,ccx+rr,ccy+rr),fill=255)
     if kind=='Music':
-        line(4,-17,4,9); line(4,-17,16,-20); line(16,-20,16,4); dot(-2,10,10); dot(10,5,10)
+        # R.35.3.2: wider double-note geometry. The two stems are 19px apart at 100% scale.
+        line(-4,-16,-4,7); line(-4,-16,15,-20); line(15,-20,15,2); dot(-11,10,10); dot(8,4,10)
     elif kind=='Nsf':
         for a in [(-13,-13,13,-13),(13,-13,13,13),(13,13,-13,13),(-13,13,-13,-13),
                   (-8,-18,-8,-13),(0,-18,0,-13),(8,-18,8,-13),(-8,13,-8,18),(0,13,0,18),(8,13,8,18),

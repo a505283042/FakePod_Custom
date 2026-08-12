@@ -6,8 +6,9 @@
 #include "esp_err.h"
 #include "media_types.h"
 
-// Stage 12.1：异步封面加载只缓存压缩后的 JPEG/PNG 字节，不做图片解码。
-// UI 在 Stage 12.2 通过 acquire/release 短期固定缓存条目，避免异步 LRU 淘汰悬空指针。
+// R.36：ArtworkLoader 只承担“当前曲压缩封面临时缓冲”。JPEG/PNG 读入 PSRAM 后由
+// CoverSurfaceTask 解码；最终 normal+dimmed Surface 成功后立即释放压缩原图。
+// 为了快速切歌期间安全跨任务，只保留 2 个瞬时交换槽，不再做多曲 LRU 长期缓存。
 enum class ArtworkLoadState : uint8_t
 {
     Stopped = 0,
@@ -73,3 +74,7 @@ bool artwork_loader_get_cache_stats(ArtworkCacheStats *out_stats);
 // 成功后必须调用 artwork_loader_release_cached()；租约存活期间对应 LRU 条目不会被淘汰。
 bool artwork_loader_acquire_cached(uint32_t track_index, ArtworkCacheLease *out_lease);
 void artwork_loader_release_cached(ArtworkCacheLease *lease);
+
+// R.36：释放所有当前未被 lease 固定的压缩封面。Surface 成功后调用，
+// 稳态不再保留 JPEG/PNG 原图；若 LVGL fallback 正在持有 lease，则自动保留到 release。
+void artwork_loader_discard_unpinned();

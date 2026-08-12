@@ -37,7 +37,9 @@ static constexpr BaseType_t ARTWORK_TASK_CORE = 1;
 static constexpr size_t ARTWORK_READ_CHUNK_MIN_BYTES = 2U * 1024U;
 static constexpr size_t ARTWORK_READ_CHUNK_MID_BYTES = 4U * 1024U;
 static constexpr size_t ARTWORK_READ_CHUNK_MAX_BYTES = 8U * 1024U;
-static constexpr size_t ARTWORK_CACHE_SLOT_COUNT = 16U;
+// R.36：不再缓存历史歌曲压缩封面。2 槽仅用于“旧 fallback lease 尚未释放 + 新当前曲正在读取”
+// 的瞬时交换，正常稳态在 Surface 成功后会全部清空。
+static constexpr size_t ARTWORK_CACHE_SLOT_COUNT = 2U;
 static constexpr size_t ARTWORK_CACHE_BUDGET_BYTES = 2U * 1024U * 1024U;
 static constexpr size_t ARTWORK_MAX_COMPRESSED_BYTES = 2U * 1024U * 1024U;
 // P1.5R.1：SD 锁竞争属于正常背压。锁尝试明确使用 0 tick（非阻塞），
@@ -395,9 +397,13 @@ static bool cache_insert(
         return false;
     }
 
-    // Catalog generation 改变后，旧 generation 的未固定条目优先释放。
+    // R.36：只保留当前请求需要的压缩原图。所有其它未 pin 条目在插入新当前曲前立即释放；
+    // 被旧 LVGL fallback 持有的条目允许暂时跨越一次切歌，由第二交换槽承接新图。
     for (size_t i = 0; i < ARTWORK_CACHE_SLOT_COUNT; ++i) {
-        if (g_cache[i].valid && g_cache[i].catalog_generation != request->catalog_generation && g_cache[i].pin_count == 0U) {
+        if (g_cache[i].valid &&
+            (g_cache[i].catalog_generation != request->catalog_generation ||
+             g_cache[i].track_index != request->track_index) &&
+            g_cache[i].pin_count == 0U) {
             cache_release_entry_locked(&g_cache[i]);
         }
     }
@@ -419,8 +425,7 @@ static bool cache_insert(
         cache_release_entry_locked(&g_cache[slot]);
     }
 
-    // 最多 16 个元数据槽，但严格受 2MB 总预算约束。预算不足时只淘汰真实有效的 LRU，
-    // 因此已经成功读取过的较小压缩封面可以跨多首歌曲长期复用。
+    // 2MB 仅作为“单张超大压缩封面 + 瞬时旧 lease”的硬上限，不再用于跨歌曲长期 LRU。
     while (cache_total_bytes_locked() + size > ARTWORK_CACHE_BUDGET_BYTES) {
         const int victim = cache_find_lru_valid_evictable_locked(slot);
         if (victim < 0 || victim == slot) {
@@ -809,11 +814,10 @@ esp_err_t artwork_loader_start()
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "ArtworkTask 已启动：核心=%ld，优先级=%u，栈=%uB，增量切片=2/4/8KB，压缩缓存=%u槽/%uKB",
+    ESP_LOGI(TAG, "R.36 ArtworkTask：核心=%ld，优先级=%u，栈=%uB，增量切片=2/4/8KB，压缩原图=2交换槽/%uKB硬上限/Surface成功即释放",
         static_cast<long>(ARTWORK_TASK_CORE),
         static_cast<unsigned>(ARTWORK_TASK_PRIORITY),
         static_cast<unsigned>(ARTWORK_TASK_STACK_BYTES),
-        static_cast<unsigned>(ARTWORK_CACHE_SLOT_COUNT),
         static_cast<unsigned>(ARTWORK_CACHE_BUDGET_BYTES / 1024U));
     ESP_LOGI(TAG, "P1.5R.1 Tick Hygiene：SD锁=non-blocking，竞争重试=1tick，slice后让步=1tick，RTOS=%uHz",
         static_cast<unsigned>(configTICK_RATE_HZ));
@@ -988,4 +992,24 @@ void artwork_loader_release_cached(ArtworkCacheLease *lease)
         xSemaphoreGive(g_cache_mutex);
     }
     *lease = {};
+}
+
+void artwork_loader_discard_unpinned()
+{
+    if (g_cache_mutex == nullptr || xSemaphoreTake(g_cache_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return;
+    }
+    size_t released = 0U;
+    for (size_t i = 0; i < ARTWORK_CACHE_SLOT_COUNT; ++i) {
+        if (g_cache[i].valid && g_cache[i].pin_count == 0U) {
+            released += g_cache[i].size;
+            cache_release_entry_locked(&g_cache[i]);
+        }
+    }
+    xSemaphoreGive(g_cache_mutex);
+    if (released > 0U) {
+        ESP_LOGI(TAG, "R.36 压缩原图已释放：%uB PSRAM_free=%u",
+            static_cast<unsigned>(released),
+            static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+    }
 }
