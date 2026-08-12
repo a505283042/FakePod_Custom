@@ -86,10 +86,10 @@ static constexpr int16_t kLauncherTouchInnerRadius = kLauncherInnerRadius - 8;
 static constexpr int16_t kLauncherTouchOuterRadius =
     static_cast<int16_t>(kLauncherOuterRadius) + 8;
 static constexpr uint32_t kLauncherAnimDurationMs = 300U;
-// P1.5.3.2R.36.6.1：保持 R.36.6 的 0B PanelWork；进一步把 PackBits 热路径改成 run-level fast path。
+// P1.5.3.2R.36.6.2：保持 0B PanelWork + PackBits run fast path；producer 直接生成 SPI wire-order，融合背景 copy+swap。
 // BoundedSPI 每次请求下一块 DMA staging 时，Strip Compositor 直接从当前
-// CoverSurface.dimmed 拷入对应背景行、顺序展开 I4 RLE、叠加中心圆/图标，再由显示层
-// 原地 byte-swap 后入队。这样继续复用 R.36.4 的有界 transaction 生命周期，同时
+// CoverSurface.dimmed 做 fused copy+native→wire、顺序展开 I4 RLE、叠加中心圆/图标，
+// DMA staging 产出即为 SPI wire-order，显示层不再第二次整块 byte-swap。这样继续复用 R.36.4 的有界 transaction 生命周期，同时
 // 再释放 231,200B Launcher 专用 PSRAM。
 static constexpr uint32_t kLauncherSurfaceStride = FAKEPOD_LCD_WIDTH * sizeof(uint16_t);
 static constexpr uint32_t kLauncherPanelWorkBytesSaved =
@@ -208,6 +208,7 @@ static uint32_t g_launcher_surface_lease_us = 0U;
 static uint16_t g_launcher_index_color565[16] = {};
 static uint8_t g_launcher_index_alpha[16] = {};
 static uint32_t g_launcher_color_pair_lut[256] = {};
+static uint32_t g_launcher_color_pair_wire_lut[256] = {};
 // R.36.6.1：把每个 packed pair 预分类，热路径不再每 pair 重复查两次 alpha。
 // 0=完全透明保留背景，1=双像素全不透明可32bit批量写，2=需要逐像素透明/AA处理。
 static uint8_t g_launcher_pair_mode[256] = {};
@@ -868,6 +869,17 @@ static uint16_t player_home_launcher_blend_rgb565(uint16_t background, uint16_t 
     return static_cast<uint16_t>((rr << 11) | (rg << 5) | rb);
 }
 
+static inline uint16_t player_home_launcher_wire565(uint16_t native)
+{
+    return static_cast<uint16_t>((native << 8U) | (native >> 8U));
+}
+
+static inline uint32_t player_home_launcher_wire565_pair(uint32_t native_pair)
+{
+    return ((native_pair & 0x00FF00FFU) << 8U) |
+        ((native_pair & 0xFF00FF00U) >> 8U);
+}
+
 static void player_home_launcher_release_surface_lease()
 {
     if (g_launcher_surface_lease.slot_index != 0xFFU) {
@@ -963,6 +975,8 @@ static void player_home_launcher_update_frame_lut()
         g_launcher_color_pair_lut[packed] =
             static_cast<uint32_t>(g_launcher_index_color565[left]) |
             (static_cast<uint32_t>(g_launcher_index_color565[right]) << 16);
+        g_launcher_color_pair_wire_lut[packed] =
+            player_home_launcher_wire565_pair(g_launcher_color_pair_lut[packed]);
         const uint8_t left_alpha = g_launcher_index_alpha[left];
         const uint8_t right_alpha = g_launcher_index_alpha[right];
         if (left_alpha == 0U && right_alpha == 0U) {
@@ -1013,7 +1027,14 @@ static void player_home_launcher_raster_pixel(
     }
     uint16_t &dst = target.pixels[
         static_cast<size_t>(y - target.y_begin) * kLauncherPanelSize + x];
-    dst = player_home_launcher_blend_rgb565(dst, color, opacity);
+    if (opacity == LV_OPA_COVER) {
+        dst = player_home_launcher_wire565(color);
+        return;
+    }
+    const uint16_t native_background = player_home_launcher_wire565(dst);
+    const uint16_t native_result = player_home_launcher_blend_rgb565(
+        native_background, color, opacity);
+    dst = player_home_launcher_wire565(native_result);
 }
 
 static void player_home_launcher_raster_disk(
@@ -1236,7 +1257,7 @@ static inline void player_home_launcher_apply_packed_pair(
         return;
     }
     if (mode == 1U) {
-        const uint32_t pair_color = g_launcher_color_pair_lut[packed];
+        const uint32_t pair_color = g_launcher_color_pair_wire_lut[packed];
         memcpy(dst, &pair_color, sizeof(pair_color));
         return;
     }
@@ -1245,13 +1266,21 @@ static inline void player_home_launcher_apply_packed_pair(
     const uint8_t right = static_cast<uint8_t>(packed & 0x0FU);
     const uint8_t left_alpha = g_launcher_index_alpha[left];
     const uint8_t right_alpha = g_launcher_index_alpha[right];
-    if (left_alpha != 0U) {
-        dst[0] = player_home_launcher_blend_rgb565(
-            dst[0], g_launcher_index_color565[left], left_alpha);
+    if (left_alpha == LV_OPA_COVER) {
+        dst[0] = player_home_launcher_wire565(g_launcher_index_color565[left]);
     }
-    if (right_alpha != 0U) {
-        dst[1] = player_home_launcher_blend_rgb565(
-            dst[1], g_launcher_index_color565[right], right_alpha);
+    else if (left_alpha != 0U) {
+        const uint16_t native_background = player_home_launcher_wire565(dst[0]);
+        dst[0] = player_home_launcher_wire565(player_home_launcher_blend_rgb565(
+            native_background, g_launcher_index_color565[left], left_alpha));
+    }
+    if (right_alpha == LV_OPA_COVER) {
+        dst[1] = player_home_launcher_wire565(g_launcher_index_color565[right]);
+    }
+    else if (right_alpha != 0U) {
+        const uint16_t native_background = player_home_launcher_wire565(dst[1]);
+        dst[1] = player_home_launcher_wire565(player_home_launcher_blend_rgb565(
+            native_background, g_launcher_index_color565[right], right_alpha));
     }
 }
 
@@ -1260,13 +1289,13 @@ static esp_err_t player_home_launcher_compose_strip(
     uint16_t source_y,
     uint16_t rows,
     uint16_t width,
-    uint8_t *dst_native_rgb565,
+    uint8_t *dst_wire_rgb565,
     size_t dst_bytes)
 {
     LauncherStripComposeContext *context =
         static_cast<LauncherStripComposeContext *>(opaque);
     if (context == nullptr || context->asset == nullptr || context->surface == nullptr ||
-        dst_native_rgb565 == nullptr || width != kLauncherPanelSize || rows == 0U ||
+        dst_wire_rgb565 == nullptr || width != kLauncherPanelSize || rows == 0U ||
         dst_bytes < static_cast<size_t>(width) * rows * sizeof(uint16_t)) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -1283,17 +1312,34 @@ static esp_err_t player_home_launcher_compose_strip(
         return ESP_ERR_INVALID_STATE;
     }
 
-    // 背景仍按行从 pinned CoverSurface.dimmed 拷入当前 DMA staging。
+    // R.36.6.2：背景 copy 与 native→wire byte-order 转换合并成一次 32-bit pair 搬运。
+    // 这样不再先 memcpy 整个 strip、再由 display 层第二次完整扫描 staging 做 byte swap。
     for (uint16_t row = 0U; row < rows; ++row) {
         const uint8_t *src_row = context->surface +
             static_cast<size_t>(source_y + row + kLauncherPanelShownY) * kLauncherSurfaceStride +
             static_cast<size_t>(kLauncherPanelX) * sizeof(uint16_t);
-        uint8_t *dst_row = dst_native_rgb565 +
+        uint8_t *dst_row = dst_wire_rgb565 +
             static_cast<size_t>(row) * width * sizeof(uint16_t);
-        memcpy(dst_row, src_row, static_cast<size_t>(width) * sizeof(uint16_t));
+        const bool pair_aligned =
+            ((reinterpret_cast<uintptr_t>(src_row) | reinterpret_cast<uintptr_t>(dst_row)) & 0x3U) == 0U &&
+            (width & 1U) == 0U;
+        if (pair_aligned) {
+            const uint32_t *src32 = reinterpret_cast<const uint32_t *>(src_row);
+            uint32_t *dst32 = reinterpret_cast<uint32_t *>(dst_row);
+            for (uint16_t pair = 0U; pair < width / 2U; ++pair) {
+                dst32[pair] = player_home_launcher_wire565_pair(src32[pair]);
+            }
+        }
+        else {
+            const uint16_t *src16 = reinterpret_cast<const uint16_t *>(src_row);
+            uint16_t *dst16 = reinterpret_cast<uint16_t *>(dst_row);
+            for (uint16_t x = 0U; x < width; ++x) {
+                dst16[x] = player_home_launcher_wire565(src16[x]);
+            }
+        }
     }
 
-    uint16_t *pixels = reinterpret_cast<uint16_t *>(dst_native_rgb565);
+    uint16_t *pixels = reinterpret_cast<uint16_t *>(dst_wire_rgb565);
     const uint32_t strip_pairs =
         static_cast<uint32_t>(rows) * static_cast<uint32_t>(width / 2U);
     uint32_t local_pair = 0U;
@@ -1320,7 +1366,7 @@ static esp_err_t player_home_launcher_compose_strip(
             }
             else if (mode == 1U) {
                 // 两个像素都全不透明时，一个32bit颜色对直接批量覆盖。
-                const uint32_t pair_color = g_launcher_color_pair_lut[packed];
+                const uint32_t pair_color = g_launcher_color_pair_wire_lut[packed];
                 uint32_t *dst32 = reinterpret_cast<uint32_t *>(dst);
                 std::fill_n(dst32, take, pair_color);
                 context->fast_fill_pairs += take;
@@ -1414,12 +1460,13 @@ static bool player_home_launcher_present_work_direct()
         static_cast<uint16_t>(kLauncherPanelShownY),
         static_cast<uint16_t>(kLauncherPanelSize),
         static_cast<uint16_t>(kLauncherPanelSize),
+        true,
         false,
         &stats);
     if (ret != ESP_OK) {
         ++g_launcher_direct_failures;
         ESP_LOGW(TAG,
-            "R.36.6 Launcher StripFrame失败：gen=%u frame=%u ret=%s failures=%u",
+            "R.36.6.2 Launcher WireStripFrame失败：gen=%u frame=%u ret=%s failures=%u",
             static_cast<unsigned>(stats.generation),
             static_cast<unsigned>(g_launcher_frame_index),
             esp_err_to_name(ret),
@@ -1444,7 +1491,7 @@ static bool player_home_launcher_present_work_direct()
     if (g_launcher_direct_present_count <= 3U ||
         g_launcher_frame_index == static_cast<uint8_t>(kLauncherAnimationAssetFrameCount - 1U)) {
         ESP_LOGI(TAG,
-            "R.36.6.1 LauncherStripFrame：gen=%u seq=%u..%u frame=%u total=%uus compose=%uus stream=%uus swap=%uus wait=%uus pairs(skip/fill/lit/blend)=%u/%u/%u/%u chunks=%u staging=%u行×%u PanelWork=0B",
+            "R.36.6.2 LauncherWireStripFrame：gen=%u seq=%u..%u frame=%u total=%uus compose=%uus stream=%uus swap=%uus wait=%uus pairs(skip/fill/lit/blend)=%u/%u/%u/%u chunks=%u staging=%u行×%u PanelWork=0B",
             static_cast<unsigned>(stats.generation),
             static_cast<unsigned>(stats.first_sequence),
             static_cast<unsigned>(stats.last_sequence),
@@ -1647,7 +1694,7 @@ static bool player_home_launcher_begin_direct_scene()
     player_home_launcher_reset_direct_stats();
     g_launcher_frame_index = 0U;
     ESP_LOGI(TAG,
-        "R.36.6.1 LauncherBoundedScene：gen=%u lease=%uus track=%u fullPresent=%uus drain=%uus stream=%uus base=CoverSurface.dimmed owner=bounded-spi root=hidden",
+        "R.36.6.2 LauncherBoundedScene：gen=%u lease=%uus track=%u fullPresent=%uus drain=%uus stream=%uus base=CoverSurface.dimmed owner=bounded-spi root=hidden",
         static_cast<unsigned>(stats.generation),
         static_cast<unsigned>(g_launcher_surface_lease_us),
         static_cast<unsigned>(g_launcher_surface_lease_track),
@@ -1973,7 +2020,7 @@ static void player_home_launcher_enter_done(lv_anim_t *anim)
         }
     }
     ESP_LOGI(TAG,
-        "R.36.6.1 Launcher动画展开完成：%ums frame=%u/%u lease=%uus compose(avg/max)=%u/%uus direct(avg/max)=%u/%uus stream(avg/max)=%u/%uus frames=%u failures=%u direct=%d，径向点击已解锁",
+        "R.36.6.2 Launcher动画展开完成：%ums frame=%u/%u lease=%uus compose(avg/max)=%u/%uus direct(avg/max)=%u/%uus stream(avg/max)=%u/%uus frames=%u failures=%u direct=%d，径向点击已解锁",
         static_cast<unsigned>(elapsed),
         static_cast<unsigned>(g_launcher_frame_index),
         static_cast<unsigned>(kLauncherAnimationAssetFrameCount - 1U),
@@ -2021,7 +2068,7 @@ static void player_home_launcher_leave_done(lv_anim_t *anim)
     now_playing_artwork_set_direct_present_allowed(true);
     const uint32_t elapsed = static_cast<uint32_t>(lv_tick_get()) - g_launcher_anim_started_ms;
     ESP_LOGI(TAG,
-        "R.36.6.1 Launcher动画收拢完成：%ums frame=%u compose(avg/max)=%u/%uus direct(avg/max)=%u/%uus frames=%u failures=%u direct=%d",
+        "R.36.6.2 Launcher动画收拢完成：%ums frame=%u compose(avg/max)=%u/%uus direct(avg/max)=%u/%uus frames=%u failures=%u direct=%d",
         static_cast<unsigned>(elapsed),
         static_cast<unsigned>(g_launcher_frame_index),
         static_cast<unsigned>(g_launcher_frame_decode_count == 0U ? 0U :
@@ -3526,15 +3573,15 @@ void player_home_create(lv_obj_t *screen)
         flash_bytes += g_launcher_animation_frames[i].size;
     }
     ESP_LOGI(TAG,
-        "R.36.6.1 Launcher StripCompositor FastPath：12帧压缩I4模板 Flash=%uB；FullBase=0B(saved=%uB)；PanelWork=0B(saved=%uB)；source=CoverSurface.dimmed；lease=pin-until-hide PSRAM_free=%u",
+        "R.36.6.2 Launcher WireOrder StripCompositor：12帧压缩I4模板 Flash=%uB；FullBase=0B(saved=%uB)；PanelWork=0B(saved=%uB)；source=CoverSurface.dimmed；producer=wire-order(copy+swap fused)；lease=pin-until-hide PSRAM_free=%u",
         static_cast<unsigned>(flash_bytes),
         static_cast<unsigned>(kLauncherFullBaseBytesSaved),
         static_cast<unsigned>(kLauncherPanelWorkBytesSaved),
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
     ESP_LOGI(TAG,
-        "R.36.6.1 Launcher动态封面：SurfaceReuse=enabled rebind=current-ready strip-recompose atomic-lease-swap；旧背景保持到新Surface ready");
+        "R.36.6.2 Launcher动态封面：SurfaceReuse=enabled rebind=current-ready strip-recompose atomic-lease-swap；旧背景保持到新Surface ready");
     ESP_LOGI(TAG,
-        "R.36.6.1 显示传输：BoundedSPI=%s Launcher=strip-stream Cover=bounded legacy-PanelIO-Direct=%s LVGL-fallback=R.32 HomeResume-Direct=%s；queue/get全有界",
+        "R.36.6.2 显示传输：BoundedSPI=%s Launcher=wire-strip-stream Cover=bounded legacy-PanelIO-Direct=%s LVGL-fallback=R.32 HomeResume-Direct=%s；queue/get全有界",
         display_launcher_bounded_spi_available() ? "ready" : "unavailable",
         kLauncherDirectSceneEnabled ? "enabled" : "disabled",
         kFullscreenHomeResumeDirectEnabled ? "enabled" : "disabled");

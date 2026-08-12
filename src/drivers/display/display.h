@@ -108,12 +108,14 @@ esp_err_t display_launcher_bounded_spi_session_begin();
 void display_launcher_bounded_spi_session_end();
 bool display_launcher_bounded_spi_session_active();
 
+// producer 输出的字节序由 present_stream() 的 wire_order 明确声明；true 时 display 层
+// 不再扫描 staging 做 byte swap，可让上层 compositor 直接生成 CO5300 SPI wire-order。
 using DisplayBoundedSpiStripProducer = esp_err_t (*)(
     void *context,
     uint16_t source_y,
     uint16_t rows,
     uint16_t width,
-    uint8_t *dst_native_rgb565,
+    uint8_t *dst_rgb565,
     size_t dst_bytes);
 
 esp_err_t display_launcher_bounded_spi_present_stream(
@@ -123,6 +125,7 @@ esp_err_t display_launcher_bounded_spi_present_stream(
     uint16_t y,
     uint16_t width,
     uint16_t height,
+    bool wire_order,
     bool wait_for_te,
     DisplayBoundedSpiStats *out_stats = nullptr);
 

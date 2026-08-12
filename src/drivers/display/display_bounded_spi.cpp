@@ -686,6 +686,7 @@ esp_err_t display_launcher_bounded_spi_present_stream(
     uint16_t y,
     uint16_t width,
     uint16_t height,
+    bool wire_order,
     bool wait_for_te,
     DisplayBoundedSpiStats *out_stats)
 {
@@ -693,7 +694,7 @@ esp_err_t display_launcher_bounded_spi_present_stream(
         return ESP_ERR_INVALID_ARG;
     }
     return display_launcher_bounded_spi_present_internal(
-        nullptr, producer, producer_context, x, y, width, height, false, wait_for_te, out_stats);
+        nullptr, producer, producer_context, x, y, width, height, wire_order, wait_for_te, out_stats);
 }
 
 esp_err_t display_launcher_bounded_spi_present(
