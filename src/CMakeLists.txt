@@ -117,6 +117,25 @@ idf_component_register(
         fatfs
 )
 
+# SRAM.1：LVGL 仍使用内置 TLSF，但其 64KB memory pool 改由 PSRAM 提供。
+# 只修改 LVGL component 的配置可见性；显示 DMA buffer 仍由 esp_lvgl_port 按 INTERNAL/DMA 能力分配。
+if(TARGET __idf_lvgl__lvgl)
+    target_include_directories(
+        __idf_lvgl__lvgl
+        PRIVATE
+            "${CMAKE_CURRENT_LIST_DIR}/ui/lvgl_config"
+    )
+    target_compile_definitions(__idf_lvgl__lvgl PRIVATE LV_CONF_INCLUDE_SIMPLE=1)
+
+    # lv_conf.h 使用 heap_caps_malloc(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)。
+    # 显式链接 heap component，保证 LVGL component 编译时可见 esp_heap_caps.h。
+    if(TARGET idf::heap)
+        target_link_libraries(__idf_lvgl__lvgl PRIVATE idf::heap)
+    endif()
+
+    message(STATUS "FakePod: LVGL 64KB builtin pool 使用 PSRAM backing store")
+endif()
+
 # ESP-IDF 的 RGB LCD 驱动在 Windows + Xtensa GCC 14.2.0 上可能在 IRA 阶段触发编译器内部错误。
 # FakePod 实际使用 QSPI CO5300，不走 RGB LCD 数据路径，但 esp_lvgl_port 链接时仍需要该驱动导出的符号。
 # 因此保留该源文件参与编译，仅对它单独使用 -O0，避免影响项目其他文件的优化和并行编译。
