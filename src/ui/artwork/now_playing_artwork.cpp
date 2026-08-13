@@ -48,6 +48,12 @@ static CoverSurfaceLease g_surface_lease = {};
 static lv_image_dsc_t g_surface_normal_dsc = {};
 static lv_image_dsc_t g_surface_dimmed_dsc = {};
 static bool g_has_surface_source = false;
+
+// 曲库选歌视觉交接：主页被全屏曲库覆盖时仍按既有规则释放常驻 lease；
+// 只有用户真正点击另一首歌的瞬间，才短暂 pin “最后一张旧封面”。
+// 新 Track Surface 未 ready 时把它作为 stale visual hold 重新绑定，
+// 新 Surface 到手后立即释放，避免旧 lease 在整个曲库停留期间长期占用 2 槽 cache。
+static CoverSurfaceLease g_transition_hold_lease = {};
 static bool g_dimmed_requested = false;
 static bool g_dimmed_applied = false;
 static uint32_t g_last_surface_state_revision = UINT32_MAX;
@@ -153,6 +159,17 @@ static void artwork_ui_release_all_sources(bool hide_image = true)
     artwork_ui_release_surface_source(hide_image);
 }
 
+static void artwork_ui_release_transition_hold()
+{
+    if (g_transition_hold_lease.slot_index != 0xFFU) {
+        ARTWORK_UI_TRACE("TRANSITION_HOLD_RELEASE track=%lu revision=%lu",
+            static_cast<unsigned long>(g_transition_hold_lease.track_index),
+            static_cast<unsigned long>(g_transition_hold_lease.slot_revision));
+        cover_surface_cache_release(&g_transition_hold_lease);
+    }
+    g_transition_hold_lease = {};
+}
+
 static void artwork_ui_init_rgb565_dsc(lv_image_dsc_t *dsc, const uint8_t *data, uint16_t width, uint16_t height, size_t size)
 {
     if (dsc == nullptr) return;
@@ -165,6 +182,56 @@ static void artwork_ui_init_rgb565_dsc(lv_image_dsc_t *dsc, const uint8_t *data,
     dsc->header.stride = static_cast<uint32_t>(width) * 2U;
     dsc->data_size = static_cast<uint32_t>(size);
     dsc->data = data;
+}
+
+static bool artwork_ui_apply_transition_hold()
+{
+    if (g_transition_hold_lease.slot_index == 0xFFU || g_image == nullptr ||
+        g_transition_hold_lease.normal_rgb565 == nullptr ||
+        g_transition_hold_lease.dimmed_rgb565 == nullptr ||
+        g_transition_hold_lease.width == 0U || g_transition_hold_lease.height == 0U ||
+        g_transition_hold_lease.data_size == 0U) {
+        return false;
+    }
+
+    CoverSurfaceLease lease = g_transition_hold_lease;
+    g_transition_hold_lease = {};
+
+    // 正常情况下主页 inactive 时没有 source；这里仍按所有权规则先清理旧 source，
+    // 再把短期 hold lease 移交给首页 image。不要 retain_track(old)，否则可能清掉
+    // 已经准备好的新 Track Surface；旧图只靠 pin_count 活到新图原子替换。
+    artwork_ui_release_all_sources(false);
+    g_surface_lease = lease;
+    artwork_ui_init_rgb565_dsc(
+        &g_surface_normal_dsc,
+        g_surface_lease.normal_rgb565,
+        g_surface_lease.width,
+        g_surface_lease.height,
+        g_surface_lease.data_size);
+    artwork_ui_init_rgb565_dsc(
+        &g_surface_dimmed_dsc,
+        g_surface_lease.dimmed_rgb565,
+        g_surface_lease.width,
+        g_surface_lease.height,
+        g_surface_lease.data_size);
+    g_dimmed_applied = g_dimmed_requested;
+
+    lv_image_set_src(
+        g_image,
+        g_dimmed_applied ? &g_surface_dimmed_dsc : &g_surface_normal_dsc);
+    lv_image_set_scale(g_image, kLvImageScaleNone);
+    lv_image_set_antialias(g_image, false);
+    lv_obj_center(g_image);
+    lv_obj_remove_flag(g_image, LV_OBJ_FLAG_HIDDEN);
+    if (g_placeholder_icon != nullptr) lv_obj_add_flag(g_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
+    if (g_status != nullptr) lv_obj_add_flag(g_status, LV_OBJ_FLAG_HIDDEN);
+    g_has_surface_source = true;
+
+    ARTWORK_UI_TRACE("TRANSITION_HOLD_APPLY stale_track=%lu current_track=%lu revision=%lu",
+        static_cast<unsigned long>(g_surface_lease.track_index),
+        static_cast<unsigned long>(g_context_track),
+        static_cast<unsigned long>(g_surface_lease.slot_revision));
+    return true;
 }
 
 static bool artwork_ui_apply_surface(uint32_t track_index)
@@ -258,6 +325,9 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
     lv_obj_remove_flag(g_image, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(g_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(g_status, LV_OBJ_FLAG_HIDDEN);
+
+    // 当前 Track 已成功接管 source；曲库选歌期间的旧封面短期 pin 到此结束。
+    artwork_ui_release_transition_hold();
 
     if (bounded_presented && invalidation_was_enabled) {
         lv_display_enable_invalidation(display, true);
@@ -478,6 +548,7 @@ static bool artwork_ui_apply_compressed_fallback(uint32_t track_index)
     lv_obj_add_flag(g_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(g_status, LV_OBJ_FLAG_HIDDEN);
     g_has_compressed_source = true;
+    artwork_ui_release_transition_hold();
 
     ESP_LOGW(TAG, "使用 LVGL 压缩图回退路径：track=%lu；Overlay 将临时使用 alpha 遮罩",
         static_cast<unsigned long>(track_index));
@@ -502,12 +573,19 @@ static void artwork_ui_sync_context(bool force)
 
     MediaArtworkViewV2 artwork = {};
     if (!media_library_get_artwork_view(track_index, &artwork)) {
+        artwork_ui_release_transition_hold();
         artwork_ui_release_all_sources();
         artwork_ui_show_placeholder("暂无封面");
     } else if (!artwork_loader_is_ready()) {
+        artwork_ui_release_transition_hold();
         artwork_ui_release_all_sources();
         artwork_ui_show_placeholder("封面服务不可用");
     } else {
+        // 曲库选歌返回时，新 Surface 尚未 ready 就把点击前短暂 pin 的旧封面重新绑定。
+        // 它故意不匹配当前 context，因此 update() 仍会持续尝试获取新 Surface。
+        if (!g_has_surface_source && !g_has_compressed_source) {
+            (void)artwork_ui_apply_transition_hold();
+        }
         artwork_ui_show_waiting_without_placeholder();
     }
 }
@@ -672,16 +750,19 @@ void now_playing_artwork_update()
             break;
 
         case ArtworkLoadState::NoArtwork:
+            artwork_ui_release_transition_hold();
             artwork_ui_release_all_sources();
             artwork_ui_show_placeholder("暂无封面");
             break;
 
         case ArtworkLoadState::Failed:
+            artwork_ui_release_transition_hold();
             artwork_ui_release_all_sources();
             artwork_ui_show_placeholder("封面加载失败");
             break;
 
         case ArtworkLoadState::Stopped:
+            artwork_ui_release_transition_hold();
             artwork_ui_release_all_sources();
             artwork_ui_show_placeholder("封面服务不可用");
             break;
@@ -690,6 +771,39 @@ void now_playing_artwork_update()
         default:
             break;
     }
+}
+
+bool now_playing_artwork_prepare_track_transition_hold()
+{
+    artwork_ui_release_transition_hold();
+    if (!player_state_is_ready() || media_library_get_count() == 0U ||
+        !cover_surface_cache_is_ready()) {
+        return false;
+    }
+
+    const uint32_t track_index = static_cast<uint32_t>(player_state_get_index());
+    CoverSurfaceLease lease = {};
+    if (!cover_surface_cache_acquire(track_index, &lease)) {
+        ARTWORK_UI_TRACE("TRANSITION_HOLD_MISS track=%lu",
+            static_cast<unsigned long>(track_index));
+        return false;
+    }
+    if (lease.normal_rgb565 == nullptr || lease.dimmed_rgb565 == nullptr ||
+        lease.width == 0U || lease.height == 0U || lease.data_size == 0U) {
+        cover_surface_cache_release(&lease);
+        return false;
+    }
+
+    g_transition_hold_lease = lease;
+    ARTWORK_UI_TRACE("TRANSITION_HOLD_PIN track=%lu revision=%lu",
+        static_cast<unsigned long>(track_index),
+        static_cast<unsigned long>(lease.slot_revision));
+    return true;
+}
+
+void now_playing_artwork_cancel_track_transition_hold()
+{
+    artwork_ui_release_transition_hold();
 }
 
 bool now_playing_artwork_set_dimmed(bool dimmed)

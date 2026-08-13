@@ -54,7 +54,7 @@ static void audio_task_log_ram(const char *stage)
 static inline void audio_task_log_ram(const char *) {}
 #endif
 
-static constexpr uint32_t AUDIO_TASK_STACK_BYTES = 12288;
+static constexpr uint32_t AUDIO_TASK_STACK_BYTES = 8192;
 static constexpr UBaseType_t AUDIO_TASK_PRIORITY = 5;
 static constexpr BaseType_t AUDIO_TASK_CORE = 0;
 static constexpr UBaseType_t AUDIO_COMMAND_QUEUE_LENGTH = 8;
@@ -76,7 +76,7 @@ static constexpr TickType_t AUDIO_START_WAIT_TIMEOUT = pdMS_TO_TICKS(1500);
 // 用户音量继续保持此前实机验证的安全模拟基线：CS43131 0.5Vrms 满量程。
 // P1.5.3.2R.13 重新分配逻辑音量曲线后，默认逻辑音量改为 50%（约 -18dB），
 // 保持接近旧版 80%=-20dB 的启动实际响度；运行期音量仍只能由 AudioTask 写 DAC。
-// 192kHz 长时间实测显示 AudioTask 峰值栈使用约 5.3KB；先保守收敛到 12KB，仍保留超过一倍的观测余量。
+// SRAM.2 压力审计记录峰值栈使用 5588B；收敛到 8192B，仍保留 2604B 观测余量。
 
 
 enum class AudioCommandType : uint8_t

@@ -11,6 +11,11 @@ void player_home_create(lv_obj_t *screen);
 // 最后强制 invalidation，确保 BoundedSPI 快路径已熔断时也能由 LVGL 完整重绘。
 void player_home_resume_from_fullscreen_view(const char *reason);
 
+// 曲库选歌专用视觉交接：在 PlayerState 改变前短暂 pin 当前封面，
+// 新 Track Surface 未 ready 时返回主页仍显示上一首封面；选歌失败必须 cancel。
+bool player_home_prepare_track_transition_hold();
+void player_home_cancel_track_transition_hold();
+
 // R.30 全页面 LVGL 性能审计：仅暴露轻量只读状态，不改变页面行为。
 bool player_home_overlay_is_visible();
 bool player_home_launcher_is_visible();

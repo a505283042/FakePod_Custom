@@ -14,7 +14,7 @@ static const char *TAG = "触摸快路";
 
 constexpr BaseType_t TOUCH_INPUT_TASK_CORE = 1;
 constexpr UBaseType_t TOUCH_INPUT_TASK_PRIORITY = 3;
-constexpr uint32_t TOUCH_INPUT_TASK_STACK_BYTES = 3072U;
+constexpr uint32_t TOUCH_INPUT_TASK_STACK_BYTES = 2560U;
 constexpr UBaseType_t TOUCH_EDGE_QUEUE_LENGTH = 8U;
 constexpr uint8_t TOUCH_RELEASE_DEBOUNCE_SAMPLES = 3U;
 constexpr uint32_t TOUCH_SAMPLE_PERIOD_MS = 8U;

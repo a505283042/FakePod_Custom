@@ -35,7 +35,7 @@ static constexpr size_t FLAC_PREFETCH_START_96K_BYTES = 96 * 1024;
 // Stage 9.5.4 将高采样率起播目标降到 64KB，预计减少约两次 32KB SD 读取的等待；
 // 稳态 ring、SD read chunk 和解码窗口均保持不变。
 static constexpr size_t FLAC_PREFETCH_START_192K_BYTES = 64 * 1024;
-static constexpr uint32_t FLAC_PREFETCH_TASK_STACK_BYTES = 4096;
+static constexpr uint32_t FLAC_PREFETCH_TASK_STACK_BYTES = 3072;
 static constexpr UBaseType_t FLAC_PREFETCH_TASK_PRIORITY = 4;
 static constexpr BaseType_t FLAC_PREFETCH_TASK_CORE = 1;
 // P1.2.15: cooperative waits must be expressed in RTOS ticks, not sub-tick milliseconds.

@@ -3401,6 +3401,16 @@ static void player_home_refresh()
     g_last_audio_state_revision = snapshot.state_revision;
 }
 
+bool player_home_prepare_track_transition_hold()
+{
+    return now_playing_artwork_prepare_track_transition_hold();
+}
+
+void player_home_cancel_track_transition_hold()
+{
+    now_playing_artwork_cancel_track_transition_hold();
+}
+
 void player_home_resume_from_fullscreen_view(const char *reason)
 {
     // 页面调用方必须先隐藏自己的全屏 root；这样 QoS 才会把主页 Artwork/timer 恢复为 active。

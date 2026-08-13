@@ -1661,6 +1661,11 @@ static void library_view_row_clicked_cb(lv_event_t *event)
         return;
     }
 
+    const bool selecting_track =
+        row->action == LibraryRowAction::PlayAllTrack ||
+        row->action == LibraryRowAction::PlayGroupTrack;
+    const bool transition_hold = selecting_track && player_home_prepare_track_transition_hold();
+
     switch (row->action) {
         case LibraryRowAction::OpenArtist:
         case LibraryRowAction::OpenAlbum:
@@ -1693,6 +1698,7 @@ static void library_view_row_clicked_cb(lv_event_t *event)
 
         case LibraryRowAction::PlayAllTrack:
             if (!player_control_select_all_tracks(row->position)) {
+                if (transition_hold) player_home_cancel_track_transition_hold();
                 ESP_LOGW(TAG, "选择全部歌曲位置失败：%lu", static_cast<unsigned long>(row->position));
                 return;
             }
@@ -1716,6 +1722,7 @@ static void library_view_row_clicked_cb(lv_event_t *event)
                     break;
             }
             if (!selected) {
+                if (transition_hold) player_home_cancel_track_transition_hold();
                 ESP_LOGW(TAG, "选择分组歌曲失败：类型=%s group=%lu pos=%lu",
                     player_playlist_type_name(row->group_type),
                     static_cast<unsigned long>(row->group_index),

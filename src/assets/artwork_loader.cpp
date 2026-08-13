@@ -28,7 +28,7 @@ static const char *TAG = "封面加载";
 #define ARTWORK_LOAD_TRACE(...) APP_DIAG_DISCARDED_LOGI(TAG, "ARTWORK_LOAD_TRACE: " __VA_ARGS__)
 #endif
 
-static constexpr uint32_t ARTWORK_TASK_STACK_BYTES = 4096U;
+static constexpr uint32_t ARTWORK_TASK_STACK_BYTES = 3584U;
 static constexpr UBaseType_t ARTWORK_TASK_PRIORITY = 2U;
 static constexpr BaseType_t ARTWORK_TASK_CORE = 1;
 // P1.2.9：压缩封面不再要求一次连续读完。ArtworkTask 只在 FLAC ring 有余量时

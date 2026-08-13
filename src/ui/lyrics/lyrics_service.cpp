@@ -22,7 +22,7 @@ namespace {
 
 static const char *TAG = "歌词服务";
 
-static constexpr uint32_t LYRICS_TASK_STACK = 6144U;
+static constexpr uint32_t LYRICS_TASK_STACK = 4096U;
 static constexpr UBaseType_t LYRICS_TASK_PRIORITY = 1U;
 static constexpr BaseType_t LYRICS_TASK_CORE = 1;
 static constexpr size_t LYRICS_FILE_MAX_BYTES = 256U * 1024U;

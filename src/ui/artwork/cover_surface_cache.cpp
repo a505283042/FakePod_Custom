@@ -27,7 +27,7 @@ static const char *TAG = "封面预处理";
 #define COVER_TRACE(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
 #endif
 
-static constexpr uint32_t COVER_TASK_STACK_BYTES = 12288U;
+static constexpr uint32_t COVER_TASK_STACK_BYTES = 4096U;
 static constexpr UBaseType_t COVER_TASK_PRIORITY = 1U;
 static constexpr BaseType_t COVER_TASK_CORE = 1;
 static constexpr size_t COVER_CACHE_SLOT_COUNT = 2U;

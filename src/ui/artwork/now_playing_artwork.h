@@ -19,6 +19,12 @@ void now_playing_artwork_refresh_context();
 // lease 与 LVGL source 状态照常更新，但不产生整屏 invalidation，避免迟到的 LVGL flush 覆盖物理快路径。
 void now_playing_artwork_set_active(bool active, bool suppress_invalidation = false);
 
+// 曲库点选新 Track 前的短期视觉 hold。只在“真正选歌”瞬间 pin 当前 Surface；
+// 曲库整个停留期间仍不持有主页 lease。返回主页后若新 Surface 未 ready，就继续显示该旧封面，
+// 新 Surface 原子接管后自动释放。选歌失败时调用 cancel 立即撤销。
+bool now_playing_artwork_prepare_track_transition_hold();
+void now_playing_artwork_cancel_track_transition_hold();
+
 // Overlay 明暗接口。R.20 若命中最终 Surface，则直接切 normal/dimmed 并返回 true；
 // 只有压缩图回退等非快速路径才返回 false，让调用方继续使用 alpha 黑层兜底。
 bool now_playing_artwork_set_dimmed(bool dimmed);
