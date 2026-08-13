@@ -18,6 +18,7 @@
 #include "player_control.h"
 #include "ui_manager.h"
 #include "system_runtime.h"
+#include "persistent_state.h"
 
 
 static const char *TAG =
@@ -229,8 +230,31 @@ static void boot_state_update()
 
 
             g_state =
-                BootState::InitI2C;
+                BootState::InitPersistentState;
 
+            break;
+        }
+
+
+        // ====================================================
+        // NVS 持久化数据层（可选能力）
+        // ====================================================
+
+        case BootState::InitPersistentState:
+        {
+#if APP_DIAG_BOOT_VERBOSE
+            ESP_LOGI(TAG, "启动阶段：初始化 NVS V1 持久化数据层");
+#endif
+            const esp_err_t persistence_ret = persistent_state_init();
+            if (persistence_ret != ESP_OK) {
+                boot_record_issue(
+                    BootFailureLevel::Optional,
+                    BootIssue::PersistenceUnavailable,
+                    persistence_ret,
+                    "NVS 持久化不可用，继续使用运行时默认值"
+                );
+            }
+            g_state = BootState::InitI2C;
             break;
         }
 
@@ -358,6 +382,15 @@ static void boot_state_update()
 #if APP_DIAG_BOOT_VERBOSE
             ESP_LOGI(TAG, "正式播放器音频服务已就绪");
 #endif
+            if (!boot_issue_recorded(BootIssue::PersistenceUnavailable) &&
+                !persistent_state_restore_audio()) {
+                boot_record_issue(
+                    BootFailureLevel::Optional,
+                    BootIssue::PersistenceUnavailable,
+                    ESP_FAIL,
+                    "NVS 音量恢复失败，继续使用 AudioTask 默认音量"
+                );
+            }
             g_state = BootState::InitSDCard;
             break;
         }
@@ -459,6 +492,12 @@ static void boot_state_update()
                     control_ret,
                     "播放器控制不可用"
                 );
+            }
+
+            if (control_ret == ESP_OK &&
+                !boot_issue_recorded(BootIssue::PersistenceUnavailable) &&
+                !persistent_state_restore_player()) {
+                ESP_LOGW(TAG, "NVS Player 恢复未完全命中，已保留可用默认/降级选择");
             }
 
             g_state = BootState::InitUI;

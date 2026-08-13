@@ -9,6 +9,7 @@
 #include "artwork_loader.h"
 #include "cover_surface_cache.h"
 #include "lyrics/lyrics_service.h"
+#include "power_service.h"
 
 static const char *TAG = "运行期";
 
@@ -30,6 +31,11 @@ void system_runtime_update()
 
     // 先置位，保证即使某个可选服务失败也不会每 10ms 重复创建任务。
     g_background_start_attempted = true;
+
+    const esp_err_t power_ret = power_service_init();
+    if (power_ret != ESP_OK) {
+        ESP_LOGW(TAG, "GPIO48 关机保存不可用：%s；硬件3秒断电仍保持原行为", esp_err_to_name(power_ret));
+    }
 
     const esp_err_t spectrum_ret = audio_spectrum_snapshot_start();
     if (spectrum_ret != ESP_OK) {
@@ -61,7 +67,8 @@ void system_runtime_update()
 
     ESP_LOGI(
         TAG,
-        "READY 后台服务：Spectrum=%s Artwork=%s CoverSurface=%s Lyrics=%s",
+        "READY 后台服务：PowerKey=%s Spectrum=%s Artwork=%s CoverSurface=%s Lyrics=%s",
+        esp_err_to_name(power_ret),
         esp_err_to_name(spectrum_ret),
         storage_services_available ? esp_err_to_name(artwork_ret) : "SKIPPED",
         storage_services_available && artwork_ret == ESP_OK ? esp_err_to_name(surface_ret) : "SKIPPED",

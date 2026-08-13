@@ -10,6 +10,7 @@
 enum class BootState
 {
     CheckPsram,
+    InitPersistentState,
     InitI2C,
     InitDisplay,
     InitUIBootstrap,
@@ -34,6 +35,7 @@ enum class BootIssue : uint32_t
     LibraryUnavailable = 1U << 3,
     PlayerStateUnavailable = 1U << 4,
     PlayerControlUnavailable = 1U << 5,
+    PersistenceUnavailable = 1U << 6,
     PsramUnavailable = 1U << 16,
     I2cUnavailable = 1U << 17,
     DisplayUnavailable = 1U << 18,

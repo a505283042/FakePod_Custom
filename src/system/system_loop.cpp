@@ -8,6 +8,8 @@
 
 #include "boot_state.h"
 #include "system_runtime.h"
+#include "persistent_state.h"
+#include "power_service.h"
 #include "player_control.h"
 #include "player_state.h"
 #include "media_catalog_v2.h"
@@ -299,6 +301,13 @@ void system_loop_update()
     // Player transport 只观察 AudioTask POD Snapshot；自然 EOF 的续播决策在 loopTask 执行，
     // AudioTask 本身不依赖 Player/Catalog，也不会直接选择下一首。
     player_control_update();
+
+    // NVS V1 这里只同步 RAM 快照/dirty，不执行任何 Flash 写入。
+    persistent_state_observe_runtime();
+
+    // GPIO48 与 EC190707 共用电源键：放在 Player/持久化 RAM 快照更新之后，
+    // 长按触发时可以 flush 本轮最新状态；不用 ISR，也不提前接管硬件最终断电。
+    power_service_update();
 
     AudioStateSnapshot audio_state = {};
     if (audio_service_get_snapshot(&audio_state) && audio_state.state == AudioPlaybackState::Error) {

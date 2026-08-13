@@ -6,6 +6,8 @@ idf_component_register(
 
         "system/system_loop.cpp"
         "system/system_runtime.cpp"
+        "system/persistent_state.cpp"
+        "system/power_service.cpp"
 
         "drivers/i2c/i2c_bus.cpp"
 
@@ -114,6 +116,7 @@ idf_component_register(
         libpng
         esp_psram
         esp_timer
+        nvs_flash
         fatfs
 )
 

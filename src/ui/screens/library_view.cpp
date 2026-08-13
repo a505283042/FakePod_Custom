@@ -137,6 +137,15 @@ enum class LibrarySearchBucket : uint8_t
     All = 9,
 };
 
+struct LibraryThemeColors
+{
+    uint32_t page_bg = 0x0D1016;
+    uint32_t header = 0xF2F3F5;
+    uint32_t accent = 0xF2F3F5;
+    uint32_t row_bg = 0x151A21;
+    uint32_t row_current_bg = 0x252C37;
+};
+
 struct LibraryRowBinding
 {
     LibraryRowAction action = LibraryRowAction::None;
@@ -262,6 +271,8 @@ static void library_view_inertia_stop(bool store_position);
 static void library_view_scrollbar_rebuild_geometry();
 static void library_view_scrollbar_update_position();
 static bool library_view_inertia_audio_safe();
+static LibraryBrowseMode library_view_category_mode_for_detail();
+static void library_view_return_to_parent_category();
 
 static int32_t library_abs(int32_t value)
 {
@@ -291,6 +302,34 @@ static bool library_click_suppressed()
 {
     const uint32_t now = static_cast<uint32_t>(lv_tick_get());
     return static_cast<int32_t>(g_gesture.suppress_click_until - now) > 0;
+}
+
+static LibraryThemeColors library_view_theme_colors()
+{
+    const LibraryBrowseMode parent = library_view_category_mode_for_detail();
+    const bool detail = g_state.mode == LibraryBrowseMode::GroupTracks;
+
+    switch (parent) {
+        case LibraryBrowseMode::Artists:
+            // 歌手：冷蓝。详情页保持同一色相，只降低明度并加深页面底色。
+            return detail
+                ? LibraryThemeColors{0x090D12, 0x6F96BA, 0x668CB1, 0x101820, 0x1B2B3B}
+                : LibraryThemeColors{0x0D1116, 0x8BB9E3, 0x7DAEDB, 0x131B24, 0x203449};
+        case LibraryBrowseMode::Albums:
+            // 专辑：低饱和紫。详情页继承色相，不切换成另一套主题。
+            return detail
+                ? LibraryThemeColors{0x0D0A12, 0x8E79B1, 0x806DA5, 0x15111B, 0x2B2138}
+                : LibraryThemeColors{0x110E16, 0xB5A0DD, 0xA28ACC, 0x1A1621, 0x332744};
+        case LibraryBrowseMode::Decades:
+            // 年代：暖琥珀。详情页只做明度变化，保持父级视觉归属。
+            return detail
+                ? LibraryThemeColors{0x100D07, 0xB58C55, 0xA67E4C, 0x17130D, 0x342619}
+                : LibraryThemeColors{0x151109, 0xDBB072, 0xC99B5D, 0x1D1811, 0x40301C};
+        case LibraryBrowseMode::AllTracks:
+        case LibraryBrowseMode::GroupTracks:
+            return {};
+    }
+    return {};
 }
 
 static lv_obj_t *library_view_create_label(
@@ -1184,6 +1223,12 @@ static void library_view_set_header()
         }
     }
 
+    const LibraryThemeColors theme = library_view_theme_colors();
+    if (g_root != nullptr) {
+        lv_obj_set_style_bg_color(g_root, lv_color_hex(theme.page_bg), 0);
+    }
+    lv_obj_set_style_text_color(g_header_title, lv_color_hex(theme.header), 0);
+
     if (g_back_button != nullptr) {
         lv_obj_remove_flag(g_back_button, LV_OBJ_FLAG_HIDDEN);
     }
@@ -1205,9 +1250,10 @@ static void library_view_apply_indicator()
         }
         lv_obj_remove_flag(g_indicator[i], LV_OBJ_FLAG_HIDDEN);
         const bool selected = static_cast<uint8_t>(active) == i;
+        const LibraryThemeColors theme = library_view_theme_colors();
         lv_obj_set_style_bg_color(
             g_indicator[i],
-            lv_color_hex(selected ? 0xF2F3F5 : 0x343B47),
+            lv_color_hex(selected ? theme.accent : 0x343B47),
             0);
         lv_obj_set_style_bg_opa(g_indicator[i], selected ? LV_OPA_COVER : LV_OPA_60, 0);
     }
@@ -1366,13 +1412,16 @@ static void library_view_set_row_text(LibraryVirtualRow &row, const char *primar
 
 static void library_view_reset_row_style(LibraryVirtualRow &row, bool current, bool arrow)
 {
-    lv_obj_set_style_bg_color(row.button, lv_color_hex(current ? 0x252C37 : 0x151A21), 0);
+    const LibraryThemeColors theme = library_view_theme_colors();
+    lv_obj_set_style_bg_color(row.button, lv_color_hex(current ? theme.row_current_bg : theme.row_bg), 0);
     lv_obj_set_style_text_color(row.label, lv_color_hex(current ? 0xFFFFFF : 0xE9ECF1), 0);
     if (row.accent != nullptr) {
+        lv_obj_set_style_bg_color(row.accent, lv_color_hex(theme.accent), 0);
         if (current) lv_obj_remove_flag(row.accent, LV_OBJ_FLAG_HIDDEN);
         else lv_obj_add_flag(row.accent, LV_OBJ_FLAG_HIDDEN);
     }
     if (row.arrow != nullptr) {
+        lv_obj_set_style_text_color(row.arrow, lv_color_hex(theme.accent), 0);
         if (arrow) lv_obj_remove_flag(row.arrow, LV_OBJ_FLAG_HIDDEN);
         else lv_obj_add_flag(row.arrow, LV_OBJ_FLAG_HIDDEN);
     }
@@ -1628,7 +1677,11 @@ static void library_view_apply_pending_gesture_async(void *user_data)
             library_view_switch_category(+1);
             break;
         case LibraryPendingGesture::SwipeRight:
-            library_view_switch_category(-1);
+            if (g_state.mode == LibraryBrowseMode::GroupTracks) {
+                library_view_return_to_parent_category();
+            } else {
+                library_view_switch_category(-1);
+            }
             break;
         case LibraryPendingGesture::None:
             break;
@@ -1747,6 +1800,23 @@ static void library_view_row_clicked_cb(lv_event_t *event)
     player_home_resume_from_fullscreen_view("library-select");
 }
 
+static void library_view_return_to_parent_category()
+{
+    if (g_state.mode != LibraryBrowseMode::GroupTracks) {
+        return;
+    }
+
+    g_state.mode = library_view_category_mode_for_detail();
+    g_state.detail_type = PlayerListType::AllTracks;
+    g_state.detail_group_index = UINT32_MAX;
+    const uint8_t mode = static_cast<uint8_t>(g_state.mode);
+    if (mode < 4U) {
+        g_state.top_scroll_y[mode] = g_state.parent_scroll_y;
+    }
+    g_state.detail_scroll_y = 0;
+    library_view_render(true);
+}
+
 static void library_view_back_cb(lv_event_t *event)
 {
     if (lv_event_get_code(event) != LV_EVENT_CLICKED || g_root == nullptr || library_click_suppressed()) {
@@ -1761,15 +1831,7 @@ static void library_view_back_cb(lv_event_t *event)
         return;
     }
 
-    g_state.mode = library_view_category_mode_for_detail();
-    g_state.detail_type = PlayerListType::AllTracks;
-    g_state.detail_group_index = UINT32_MAX;
-    const uint8_t mode = static_cast<uint8_t>(g_state.mode);
-    if (mode < 4U) {
-        g_state.top_scroll_y[mode] = g_state.parent_scroll_y;
-    }
-    g_state.detail_scroll_y = 0;
-    library_view_render(true);
+    library_view_return_to_parent_category();
 }
 
 static void library_view_search_cb(lv_event_t *event)
@@ -2143,11 +2205,18 @@ void library_view_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick
 
         if (g_gesture.axis == LibraryGestureAxis::Horizontal &&
             !g_search.active &&
-            g_state.mode != LibraryBrowseMode::GroupTracks &&
             ax >= LIBRARY_HORIZONTAL_TRIGGER_PX &&
             ax * 100 >= ay * 135 &&
             library_speed_ok(ax, elapsed, LIBRARY_HORIZONTAL_MIN_SPEED)) {
-            action = dx < 0 ? LibraryPendingGesture::SwipeLeft : LibraryPendingGesture::SwipeRight;
+            if (g_state.mode == LibraryBrowseMode::GroupTracks) {
+                // 详情页绝不跟手横移：右滑只作为“返回父级”的离散手势，左滑无动作。
+                if (dx > 0) {
+                    action = LibraryPendingGesture::SwipeRight;
+                }
+            } else {
+                // 顶层仍保留四分类的离散左右切换，同样不移动整页对象。
+                action = dx < 0 ? LibraryPendingGesture::SwipeLeft : LibraryPendingGesture::SwipeRight;
+            }
         }
     }
 
