@@ -117,24 +117,35 @@ idf_component_register(
         fatfs
 )
 
-# SRAM.1：LVGL 仍使用内置 TLSF，但其 64KB memory pool 改由 PSRAM 提供。
-# 只修改 LVGL component 的配置可见性；显示 DMA buffer 仍由 esp_lvgl_port 按 INTERNAL/DMA 能力分配。
-if(TARGET __idf_lvgl__lvgl)
-    target_include_directories(
-        __idf_lvgl__lvgl
-        PRIVATE
-            "${CMAKE_CURRENT_LIST_DIR}/ui/lvgl_config"
-    )
-    target_compile_definitions(__idf_lvgl__lvgl PRIVATE LV_CONF_INCLUDE_SIMPLE=1)
-
-    # lv_conf.h 使用 heap_caps_malloc(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)。
-    # 显式链接 heap component，保证 LVGL component 编译时可见 esp_heap_caps.h。
-    if(TARGET idf::heap)
-        target_link_libraries(__idf_lvgl__lvgl PRIVATE idf::heap)
-    endif()
-
-    message(STATUS "FakePod: LVGL 64KB builtin pool 使用 PSRAM backing store")
+# SRAM.1.2：LVGL 仍使用内置 TLSF，但其 64KB backing pool 直接由 PSRAM allocator 提供。
+# LVGL 9.2.2 的 ESP-IDF Kconfig 默认 CONFIG_LV_CONF_SKIP=y，因此这里不再依赖 lv_conf.h。
+# 直接给 LVGL component 定义 LV_MEM_POOL_INCLUDE / LV_MEM_POOL_ALLOC，避免配置被 Kconfig 跳过。
+# 显示 DMA buffer 仍由 esp_lvgl_port 按 INTERNAL/DMA 能力分配，不受本配置影响。
+if(NOT TARGET __idf_lvgl__lvgl)
+    message(FATAL_ERROR "FakePod SRAM.1.2: LVGL component target 不可用，拒绝静默退回 64KB INTERNAL pool")
 endif()
+
+if(NOT TARGET idf::heap)
+    message(FATAL_ERROR "FakePod SRAM.1.2: ESP-IDF heap component target 不可用")
+endif()
+
+target_include_directories(
+    __idf_lvgl__lvgl
+    PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/ui/lvgl_config"
+)
+
+target_compile_definitions(
+    __idf_lvgl__lvgl
+    PRIVATE
+        LV_MEM_POOL_INCLUDE=\"fakepod_lvgl_pool.h\"
+        LV_MEM_POOL_ALLOC=fakepod_lvgl_psram_pool_alloc
+)
+
+# fakepod_lvgl_pool.h 使用 heap_caps_malloc(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)。
+target_link_libraries(__idf_lvgl__lvgl PRIVATE idf::heap)
+
+message(STATUS "FakePod: LVGL 64KB builtin TLSF pool 强制使用 PSRAM backing store")
 
 # ESP-IDF 的 RGB LCD 驱动在 Windows + Xtensa GCC 14.2.0 上可能在 IRA 阶段触发编译器内部错误。
 # FakePod 实际使用 QSPI CO5300，不走 RGB LCD 数据路径，但 esp_lvgl_port 链接时仍需要该驱动导出的符号。
