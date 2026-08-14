@@ -4,6 +4,7 @@
 #include "esp_log.h"
 
 #include "audio_spectrum_snapshot.h"
+#include "app_manager.h"
 #include "sdcard.h"
 #include "media_catalog_v2.h"
 #include "artwork_loader.h"
@@ -31,6 +32,11 @@ void system_runtime_update()
 
     // 先置位，保证即使某个可选服务失败也不会每 10ms 重复创建任务。
     g_background_start_attempted = true;
+
+    const esp_err_t app_ret = app_manager_init();
+    if (app_ret != ESP_OK) {
+        ESP_LOGW(TAG, "App Manager 初始化失败：%s；继续沿用Legacy Music前台", esp_err_to_name(app_ret));
+    }
 
     const esp_err_t power_ret = power_service_init();
     if (power_ret != ESP_OK) {
@@ -67,7 +73,8 @@ void system_runtime_update()
 
     ESP_LOGI(
         TAG,
-        "READY 后台服务：PowerKey=%s Spectrum=%s Artwork=%s CoverSurface=%s Lyrics=%s",
+        "READY 后台服务：Apps=%s PowerKey=%s Spectrum=%s Artwork=%s CoverSurface=%s Lyrics=%s",
+        esp_err_to_name(app_ret),
         esp_err_to_name(power_ret),
         esp_err_to_name(spectrum_ret),
         storage_services_available ? esp_err_to_name(artwork_ret) : "SKIPPED",

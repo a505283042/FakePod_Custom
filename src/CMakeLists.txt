@@ -4,6 +4,8 @@ idf_component_register(
 
         "boot/boot_state.cpp"
 
+        "app/app_manager.cpp"
+
         "system/system_loop.cpp"
         "system/system_runtime.cpp"
         "system/persistent_state.cpp"
@@ -73,6 +75,8 @@ idf_component_register(
         "board"
 
         "boot"
+
+        "app"
 
         "system"
 
