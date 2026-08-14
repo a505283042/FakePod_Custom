@@ -2005,6 +2005,22 @@ void library_view_create(lv_obj_t *screen)
         static_cast<int>(LIBRARY_SCROLLBAR_W));
 }
 
+void library_view_suspend_for_app_switch()
+{
+    if (g_root == nullptr) {
+        return;
+    }
+    library_view_inertia_stop(false);
+    if (lv_obj_has_flag(g_root, LV_OBJ_FLAG_HIDDEN)) {
+        return;
+    }
+    library_view_store_scroll_position();
+    library_view_scrollbar_set_visible(false);
+    g_gesture = {};
+    lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
+    UI_PAGE_INTERACTION_LOGI("曲库因APP切换挂起");
+}
+
 void library_view_open()
 {
     if (g_root == nullptr) {

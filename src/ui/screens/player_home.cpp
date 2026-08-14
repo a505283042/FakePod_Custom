@@ -271,7 +271,9 @@ static int32_t g_launcher_anim_progress = 0;
 
 static lv_timer_t *g_audio_timer = nullptr;
 static lv_timer_t *g_artwork_timer = nullptr;
+static lv_timer_t *g_gesture_timer = nullptr;
 static bool g_background_timers_running = true;
+static bool g_app_foreground = true;
 // BoundedSPI 退出已把当前封面恢复到 GRAM 时，下一次 Artwork resume 只同步 lease/source，
 // 不再产生一笔 460x460 LVGL invalidation。
 static bool g_artwork_resume_without_invalidation = false;
@@ -2218,6 +2220,39 @@ static void player_home_launcher_backdrop_tap_cb(lv_event_t *event)
     player_home_launcher_hide();
 }
 
+static void player_home_launcher_activate_index(
+    uint8_t index,
+    int32_t touch_x,
+    int32_t touch_y)
+{
+    if (index >= kLauncherItemCount) {
+        return;
+    }
+
+    g_launcher_selected_index = index;
+    const AppId target = kLauncherItems[index].app_id;
+    app_manager_set_launcher_target(target);
+    player_home_launcher_apply_selection();
+    HOME_INTERACTION_LOGI("Launcher径向命中：index=%u name=%s touch=(%ld,%ld)",
+        static_cast<unsigned>(index),
+        kLauncherItems[index].name,
+        static_cast<long>(touch_x),
+        static_cast<long>(touch_y));
+
+    // APP.2 起 Launcher 对已注册的非 Music APP 直接发起前台切换。
+    // Music 用 PreserveBackground 离场，因此 AudioTask/PlayerState 继续工作；未注册扇区仍只做选择。
+    if (target == AppId::Music || !app_manager_is_registered(target)) {
+        return;
+    }
+
+    const esp_err_t ret = app_manager_request_foreground(
+        target, AppTransitionMode::PreserveBackground);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Launcher进入APP失败：name=%s ret=%s",
+            app_manager_name(target), esp_err_to_name(ret));
+    }
+}
+
 static void player_home_launcher_panel_click_cb(lv_event_t *event)
 {
     if (event == nullptr || lv_event_get_code(event) != LV_EVENT_CLICKED ||
@@ -2237,15 +2272,8 @@ static void player_home_launcher_panel_click_cb(lv_event_t *event)
         return;
     }
 
-    const uint8_t index = static_cast<uint8_t>(hit);
-    g_launcher_selected_index = index;
-    app_manager_set_launcher_target(kLauncherItems[index].app_id);
-    player_home_launcher_apply_selection();
-    HOME_INTERACTION_LOGI("Launcher径向命中：index=%u name=%s touch=(%ld,%ld)",
-        static_cast<unsigned>(index),
-        kLauncherItems[index].name,
-        static_cast<long>(point.x),
-        static_cast<long>(point.y));
+    player_home_launcher_activate_index(
+        static_cast<uint8_t>(hit), point.x, point.y);
 }
 
 static void player_home_set_volume_adjust_armed(bool armed)
@@ -2596,8 +2624,9 @@ static void player_home_artwork_watch_track_change()
 static void player_home_update_background_timer_qos()
 {
     // 主页被歌词/频谱/曲库完整覆盖时，不让主页自己的 100ms Audio/Artwork timer
-    // 继续在 LVGL P3 后台醒来。Gesture timer 保持运行，负责统一页面导航与恢复。
+    // 继续在 LVGL P3 后台醒来。Music APP 真正转入 Background 时，Gesture timer 也由 Adapter 单独暂停。
     const bool should_run =
+        g_app_foreground &&
         !library_view_is_visible() &&
         !lyrics_view_is_visible() &&
         !spectrum_view_is_visible() &&
@@ -2678,6 +2707,9 @@ static bool player_home_handle_vertical_track_swipe(
 static void player_home_gesture_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
+    if (!g_app_foreground) {
+        return;
+    }
     player_home_update_background_timer_qos();
     if (library_view_is_visible()) {
         return;
@@ -2802,6 +2834,9 @@ static void player_home_gesture_timer_cb(lv_timer_t *timer)
 
 static void player_home_screen_tap_cb(lv_event_t *event)
 {
+    if (!g_app_foreground) {
+        return;
+    }
     if (g_launcher_visible) {
         // BoundedSPI 模式下 Launcher LVGL 根对象保持 hidden，Tap 会落到主页 screen。
         // 动画完成后在这里复用同一极坐标 hit-test，使物理显示与输入保持解耦。
@@ -2816,16 +2851,8 @@ static void player_home_screen_tap_cb(lv_event_t *event)
                 lv_indev_get_point(indev, &point);
                 const int8_t hit = player_home_launcher_hit_test(point.x, point.y);
                 if (hit >= 0) {
-                    const uint8_t index = static_cast<uint8_t>(hit);
-                    g_launcher_selected_index = index;
-                    app_manager_set_launcher_target(kLauncherItems[index].app_id);
-                    player_home_launcher_apply_selection();
-                    ESP_LOGI(TAG,
-                        "Launcher径向命中：index=%u name=%s touch=(%ld,%ld)",
-                        static_cast<unsigned>(index),
-                        kLauncherItems[index].name,
-                        static_cast<long>(point.x),
-                        static_cast<long>(point.y));
+                    player_home_launcher_activate_index(
+                        static_cast<uint8_t>(hit), point.x, point.y);
                 } else if (g_launcher_panel != nullptr) {
                     lv_area_t panel = {};
                     lv_obj_get_coords(g_launcher_panel, &panel);
@@ -3433,6 +3460,88 @@ void player_home_resume_from_fullscreen_view(const char *reason)
         g_overlay_visible ? 1U : 0U);
 }
 
+static void player_home_launcher_abort_for_app_switch()
+{
+    if (g_launcher_panel != nullptr) {
+        lv_anim_delete(g_launcher_panel, player_home_launcher_progress_anim_exec);
+    }
+    if (g_launcher_bounded_session_active) {
+        display_launcher_bounded_spi_session_end();
+    }
+    g_launcher_bounded_session_active = false;
+    player_home_launcher_release_surface_lease();
+    g_launcher_frame_cache_active = false;
+    g_launcher_frame_index = kLauncherFrameInvalid;
+    g_launcher_visible = false;
+    g_launcher_motion = LauncherMotionState::Hidden;
+    g_launcher_anim_progress = 0;
+    g_artwork_resume_without_invalidation = false;
+    if (g_launcher != nullptr) {
+        lv_obj_add_flag(g_launcher, LV_OBJ_FLAG_HIDDEN);
+    }
+    now_playing_artwork_set_bounded_present_allowed(false);
+}
+
+esp_err_t player_home_app_leave_background()
+{
+    if (!g_app_foreground) {
+        return ESP_OK;
+    }
+
+    // Music 的子页面必须先静默收口，不能调用 HomeResume；否则会在 Manager 已准备切 APP 时
+    // 重新 acquire Artwork lease / 恢复 timer。
+    library_view_suspend_for_app_switch();
+    lyrics_view_close();
+    spectrum_view_close();
+    player_home_launcher_abort_for_app_switch();
+    player_home_overlay_hide();
+    player_home_cancel_progress_interaction();
+    g_volume_dragging = false;
+    g_volume_adjust_armed = false;
+    gesture_router_set_vertical_adjust_enabled(false);
+    gesture_router_reset();
+
+    g_app_foreground = false;
+    if (g_gesture_timer != nullptr) {
+        lv_timer_pause(g_gesture_timer);
+    }
+    if (g_overlay_timer != nullptr) {
+        lv_timer_pause(g_overlay_timer);
+    }
+    player_home_update_background_timer_qos();
+
+    ESP_LOGI(TAG, "Music前台已挂起：AudioTask继续运行，Home/Artwork/手势timer暂停");
+    return ESP_OK;
+}
+
+esp_err_t player_home_app_enter_foreground()
+{
+    if (g_app_foreground) {
+        return ESP_OK;
+    }
+
+    g_app_foreground = true;
+    now_playing_artwork_set_bounded_present_allowed(true);
+    if (g_gesture_timer != nullptr) {
+        lv_timer_reset(g_gesture_timer);
+        lv_timer_resume(g_gesture_timer);
+    }
+
+    // APP 返回 Music 固定落到 Home；歌词/频谱/曲库下次由用户重新打开。
+    player_home_refresh();
+    lv_obj_t *screen = lv_screen_active();
+    if (screen != nullptr) {
+        lv_obj_invalidate(screen);
+    }
+    ESP_LOGI(TAG, "Music恢复前台：Home/Artwork/手势timer恢复");
+    return ESP_OK;
+}
+
+bool player_home_app_is_foreground()
+{
+    return g_app_foreground;
+}
+
 void player_home_create(lv_obj_t *screen)
 {
     if (screen == nullptr) {
@@ -3471,7 +3580,9 @@ void player_home_create(lv_obj_t *screen)
     g_volume_mode_button = nullptr;
     g_audio_timer = nullptr;
     g_artwork_timer = nullptr;
+    g_gesture_timer = nullptr;
     g_background_timers_running = true;
+    g_app_foreground = true;
     g_artwork_resume_without_invalidation = false;
     g_last_artwork_bound_track = UINT32_MAX;
     gesture_router_reset();
@@ -3737,7 +3848,7 @@ void player_home_create(lv_obj_t *screen)
 
     g_audio_timer = lv_timer_create(player_home_audio_timer_cb, 100, nullptr);
     g_artwork_timer = lv_timer_create(player_home_artwork_timer_cb, 100, nullptr);
-    lv_timer_create(player_home_gesture_timer_cb, 20, nullptr);
+    g_gesture_timer = lv_timer_create(player_home_gesture_timer_cb, 20, nullptr);
     g_overlay_timer = lv_timer_create(player_home_overlay_timeout_cb, kOverlayTimeoutMs, nullptr);
     if (g_overlay_timer != nullptr) {
         lv_timer_pause(g_overlay_timer);

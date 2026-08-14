@@ -5,6 +5,8 @@
 
 #include "audio_spectrum_snapshot.h"
 #include "app_manager.h"
+#include "music_app_adapter.h"
+#include "ebook_app.h"
 #include "sdcard.h"
 #include "media_catalog_v2.h"
 #include "artwork_loader.h"
@@ -36,6 +38,20 @@ void system_runtime_update()
     const esp_err_t app_ret = app_manager_init();
     if (app_ret != ESP_OK) {
         ESP_LOGW(TAG, "App Manager 初始化失败：%s；继续沿用Legacy Music前台", esp_err_to_name(app_ret));
+    }
+    const esp_err_t music_adapter_ret = app_ret == ESP_OK
+        ? music_app_adapter_bind()
+        : ESP_ERR_INVALID_STATE;
+    if (music_adapter_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Music Lifecycle Adapter 绑定失败：%s；继续保持Legacy保护",
+            esp_err_to_name(music_adapter_ret));
+    }
+    const esp_err_t ebook_ret = app_ret == ESP_OK
+        ? ebook_app_register()
+        : ESP_ERR_INVALID_STATE;
+    if (ebook_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Ebook APP 注册失败：%s；Launcher仍保持选择但不会进入",
+            esp_err_to_name(ebook_ret));
     }
 
     const esp_err_t power_ret = power_service_init();
@@ -73,8 +89,10 @@ void system_runtime_update()
 
     ESP_LOGI(
         TAG,
-        "READY 后台服务：Apps=%s PowerKey=%s Spectrum=%s Artwork=%s CoverSurface=%s Lyrics=%s",
+        "READY 后台服务：Apps=%s MusicAdapter=%s Ebook=%s PowerKey=%s Spectrum=%s Artwork=%s CoverSurface=%s Lyrics=%s",
         esp_err_to_name(app_ret),
+        esp_err_to_name(music_adapter_ret),
+        esp_err_to_name(ebook_ret),
         esp_err_to_name(power_ret),
         esp_err_to_name(spectrum_ret),
         storage_services_available ? esp_err_to_name(artwork_ret) : "SKIPPED",

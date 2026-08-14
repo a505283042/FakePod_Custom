@@ -5,6 +5,9 @@ idf_component_register(
         "boot/boot_state.cpp"
 
         "app/app_manager.cpp"
+        "app/music_app_adapter.cpp"
+        "app/ebook_app.cpp"
+        "app/ebook_reader_model.cpp"
 
         "system/system_loop.cpp"
         "system/system_runtime.cpp"
