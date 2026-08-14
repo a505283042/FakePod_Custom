@@ -53,8 +53,9 @@ struct TextPage
 esp_err_t scan_directory(const char *path, DirectorySnapshot *out_snapshot);
 void release_directory(DirectorySnapshot *snapshot);
 
-// 从稳定文件字节偏移读取单页。每页只读一个小窗口，并按实际字体像素宽度/可见行数切页；
-// next_offset 只推进本页真正显示过的 UTF-8 字节及对应行结束符。offset=0 时识别 UTF-8 BOM；UTF-16/非法 UTF-8 会拒绝。
+// 从稳定文件字节偏移读取单页。每页只读一个小窗口，并按实际字体像素宽度/可见行数切页。
+// 小说重排采用保守策略：短对白/诗句/效果字保留原换行，高置信度网页机械折行软合并，明确网站广告仅隐藏显示。
+// 所有显示变换仍精确消费原 TXT 字节，next_offset 永远保持源文件 offset；offset=0 时识别 UTF-8 BOM，UTF-16/非法 UTF-8 拒绝。
 esp_err_t load_text_page(
     const char *path, uint64_t offset, const PageLayout &layout, TextPage *out_page);
 void release_text_page(TextPage *page);

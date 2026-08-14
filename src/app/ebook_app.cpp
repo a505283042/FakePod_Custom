@@ -33,8 +33,8 @@ static constexpr int32_t kRowHeight = 58;
 static constexpr int16_t kPageSwipeThresholdPx = 72;
 static constexpr int16_t kPageSwipeVerticalTolerancePx = 72;
 static constexpr int32_t kReaderMarginX = 12;
-static constexpr int32_t kReaderTextHeight = 306;
-static constexpr int32_t kReaderLineSpace = 7;
+static constexpr int32_t kReaderTextHeight = 314;
+static constexpr int32_t kReaderLineSpace = 3;
 static constexpr size_t kInitialHistoryCapacity = 64;
 
 static lv_obj_t *g_root = nullptr;
@@ -345,9 +345,12 @@ static void ebook_row_clicked_cb(lv_event_t *event)
         return;
     }
     ebook_show_reader();
-    ESP_LOGI(TAG, "TXT分页打开：%s bytes=%llu first_next=%llu",
+    const EbookReader::PageLayout layout = ebook_reader_page_layout();
+    ESP_LOGI(TAG, "TXT小说重排打开：%s bytes=%llu width=%u lines=%u first_next=%llu",
         entry.name,
         static_cast<unsigned long long>(g_book_size),
+        static_cast<unsigned>(layout.text_width_px),
+        static_cast<unsigned>(layout.max_lines),
         static_cast<unsigned long long>(g_page_next));
 
 }
@@ -731,7 +734,7 @@ static esp_err_t ebook_create()
     }
 
     if (restore_invalidation) lv_display_enable_invalidation(display, true);
-    ESP_LOGI(TAG, "Ebook create完成：Browser + 固定页TXT Reader UI已建立（Hidden）");
+    ESP_LOGI(TAG, "Ebook create完成：Browser + 小说智能重排分页 Reader UI已建立（Hidden）");
     return ESP_OK;
 }
 
@@ -824,7 +827,7 @@ esp_err_t ebook_app_register()
 
     const esp_err_t ret = app_manager_register(descriptor);
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Ebook APP已注册：/BOOKS 浏览 + UTF-8 TXT 固定分页 Reader V1");
+        ESP_LOGI(TAG, "Ebook APP已注册：/BOOKS 浏览 + UTF-8 TXT 小说智能重排 Reader");
     }
     return ret;
 }
