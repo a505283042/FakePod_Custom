@@ -86,6 +86,7 @@ struct Mp3Decoder
 #endif
 
     bool runtime_info_verified = false;
+    bool streaming_source = false;
     bool eof = false;
 };
 
@@ -143,7 +144,12 @@ bool mp3_decoder_get_perf_snapshot(Mp3PerfSnapshot *out_snapshot);
 esp_err_t mp3_decoder_register_backend();
 
 // 从统一 AudioSource 打开 MP3，并预解码第一块 PCM，以便在启动 I2S/DAC 前确认真实输出格式。
-esp_err_t mp3_decoder_open(Mp3Decoder *decoder, AudioSource *source, AudioDecodeWorkspace *workspace = nullptr);
+esp_err_t mp3_decoder_open(
+    Mp3Decoder *decoder,
+    AudioSource *source,
+    AudioDecodeWorkspace *workspace = nullptr,
+    bool streaming_source = false
+);
 
 // 流式解码并统一转换为 32bit I2S 立体声容器；单声道自动复制到左右声道。
 esp_err_t mp3_decoder_read_pcm32(

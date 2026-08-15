@@ -12,6 +12,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "audio/audio_service.h"
+#include "audio/sources/avi_mp3_audio_source.h"
 #include "video_media_io.h"
 #include "video_jpeg_probe.h"
 
@@ -23,7 +25,7 @@ namespace
 {
 
 static constexpr size_t kFrameSlotCount = 2U;
-static constexpr size_t kCompressedSlotCount = 3U;
+static constexpr size_t kCompressedSlotCount = 8U;
 static constexpr size_t kCompressedSlotBytes = 128U * 1024U;
 static constexpr uint32_t kExtractorPoolBytes = 384U * 1024U;
 static constexpr uint32_t kTaskStack = 8192U;
@@ -42,6 +44,10 @@ static constexpr uint32_t kDeadlineSafetyMaxUs = 12000U;
 static constexpr uint32_t kDecodeJitterReserveMaxUs = 10000U;
 static constexpr uint8_t kDecodeTimingEwmaShift = 3U; // alpha = 1/8
 static constexpr uint32_t kPreDecodeLogEveryDrops = 32U;
+static constexpr size_t kAudioBridgeBytes = 32U * 1024U;
+static constexpr size_t kAudioPrebufferBytes = 4U * 1024U;
+static constexpr uint32_t kAudioPrebufferTimeoutMs = 1500U;
+static constexpr uint32_t kAudioBridgePushTimeoutMs = 250U;
 
 struct FrameSlot
 {
@@ -109,6 +115,19 @@ struct DecodeTimingModel
     uint32_t jitter_ewma_us = 0U;
 };
 
+struct AudioProbeStats
+{
+    uint32_t frames_read = 0U;
+    uint64_t compressed_bytes = 0ULL;
+    uint32_t compressed_bytes_max = 0U;
+    uint32_t first_pts_ms = 0U;
+    uint32_t last_pts_ms = 0U;
+    uint64_t extract_us_total = 0ULL;
+    uint32_t extract_us_max = 0U;
+    uint64_t storage_us_total = 0ULL;
+    uint32_t storage_us_max = 0U;
+};
+
 static portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
 static Snapshot g_snapshot = {};
 static uint32_t g_generation = 1U;
@@ -123,6 +142,55 @@ static FrameSlot g_slots[kFrameSlotCount] = {};
 static CompressedSlot g_compressed_slots[kCompressedSlotCount] = {};
 static uint8_t g_leased_mask = 0U;
 static PresentationClock g_presentation_clock = {};
+static AudioProbeStats g_audio_probe = {};
+
+static void merge_audio_probe_unlocked(Snapshot *snapshot)
+{
+    if (snapshot == nullptr) return;
+    snapshot->audio_frames_read = g_audio_probe.frames_read;
+    snapshot->audio_compressed_bytes = g_audio_probe.compressed_bytes;
+    snapshot->audio_compressed_bytes_max = g_audio_probe.compressed_bytes_max;
+    snapshot->audio_first_pts_ms = g_audio_probe.first_pts_ms;
+    snapshot->audio_last_pts_ms = g_audio_probe.last_pts_ms;
+    snapshot->audio_extract_us_total = g_audio_probe.extract_us_total;
+    snapshot->audio_extract_us_max = g_audio_probe.extract_us_max;
+    snapshot->audio_storage_us_total = g_audio_probe.storage_us_total;
+    snapshot->audio_storage_us_max = g_audio_probe.storage_us_max;
+}
+
+static void snapshot_audio_probe(Snapshot *snapshot)
+{
+    if (snapshot == nullptr) return;
+    portENTER_CRITICAL(&g_mux);
+    merge_audio_probe_unlocked(snapshot);
+    portEXIT_CRITICAL(&g_mux);
+}
+
+static bool record_audio_probe(
+    const esp_extractor_frame_info_t &frame,
+    uint32_t extract_us,
+    uint32_t storage_us,
+    uint32_t generation)
+{
+    bool first = false;
+    portENTER_CRITICAL(&g_mux);
+    if (generation == g_generation && g_stop_generation != generation) {
+        first = g_audio_probe.frames_read == 0U;
+        ++g_audio_probe.frames_read;
+        g_audio_probe.compressed_bytes += frame.frame_size;
+        if (frame.frame_size > g_audio_probe.compressed_bytes_max) {
+            g_audio_probe.compressed_bytes_max = frame.frame_size;
+        }
+        if (first) g_audio_probe.first_pts_ms = frame.pts;
+        g_audio_probe.last_pts_ms = frame.pts;
+        g_audio_probe.extract_us_total += extract_us;
+        if (extract_us > g_audio_probe.extract_us_max) g_audio_probe.extract_us_max = extract_us;
+        g_audio_probe.storage_us_total += storage_us;
+        if (storage_us > g_audio_probe.storage_us_max) g_audio_probe.storage_us_max = storage_us;
+    }
+    portEXIT_CRITICAL(&g_mux);
+    return first;
+}
 
 static bool generation_matches(uint32_t generation)
 {
@@ -145,14 +213,20 @@ static bool generation_current(uint32_t generation)
 static void publish(const Snapshot &snapshot)
 {
     portENTER_CRITICAL(&g_mux);
-    if (snapshot.generation == g_generation) g_snapshot = snapshot;
+    if (snapshot.generation == g_generation) {
+        g_snapshot = snapshot;
+        merge_audio_probe_unlocked(&g_snapshot);
+    }
     portEXIT_CRITICAL(&g_mux);
 }
 
 static void publish_task_exit(const Snapshot &snapshot)
 {
     portENTER_CRITICAL(&g_mux);
-    if (snapshot.generation == g_generation) g_snapshot = snapshot;
+    if (snapshot.generation == g_generation) {
+        g_snapshot = snapshot;
+        merge_audio_probe_unlocked(&g_snapshot);
+    }
     g_task = nullptr;
     portEXIT_CRITICAL(&g_mux);
 }
@@ -243,6 +317,38 @@ static void wait_extract_task_exit()
     while (extract_task_running()) vTaskDelay(1);
 }
 
+static esp_err_t wait_audio_prebuffer(
+    uint32_t generation,
+    AviMp3BridgeSnapshot *out_snapshot,
+    uint32_t *out_wait_ms)
+{
+    if (out_snapshot == nullptr || out_wait_ms == nullptr) return ESP_ERR_INVALID_ARG;
+    *out_snapshot = {};
+    *out_wait_ms = 0U;
+    const int64_t started_us = esp_timer_get_time();
+
+    while (generation_current(generation)) {
+        AviMp3BridgeSnapshot snapshot = {};
+        if (!avi_mp3_bridge_get_snapshot(&snapshot) || !snapshot.active || snapshot.cancelled) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        const int64_t elapsed_signed_us = esp_timer_get_time() - started_us;
+        const uint64_t elapsed_us = elapsed_signed_us > 0LL
+            ? static_cast<uint64_t>(elapsed_signed_us) : 0ULL;
+        *out_wait_ms = static_cast<uint32_t>(elapsed_us / 1000ULL);
+        *out_snapshot = snapshot;
+
+        if (snapshot.buffered_bytes >= kAudioPrebufferBytes) return ESP_OK;
+        // 极短 AVI 可能在 4KB 前已经到 EOS；只要至少有一帧压缩音频，就允许启动并自然排空。
+        if (snapshot.eof && snapshot.buffered_bytes != 0U) return ESP_OK;
+        if (elapsed_us >= static_cast<uint64_t>(kAudioPrebufferTimeoutMs) * 1000ULL) {
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(1);
+    }
+    return ESP_ERR_INVALID_STATE;
+}
+
 static esp_err_t validate_stream(esp_extractor_handle_t extractor, Snapshot *snapshot)
 {
     if (extractor == nullptr || snapshot == nullptr) return ESP_ERR_INVALID_ARG;
@@ -266,6 +372,44 @@ static esp_err_t validate_stream(esp_extractor_handle_t extractor, Snapshot *sna
             static_cast<unsigned>(snapshot->width), static_cast<unsigned>(snapshot->height),
             static_cast<unsigned>(kWidth), static_cast<unsigned>(kHeight));
         return ESP_ERR_INVALID_SIZE;
+    }
+
+    uint16_t audio_num = 0U;
+    const esp_extractor_err_t audio_num_ret = esp_extractor_get_stream_num(
+        extractor, ESP_EXTRACTOR_STREAM_TYPE_AUDIO, &audio_num);
+    if (audio_num_ret == ESP_EXTRACTOR_ERR_OK && audio_num > 0U) {
+        esp_extractor_stream_info_t audio = {};
+        if (esp_extractor_get_stream_info(
+                extractor, ESP_EXTRACTOR_STREAM_TYPE_AUDIO, 0U, &audio) != ESP_EXTRACTOR_ERR_OK) {
+            return ESP_FAIL;
+        }
+        snapshot->audio_streams = audio_num;
+        snapshot->audio_format = static_cast<uint32_t>(audio.audio_info.format);
+        snapshot->audio_duration_ms = audio.duration;
+        snapshot->audio_bitrate = audio.bitrate;
+        snapshot->audio_sample_rate = audio.audio_info.sample_rate;
+        snapshot->audio_channels = audio.audio_info.channel;
+        snapshot->audio_bits_per_sample = audio.audio_info.bits_per_sample;
+        if (audio.audio_info.format != ESP_EXTRACTOR_AUDIO_FORMAT_MP3) {
+            ESP_LOGE(TAG,
+                "AVI AUDIO轨暂不支持：format=0x%08lx streams=%u；Video V1要求MP3",
+                static_cast<unsigned long>(snapshot->audio_format),
+                static_cast<unsigned>(audio_num));
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+        ESP_LOGI(TAG,
+            "AVI MP3 Audio Pipeline V1：streams=%u %luHz/%uch bits=%u bitrate=%lu duration=%lums；Extractor->32KB PSRAM Bridge->AudioTask->MP3->PCM",
+            static_cast<unsigned>(audio_num),
+            static_cast<unsigned long>(snapshot->audio_sample_rate),
+            static_cast<unsigned>(snapshot->audio_channels),
+            static_cast<unsigned>(snapshot->audio_bits_per_sample),
+            static_cast<unsigned long>(snapshot->audio_bitrate),
+            static_cast<unsigned long>(snapshot->audio_duration_ms));
+    } else if (audio_num_ret == ESP_EXTRACTOR_ERR_OK || audio_num_ret == ESP_EXTRACTOR_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG, "AVI MP3 Audio Pipeline：未发现AUDIO轨；继续VIDEO-only兼容路径");
+    } else {
+        ESP_LOGE(TAG, "查询AVI AUDIO轨失败：extractor_ret=%d", static_cast<int>(audio_num_ret));
+        return ESP_FAIL;
     }
     return ESP_OK;
 }
@@ -361,6 +505,7 @@ static void extract_task(void *arg)
 
         if (ex == ESP_EXTRACTOR_ERR_EOS) {
             return_compressed_to_free(compressed_slot_index);
+            avi_mp3_bridge_mark_eof();
             PipelineMessage message = {};
             message.type = PipelineMessageType::Eof;
             message.result = ESP_OK;
@@ -370,6 +515,7 @@ static void extract_task(void *arg)
 
         if (ex != ESP_EXTRACTOR_ERR_OK) {
             return_compressed_to_free(compressed_slot_index);
+            avi_mp3_bridge_cancel();
             PipelineMessage message = {};
             if (!generation_current(args->generation) || ex == ESP_EXTRACTOR_ERR_ABORTED) {
                 message.type = PipelineMessageType::Stopped;
@@ -380,6 +526,41 @@ static void extract_task(void *arg)
             }
             (void)send_pipeline_message(message, args->generation);
             break;
+        }
+
+        if (frame.stream_type == ESP_EXTRACTOR_STREAM_TYPE_AUDIO) {
+            esp_err_t audio_push_ret = ESP_OK;
+            if (frame.frame_buffer != nullptr && frame.frame_size != 0U) {
+                const bool first_audio = record_audio_probe(
+                    frame, extract_us, storage_us, args->generation);
+                audio_push_ret = avi_mp3_bridge_push(
+                    frame.frame_buffer, frame.frame_size, kAudioBridgePushTimeoutMs);
+                if (first_audio) {
+                    ESP_LOGI(TAG,
+                        "AVI MP3首帧入Bridge：stream=%u pts=%lums bytes=%lu pos=%lu capacity=%uKB",
+                        static_cast<unsigned>(frame.stream_idx),
+                        static_cast<unsigned long>(frame.pts),
+                        static_cast<unsigned long>(frame.frame_size),
+                        static_cast<unsigned long>(frame.frame_pos),
+                        static_cast<unsigned>(kAudioBridgeBytes / 1024U));
+                }
+            }
+            (void)esp_extractor_release_frame(args->extractor, &frame);
+            return_compressed_to_free(compressed_slot_index);
+            if (audio_push_ret != ESP_OK) {
+                PipelineMessage message = {};
+                message.type = generation_current(args->generation)
+                    ? PipelineMessageType::Failed : PipelineMessageType::Stopped;
+                message.result = generation_current(args->generation)
+                    ? audio_push_ret : ESP_OK;
+                ESP_LOGE(TAG, "AVI MP3 Bridge写入失败：ret=%s pts=%lums bytes=%lu",
+                    esp_err_to_name(audio_push_ret),
+                    static_cast<unsigned long>(frame.pts),
+                    static_cast<unsigned long>(frame.frame_size));
+                (void)send_pipeline_message(message, args->generation);
+                break;
+            }
+            continue;
         }
 
         if (frame.stream_type != ESP_EXTRACTOR_STREAM_TYPE_VIDEO ||
@@ -484,21 +665,60 @@ static int64_t adaptive_predecode_deadline_us(const DecodeTimingModel &timing)
     return kUiEmergencyLateUs - static_cast<int64_t>(safety_us);
 }
 
+static bool audio_master_late_us(uint32_t video_pts_ms, int64_t *out_late_us)
+{
+    if (out_late_us != nullptr) *out_late_us = 0LL;
+
+    uint32_t audio_first_pts_ms = 0U;
+    bool have_audio_pts = false;
+    portENTER_CRITICAL(&g_mux);
+    if (g_audio_probe.frames_read != 0U) {
+        audio_first_pts_ms = g_audio_probe.first_pts_ms;
+        have_audio_pts = true;
+    }
+    portEXIT_CRITICAL(&g_mux);
+    if (!have_audio_pts) return false;
+
+    AudioVideoClockSnapshot audio_clock = {};
+    if (!audio_service_video_mp3_get_clock(&audio_clock) ||
+        !audio_clock.active || audio_clock.eof || audio_clock.sample_rate_hz == 0U ||
+        audio_clock.submitted_frames == 0ULL) {
+        return false;
+    }
+
+    const int64_t target_audio_us =
+        (static_cast<int64_t>(video_pts_ms) - static_cast<int64_t>(audio_first_pts_ms)) * 1000LL;
+    const int64_t late_us = static_cast<int64_t>(audio_clock.position_us) - target_audio_us;
+    if (out_late_us != nullptr) *out_late_us = late_us;
+    return true;
+}
+
 static bool should_predecode_drop(
     const PresentationClock &clock,
     uint32_t pts_ms,
     uint32_t decode_estimate,
     int64_t deadline_us,
     int64_t *out_late_us,
-    int64_t *out_projected_late_us)
+    int64_t *out_projected_late_us,
+    bool *out_audio_master)
 {
     if (out_late_us != nullptr) *out_late_us = 0LL;
     if (out_projected_late_us != nullptr) *out_projected_late_us = 0LL;
-    if (!clock.started || decode_estimate == 0U) return false;
+    if (out_audio_master != nullptr) *out_audio_master = false;
+    if (decode_estimate == 0U) return false;
 
-    const uint32_t pts_delta_ms = pts_ms >= clock.first_pts_ms ? pts_ms - clock.first_pts_ms : 0U;
-    const int64_t target_us = clock.base_us + static_cast<int64_t>(pts_delta_ms) * 1000LL;
-    const int64_t late_us = esp_timer_get_time() - target_us;
+    int64_t late_us = 0LL;
+    if (audio_master_late_us(pts_ms, &late_us)) {
+        if (out_audio_master != nullptr) *out_audio_master = true;
+    } else {
+        if (!clock.started) return false;
+        const uint32_t pts_delta_ms =
+            pts_ms >= clock.first_pts_ms ? pts_ms - clock.first_pts_ms : 0U;
+        const int64_t target_us =
+            clock.base_us + static_cast<int64_t>(pts_delta_ms) * 1000LL;
+        late_us = esp_timer_get_time() - target_us;
+    }
+
     const int64_t projected_late_us = late_us + static_cast<int64_t>(decode_estimate);
     if (out_late_us != nullptr) *out_late_us = late_us;
     if (out_projected_late_us != nullptr) *out_projected_late_us = projected_late_us;
@@ -531,7 +751,7 @@ static void benchmark_task(void *arg)
     if (ret == ESP_OK && generation_current(args->generation)) {
         esp_extractor_config_t cfg = {};
         cfg.type = ESP_EXTRACTOR_TYPE_AVI;
-        cfg.extract_mask = ESP_EXTRACT_MASK_VIDEO;
+        cfg.extract_mask = ESP_EXTRACT_MASK_AV;
         cfg.in_read_cb = VideoMediaIo::read_cb;
         cfg.in_seek_cb = VideoMediaIo::seek_cb;
         cfg.in_size_cb = VideoMediaIo::size_cb;
@@ -559,6 +779,13 @@ static void benchmark_task(void *arg)
         // Full-image native-size decode；显示端仅做局部居中，不做运行时 resize。
         config.block_enable = false;
         if (jpeg_dec_open(&config, &decoder) != JPEG_ERR_OK || decoder == nullptr) ret = ESP_FAIL;
+    }
+
+    if (ret == ESP_OK && generation_current(args->generation) && result.audio_streams != 0U) {
+        ret = avi_mp3_bridge_begin(kAudioBridgeBytes);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "创建AVI MP3 32KB PSRAM Bridge失败：%s", esp_err_to_name(ret));
+        }
     }
 
     uint64_t copy_us_total = 0ULL;
@@ -589,12 +816,52 @@ static void benchmark_task(void *arg)
         }
     }
 
+    if (ret == ESP_OK && generation_current(args->generation) && result.audio_streams != 0U) {
+        AviMp3BridgeSnapshot prebuffer = {};
+        uint32_t prebuffer_wait_ms = 0U;
+        ret = wait_audio_prebuffer(args->generation, &prebuffer, &prebuffer_wait_ms);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG,
+                "AVI MP3预取失败：need=%uB buffered=%uB high=%uB wait=%lums ret=%s；拒绝带欠载风险启动AudioTask",
+                static_cast<unsigned>(kAudioPrebufferBytes),
+                static_cast<unsigned>(prebuffer.buffered_bytes),
+                static_cast<unsigned>(prebuffer.high_water_bytes),
+                static_cast<unsigned long>(prebuffer_wait_ms),
+                esp_err_to_name(ret));
+            avi_mp3_bridge_cancel();
+            stop_generation(args->generation);
+        } else {
+            ESP_LOGI(TAG,
+                "AVI MP3 Realtime Prefetch就绪：buffered=%u/%uB high=%uB wait=%lums video_slots=%u（约%lums@24fps）；现在才启动AudioTask",
+                static_cast<unsigned>(prebuffer.buffered_bytes),
+                static_cast<unsigned>(prebuffer.capacity_bytes),
+                static_cast<unsigned>(prebuffer.high_water_bytes),
+                static_cast<unsigned long>(prebuffer_wait_ms),
+                static_cast<unsigned>(kCompressedSlotCount),
+                static_cast<unsigned long>((kCompressedSlotCount * 1000U) / 24U));
+        }
+    }
+
+    if (ret == ESP_OK && generation_current(args->generation) && result.audio_streams != 0U) {
+        const bool audio_started = audio_service_video_mp3_start(
+            result.audio_sample_rate,
+            result.audio_channels,
+            result.audio_bits_per_sample,
+            true);
+        if (!audio_started) {
+            ESP_LOGE(TAG, "AVI MP3 AudioTask启动失败；取消本次Video，避免无声状态继续占用Bridge");
+            avi_mp3_bridge_cancel();
+            stop_generation(args->generation);
+            ret = ESP_FAIL;
+        }
+    }
+
     if (ret == ESP_OK && generation_current(args->generation)) {
         result.state = State::Running;
         result.result = ESP_OK;
         publish(result);
         ESP_LOGI(TAG,
-            "MJPEG Benchmark启动：native=%ux%u canvas<=460x460 fps_hint=%u AVI_index=OFF extractor_pool=%uKB RGB565=BE 双帧PSRAM(max)=%uKB pipeline=ExtractCore%d/P%u->DecodeCore%d/P%u compressed=%ux%uKB；仅VIDEO轨，AVI MP3暂不播放",
+            "MJPEG Benchmark启动：native=%ux%u canvas<=460x460 fps_hint=%u AVI_index=OFF extractor_pool=%uKB RGB565=BE 双帧PSRAM(max)=%uKB pipeline=ExtractCore%d/P%u->DecodeCore%d/P%u compressed=%ux%uKB；extract_mask=AV，VIDEO->JPEG Pipeline，MP3->32KB Bridge(>=4KB prebuffer)->AudioTask",
             static_cast<unsigned>(result.width), static_cast<unsigned>(result.height),
             static_cast<unsigned>(result.fps_hint), static_cast<unsigned>(kExtractorPoolBytes / 1024U),
             static_cast<unsigned>((kRgb565Bytes * kFrameSlotCount) / 1024U),
@@ -603,13 +870,13 @@ static void benchmark_task(void *arg)
             static_cast<unsigned>(kCompressedSlotCount),
             static_cast<unsigned>(kCompressedSlotBytes / 1024U));
         ESP_LOGI(TAG,
-            "MJPEG Pipeline A/B：Extractor/TF与JPEG Decode并行；压缩帧复制后立即release extractor frame，AudioTask优先级/FLAC gate不变");
+            "MJPEG Pipeline A/B：Extractor/TF与JPEG Decode并行；VIDEO压缩队列扩为8帧以给AUDIO建立约1/3秒预取；AUDIO payload复制进32KB PSRAM Bridge后立即release；AudioTask唯一拥有MP3/PCM/I2S/DAC");
         ESP_LOGI(TAG,
             "Decode Scheduler Safety：每%u帧主动Block %u tick，为IDLE0/TWDT留出CPU0运行窗口",
             static_cast<unsigned>(kDecodeYieldEveryFrames),
             static_cast<unsigned>(kDecodeYieldTicks));
         ESP_LOGI(TAG,
-            "Unified PTS + Adaptive PreDecode：UI emergency=%lldms，deadline=%lu..%lums，JPEG EWMA alpha=1/8 + jitter reserve；Decode等待UI发布唯一Presentation Clock",
+            "Audio Master + Adaptive PreDecode：有AVI MP3时以AudioTask submitted PCM Clock判断late/drop；无音轨/PCM尚未启动时回退Unified Timer；UI emergency=%lldms deadline=%lu..%lums",
             static_cast<long long>(kUiEmergencyLateUs / 1000LL),
             static_cast<unsigned long>((kUiEmergencyLateUs - kDeadlineSafetyMaxUs) / 1000LL),
             static_cast<unsigned long>((kUiEmergencyLateUs - kDeadlineSafetyBaseUs) / 1000LL));
@@ -671,12 +938,13 @@ static void benchmark_task(void *arg)
 
             int64_t late_us = 0LL;
             int64_t projected_late_us = 0LL;
+            bool predecode_audio_master = false;
             PresentationClock clock = presentation_clock_snapshot(args->generation);
             uint32_t estimated_decode_us = decode_estimate_us(decode_timing);
             int64_t deadline_us = adaptive_predecode_deadline_us(decode_timing);
             if (should_predecode_drop(
                     clock, compressed.pts_ms, estimated_decode_us, deadline_us,
-                    &late_us, &projected_late_us)) {
+                    &late_us, &projected_late_us, &predecode_audio_master)) {
                 ++predecode_drops;
                 if (!catchup_active) {
                     ++catchup_events;
@@ -685,14 +953,15 @@ static void benchmark_task(void *arg)
                 if (projected_late_us > projected_late_us_max) projected_late_us_max = projected_late_us;
                 if (predecode_drops == 1U || (predecode_drops % kPreDecodeLogEveryDrops) == 0U) {
                     ESP_LOGW(TAG,
-                        "PreDecode Deadline丢帧：drop=%lu event=%lu pts=%lums late=%lldms projected=%lldms deadline=%lldms jpeg_est=%luus",
+                        "PreDecode Deadline丢帧：drop=%lu event=%lu pts=%lums late=%lldms projected=%lldms deadline=%lldms jpeg_est=%luus clock=%s",
                         static_cast<unsigned long>(predecode_drops),
                         static_cast<unsigned long>(catchup_events),
                         static_cast<unsigned long>(compressed.pts_ms),
                         static_cast<long long>(late_us / 1000LL),
                         static_cast<long long>(projected_late_us / 1000LL),
                         static_cast<long long>(deadline_us / 1000LL),
-                        static_cast<unsigned long>(estimated_decode_us));
+                        static_cast<unsigned long>(estimated_decode_us),
+                        predecode_audio_master ? "AudioPCM" : "FallbackTimer");
                 }
                 return_compressed_to_free(message.slot);
                 if ((result.frames_read % kPublishEveryFrames) == 0U) publish(result);
@@ -705,13 +974,13 @@ static void benchmark_task(void *arg)
                 break;
             }
 
-            // 等 RGB565 空槽也可能耗时；真正进入 JPEG 前用同一 Presentation Clock 再检查一次。
+            // 等 RGB565 空槽也可能耗时；真正进入 JPEG 前用同一 Master Clock 再检查一次。
             clock = presentation_clock_snapshot(args->generation);
             estimated_decode_us = decode_estimate_us(decode_timing);
             deadline_us = adaptive_predecode_deadline_us(decode_timing);
             if (should_predecode_drop(
                     clock, compressed.pts_ms, estimated_decode_us, deadline_us,
-                    &late_us, &projected_late_us)) {
+                    &late_us, &projected_late_us, &predecode_audio_master)) {
                 ++predecode_drops;
                 if (!catchup_active) {
                     ++catchup_events;
@@ -720,14 +989,15 @@ static void benchmark_task(void *arg)
                 if (projected_late_us > projected_late_us_max) projected_late_us_max = projected_late_us;
                 if (predecode_drops == 1U || (predecode_drops % kPreDecodeLogEveryDrops) == 0U) {
                     ESP_LOGW(TAG,
-                        "PreDecode Deadline丢帧：drop=%lu event=%lu pts=%lums late=%lldms projected=%lldms deadline=%lldms jpeg_est=%luus（等待RGB槽后）",
+                        "PreDecode Deadline丢帧：drop=%lu event=%lu pts=%lums late=%lldms projected=%lldms deadline=%lldms jpeg_est=%luus clock=%s（等待RGB槽后）",
                         static_cast<unsigned long>(predecode_drops),
                         static_cast<unsigned long>(catchup_events),
                         static_cast<unsigned long>(compressed.pts_ms),
                         static_cast<long long>(late_us / 1000LL),
                         static_cast<long long>(projected_late_us / 1000LL),
                         static_cast<long long>(deadline_us / 1000LL),
-                        static_cast<unsigned long>(estimated_decode_us));
+                        static_cast<unsigned long>(estimated_decode_us),
+                        predecode_audio_master ? "AudioPCM" : "FallbackTimer");
                 }
                 return_slot_to_free(slot_index);
                 return_compressed_to_free(message.slot);
@@ -805,6 +1075,9 @@ static void benchmark_task(void *arg)
     result.storage_gate_wait_us = io.gate_wait_us_total;
     result.storage_gate_wait_count = io.gate_wait_count;
 
+    // 非正常 EOF 先取消 AudioSource，立即唤醒可能正在等压缩数据的 AudioTask。
+    if (result.state != State::Eof) avi_mp3_bridge_cancel();
+
     // 任何退出路径都先确保 ExtractTask 不再访问 extractor/io，再释放底层资源。
     if (extract_task_running()) {
         if (result.state == State::Failed || !generation_current(args->generation)) {
@@ -817,9 +1090,14 @@ static void benchmark_task(void *arg)
     if (extractor != nullptr) esp_extractor_close(extractor);
     VideoMediaIo::close(&io);
 
+    snapshot_audio_probe(&result);
+
     if (generation_matches(args->generation)) {
+        const int32_t av0_delta_ms = (result.audio_frames_read != 0U && result.frames_decoded != 0U)
+            ? static_cast<int32_t>(result.audio_first_pts_ms) - static_cast<int32_t>(result.first_pts_ms)
+            : 0;
         ESP_LOGI(TAG,
-            "MJPEG Benchmark解码端结束：state=%s read=%lu decoded=%lu pre_drop=%lu catchup=%lu pool_skip=%lu decode_fail=%lu jpeg_avg=%luB max=%luB extract_avg=%luus max=%luus storage_avg=%luus max=%luus decode_avg=%luus max=%luus jpeg_ewma=%luus jitter=%luus copy_avg=%luus max=%luus pipe_qmax=%lu deadline_now=%lldms projected_late_max=%lldms gate=%lu次/%lums",
+            "MJPEG Benchmark解码端结束：state=%s read=%lu decoded=%lu pre_drop=%lu catchup=%lu pool_skip=%lu decode_fail=%lu jpeg_avg=%luB max=%luB extract_avg=%luus max=%luus storage_avg=%luus max=%luus decode_avg=%luus max=%luus jpeg_ewma=%luus jitter=%luus copy_avg=%luus max=%luus pipe_qmax=%lu deadline_now=%lldms projected_late_max=%lldms gate=%lu次/%lums audio_frames=%lu audio_avg=%luB max=%luB audio_pts=%lu..%lu av0_delta=%ldms",
             state_name(result.state),
             static_cast<unsigned long>(result.frames_read),
             static_cast<unsigned long>(result.frames_decoded),
@@ -843,7 +1121,14 @@ static void benchmark_task(void *arg)
             static_cast<long long>(adaptive_predecode_deadline_us(decode_timing) / 1000LL),
             static_cast<long long>(projected_late_us_max / 1000LL),
             static_cast<unsigned long>(result.storage_gate_wait_count),
-            static_cast<unsigned long>(result.storage_gate_wait_us / 1000ULL));
+            static_cast<unsigned long>(result.storage_gate_wait_us / 1000ULL),
+            static_cast<unsigned long>(result.audio_frames_read),
+            static_cast<unsigned long>(result.audio_frames_read
+                ? result.audio_compressed_bytes / result.audio_frames_read : 0ULL),
+            static_cast<unsigned long>(result.audio_compressed_bytes_max),
+            static_cast<unsigned long>(result.audio_first_pts_ms),
+            static_cast<unsigned long>(result.audio_last_pts_ms),
+            static_cast<long>(av0_delta_ms));
     }
 
     publish_task_exit(result);
@@ -942,6 +1227,7 @@ esp_err_t start(const char *path)
     g_leased_mask = 0U;
     g_presentation_clock = {};
     g_presentation_clock.generation = g_generation;
+    g_audio_probe = {};
     portEXIT_CRITICAL(&g_mux);
 
     // 直接让 FreeRTOS 写入全局 handle，避免 task 极快退出后 caller 再把过期 handle 写回 g_task。
@@ -963,6 +1249,7 @@ esp_err_t start(const char *path)
 
 void stop()
 {
+    avi_mp3_bridge_cancel();
     portENTER_CRITICAL(&g_mux);
     if (g_task != nullptr || g_extract_task != nullptr) {
         // 不推进 generation：让正在退出的 task 仍可发布最终统计；只用 stop_generation
@@ -1010,7 +1297,7 @@ bool set_presentation_clock(uint32_t first_pts_ms, int64_t clock_base_us)
 
     if (first_publish) {
         ESP_LOGI(TAG,
-            "Unified PTS时钟已锚定：generation=%lu first_pts=%lums base=%lldus；Decode/UI共用同一Presentation Clock",
+            "Fallback PTS时钟已锚定：generation=%lu first_pts=%lums base=%lldus；仅在Audio PCM Master不可用时使用",
             static_cast<unsigned long>(generation),
             static_cast<unsigned long>(first_pts_ms),
             static_cast<long long>(clock_base_us));
@@ -1073,6 +1360,8 @@ esp_err_t cleanup()
     can_cleanup = g_task == nullptr && g_extract_task == nullptr && g_leased_mask == 0U;
     portEXIT_CRITICAL(&g_mux);
     if (!can_cleanup) return ESP_ERR_INVALID_STATE;
+    const esp_err_t bridge_ret = avi_mp3_bridge_release();
+    if (bridge_ret != ESP_OK) return bridge_ret;
     free_resources_unlocked();
     return ESP_OK;
 }

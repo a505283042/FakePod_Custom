@@ -15,6 +15,7 @@
 #include "audio_decode_workspace.h"
 #include "audio_playback_clock.h"
 #include "audio_spectrum_snapshot.h"
+#include "sources/avi_mp3_audio_source.h"
 #include "app_diag_config.h"
 
 static const char *TAG = "音频服务";
@@ -93,7 +94,9 @@ enum class AudioCommandType : uint8_t
     Resume,
     Seek,
     SetVolume,
-    SetMute
+    SetMute,
+    VideoMp3Start,
+    VideoMp3Stop
 };
 
 struct AudioRequest
@@ -107,6 +110,9 @@ struct AudioRequest
     MediaTechnicalInfo technical_info = {};
     uint8_t volume_percent = 50;
     bool mute = false;
+    uint32_t video_sample_rate_hz = 0U;
+    uint8_t video_channels = 0U;
+    uint8_t video_bits_per_sample = 0U;
     uint32_t expected_playback_revision = 0;
     uint64_t seek_target_ms = 0;
     char path[AUDIO_INLINE_PATH_SIZE] = {};
@@ -177,6 +183,46 @@ static int64_t g_flac_starve_grace_started_us = 0;
 // WAV/FLAC/MP3 都通过统一 PcmDecoder 产出 32bit stereo PCM，I2S/DAC 不关心源格式。
 static PcmDecoder g_decoder = {};
 static AudioDecodeWorkspace g_decode_workspace = {};
+
+// R.40.4.1：AVI MP3 是 AudioTask 内的临时第二 decoder。Music decoder/source 保持暂停原位，
+// Video 结束后重新配置硬件并恢复原 Music pipeline，不重新打开文件、不丢播放位置。
+static Mp3Decoder g_video_mp3_decoder = {};
+static AudioSource g_video_mp3_source = {};
+static AviMp3AudioSource g_video_mp3_source_storage = {};
+static AudioPlaybackClock g_video_playback_clock = {};
+static bool g_video_mp3_active = false;
+static bool g_video_mp3_eof = false;
+static bool g_video_restore_paused_music_hardware = false;
+static uint32_t g_video_mp3_sample_rate_hz = 0U;
+static uint16_t g_video_mp3_channels = 0U;
+static uint16_t g_video_mp3_bits_per_sample = 0U;
+static uint64_t g_video_mp3_last_log_frame = 0ULL;
+
+// R.40.4.2：AudioTask 单写、Video Presenter/Decode 多读的 PCM 主时钟发布槽。
+// 不让 Video 直接读取 AudioTask 内部 decoder/clock，避免跨核撕裂 64-bit 计数。
+static portMUX_TYPE g_video_clock_snapshot_mux = portMUX_INITIALIZER_UNLOCKED;
+static AudioVideoClockSnapshot g_video_clock_snapshot = {};
+static uint32_t g_video_clock_revision = 0U;
+
+static void audio_task_publish_video_clock_snapshot()
+{
+    AudioVideoClockSnapshot snapshot = {};
+    snapshot.active = g_video_mp3_active;
+    snapshot.eof = g_video_mp3_eof;
+    snapshot.revision = g_video_clock_revision;
+    snapshot.sample_rate_hz = g_video_playback_clock.sample_rate_hz;
+    snapshot.submitted_frames = g_video_playback_clock.submitted_frames;
+    snapshot.decoder_frames = g_video_playback_clock.decoder_frames;
+    if (snapshot.sample_rate_hz != 0U) {
+        snapshot.position_us =
+            (snapshot.submitted_frames * 1000000ULL) / snapshot.sample_rate_hz;
+    }
+
+    portENTER_CRITICAL(&g_video_clock_snapshot_mux);
+    g_video_clock_snapshot = snapshot;
+    portEXIT_CRITICAL(&g_video_clock_snapshot_mux);
+}
+
 static bool g_pipeline_clock_prepared = false;
 static bool g_pipeline_i2s_started = false;
 static bool g_pipeline_asp_enabled = false;
@@ -493,6 +539,8 @@ static const char *audio_command_name(AudioCommandType type)
         case AudioCommandType::Seek: return "SEEK";
         case AudioCommandType::SetVolume: return "VOLUME";
         case AudioCommandType::SetMute: return "MUTE";
+        case AudioCommandType::VideoMp3Start: return "VIDEO_MP3_START";
+        case AudioCommandType::VideoMp3Stop: return "VIDEO_MP3_STOP";
     }
     return "UNKNOWN";
 }
@@ -551,10 +599,11 @@ static void audio_task_reset_pcm_fade_in()
     g_pcm_fade_in_logged_done = true;
 }
 
-static void audio_task_begin_pcm_fade_in(const char *reason)
+static void audio_task_begin_pcm_fade_in(const char *reason, uint32_t sample_rate_hz = 0U)
 {
-    const uint32_t sample_rate =
-        g_task_sample_rate_hz > 0 ? g_task_sample_rate_hz : 48000U;
+    const uint32_t sample_rate = sample_rate_hz > 0U
+        ? sample_rate_hz
+        : (g_task_sample_rate_hz > 0U ? g_task_sample_rate_hz : 48000U);
     g_pcm_fade_in_total_frames = static_cast<uint32_t>(
         (static_cast<uint64_t>(sample_rate) * AUDIO_PCM_FADE_IN_MS + 999ULL) / 1000ULL
     );
@@ -707,36 +756,31 @@ static esp_err_t audio_task_unmute_when_pcm_ready()
     return ESP_OK;
 }
 
-static esp_err_t audio_task_shutdown_pipeline()
+static esp_err_t audio_task_shutdown_output_hardware(uint32_t active_rate_hz, const char *owner)
 {
-    audio_task_reset_flac_starve_grace();
     esp_err_t first_error = ESP_OK;
+    const uint32_t settle_rate = active_rate_hz > 0U ? active_rate_hz : 48000U;
 
-    audio_task_log_ram("shutdown_begin");
     AUDIO_POP_TRACE_LOG(
-        "SHUTDOWN_BEGIN rate=%lu hp=%u asp=%u i2s=%u",
-        static_cast<unsigned long>(g_task_sample_rate_hz),
+        "OUTPUT_SHUTDOWN_BEGIN owner=%s rate=%lu hp=%u asp=%u i2s=%u",
+        owner != nullptr ? owner : "unknown",
+        static_cast<unsigned long>(settle_rate),
         static_cast<unsigned>(g_pipeline_headphone_enabled),
         static_cast<unsigned>(g_pipeline_asp_enabled),
         static_cast<unsigned>(g_pipeline_i2s_started));
 
-    // 先触发 PCM 软斜坡静音，并在整个静音收敛窗口持续发送全零 PCM。
-    // CS43131 的 PCM_SZC=soft-ramp 模式不是“写寄存器后立即静音”；官方多个切换序列
-    // 都为软斜坡静音预留 150ms。必须等斜坡完成后再置 PDN_HP，否则长时间真实播放后
-    // 可能出现 PDN_DONE 未在短窗口内到达，而短测试音却偶尔能立即完成的现象。
     if (g_pipeline_headphone_enabled) {
-        esp_err_t mute_ret = cs43131_set_pcm_mute(true);
+        const esp_err_t mute_ret = cs43131_set_pcm_mute(true);
         audio_task_remember_first_error(mute_ret, &first_error);
 
         if (mute_ret == ESP_OK) {
-            const uint32_t settle_rate = g_task_sample_rate_hz > 0 ? g_task_sample_rate_hz : 48000U;
             const size_t settle_frames = static_cast<size_t>(
                 (static_cast<uint64_t>(settle_rate) * AUDIO_PCM_MUTE_SETTLE_MS + 999ULL) / 1000ULL
             );
-
             if (g_pipeline_i2s_started && i2s_output_is_started()) {
 #if APP_DIAG_AUDIO_POP
-                ESP_LOGI(TAG, "PCM软静音收敛：保持%lums全零PCM，帧=%u",
+                ESP_LOGI(TAG, "PCM软静音收敛：owner=%s 保持%lums全零PCM，帧=%u",
+                    owner != nullptr ? owner : "unknown",
                     static_cast<unsigned long>(AUDIO_PCM_MUTE_SETTLE_MS),
                     static_cast<unsigned>(settle_frames));
 #endif
@@ -744,7 +788,6 @@ static esp_err_t audio_task_shutdown_pipeline()
                     i2s_output_stream_write_silence(settle_frames, AUDIO_I2S_WRITE_TIMEOUT_MS),
                     &first_error);
             } else {
-                // 异常清理路径没有 I2S 时仍给模拟静音电路留出收敛时间。
                 vTaskDelay(pdMS_TO_TICKS(AUDIO_PCM_MUTE_SETTLE_MS));
             }
         }
@@ -754,7 +797,6 @@ static esp_err_t audio_task_shutdown_pipeline()
         g_pipeline_asp_enabled = false;
     }
 
-    // 即使 ASP/耳放启动过程中失败，也用统一 finish 将 ASP、XTAL 恢复到安全待机状态。
     if (g_pipeline_clock_prepared || g_pipeline_asp_enabled) {
         audio_task_remember_first_error(cs43131_finish_pcm_playback(), &first_error);
         g_pipeline_clock_prepared = false;
@@ -766,6 +808,20 @@ static esp_err_t audio_task_shutdown_pipeline()
         g_pipeline_i2s_started = false;
     }
 
+    g_pcm_unmute_pending = false;
+    audio_task_reset_pcm_fade_in();
+    AUDIO_POP_TRACE_LOG("OUTPUT_SHUTDOWN_END owner=%s ret=%s",
+        owner != nullptr ? owner : "unknown", esp_err_to_name(first_error));
+    return first_error;
+}
+
+static esp_err_t audio_task_shutdown_pipeline()
+{
+    audio_task_reset_flac_starve_grace();
+    audio_task_log_ram("shutdown_begin");
+
+    esp_err_t first_error = audio_task_shutdown_output_hardware(g_task_sample_rate_hz, "Music");
+
     if (pcm_decoder_is_open(&g_decoder)) {
         pcm_decoder_close(&g_decoder);
     }
@@ -773,9 +829,6 @@ static esp_err_t audio_task_shutdown_pipeline()
         &g_decode_workspace,
         AUDIO_DECODE_WORKSPACE_RETAIN_INPUT_BYTES,
         AUDIO_DECODE_WORKSPACE_RETAIN_PCM_BYTES);
-
-    g_pcm_unmute_pending = false;
-    audio_task_reset_pcm_fade_in();
 
     AUDIO_POP_TRACE_LOG("SHUTDOWN_END ret=%s", esp_err_to_name(first_error));
     audio_task_log_ram("shutdown_end");
@@ -899,6 +952,151 @@ static void audio_task_verify_index_snapshot(
 #endif
 }
 
+static esp_err_t audio_task_start_output_hardware(
+    uint32_t sample_rate_hz,
+    uint16_t bits_per_sample,
+    uint16_t channels,
+    const char *owner,
+    const AudioRequest *transport_request,
+    bool arm_unmute,
+    const char *fade_reason)
+{
+    if (sample_rate_hz == 0U || channels == 0U) return ESP_ERR_INVALID_ARG;
+    const char *label = owner != nullptr ? owner : "PCM";
+
+    AUDIO_POP_TRACE_LOG(
+        "START_BEGIN format=%s rate=%lu bits=%u channels=%u",
+        label,
+        static_cast<unsigned long>(sample_rate_hz),
+        static_cast<unsigned>(bits_per_sample),
+        static_cast<unsigned>(channels));
+
+    g_pipeline_clock_prepared = true;
+    esp_err_t ret = cs43131_prepare_pcm_playback_32bit(sample_rate_hz);
+    if (ret != ESP_OK) {
+        audio_task_shutdown_output_hardware(sample_rate_hz, label);
+        return ret;
+    }
+    if (transport_request != nullptr &&
+        audio_task_transport_request_superseded(transport_request, "after_dac_prepare")) {
+        audio_task_shutdown_output_hardware(sample_rate_hz, label);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ret = i2s_output_stream_start_32bit(sample_rate_hz);
+    if (ret != ESP_OK) {
+        audio_task_shutdown_output_hardware(sample_rate_hz, label);
+        return ret;
+    }
+    g_pipeline_i2s_started = true;
+    AUDIO_POP_TRACE_LOG(
+        "I2S_START rate=%lu bclk=%lu",
+        static_cast<unsigned long>(sample_rate_hz),
+        static_cast<unsigned long>(sample_rate_hz * 64UL));
+    if (transport_request != nullptr &&
+        audio_task_transport_request_superseded(transport_request, "after_i2s_start")) {
+        audio_task_shutdown_output_hardware(sample_rate_hz, label);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ret = i2s_output_stream_write_silence(AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
+    if (ret != ESP_OK) {
+        audio_task_shutdown_output_hardware(sample_rate_hz, label);
+        return ret;
+    }
+
+    ret = cs43131_enable_asp_input();
+    if (ret != ESP_OK) {
+        audio_task_shutdown_output_hardware(sample_rate_hz, label);
+        return ret;
+    }
+    g_pipeline_asp_enabled = true;
+
+    for (int i = 0; i < 3; ++i) {
+        ret = i2s_output_stream_write_silence(AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
+        if (ret != ESP_OK) {
+            audio_task_shutdown_output_hardware(sample_rate_hz, label);
+            return ret;
+        }
+    }
+
+    uint8_t asp_status = 0;
+    ret = cs43131_read_asp_status(&asp_status);
+    if (ret != ESP_OK) {
+        audio_task_shutdown_output_hardware(sample_rate_hz, label);
+        return ret;
+    }
+
+    for (int i = 0; i < 2; ++i) {
+        ret = i2s_output_stream_write_silence(AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
+        if (ret != ESP_OK) {
+            audio_task_shutdown_output_hardware(sample_rate_hz, label);
+            return ret;
+        }
+    }
+
+    asp_status = 0;
+    ret = cs43131_read_asp_status(&asp_status);
+    if (ret != ESP_OK) {
+        audio_task_shutdown_output_hardware(sample_rate_hz, label);
+        return ret;
+    }
+#if APP_DIAG_AUDIO_POP
+    ESP_LOGI(TAG, "%s起播前 ASP 稳定状态：0x%02X", label, asp_status);
+#endif
+    AUDIO_POP_TRACE_LOG("ASP_STABLE status=0x%02X", asp_status);
+    if ((asp_status & 0xF8U) != 0) {
+        ESP_LOGE(TAG, "ASP 时序异常，拒绝开启耳放：INT_STATUS2=0x%02X", asp_status);
+        audio_task_shutdown_output_hardware(sample_rate_hz, label);
+        return ESP_FAIL;
+    }
+    if (transport_request != nullptr &&
+        audio_task_transport_request_superseded(transport_request, "before_headphone_enable")) {
+        audio_task_shutdown_output_hardware(sample_rate_hz, label);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    g_pipeline_headphone_enabled = true;
+    ret = cs43131_prepare_headphone_playback_low_volume();
+    if (ret != ESP_OK) {
+        audio_task_shutdown_output_hardware(sample_rate_hz, label);
+        return ret;
+    }
+    ret = audio_task_apply_user_volume();
+    if (ret != ESP_OK) {
+        audio_task_shutdown_output_hardware(sample_rate_hz, label);
+        return ret;
+    }
+    AUDIO_POP_TRACE_LOG("HP_ENABLE volume=%u muted=%u",
+        static_cast<unsigned>(g_task_volume_percent),
+        static_cast<unsigned>(g_task_user_muted));
+
+    for (int i = 0; i < 4; ++i) {
+        ret = i2s_output_stream_write_silence(AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
+        if (ret != ESP_OK) {
+            audio_task_shutdown_output_hardware(sample_rate_hz, label);
+            return ret;
+        }
+    }
+
+    if (transport_request != nullptr &&
+        audio_task_transport_request_superseded(transport_request, "before_pipeline_commit")) {
+        audio_task_shutdown_output_hardware(sample_rate_hz, label);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (arm_unmute) {
+        audio_task_begin_pcm_fade_in(fade_reason != nullptr ? fade_reason : "start", sample_rate_hz);
+        g_pcm_unmute_pending = true;
+        AUDIO_POP_TRACE_LOG("PCM_UNMUTE_ARMED reason=%s",
+            fade_reason != nullptr ? fade_reason : "start");
+    } else {
+        g_pcm_unmute_pending = false;
+        audio_task_reset_pcm_fade_in();
+    }
+    return ESP_OK;
+}
+
 static esp_err_t audio_task_start_pcm_pipeline(
     PcmDecoderType decoder_type,
     const char *path,
@@ -1020,133 +1218,18 @@ static esp_err_t audio_task_start_pcm_pipeline(
         g_task_sample_rate_hz);
     audio_task_publish_snapshot();
 
-    AUDIO_POP_TRACE_LOG(
-        "START_BEGIN format=%s rate=%lu bits=%u channels=%u",
+    ret = audio_task_start_output_hardware(
+        g_task_sample_rate_hz,
+        g_task_bits_per_sample,
+        g_task_channels,
         pcm_decoder_type_name(decoder_type),
-        static_cast<unsigned long>(g_task_sample_rate_hz),
-        static_cast<unsigned>(g_task_bits_per_sample),
-        static_cast<unsigned>(g_task_channels));
-
-    // 从这一刻开始即使 CS43131 准备过程中途失败，也必须执行 finish 清理。
-    g_pipeline_clock_prepared = true;
-    ret = cs43131_prepare_pcm_playback_32bit(g_task_sample_rate_hz);
+        request,
+        true,
+        "start");
     if (ret != ESP_OK) {
         audio_task_shutdown_pipeline();
         return ret;
     }
-    if (request != nullptr && audio_task_transport_request_superseded(request, "after_dac_prepare")) {
-        audio_task_shutdown_pipeline();
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    ret = i2s_output_stream_start_32bit(g_task_sample_rate_hz);
-    if (ret != ESP_OK) {
-        audio_task_shutdown_pipeline();
-        return ret;
-    }
-    g_pipeline_i2s_started = true;
-    AUDIO_POP_TRACE_LOG(
-        "I2S_START rate=%lu bclk=%lu",
-        static_cast<unsigned long>(g_task_sample_rate_hz),
-        static_cast<unsigned long>(g_task_sample_rate_hz * 64UL));
-    if (request != nullptr && audio_task_transport_request_superseded(request, "after_i2s_start")) {
-        audio_task_shutdown_pipeline();
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    // 先给 I2S DMA 填入全零 PCM，再开启 CS43131 ASP，避免 ASP 上电瞬间面对不稳定时钟。
-    ret = i2s_output_stream_write_silence(AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
-    if (ret != ESP_OK) {
-        audio_task_shutdown_pipeline();
-        return ret;
-    }
-
-    ret = cs43131_enable_asp_input();
-    if (ret != ESP_OK) {
-        audio_task_shutdown_pipeline();
-        return ret;
-    }
-    g_pipeline_asp_enabled = true;
-
-    // 保持约 15ms 全零 PCM，让 ASP 锁定 BCLK/LRCK。
-    for (int i = 0; i < 3; ++i) {
-        ret = i2s_output_stream_write_silence(AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
-        if (ret != ESP_OK) {
-            audio_task_shutdown_pipeline();
-            return ret;
-        }
-    }
-
-    uint8_t asp_status = 0;
-    ret = cs43131_read_asp_status(&asp_status); // 清启动阶段 sticky 状态
-    if (ret != ESP_OK) {
-        audio_task_shutdown_pipeline();
-        return ret;
-    }
-
-    for (int i = 0; i < 2; ++i) {
-        ret = i2s_output_stream_write_silence(AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
-        if (ret != ESP_OK) {
-            audio_task_shutdown_pipeline();
-            return ret;
-        }
-    }
-
-    asp_status = 0;
-    ret = cs43131_read_asp_status(&asp_status);
-    if (ret != ESP_OK) {
-        audio_task_shutdown_pipeline();
-        return ret;
-    }
-#if APP_DIAG_AUDIO_POP
-    ESP_LOGI(TAG, "%s起播前 ASP 稳定状态：0x%02X", pcm_decoder_type_name(decoder_type), asp_status);
-#endif
-    AUDIO_POP_TRACE_LOG("ASP_STABLE status=0x%02X", asp_status);
-    if ((asp_status & 0xF8U) != 0) {
-        ESP_LOGE(TAG, "ASP 时序异常，拒绝开启耳放：INT_STATUS2=0x%02X", asp_status);
-        audio_task_shutdown_pipeline();
-        return ESP_FAIL;
-    }
-    if (request != nullptr && audio_task_transport_request_superseded(request, "before_headphone_enable")) {
-        audio_task_shutdown_pipeline();
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    // 预先标记“耳放可能已被触及”，保证寄存器写到一半失败时仍会尝试安全掉电。
-    g_pipeline_headphone_enabled = true;
-    ret = cs43131_prepare_headphone_playback_low_volume();
-    if (ret != ESP_OK) {
-        audio_task_shutdown_pipeline();
-        return ret;
-    }
-    ret = audio_task_apply_user_volume();
-    if (ret != ESP_OK) {
-        audio_task_shutdown_pipeline();
-        return ret;
-    }
-    AUDIO_POP_TRACE_LOG("HP_ENABLE volume=%u muted=%u",
-        static_cast<unsigned>(g_task_volume_percent),
-        static_cast<unsigned>(g_task_user_muted));
-
-    // 耳放 pop-free 上电后继续送约 20ms 静音，再解除 PCM 手动静音。
-    for (int i = 0; i < 4; ++i) {
-        ret = i2s_output_stream_write_silence(AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
-        if (ret != ESP_OK) {
-            audio_task_shutdown_pipeline();
-            return ret;
-        }
-    }
-
-    if (request != nullptr && audio_task_transport_request_superseded(request, "before_pipeline_commit")) {
-        audio_task_shutdown_pipeline();
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    // 耳放保持手动静音，等第一块真实 PCM 已经解码完成后再解除。
-    // 这样即使 FLAC 首次 process 发生秒级延迟，也不会出现“先开声、后等数据”的窗口。
-    audio_task_begin_pcm_fade_in("start");
-    g_pcm_unmute_pending = true;
-    AUDIO_POP_TRACE_LOG("PCM_UNMUTE_ARMED reason=start");
     audio_task_log_ram("pipeline_playing");
 
     const uint64_t duration_ms = g_task_sample_rate_hz > 0 && g_task_total_frames > 0
@@ -1452,6 +1535,290 @@ static void audio_task_service_pause_silence()
     }
 }
 
+static void audio_task_video_mp3_close_decoder()
+{
+    if (mp3_decoder_is_open(&g_video_mp3_decoder)) {
+        mp3_decoder_close(&g_video_mp3_decoder);
+    }
+    if (audio_source_is_open(&g_video_mp3_source)) {
+        (void)audio_source_close(&g_video_mp3_source);
+    }
+    g_video_mp3_source_storage = {};
+}
+
+static esp_err_t audio_task_restore_paused_music_hardware(const char *reason)
+{
+    if (!g_video_restore_paused_music_hardware) return ESP_OK;
+    if (g_task_state != AudioPlaybackState::Paused || !pcm_decoder_is_open(&g_decoder) ||
+        g_task_sample_rate_hz == 0U) {
+        ESP_LOGE(TAG, "AVI MP3恢复Music硬件失败：Music pipeline不再处于Paused reason=%s",
+            reason != nullptr ? reason : "unknown");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const esp_err_t ret = audio_task_start_output_hardware(
+        g_task_sample_rate_hz,
+        g_task_bits_per_sample,
+        g_task_channels,
+        "Music-Restore",
+        nullptr,
+        false,
+        nullptr);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "AVI MP3已恢复Paused Music硬件：%luHz/%ubit/%uch reason=%s；保持mute等待Video退出后resume",
+            static_cast<unsigned long>(g_task_sample_rate_hz),
+            static_cast<unsigned>(g_task_bits_per_sample),
+            static_cast<unsigned>(g_task_channels),
+            reason != nullptr ? reason : "unknown");
+    }
+    return ret;
+}
+
+static esp_err_t audio_task_stop_video_mp3_internal(bool restore_music_hardware, const char *reason)
+{
+    if (!g_video_mp3_active && !mp3_decoder_is_open(&g_video_mp3_decoder) &&
+        !audio_source_is_open(&g_video_mp3_source)) {
+        g_video_restore_paused_music_hardware = false;
+        return ESP_OK;
+    }
+
+    esp_err_t first_error = ESP_OK;
+    const uint32_t video_rate = g_video_mp3_sample_rate_hz > 0U
+        ? g_video_mp3_sample_rate_hz : 44100U;
+    audio_task_remember_first_error(
+        audio_task_shutdown_output_hardware(video_rate, "AVI-MP3"), &first_error);
+
+    audio_task_video_mp3_close_decoder();
+    const bool should_restore = restore_music_hardware && g_video_restore_paused_music_hardware;
+    g_video_mp3_active = false;
+    g_video_mp3_eof = false;
+    g_video_mp3_sample_rate_hz = 0U;
+    g_video_mp3_channels = 0U;
+    g_video_mp3_bits_per_sample = 0U;
+    g_video_mp3_last_log_frame = 0ULL;
+    audio_playback_clock_reset(&g_video_playback_clock, 0U);
+    audio_task_publish_video_clock_snapshot();
+
+    if (should_restore) {
+        audio_task_remember_first_error(
+            audio_task_restore_paused_music_hardware(reason), &first_error);
+    }
+    g_video_restore_paused_music_hardware = false;
+
+    ESP_LOGI(TAG, "AVI MP3 Audio Pipeline已停止：reason=%s restore_music=%u ret=%s",
+        reason != nullptr ? reason : "unknown",
+        static_cast<unsigned>(should_restore),
+        esp_err_to_name(first_error));
+    return first_error;
+}
+
+static void audio_task_handle_video_mp3_start(AudioRequest *request)
+{
+    if (request == nullptr) return;
+    g_task_last_request_id = request->request_id;
+
+    if (g_video_mp3_active || mp3_decoder_is_open(&g_video_mp3_decoder)) {
+        ESP_LOGW(TAG, "AVI MP3启动被拒绝：已有Video Audio pipeline");
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+    if (g_task_state == AudioPlaybackState::Playing ||
+        g_task_state == AudioPlaybackState::Preparing ||
+        g_task_state == AudioPlaybackState::Seeking) {
+        ESP_LOGE(TAG, "AVI MP3启动要求Music先暂停：当前state=%s",
+            audio_playback_state_name_cn(g_task_state));
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+
+    g_video_restore_paused_music_hardware =
+        g_task_state == AudioPlaybackState::Paused && pcm_decoder_is_open(&g_decoder);
+
+    if (g_pipeline_headphone_enabled || g_pipeline_clock_prepared ||
+        g_pipeline_i2s_started || i2s_output_is_started()) {
+        const uint32_t active_rate = g_task_sample_rate_hz > 0U ? g_task_sample_rate_hz : 48000U;
+        const esp_err_t shutdown_ret = audio_task_shutdown_output_hardware(active_rate, "Music-Paused");
+        if (shutdown_ret != ESP_OK) {
+            g_video_restore_paused_music_hardware = false;
+            audio_request_complete(request, false, shutdown_ret);
+            return;
+        }
+    }
+
+    esp_err_t ret = avi_mp3_audio_source_open(&g_video_mp3_source, &g_video_mp3_source_storage);
+    if (ret == ESP_OK) {
+        ret = mp3_decoder_open(&g_video_mp3_decoder, &g_video_mp3_source, nullptr, true);
+    }
+    if (ret != ESP_OK) {
+        audio_task_video_mp3_close_decoder();
+        if (g_video_restore_paused_music_hardware) {
+            (void)audio_task_restore_paused_music_hardware("video_open_failed");
+        }
+        g_video_restore_paused_music_hardware = false;
+        ESP_LOGE(TAG, "AVI MP3 streaming decoder启动失败：%s", esp_err_to_name(ret));
+        audio_request_complete(request, false, ret);
+        return;
+    }
+
+    if ((request->video_sample_rate_hz != 0U &&
+         request->video_sample_rate_hz != g_video_mp3_decoder.sample_rate_hz) ||
+        (request->video_channels != 0U && request->video_channels != g_video_mp3_decoder.channels) ||
+        (request->video_bits_per_sample != 0U &&
+         request->video_bits_per_sample != g_video_mp3_decoder.bits_per_sample)) {
+        ESP_LOGE(TAG,
+            "AVI MP3格式与Extractor不一致：expected=%luHz/%ubit/%uch decoder=%luHz/%ubit/%uch",
+            static_cast<unsigned long>(request->video_sample_rate_hz),
+            static_cast<unsigned>(request->video_bits_per_sample),
+            static_cast<unsigned>(request->video_channels),
+            static_cast<unsigned long>(g_video_mp3_decoder.sample_rate_hz),
+            static_cast<unsigned>(g_video_mp3_decoder.bits_per_sample),
+            static_cast<unsigned>(g_video_mp3_decoder.channels));
+        audio_task_video_mp3_close_decoder();
+        if (g_video_restore_paused_music_hardware) {
+            (void)audio_task_restore_paused_music_hardware("video_format_mismatch");
+        }
+        g_video_restore_paused_music_hardware = false;
+        audio_request_complete(request, false, ESP_ERR_INVALID_RESPONSE);
+        return;
+    }
+
+    g_video_mp3_sample_rate_hz = g_video_mp3_decoder.sample_rate_hz;
+    g_video_mp3_channels = g_video_mp3_decoder.channels;
+    g_video_mp3_bits_per_sample = g_video_mp3_decoder.bits_per_sample;
+    audio_playback_clock_reset(&g_video_playback_clock, g_video_mp3_sample_rate_hz);
+    g_video_mp3_eof = false;
+    g_video_mp3_last_log_frame = 0ULL;
+
+    ret = audio_task_start_output_hardware(
+        g_video_mp3_sample_rate_hz,
+        g_video_mp3_bits_per_sample,
+        g_video_mp3_channels,
+        "AVI-MP3",
+        nullptr,
+        true,
+        "video");
+    if (ret != ESP_OK) {
+        audio_task_video_mp3_close_decoder();
+        if (g_video_restore_paused_music_hardware) {
+            (void)audio_task_restore_paused_music_hardware("video_hw_failed");
+        }
+        g_video_restore_paused_music_hardware = false;
+        audio_request_complete(request, false, ret);
+        return;
+    }
+
+    ++g_video_clock_revision;
+    if (g_video_clock_revision == 0U) ++g_video_clock_revision;
+    g_video_mp3_active = true;
+    audio_task_publish_video_clock_snapshot();
+    ESP_LOGI(TAG,
+        "AVI MP3 Audio Pipeline已启动：%luHz/%ubit/%uch；Music decoder保持%s，AudioTask继续唯一持有I2S/CS43131；A/V PCM Clock rev=%lu",
+        static_cast<unsigned long>(g_video_mp3_sample_rate_hz),
+        static_cast<unsigned>(g_video_mp3_bits_per_sample),
+        static_cast<unsigned>(g_video_mp3_channels),
+        g_video_restore_paused_music_hardware ? "Paused原位" : "无活动Music",
+        static_cast<unsigned long>(g_video_clock_revision));
+    audio_request_complete(request, true, ESP_OK);
+}
+
+static void audio_task_handle_video_mp3_stop(AudioRequest *request)
+{
+    if (request == nullptr) return;
+    g_task_last_request_id = request->request_id;
+    const esp_err_t ret = audio_task_stop_video_mp3_internal(true, "video_stop_command");
+    if (ret != ESP_OK) {
+        audio_task_set_state(AudioPlaybackState::Error, ret);
+        audio_request_complete(request, false, ret);
+        return;
+    }
+    audio_request_complete(request, true, ESP_OK);
+}
+
+static void audio_task_service_video_mp3()
+{
+    if (!g_video_mp3_active || !mp3_decoder_is_open(&g_video_mp3_decoder)) return;
+
+    if (g_video_mp3_eof) {
+        const esp_err_t silence_ret =
+            i2s_output_stream_write_silence(AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
+        if (silence_ret != ESP_OK) {
+            ESP_LOGE(TAG, "AVI MP3 EOF静音维持失败：%s", esp_err_to_name(silence_ret));
+        }
+        return;
+    }
+
+    size_t frames = 0U;
+    esp_err_t ret = mp3_decoder_read_pcm32(
+        &g_video_mp3_decoder,
+        g_pcm_block,
+        AUDIO_STREAM_FRAMES,
+        &frames);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "AVI MP3读取PCM失败：%s；本段Video后续保持静音", esp_err_to_name(ret));
+        (void)cs43131_set_pcm_mute(true);
+        g_video_mp3_eof = true;
+        audio_task_publish_video_clock_snapshot();
+        return;
+    }
+
+    audio_playback_clock_note_decoder(&g_video_playback_clock, g_video_mp3_decoder.frames_read);
+    if (frames == 0U) {
+        if (mp3_decoder_is_eof(&g_video_mp3_decoder)) {
+            g_video_mp3_eof = true;
+            audio_task_publish_video_clock_snapshot();
+            ESP_LOGI(TAG, "AVI MP3压缩流EOS：PCM=%lluf/%llums；等待Video结束后恢复Music",
+                static_cast<unsigned long long>(g_video_playback_clock.submitted_frames),
+                static_cast<unsigned long long>(audio_playback_clock_position_ms(&g_video_playback_clock)));
+        }
+        return;
+    }
+
+    audio_task_apply_pcm_fade_in(g_pcm_block, frames);
+    ret = audio_task_unmute_when_pcm_ready();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "AVI MP3首PCM解除静音失败：%s", esp_err_to_name(ret));
+        g_video_mp3_eof = true;
+        audio_task_publish_video_clock_snapshot();
+        return;
+    }
+    ret = i2s_output_stream_write_pcm32(g_pcm_block, frames, AUDIO_I2S_WRITE_TIMEOUT_MS);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "AVI MP3 I2S发送失败：%s", esp_err_to_name(ret));
+        g_video_mp3_eof = true;
+        audio_task_publish_video_clock_snapshot();
+        return;
+    }
+    audio_playback_clock_commit_pcm(&g_video_playback_clock, frames);
+    audio_task_publish_video_clock_snapshot();
+
+    const uint64_t log_step = static_cast<uint64_t>(g_video_mp3_sample_rate_hz) * 5ULL;
+    if (log_step != 0ULL &&
+        g_video_playback_clock.submitted_frames - g_video_mp3_last_log_frame >= log_step) {
+        g_video_mp3_last_log_frame = g_video_playback_clock.submitted_frames;
+        AviMp3BridgeSnapshot bridge = {};
+        (void)avi_mp3_bridge_get_snapshot(&bridge);
+        const uint32_t read_wait_avg_us = bridge.read_wait_count != 0U
+            ? static_cast<uint32_t>(bridge.read_wait_us_total / bridge.read_wait_count)
+            : 0U;
+        ESP_LOGI(TAG,
+            "AVI MP3 Audio：pcm=%llums submitted=%lluf decoder=%lluf bridge=%u/%uB high=%uB push_wait=%lu read_wait=%lu avg=%luus max=%luus >1ms=%lu >5ms=%lu >10ms=%lu timeout20ms=%lu",
+            static_cast<unsigned long long>(audio_playback_clock_position_ms(&g_video_playback_clock)),
+            static_cast<unsigned long long>(g_video_playback_clock.submitted_frames),
+            static_cast<unsigned long long>(g_video_playback_clock.decoder_frames),
+            static_cast<unsigned>(bridge.buffered_bytes),
+            static_cast<unsigned>(bridge.capacity_bytes),
+            static_cast<unsigned>(bridge.high_water_bytes),
+            static_cast<unsigned long>(bridge.push_wait_count),
+            static_cast<unsigned long>(bridge.read_wait_count),
+            static_cast<unsigned long>(read_wait_avg_us),
+            static_cast<unsigned long>(bridge.read_wait_us_max),
+            static_cast<unsigned long>(bridge.read_wait_over_1ms),
+            static_cast<unsigned long>(bridge.read_wait_over_5ms),
+            static_cast<unsigned long>(bridge.read_wait_over_10ms),
+            static_cast<unsigned long>(bridge.read_wait_timeout_count));
+    }
+}
+
 static bool audio_task_pipeline_has_resources()
 {
     return
@@ -1475,6 +1842,9 @@ static PcmDecoderType audio_decoder_type_for_format(MediaFormat format)
 
 static void audio_task_handle_play(AudioRequest *request)
 {
+    if (g_video_mp3_active || mp3_decoder_is_open(&g_video_mp3_decoder)) {
+        (void)audio_task_stop_video_mp3_internal(false, "music_play_override");
+    }
     const char *path = audio_request_path(request);
 
     // 队列中的 transport 唤醒项可能已经被更新 intent 覆盖；这种请求不能触碰当前 pipeline。
@@ -1712,6 +2082,9 @@ static void audio_task_handle_seek(AudioRequest *request)
 static void audio_task_handle_stop(AudioRequest *request)
 {
     g_task_last_request_id = request->request_id;
+    if (g_video_mp3_active || mp3_decoder_is_open(&g_video_mp3_decoder)) {
+        (void)audio_task_stop_video_mp3_internal(false, "global_stop");
+    }
     esp_err_t ret = audio_task_shutdown_pipeline();
     audio_task_advance_playback_revision();
     g_task_track_index = UINT32_MAX;
@@ -1738,6 +2111,11 @@ static void audio_task_handle_stop(AudioRequest *request)
 static void audio_task_handle_pause(AudioRequest *request)
 {
     g_task_last_request_id = request->request_id;
+    if (g_video_mp3_active) {
+        ESP_LOGW(TAG, "Video Audio活动期间拒绝Music Pause重复请求");
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
     if (g_task_state != AudioPlaybackState::Playing || !g_pipeline_headphone_enabled) {
         ESP_LOGW(TAG, "暂停请求被拒绝：当前状态=%s",
             audio_playback_state_name_cn(g_task_state));
@@ -1768,6 +2146,11 @@ static void audio_task_handle_pause(AudioRequest *request)
 static void audio_task_handle_resume(AudioRequest *request)
 {
     g_task_last_request_id = request->request_id;
+    if (g_video_mp3_active) {
+        ESP_LOGW(TAG, "Video Audio活动期间拒绝Music Resume；必须先停止AVI MP3");
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
     if (g_task_state != AudioPlaybackState::Paused || !g_pipeline_headphone_enabled) {
         ESP_LOGW(TAG, "恢复请求被拒绝：当前状态=%s",
             audio_playback_state_name_cn(g_task_state));
@@ -1879,6 +2262,12 @@ static void audio_task_process_request(AudioRequest *request)
             break;
         case AudioCommandType::SetMute:
             audio_task_handle_set_mute(request);
+            break;
+        case AudioCommandType::VideoMp3Start:
+            audio_task_handle_video_mp3_start(request);
+            break;
+        case AudioCommandType::VideoMp3Stop:
+            audio_task_handle_video_mp3_stop(request);
             break;
     }
 }
@@ -2006,6 +2395,7 @@ static void audio_task_main(void *arg)
     while (true) {
         AudioRequest *request = nullptr;
         const bool stream_needs_service =
+            g_video_mp3_active ||
             g_task_state == AudioPlaybackState::Playing ||
             g_task_state == AudioPlaybackState::Paused;
         const TickType_t wait_ticks = stream_needs_service ? 0 : portMAX_DELAY;
@@ -2015,7 +2405,9 @@ static void audio_task_main(void *arg)
             audio_request_release(request); // 释放 queue 引用
         }
 
-        if (g_task_state == AudioPlaybackState::Playing) {
+        if (g_video_mp3_active) {
+            audio_task_service_video_mp3();
+        } else if (g_task_state == AudioPlaybackState::Playing) {
             audio_task_service_pcm_playback();
         } else if (g_task_state == AudioPlaybackState::Paused) {
             audio_task_service_pause_silence();
@@ -2407,6 +2799,35 @@ bool audio_service_set_mute(bool mute, bool wait)
     }
     request->mute = mute;
     return audio_service_submit(request, wait);
+}
+
+bool audio_service_video_mp3_start(
+    uint32_t sample_rate_hz,
+    uint8_t channels,
+    uint8_t bits_per_sample,
+    bool wait)
+{
+    AudioRequest *request = audio_request_create(AudioCommandType::VideoMp3Start, wait);
+    if (request == nullptr) return false;
+    request->video_sample_rate_hz = sample_rate_hz;
+    request->video_channels = channels;
+    request->video_bits_per_sample = bits_per_sample;
+    return audio_service_submit(request, wait);
+}
+
+bool audio_service_video_mp3_stop(bool wait)
+{
+    AudioRequest *request = audio_request_create(AudioCommandType::VideoMp3Stop, wait);
+    return audio_service_submit(request, wait);
+}
+
+bool audio_service_video_mp3_get_clock(AudioVideoClockSnapshot *out_snapshot)
+{
+    if (out_snapshot == nullptr) return false;
+    portENTER_CRITICAL(&g_video_clock_snapshot_mux);
+    *out_snapshot = g_video_clock_snapshot;
+    portEXIT_CRITICAL(&g_video_clock_snapshot_mux);
+    return true;
 }
 
 uint32_t audio_service_playback_revision()

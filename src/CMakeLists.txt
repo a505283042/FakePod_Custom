@@ -42,6 +42,7 @@ idf_component_register(
         "audio/audio_spectrum_snapshot.cpp"
         "audio/sources/audio_source.cpp"
         "audio/sources/sd_file_audio_source.cpp"
+        "audio/sources/avi_mp3_audio_source.cpp"
         "audio/decoders/pcm_decoder.cpp"
         "audio/decoders/wav_decoder.cpp"
         "audio/decoders/flac_decoder.cpp"

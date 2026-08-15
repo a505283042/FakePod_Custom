@@ -7,9 +7,11 @@
 #include "app_launcher_overlay.h"
 #include "app_manager.h"
 #include "audio/decoders/flac_decoder.h"
+#include "audio/audio_service.h"
 #include "drivers/display/display_bounded_spi.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -53,6 +55,10 @@ static constexpr int64_t kVideoLateDropUs = 50000LL;
 // 59.8Hz TE 半周期约 8.4ms；Dedicated Presenter 在 RGB ready queue 唤醒后直接做 PTS pacing。
 // 本轮保持 R.40.3.3.2 的 14ms TE arm 不变，只隔离“LVGL轮询”这一变量。
 static constexpr int64_t kBenchmarkTeArmLeadUs = 14000LL;
+// Minimal Tear Guard：460x460 实机在 Y=0、仅 300us TE 后微相位时已无撕裂。
+// R.40.3.3.3.2 不再按 frame_y 追加 2~4ms 扫描等待，所有尺寸统一只保留 300us。
+// 仅改 TE 后 stream 微相位，不改 PTS/Presenter/Decode 行为。
+static constexpr uint32_t kScanPhaseSafetyUs = 300U;
 static constexpr int64_t kBenchmarkReportIntervalUs = 5000000LL;
 static constexpr uint32_t kDestroyCleanupWaitMs = 300U;
 static constexpr uint32_t kBrowserTimerPeriodMs = 20U;
@@ -118,6 +124,9 @@ struct BenchmarkUiState
     bool has_held = false;
     bool bounded_session = false;
     bool clock_started = false;
+    bool audio_master_active = false;
+    uint32_t audio_master_revision = 0U;
+    uint32_t audio_first_pts_ms = 0U;
     bool terminal_shown = false;
     bool cleanup_pending = false;
     uint32_t first_pts_ms = 0U;
@@ -168,6 +177,7 @@ static portMUX_TYPE g_benchmark_ui_mux = portMUX_INITIALIZER_UNLOCKED;
 static TaskHandle_t g_present_task = nullptr;
 static bool g_present_running = false;
 static bool g_present_stop_requested = false;
+static bool g_music_paused_for_benchmark = false;
 
 static esp_err_t cleanup_create_failure(esp_err_t err)
 {
@@ -227,6 +237,51 @@ static bool flac_storage_safe(bool *out_competing = nullptr, uint32_t *out_perce
     if (out_competing != nullptr) *out_competing = true;
     if (out_percent != nullptr) *out_percent = percent;
     return percent >= kFlacSafePercent;
+}
+
+static bool benchmark_pause_music_for_exclusive()
+{
+    if (g_music_paused_for_benchmark) return true;
+
+    AudioStateSnapshot snapshot = {};
+    if (!audio_service_get_snapshot(&snapshot) || !snapshot.ready) {
+        ESP_LOGI(TAG, "Video Exclusive：AudioTask未就绪，无活动Music需要暂停");
+        return true;
+    }
+    if (snapshot.state != AudioPlaybackState::Playing) {
+        ESP_LOGI(TAG, "Video Exclusive：Music当前非Playing(state=%u)，保持原状态",
+            static_cast<unsigned>(snapshot.state));
+        return true;
+    }
+
+    if (!audio_service_pause(true)) {
+        ESP_LOGE(TAG, "Video Exclusive：暂停Music失败，取消AVI启动");
+        return false;
+    }
+    g_music_paused_for_benchmark = true;
+    ESP_LOGI(TAG, "Video Exclusive：Music已暂停；AVI独占TF/Decode/Presenter性能窗口");
+    return true;
+}
+
+static void benchmark_restore_music_after_exclusive(const char *reason)
+{
+    if (!g_music_paused_for_benchmark) return;
+    if (!audio_service_resume(false)) {
+        ESP_LOGW(TAG, "Video Exclusive：恢复Music请求失败 reason=%s；保留暂停标记等待后续生命周期重试",
+            reason != nullptr ? reason : "unknown");
+        return;
+    }
+    g_music_paused_for_benchmark = false;
+    ESP_LOGI(TAG, "Video Exclusive：已请求恢复Music reason=%s",
+        reason != nullptr ? reason : "unknown");
+}
+
+static bool benchmark_stop_avi_audio(const char *reason)
+{
+    if (audio_service_video_mp3_stop(true)) return true;
+    ESP_LOGE(TAG, "AVI MP3 AudioTask停止/恢复Paused Music硬件失败：reason=%s",
+        reason != nullptr ? reason : "unknown");
+    return false;
 }
 
 static void set_visible(lv_obj_t *obj, bool visible)
@@ -479,6 +534,55 @@ static esp_err_t benchmark_black_strip_producer(
     return ESP_OK;
 }
 
+struct BenchmarkFrameStripContext
+{
+    const uint8_t *rgb565_be = nullptr;
+    uint16_t width = 0U;
+    uint16_t height = 0U;
+    uint32_t phase_delay_us = 0U;
+    bool phase_applied = false;
+};
+
+static uint32_t benchmark_scan_phase_delay_us(uint16_t frame_y)
+{
+    (void)frame_y;
+    return kScanPhaseSafetyUs;
+}
+
+static esp_err_t benchmark_frame_strip_producer(
+    void *context,
+    uint16_t source_y,
+    uint16_t rows,
+    uint16_t width,
+    uint8_t *dst_rgb565,
+    size_t dst_bytes)
+{
+    BenchmarkFrameStripContext *frame = static_cast<BenchmarkFrameStripContext *>(context);
+    if (frame == nullptr || frame->rgb565_be == nullptr || dst_rgb565 == nullptr ||
+        width == 0U || rows == 0U || width != frame->width ||
+        source_y >= frame->height || rows > static_cast<uint16_t>(frame->height - source_y)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const size_t required =
+        static_cast<size_t>(rows) * static_cast<size_t>(width) * 2U;
+    if (required > dst_bytes) return ESP_ERR_INVALID_SIZE;
+
+    // display_bounded_spi 在调用首个 producer 前已经完成当前帧的 TE wait；
+    // 因此这里只延迟第一次 producer，就能把真正 RAMWR stream 平移到目标 scan phase。
+    if (!frame->phase_applied) {
+        frame->phase_applied = true;
+        if (frame->phase_delay_us > 0U) {
+            esp_rom_delay_us(frame->phase_delay_us);
+        }
+    }
+
+    const uint8_t *src = frame->rgb565_be +
+        static_cast<size_t>(source_y) * static_cast<size_t>(width) * 2U;
+    memcpy(dst_rgb565, src, required);
+    return ESP_OK;
+}
+
 static int32_t benchmark_probe_clamp_i32(int64_t value)
 {
     if (value > 2147483647LL) return 2147483647;
@@ -536,12 +640,34 @@ static void benchmark_presenter_set_error(esp_err_t error)
     portEXIT_CRITICAL(&g_benchmark_ui_mux);
 }
 
+static bool benchmark_audio_master_snapshot(AudioVideoClockSnapshot *out_clock)
+{
+    if (out_clock == nullptr) return false;
+    AudioVideoClockSnapshot clock = {};
+    if (!audio_service_video_mp3_get_clock(&clock) ||
+        !clock.active || clock.sample_rate_hz == 0U ||
+        clock.submitted_frames == 0ULL || clock.eof) {
+        return false;
+    }
+    *out_clock = clock;
+    return true;
+}
+
+static int64_t benchmark_audio_master_target_us(uint32_t video_pts_ms, uint32_t audio_first_pts_ms)
+{
+    return (static_cast<int64_t>(video_pts_ms) -
+            static_cast<int64_t>(audio_first_pts_ms)) * 1000LL;
+}
+
 static void benchmark_presenter_task(void *arg)
 {
     (void)arg;
     bool bounded_session = false;
     bool clock_started = false;
+    bool audio_master_expected = false;
+    bool audio_master_logged = false;
     uint32_t first_pts_ms = 0U;
+    uint32_t audio_first_pts_ms = 0U;
     int64_t clock_base_us = 0LL;
     int64_t last_present_done_us = 0LL;
     int64_t last_wake_us = 0LL;
@@ -589,6 +715,13 @@ static void benchmark_presenter_task(void *arg)
             clock_started = true;
             first_pts_ms = frame.pts_ms;
             clock_base_us = acquired_us;
+
+            VideoBenchmark::Snapshot stream_snapshot = {};
+            if (VideoBenchmark::get_snapshot(&stream_snapshot) && stream_snapshot.audio_streams != 0U) {
+                audio_master_expected = true;
+                audio_first_pts_ms = stream_snapshot.audio_first_pts_ms;
+            }
+
             portENTER_CRITICAL(&g_benchmark_ui_mux);
             g_benchmark_ui.clock_started = true;
             g_benchmark_ui.first_pts_ms = first_pts_ms;
@@ -596,13 +729,39 @@ static void benchmark_presenter_task(void *arg)
             g_benchmark_ui.last_report_us = clock_base_us;
             portEXIT_CRITICAL(&g_benchmark_ui_mux);
             if (!VideoBenchmark::set_presentation_clock(first_pts_ms, clock_base_us)) {
-                ESP_LOGW(TAG, "Unified PTS时钟发布失败；本次退化为Presenter pacing，Decode不做PreDecode时钟判断");
+                ESP_LOGW(TAG, "Fallback PTS时钟发布失败；Audio PCM Master不可用时Decode将暂不做PreDecode时钟判断");
             }
         }
 
         const uint32_t pts_delta_ms = frame.pts_ms >= first_pts_ms
             ? frame.pts_ms - first_pts_ms : 0U;
-        const int64_t target_us = clock_base_us + static_cast<int64_t>(pts_delta_ms) * 1000LL;
+        const int64_t fallback_target_us =
+            clock_base_us + static_cast<int64_t>(pts_delta_ms) * 1000LL;
+        const int64_t audio_target_us =
+            benchmark_audio_master_target_us(frame.pts_ms, audio_first_pts_ms);
+
+        AudioVideoClockSnapshot audio_clock = {};
+        bool use_audio_master =
+            audio_master_expected && benchmark_audio_master_snapshot(&audio_clock);
+        const int64_t ready_late_us = use_audio_master
+            ? static_cast<int64_t>(audio_clock.position_us) - audio_target_us
+            : acquired_us - fallback_target_us;
+
+        if (use_audio_master && !audio_master_logged) {
+            audio_master_logged = true;
+            portENTER_CRITICAL(&g_benchmark_ui_mux);
+            g_benchmark_ui.audio_master_active = true;
+            g_benchmark_ui.audio_master_revision = audio_clock.revision;
+            g_benchmark_ui.audio_first_pts_ms = audio_first_pts_ms;
+            portEXIT_CRITICAL(&g_benchmark_ui_mux);
+            ESP_LOGI(TAG,
+                "Audio Master A/V Sync已接管：clock_rev=%lu audio_pts0=%lums video_pts0=%lums av0_delta=%ldms pcm=%lluus；Presenter等待/late/drop以AudioTask submitted PCM为准",
+                static_cast<unsigned long>(audio_clock.revision),
+                static_cast<unsigned long>(audio_first_pts_ms),
+                static_cast<unsigned long>(first_pts_ms),
+                static_cast<long>(static_cast<int32_t>(audio_first_pts_ms) - static_cast<int32_t>(first_pts_ms)),
+                static_cast<unsigned long long>(audio_clock.position_us));
+        }
 
         portENTER_CRITICAL(&g_benchmark_ui_mux);
         benchmark_probe_record_signed(
@@ -610,13 +769,24 @@ static void benchmark_presenter_task(void *arg)
             g_benchmark_ui.probe.ready_late_us_total,
             g_benchmark_ui.probe.ready_late_us_min,
             g_benchmark_ui.probe.ready_late_us_max,
-            acquired_us - target_us);
+            ready_late_us);
         portEXIT_CRITICAL(&g_benchmark_ui_mux);
 
         bool pts_waited = false;
         while (!benchmark_presenter_should_stop()) {
-            const int64_t now_us = esp_timer_get_time();
-            const int64_t wait_us = target_us - kBenchmarkTeArmLeadUs - now_us;
+            int64_t wait_us = 0LL;
+            if (use_audio_master) {
+                AudioVideoClockSnapshot latest_clock = {};
+                if (!benchmark_audio_master_snapshot(&latest_clock)) {
+                    use_audio_master = false;
+                    continue;
+                }
+                audio_clock = latest_clock;
+                wait_us = audio_target_us - kBenchmarkTeArmLeadUs -
+                    static_cast<int64_t>(audio_clock.position_us);
+            } else {
+                wait_us = fallback_target_us - kBenchmarkTeArmLeadUs - esp_timer_get_time();
+            }
             if (wait_us <= 0LL) break;
             pts_waited = true;
             uint32_t wait_ms = static_cast<uint32_t>((wait_us + 999LL) / 1000LL);
@@ -635,8 +805,19 @@ static void benchmark_presenter_task(void *arg)
             break;
         }
 
-        const int64_t now_us = esp_timer_get_time();
-        const int64_t late_us = now_us - target_us;
+        int64_t late_us = 0LL;
+        if (use_audio_master) {
+            AudioVideoClockSnapshot latest_clock = {};
+            if (benchmark_audio_master_snapshot(&latest_clock)) {
+                audio_clock = latest_clock;
+                late_us = static_cast<int64_t>(audio_clock.position_us) - audio_target_us;
+            } else {
+                use_audio_master = false;
+                late_us = esp_timer_get_time() - fallback_target_us;
+            }
+        } else {
+            late_us = esp_timer_get_time() - fallback_target_us;
+        }
         if (presented_local > 0U && late_us > kVideoLateDropUs) {
             portENTER_CRITICAL(&g_benchmark_ui_mux);
             ++g_benchmark_ui.dropped;
@@ -660,6 +841,7 @@ static void benchmark_presenter_task(void *arg)
 
         const uint16_t frame_x = static_cast<uint16_t>((VideoBenchmark::kWidth - frame_width) / 2U);
         const uint16_t frame_y = static_cast<uint16_t>((VideoBenchmark::kHeight - frame_height) / 2U);
+        const uint32_t scan_phase_delay_us = benchmark_scan_phase_delay_us(frame_y);
 
         if (!bounded_session) {
             const esp_err_t begin_ret = display_launcher_bounded_spi_session_begin();
@@ -687,15 +869,35 @@ static void benchmark_presenter_task(void *arg)
             }
 
             ESP_LOGI(TAG,
-                "MJPEG Benchmark进入Dedicated Presenter局部GRAM：video=%ux%u window=(%u,%u) canvas=460x460；TE-aware arm=14ms；LVGL Present=OFF",
+                "MJPEG Benchmark进入Dedicated Presenter局部GRAM：video=%ux%u window=(%u,%u) canvas=460x460；TE-aware arm=14ms；Minimal Tear Guard=ON phase=%uus@Y=%u；LVGL Present=OFF",
                 static_cast<unsigned>(frame_width), static_cast<unsigned>(frame_height),
-                static_cast<unsigned>(frame_x), static_cast<unsigned>(frame_y));
+                static_cast<unsigned>(frame_x), static_cast<unsigned>(frame_y),
+                static_cast<unsigned>(scan_phase_delay_us),
+                static_cast<unsigned>(frame_y));
+        }
+
+        BenchmarkFrameStripContext strip_context = {};
+        strip_context.rgb565_be = frame.rgb565_be;
+        strip_context.width = frame_width;
+        strip_context.height = frame_height;
+        strip_context.phase_delay_us = scan_phase_delay_us;
+
+        int64_t present_start_master_late_us = 0LL;
+        bool present_start_master_valid = false;
+        if (use_audio_master) {
+            AudioVideoClockSnapshot clock_at_start = {};
+            if (benchmark_audio_master_snapshot(&clock_at_start)) {
+                present_start_master_late_us =
+                    static_cast<int64_t>(clock_at_start.position_us) - audio_target_us;
+                present_start_master_valid = true;
+            }
         }
 
         const int64_t present_start_us = esp_timer_get_time();
         DisplayBoundedSpiStats stats = {};
-        const esp_err_t present_ret = display_launcher_bounded_spi_present(
-            frame.rgb565_be,
+        const esp_err_t present_ret = display_launcher_bounded_spi_present_stream(
+            benchmark_frame_strip_producer,
+            &strip_context,
             frame_x, frame_y,
             frame_width, frame_height,
             true,
@@ -710,6 +912,19 @@ static void benchmark_presenter_task(void *arg)
             break;
         }
 
+        int64_t present_start_late_us = present_start_us - fallback_target_us;
+        int64_t present_done_late_us = present_done_us - fallback_target_us;
+        if (present_start_master_valid) {
+            present_start_late_us = present_start_master_late_us;
+            AudioVideoClockSnapshot clock_at_done = {};
+            if (benchmark_audio_master_snapshot(&clock_at_done)) {
+                present_done_late_us =
+                    static_cast<int64_t>(clock_at_done.position_us) - audio_target_us;
+            } else {
+                present_done_late_us = present_start_master_late_us;
+            }
+        }
+
         ++presented_local;
         portENTER_CRITICAL(&g_benchmark_ui_mux);
         BenchmarkUiState &ui = g_benchmark_ui;
@@ -719,11 +934,11 @@ static void benchmark_presenter_task(void *arg)
         benchmark_probe_record_signed(
             ui.probe.present_start_samples, ui.probe.present_start_late_us_total,
             ui.probe.present_start_late_us_min, ui.probe.present_start_late_us_max,
-            present_start_us - target_us);
+            present_start_late_us);
         benchmark_probe_record_signed(
             ui.probe.present_done_samples, ui.probe.present_done_late_us_total,
             ui.probe.present_done_late_us_min, ui.probe.present_done_late_us_max,
-            present_done_us - target_us);
+            present_done_late_us);
         if (last_present_done_us != 0LL) {
             benchmark_probe_record_unsigned(
                 ui.probe.post_idle_samples, ui.probe.post_idle_us_total, ui.probe.post_idle_us_max,
@@ -791,6 +1006,7 @@ static bool benchmark_request_stop(const char *reason)
 {
     benchmark_presenter_request_stop();
     VideoBenchmark::stop();
+    const bool audio_stopped = benchmark_stop_avi_audio(reason);
     const bool presenter_stopped = benchmark_presenter_wait_stopped(kPresenterStopWaitMs);
     g_benchmark_ui.cleanup_pending = true;
     const BenchmarkUiState ui = benchmark_ui_snapshot();
@@ -802,8 +1018,10 @@ static bool benchmark_request_stop(const char *reason)
     if (!presenter_stopped) {
         ESP_LOGW(TAG, "Dedicated Presenter在%ums内未退出；暂不恢复Video LVGL以避免与BoundedSPI并发写屏",
             static_cast<unsigned>(kPresenterStopWaitMs));
+    } else if (audio_stopped) {
+        benchmark_restore_music_after_exclusive(reason);
     }
-    return presenter_stopped;
+    return presenter_stopped && audio_stopped;
 }
 
 static void benchmark_cleanup_tick()
@@ -876,6 +1094,45 @@ static void benchmark_log_realtime(const VideoBenchmark::Snapshot &snapshot, int
         static_cast<unsigned long>(te_avg_us),
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) / 1024U));
 
+    if (snapshot.audio_streams != 0U) {
+        const uint32_t audio_avg_bytes = snapshot.audio_frames_read != 0U
+            ? static_cast<uint32_t>(snapshot.audio_compressed_bytes / snapshot.audio_frames_read) : 0U;
+        const uint32_t audio_extract_avg_us = snapshot.audio_frames_read != 0U
+            ? static_cast<uint32_t>(snapshot.audio_extract_us_total / snapshot.audio_frames_read) : 0U;
+        const uint32_t audio_storage_avg_us = snapshot.audio_frames_read != 0U
+            ? static_cast<uint32_t>(snapshot.audio_storage_us_total / snapshot.audio_frames_read) : 0U;
+        const int32_t av0_delta_ms = (snapshot.audio_frames_read != 0U && snapshot.frames_decoded != 0U)
+            ? static_cast<int32_t>(snapshot.audio_first_pts_ms) - static_cast<int32_t>(snapshot.first_pts_ms)
+            : 0;
+        ESP_LOGI(TAG,
+            "AVIAudio: MP3 %luHz/%uch bits=%u bitrate=%lu frames=%lu avg=%luB max=%luB pts=%lu..%lu av0_delta=%ldms extract_avg=%luus TF_avg=%luus output=AudioTask",
+            static_cast<unsigned long>(snapshot.audio_sample_rate),
+            static_cast<unsigned>(snapshot.audio_channels),
+            static_cast<unsigned>(snapshot.audio_bits_per_sample),
+            static_cast<unsigned long>(snapshot.audio_bitrate),
+            static_cast<unsigned long>(snapshot.audio_frames_read),
+            static_cast<unsigned long>(audio_avg_bytes),
+            static_cast<unsigned long>(snapshot.audio_compressed_bytes_max),
+            static_cast<unsigned long>(snapshot.audio_first_pts_ms),
+            static_cast<unsigned long>(snapshot.audio_last_pts_ms),
+            static_cast<long>(av0_delta_ms),
+            static_cast<unsigned long>(audio_extract_avg_us),
+            static_cast<unsigned long>(audio_storage_avg_us));
+    }
+
+    if (ui.audio_master_active) {
+        AudioVideoClockSnapshot audio_clock = {};
+        if (audio_service_video_mp3_get_clock(&audio_clock) && audio_clock.active) {
+            ESP_LOGI(TAG,
+                "AVMaster: source=AudioPCM rev=%lu pcm=%llums submitted=%lluf audio_pts0=%lums probe_late_ref=AudioPCM eof=%u",
+                static_cast<unsigned long>(audio_clock.revision),
+                static_cast<unsigned long long>(audio_clock.position_us / 1000ULL),
+                static_cast<unsigned long long>(audio_clock.submitted_frames),
+                static_cast<unsigned long>(ui.audio_first_pts_ms),
+                static_cast<unsigned>(audio_clock.eof));
+        }
+    }
+
     const CadenceProbeWindow &probe = ui.probe;
     const uint32_t wake_gap_avg_us = probe.tick_gap_samples != 0U
         ? static_cast<uint32_t>(probe.tick_gap_us_total / probe.tick_gap_samples) : 0U;
@@ -926,6 +1183,11 @@ static void benchmark_show_terminal(const VideoBenchmark::Snapshot &snapshot)
     set_visible(g_root, true);
     g_benchmark_ui.terminal_shown = true;
     g_benchmark_ui.cleanup_pending = true;
+    const char *terminal_reason =
+        snapshot.state == VideoBenchmark::State::Eof ? "eof" : "terminal";
+    if (benchmark_stop_avi_audio(terminal_reason)) {
+        benchmark_restore_music_after_exclusive(terminal_reason);
+    }
 
     const BenchmarkUiState ui = benchmark_ui_snapshot();
     const uint32_t fps_milli = benchmark_fps_milli(ui);
@@ -1049,6 +1311,11 @@ static void row_clicked_cb(lv_event_t *event)
     }
 
     snprintf(g_selected_path, VideoBrowser::kPathBytes, "%s", g_scratch_path);
+    if (!benchmark_pause_music_for_exclusive()) {
+        show_status("无法暂停当前Music，Video Exclusive未启动", 0xE18A8A);
+        gesture_router_reset();
+        return;
+    }
     g_page = VideoPage::Benchmark;
     if (g_timer != nullptr) lv_timer_set_period(g_timer, kBenchmarkTimerPeriodMs);
     set_visible(g_browser_host, false);
@@ -1057,7 +1324,7 @@ static void row_clicked_cb(lv_event_t *event)
     lv_label_set_text(g_probe_title, name);
     lv_label_set_text(g_probe_video, "准备 460x460 MJPEG 解码…");
     lv_label_set_text(g_probe_audio, "Dedicated Presenter + Unified PTS + CO5300 BoundedSPI");
-    lv_label_set_text(g_probe_misc, "R.40.3.3.3：Presenter阻塞等待RGB Ready Queue；AVI内MP3本阶段暂不播放\n右滑可随时停止并返回目录");
+    lv_label_set_text(g_probe_misc, "R.40.4.1：AVI MJPEG + MP3 Audio Pipeline V1；启动AVI前暂停Music\nMP3->32KB Bridge->AudioTask->PCM/CS43131，右滑停止后恢复Music");
     // 物理 GRAM 即将由 BoundedSPI 视频帧接管。提前隐藏 Video LVGL root，留出至少一个
     // decoder warm-up 窗口让 LVGL 消化隐藏 invalidation；播放期间不再产生覆盖视频的 repaint。
     set_visible(g_root, false);
@@ -1069,6 +1336,8 @@ static void row_clicked_cb(lv_event_t *event)
         lv_label_set_text(g_probe_video, line);
         g_benchmark_ui.terminal_shown = true;
         g_benchmark_ui.cleanup_pending = true;
+        (void)benchmark_stop_avi_audio("benchmark_start_failed");
+        benchmark_restore_music_after_exclusive("benchmark_start_failed");
         set_visible(g_root, true);
         if (g_timer != nullptr) lv_timer_set_period(g_timer, kBrowserTimerPeriodMs);
     } else {
@@ -1077,6 +1346,9 @@ static void row_clicked_cb(lv_event_t *event)
             VideoBenchmark::stop();
             g_benchmark_ui.display_error = presenter_ret;
             g_benchmark_ui.cleanup_pending = true;
+            if (benchmark_stop_avi_audio("presenter_start_failed")) {
+                benchmark_restore_music_after_exclusive("presenter_start_failed");
+            }
             char line[128] = {};
             snprintf(line, sizeof(line), "Presenter启动失败：%s", esp_err_to_name(presenter_ret));
             lv_label_set_text(g_probe_video, line);
@@ -1272,7 +1544,7 @@ static esp_err_t video_enter()
         lv_timer_resume(g_timer);
     }
     begin_browser_load();
-    ESP_LOGI(TAG, "Video进入Foreground：/VIDEO AVI Browser已显示；MJPEG Dedicated Presenter Benchmark就绪，Music保持后台作为压力条件");
+    ESP_LOGI(TAG, "Video进入Foreground：/VIDEO AVI Browser已显示；目录页Music保持后台，启动AVI时暂停Music并由AudioTask接管AVI MP3");
     return ESP_OK;
 }
 
@@ -1285,7 +1557,8 @@ static esp_err_t video_leave(AppRunState next_state)
     gesture_router_reset();
     app_launcher_overlay_hide();
     set_visible(g_root, false);
-    ESP_LOGI(TAG, "Video离开Foreground：MJPEG Benchmark/目录协作任务已停止");
+    if (!benchmark_presenter_is_running()) benchmark_restore_music_after_exclusive("leave");
+    ESP_LOGI(TAG, "Video离开Foreground：MJPEG Benchmark/目录协作任务已停止，Video Exclusive Music状态已恢复");
     return ESP_OK;
 }
 
@@ -1330,8 +1603,9 @@ static void video_destroy()
     g_scratch_path = nullptr;
     g_selected_path = nullptr;
     g_page = VideoPage::Browser;
+    if (!benchmark_presenter_is_running()) benchmark_restore_music_after_exclusive("destroy");
     g_benchmark_ui = {};
-    ESP_LOGI(TAG, "Video destroy完成：LVGL/目录索引/路径PSRAM已释放；Benchmark已请求回收");
+    ESP_LOGI(TAG, "Video destroy完成：LVGL/目录索引/路径PSRAM已释放；Benchmark已请求回收，Exclusive Music状态已处理");
 }
 
 } // namespace
@@ -1353,7 +1627,7 @@ esp_err_t video_app_register()
     descriptor.lifecycle.destroy = video_destroy;
     const esp_err_t ret = app_manager_register(descriptor);
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Video APP已注册：AVI Browser + Native MJPEG Dedicated Presenter/CO5300 Benchmark（AVI内MP3暂不播放）");
+        ESP_LOGI(TAG, "Video APP已注册：AVI Browser + Native MJPEG Dedicated Presenter + Audio Master A/V Sync V1");
     }
     return ret;
 }

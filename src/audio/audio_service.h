@@ -40,6 +40,32 @@ bool audio_service_stop(bool wait = true);
 bool audio_service_pause(bool wait = true);
 bool audio_service_resume(bool wait = true);
 
+// R.40.4.1：AVI 内 MP3 临时接管 AudioTask 的 PCM/I2S/CS43131 输出。
+// 调用前 Video Exclusive 已暂停当前 Music；Video MP3 stop 后会恢复 Paused Music 硬件，
+// 真正的 Music resume 仍由 Video 生命周期决定。Video/Extractor 从不直接操作 I2S/DAC。
+bool audio_service_video_mp3_start(
+    uint32_t sample_rate_hz,
+    uint8_t channels,
+    uint8_t bits_per_sample,
+    bool wait = true
+);
+bool audio_service_video_mp3_stop(bool wait = true);
+
+// R.40.4.2：Video Presenter / PreDecode 只读的 AVI MP3 PCM 主时钟快照。
+// position_us 来自“真实已成功提交到 I2S DMA”的 PCM sample 数；Video 永远只读，
+// 不得通过该接口控制 AudioTask / I2S / DAC。
+struct AudioVideoClockSnapshot
+{
+    bool active = false;
+    bool eof = false;
+    uint32_t revision = 0U;
+    uint32_t sample_rate_hz = 0U;
+    uint64_t submitted_frames = 0ULL;
+    uint64_t decoder_frames = 0ULL;
+    uint64_t position_us = 0ULL;
+};
+bool audio_service_video_mp3_get_clock(AudioVideoClockSnapshot *out_snapshot);
+
 // Stage 11.x：对当前选中 Track 发起 Seek。Play/Seek 共用 latest-intent 单槽；
 // 路径/技术索引仍复制进请求，AudioTask 会核对 track + playback_revision，并丢弃被更新意图覆盖的旧请求。
 bool audio_service_seek_track(

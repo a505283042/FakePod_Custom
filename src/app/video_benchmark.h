@@ -32,6 +32,24 @@ struct Snapshot
     uint16_t height = 0U;
     uint16_t fps_hint = 0U;
 
+    // R.40.4.1 AVI MP3 Audio Pipeline V1：AUDIO 压缩帧送入 PSRAM Bridge，由 AudioTask 解码并输出 PCM。
+    uint16_t audio_streams = 0U;
+    uint32_t audio_format = 0U;
+    uint32_t audio_duration_ms = 0U;
+    uint32_t audio_bitrate = 0U;
+    uint32_t audio_sample_rate = 0U;
+    uint8_t audio_channels = 0U;
+    uint8_t audio_bits_per_sample = 0U;
+    uint32_t audio_frames_read = 0U;
+    uint64_t audio_compressed_bytes = 0ULL;
+    uint32_t audio_compressed_bytes_max = 0U;
+    uint32_t audio_first_pts_ms = 0U;
+    uint32_t audio_last_pts_ms = 0U;
+    uint64_t audio_extract_us_total = 0ULL;
+    uint32_t audio_extract_us_max = 0U;
+    uint64_t audio_storage_us_total = 0ULL;
+    uint32_t audio_storage_us_max = 0U;
+
     uint32_t frames_read = 0U;
     uint32_t frames_decoded = 0U;
     uint32_t frames_pool_skipped = 0U;
@@ -66,7 +84,7 @@ struct FrameView
     uint8_t slot = 0xFFU;
 };
 
-// 启动一个一次性 MJPEG benchmark task。只抽取 VIDEO track，不读取/解码 AVI 内 MP3。
+// 启动 AVI A/V pipeline：VIDEO 进入 MJPEG pipeline；MP3 AUDIO 经 PSRAM Bridge 送 AudioTask 解码/输出。
 // RGB565 输出固定为 CO5300 wire-order (big-endian)，供 BoundedSPI 直接提交。
 esp_err_t start(const char *path);
 void stop();

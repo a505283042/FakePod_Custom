@@ -1089,7 +1089,11 @@ esp_err_t mp3_decoder_register_backend()
     return ESP_OK;
 }
 
-esp_err_t mp3_decoder_open(Mp3Decoder *decoder, AudioSource *source, AudioDecodeWorkspace *workspace)
+esp_err_t mp3_decoder_open(
+    Mp3Decoder *decoder,
+    AudioSource *source,
+    AudioDecodeWorkspace *workspace,
+    bool streaming_source)
 {
     if (decoder == nullptr || !audio_source_is_open(source)) {
         return ESP_ERR_INVALID_ARG;
@@ -1102,25 +1106,37 @@ esp_err_t mp3_decoder_open(Mp3Decoder *decoder, AudioSource *source, AudioDecode
     }
 
     decoder->source = source;
-    if (!audio_source_has_capability(source, AUDIO_SOURCE_CAP_READ) ||
-        !audio_source_has_capability(source, AUDIO_SOURCE_CAP_SEEK) ||
-        !audio_source_has_capability(source, AUDIO_SOURCE_CAP_SIZE)) {
+    decoder->streaming_source = streaming_source;
+    if (!audio_source_has_capability(source, AUDIO_SOURCE_CAP_READ)) {
         mp3_decoder_close(decoder);
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    uint64_t file_size = 0;
-    ret = audio_source_size(source, &file_size);
-    if (ret != ESP_OK || file_size == 0) {
-        mp3_decoder_close(decoder);
-        return ret != ESP_OK ? ret : ESP_ERR_INVALID_SIZE;
+    if (streaming_source) {
+        if (!audio_source_has_capability(source, AUDIO_SOURCE_CAP_STREAMING)) {
+            mp3_decoder_close(decoder);
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+        decoder->file_size_bytes = 0ULL;
+    } else {
+        if (!audio_source_has_capability(source, AUDIO_SOURCE_CAP_SEEK) ||
+            !audio_source_has_capability(source, AUDIO_SOURCE_CAP_SIZE)) {
+            mp3_decoder_close(decoder);
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+        uint64_t file_size = 0;
+        ret = audio_source_size(source, &file_size);
+        if (ret != ESP_OK || file_size == 0) {
+            mp3_decoder_close(decoder);
+            return ret != ESP_OK ? ret : ESP_ERR_INVALID_SIZE;
+        }
+        ret = audio_source_seek(source, 0, AudioSourceSeekOrigin::Begin);
+        if (ret != ESP_OK) {
+            mp3_decoder_close(decoder);
+            return ret;
+        }
+        decoder->file_size_bytes = file_size;
     }
-    ret = audio_source_seek(source, 0, AudioSourceSeekOrigin::Begin);
-    if (ret != ESP_OK) {
-        mp3_decoder_close(decoder);
-        return ret;
-    }
-    decoder->file_size_bytes = file_size;
 
     decoder->workspace = workspace;
     if (workspace != nullptr) {
@@ -1192,7 +1208,9 @@ esp_err_t mp3_decoder_open(Mp3Decoder *decoder, AudioSource *source, AudioDecode
 #endif
 
 #if APP_DIAG_AUDIO_CODEC
-    ESP_LOGI(TAG, "MP3流式解码已就绪：文件=%lluB，输入缓冲=%uB，PCM缓冲=%uB，首块PCM=%uB，工作区使用PSRAM",
+    ESP_LOGI(TAG, "MP3 decoder ready: source=%s streaming=%u file=%lluB input=%uB pcm=%uB first_pcm=%uB PSRAM",
+        audio_source_name(decoder->source),
+        static_cast<unsigned>(decoder->streaming_source),
         static_cast<unsigned long long>(decoder->file_size_bytes),
         static_cast<unsigned>(decoder->input_capacity),
         static_cast<unsigned>(decoder->decoded_capacity),
