@@ -8,7 +8,7 @@
 namespace EbookReader
 {
 
-static constexpr const char *kRootDirectory = "/sdcard/BOOKS";
+static constexpr const char *kRootDirectory = "/sdcard/txt";
 static constexpr size_t kEntryNameBytes = 256;
 static constexpr size_t kPathBytes = 512;
 static constexpr size_t kPageReadBytes = 2048;

@@ -1434,7 +1434,7 @@ static const char *ebook_error_message(esp_err_t err)
 {
     switch (err) {
         case ESP_ERR_NOT_FOUND:
-            return "未找到 /BOOKS\n请在TF卡根目录创建 BOOKS 文件夹";
+            return "未找到 /txt\n请在TF卡根目录创建 txt 文件夹";
         case ESP_ERR_TIMEOUT:
             return "TF卡正忙\n请稍后再试";
         case ESP_ERR_NO_MEM:
@@ -2381,7 +2381,7 @@ static esp_err_t ebook_enter()
     lv_obj_remove_flag(g_root, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(g_root);
     lv_obj_invalidate(g_root);
-    ESP_LOGI(TAG, "Ebook进入Foreground：/BOOKS Browser已显示，Music可继续后台播放");
+    ESP_LOGI(TAG, "Ebook进入Foreground：/txt Browser已显示，Music可继续后台播放");
     return ESP_OK;
 }
 

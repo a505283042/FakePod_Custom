@@ -1,12 +1,12 @@
 # FakePod Ebook Reader V1 Final
 
-正式版本：**P1.5.3.2R.39.6.5 — ebook-reader-v1-final**
+正式版本：**P1.5.3.2R.39.6.5.1 — ebook-root-txt-path-fix**
 
 本版本冻结 Ebook Reader V1。后续默认不再增加 Ebook V1 功能；仅接受影响正确性、稳定性或硬件兼容性的 bugfix。字号/主题、GBK/GB18030、章节导航、搜索、多书签等进入 V2 backlog。
 
 ## V1 冻结范围
 
-- 书库根目录固定 `/sdcard/BOOKS`，支持子目录。
+- 书库根目录固定 `/sdcard/txt`，支持子目录。
 - Browser 仅显示目录和 `.txt`；目录优先、名称大小写不敏感排序。
 - Browser 数据层采用 PSRAM `DirectoryEntryIndex + StringPool`，不再有 48 项硬上限；EntryIndex 固定 16B/项并按需扩容。
 - Browser UI 固定复用 5 个 Virtual Row，不使用 LVGL native continuous scroll / momentum / elastic；纵向手势按 4 项步进，避免大对象列表持续 redraw 压垮后台 FLAC。
