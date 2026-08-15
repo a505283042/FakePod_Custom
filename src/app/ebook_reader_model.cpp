@@ -46,14 +46,173 @@ static int ascii_casecmp(const char *lhs, const char *rhs)
     return *lhs == '\0' ? -1 : 1;
 }
 
-static int entry_compare(const void *lhs_ptr, const void *rhs_ptr)
+static constexpr size_t kInitialDirectoryEntryCapacity = 32U;
+static constexpr size_t kInitialDirectoryPoolCapacity = 2048U;
+
+static bool directory_index_is_directory(const DirectoryEntryIndex &entry)
 {
-    const Entry &lhs = *static_cast<const Entry *>(lhs_ptr);
-    const Entry &rhs = *static_cast<const Entry *>(rhs_ptr);
-    if (lhs.is_directory != rhs.is_directory) {
-        return lhs.is_directory ? -1 : 1;
+    return (entry.flags & kDirectoryEntryDirectory) != 0U;
+}
+
+static const char *directory_pool_string(
+    const char *pool, size_t pool_size, uint32_t offset)
+{
+    if (pool == nullptr || static_cast<size_t>(offset) >= pool_size) return nullptr;
+    const char *text = pool + offset;
+    return memchr(text, '\0', pool_size - static_cast<size_t>(offset)) != nullptr
+        ? text
+        : nullptr;
+}
+
+static int directory_entry_compare(
+    const DirectoryEntryIndex &lhs,
+    const DirectoryEntryIndex &rhs,
+    const char *pool,
+    size_t pool_size)
+{
+    const bool lhs_dir = directory_index_is_directory(lhs);
+    const bool rhs_dir = directory_index_is_directory(rhs);
+    if (lhs_dir != rhs_dir) return lhs_dir ? -1 : 1;
+
+    const char *lhs_name = directory_pool_string(pool, pool_size, lhs.name_off);
+    const char *rhs_name = directory_pool_string(pool, pool_size, rhs.name_off);
+    if (lhs_name == nullptr) return rhs_name == nullptr ? 0 : 1;
+    if (rhs_name == nullptr) return -1;
+    const int folded = ascii_casecmp(lhs_name, rhs_name);
+    return folded != 0 ? folded : strcmp(lhs_name, rhs_name);
+}
+
+static bool grow_psram_block(void **block, size_t old_bytes, size_t new_bytes)
+{
+    if (block == nullptr || new_bytes <= old_bytes) return false;
+    void *next = heap_caps_malloc(new_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (next == nullptr) return false;
+    if (*block != nullptr && old_bytes > 0) memcpy(next, *block, old_bytes);
+    if (*block != nullptr) heap_caps_free(*block);
+    *block = next;
+    return true;
+}
+
+static bool reserve_directory_entries(DirectoryScanSession *session, size_t needed)
+{
+    if (session == nullptr) return false;
+    if (needed <= session->entry_capacity) return true;
+    if (needed > SIZE_MAX / sizeof(DirectoryEntryIndex)) return false;
+
+    size_t next_capacity = session->entry_capacity > 0
+        ? session->entry_capacity
+        : kInitialDirectoryEntryCapacity;
+    while (next_capacity < needed) {
+        if (next_capacity > SIZE_MAX / 2U) {
+            next_capacity = needed;
+            break;
+        }
+        next_capacity *= 2U;
     }
-    return ascii_casecmp(lhs.name, rhs.name);
+    if (next_capacity > SIZE_MAX / sizeof(DirectoryEntryIndex)) return false;
+
+    void *entries = session->entries;
+    const size_t old_bytes = session->entry_capacity * sizeof(DirectoryEntryIndex);
+    const size_t new_bytes = next_capacity * sizeof(DirectoryEntryIndex);
+    if (!grow_psram_block(&entries, old_bytes, new_bytes)) return false;
+    session->entries = static_cast<DirectoryEntryIndex *>(entries);
+    session->entry_capacity = next_capacity;
+    return true;
+}
+
+static bool reserve_directory_pool(DirectoryScanSession *session, size_t needed)
+{
+    if (session == nullptr) return false;
+    if (needed <= session->pool_capacity) return true;
+
+    size_t next_capacity = session->pool_capacity > 0
+        ? session->pool_capacity
+        : kInitialDirectoryPoolCapacity;
+    while (next_capacity < needed) {
+        if (next_capacity > SIZE_MAX / 2U) {
+            next_capacity = needed;
+            break;
+        }
+        next_capacity *= 2U;
+    }
+
+    void *pool = session->string_pool;
+    if (!grow_psram_block(&pool, session->pool_capacity, next_capacity)) return false;
+    session->string_pool = static_cast<char *>(pool);
+    session->pool_capacity = next_capacity;
+    return true;
+}
+
+static esp_err_t append_directory_entry(
+    DirectoryScanSession *session,
+    const char *name,
+    bool is_directory,
+    uint64_t size_bytes)
+{
+    if (session == nullptr || name == nullptr || name[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const size_t name_bytes = strlen(name) + 1U;
+    if (session->pool_size > UINT32_MAX ||
+        name_bytes > static_cast<size_t>(UINT32_MAX) - session->pool_size) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    const size_t pool_needed = session->pool_size + name_bytes;
+    if (!reserve_directory_entries(session, session->count + 1U) ||
+        !reserve_directory_pool(session, pool_needed)) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    const uint32_t name_off = static_cast<uint32_t>(session->pool_size);
+    memcpy(session->string_pool + session->pool_size, name, name_bytes);
+    session->pool_size = pool_needed;
+
+    DirectoryEntryIndex &entry = session->entries[session->count++];
+    entry.size_bytes = is_directory ? 0U : size_bytes;
+    entry.name_off = name_off;
+    entry.flags = is_directory ? kDirectoryEntryDirectory : kDirectoryEntryNone;
+    return ESP_OK;
+}
+
+static void directory_heap_sift_down(
+    DirectoryEntryIndex *entries,
+    size_t count,
+    size_t root,
+    const char *pool,
+    size_t pool_size)
+{
+    while (true) {
+        const size_t left = root * 2U + 1U;
+        if (left >= count) return;
+        size_t largest = left;
+        const size_t right = left + 1U;
+        if (right < count &&
+            directory_entry_compare(entries[largest], entries[right], pool, pool_size) < 0) {
+            largest = right;
+        }
+        if (directory_entry_compare(entries[root], entries[largest], pool, pool_size) >= 0) {
+            return;
+        }
+        const DirectoryEntryIndex tmp = entries[root];
+        entries[root] = entries[largest];
+        entries[largest] = tmp;
+        root = largest;
+    }
+}
+
+static void sort_directory_entries(
+    DirectoryEntryIndex *entries, size_t count, const char *pool, size_t pool_size)
+{
+    if (entries == nullptr || count < 2U || pool == nullptr) return;
+    for (size_t start = count / 2U; start > 0; --start) {
+        directory_heap_sift_down(entries, count, start - 1U, pool, pool_size);
+    }
+    for (size_t end = count; end > 1U; --end) {
+        const DirectoryEntryIndex tmp = entries[0];
+        entries[0] = entries[end - 1U];
+        entries[end - 1U] = tmp;
+        directory_heap_sift_down(entries, end - 1U, 0U, pool, pool_size);
+    }
 }
 
 static size_t trim_incomplete_utf8_tail(const uint8_t *data, size_t size)
@@ -438,12 +597,12 @@ esp_err_t parent_path(const char *path, char *out, size_t out_size)
     return path_is_inside_root(out) ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
-esp_err_t scan_directory(const char *path, DirectorySnapshot *out_snapshot)
+esp_err_t begin_directory_scan(const char *path, DirectoryScanSession *session)
 {
-    if (path == nullptr || out_snapshot == nullptr || !path_is_inside_root(path)) {
+    if (path == nullptr || session == nullptr || !path_is_inside_root(path)) {
         return ESP_ERR_INVALID_ARG;
     }
-    release_directory(out_snapshot);
+    cancel_directory_scan(session);
 
     DIR *dir = nullptr;
     {
@@ -453,32 +612,55 @@ esp_err_t scan_directory(const char *path, DirectorySnapshot *out_snapshot)
     }
     if (dir == nullptr) return ESP_ERR_NOT_FOUND;
 
-    Entry *entries = static_cast<Entry *>(heap_caps_calloc(
-        kMaxEntries, sizeof(Entry), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    char *path_copy = static_cast<char *>(heap_caps_calloc(
+        kPathBytes, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     char *scratch = static_cast<char *>(heap_caps_malloc(
         kEntryNameBytes + kPathBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (entries == nullptr || scratch == nullptr) {
-        if (entries != nullptr) heap_caps_free(entries);
+    if (path_copy == nullptr || scratch == nullptr) {
+        if (path_copy != nullptr) heap_caps_free(path_copy);
         if (scratch != nullptr) heap_caps_free(scratch);
         StorageSdLockGuard guard(portMAX_DELAY);
         if (guard) closedir(dir);
         return ESP_ERR_NO_MEM;
     }
-    char *name = scratch;
-    char *full_path = scratch + kEntryNameBytes;
 
-    size_t count = 0;
-    bool truncated = false;
-    esp_err_t result = ESP_OK;
-    while (true) {
+    session->dir = dir;
+    session->path = path_copy;
+    session->scratch = scratch;
+    snprintf(session->path, kPathBytes, "%s", path);
+
+    if (!reserve_directory_entries(session, kInitialDirectoryEntryCapacity) ||
+        !reserve_directory_pool(session, kInitialDirectoryPoolCapacity)) {
+        cancel_directory_scan(session);
+        return ESP_ERR_NO_MEM;
+    }
+    // StringPool offset 0 保留为空串，与 Music Catalog 的 offset 语义一致。
+    session->string_pool[0] = '\0';
+    session->pool_size = 1U;
+    return ESP_OK;
+}
+
+esp_err_t scan_directory_step(
+    DirectoryScanSession *session, size_t max_raw_entries, bool *out_done)
+{
+    if (session == nullptr || out_done == nullptr || session->dir == nullptr ||
+        session->entries == nullptr || session->string_pool == nullptr ||
+        session->path == nullptr || session->scratch == nullptr ||
+        max_raw_entries == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *out_done = false;
+    DIR *dir = static_cast<DIR *>(session->dir);
+    char *name = session->scratch;
+    char *full_path = session->scratch + kEntryNameBytes;
+
+    for (size_t processed = 0; processed < max_raw_entries; ++processed) {
         name[0] = '\0';
         bool end = false;
         {
             StorageSdLockGuard guard(kStorageLockTimeout);
-            if (!guard) {
-                result = ESP_ERR_TIMEOUT;
-                break;
-            }
+            if (!guard) return ESP_ERR_TIMEOUT;
             struct dirent *entry = readdir(dir);
             if (entry == nullptr) {
                 end = true;
@@ -486,161 +668,231 @@ esp_err_t scan_directory(const char *path, DirectorySnapshot *out_snapshot)
                 snprintf(name, kEntryNameBytes, "%s", entry->d_name);
             }
         }
-        if (end) break;
-        if (name_is_hidden(name)) continue;
-
-        full_path[0] = '\0';
-        if (join_child_path(path, name, full_path, kPathBytes) != ESP_OK) {
+        if (end) {
+            *out_done = true;
+            return ESP_OK;
+        }
+        if (name_is_hidden(name)) {
+            taskYIELD();
             continue;
         }
+
+        full_path[0] = '\0';
+        if (join_child_path(session->path, name, full_path, kPathBytes) != ESP_OK) {
+            taskYIELD();
+            continue;
+        }
+
         struct stat info = {};
         {
             StorageSdLockGuard guard(kStorageLockTimeout);
-            if (!guard) {
-                result = ESP_ERR_TIMEOUT;
-                break;
-            }
+            if (!guard) return ESP_ERR_TIMEOUT;
             if (stat(full_path, &info) != 0) {
+                taskYIELD();
                 continue;
             }
         }
 
         const bool is_dir = S_ISDIR(info.st_mode);
         if (!is_dir && (!S_ISREG(info.st_mode) || !is_txt_name(name))) {
-            continue;
-        }
-        if (count >= kMaxEntries) {
-            truncated = true;
+            taskYIELD();
             continue;
         }
 
-        Entry &target = entries[count++];
-        target.is_directory = is_dir;
-        target.size_bytes = is_dir ? 0U : static_cast<uint64_t>(info.st_size < 0 ? 0 : info.st_size);
-        snprintf(target.name, sizeof(target.name), "%s", name);
+        const uint64_t size_bytes = is_dir
+            ? 0U
+            : static_cast<uint64_t>(info.st_size < 0 ? 0 : info.st_size);
+        const esp_err_t append_ret = append_directory_entry(
+            session, name, is_dir, size_bytes);
+        if (append_ret != ESP_OK) return append_ret;
         taskYIELD();
+    }
+    return ESP_OK;
+}
+
+esp_err_t finish_directory_scan(
+    DirectoryScanSession *session, DirectorySnapshot *out_snapshot)
+{
+    if (session == nullptr || out_snapshot == nullptr || session->dir == nullptr ||
+        session->entries == nullptr || session->string_pool == nullptr) {
+        return ESP_ERR_INVALID_ARG;
     }
 
     {
         StorageSdLockGuard guard(portMAX_DELAY);
-        if (guard) closedir(dir);
+        if (!guard) return ESP_ERR_TIMEOUT;
+        closedir(static_cast<DIR *>(session->dir));
     }
-    heap_caps_free(scratch);
+    session->dir = nullptr;
 
-    if (result != ESP_OK) {
-        heap_caps_free(entries);
-        return result;
-    }
-    if (count > 1) {
-        qsort(entries, count, sizeof(Entry), entry_compare);
-    }
+    sort_directory_entries(
+        session->entries, session->count, session->string_pool, session->pool_size);
 
-    out_snapshot->entries = entries;
-    out_snapshot->count = count;
-    out_snapshot->truncated = truncated;
+    release_directory(out_snapshot);
+    out_snapshot->entries = session->entries;
+    out_snapshot->string_pool = session->string_pool;
+    out_snapshot->count = session->count;
+    out_snapshot->pool_size = session->pool_size;
+
+    session->entries = nullptr;
+    session->string_pool = nullptr;
+    if (session->path != nullptr) heap_caps_free(session->path);
+    if (session->scratch != nullptr) heap_caps_free(session->scratch);
+    session->path = nullptr;
+    session->scratch = nullptr;
+    session->count = 0;
+    session->entry_capacity = 0;
+    session->pool_size = 0;
+    session->pool_capacity = 0;
     return ESP_OK;
+}
+
+void cancel_directory_scan(DirectoryScanSession *session)
+{
+    if (session == nullptr) return;
+    if (session->dir != nullptr) {
+        StorageSdLockGuard guard(portMAX_DELAY);
+        if (guard) {
+            closedir(static_cast<DIR *>(session->dir));
+            session->dir = nullptr;
+        }
+    }
+    if (session->entries != nullptr) heap_caps_free(session->entries);
+    if (session->string_pool != nullptr) heap_caps_free(session->string_pool);
+    if (session->path != nullptr) heap_caps_free(session->path);
+    if (session->scratch != nullptr) heap_caps_free(session->scratch);
+    *session = {};
+}
+
+esp_err_t scan_directory(const char *path, DirectorySnapshot *out_snapshot)
+{
+    if (path == nullptr || out_snapshot == nullptr || !path_is_inside_root(path)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    DirectoryScanSession session = {};
+    esp_err_t ret = begin_directory_scan(path, &session);
+    if (ret != ESP_OK) return ret;
+
+    bool done = false;
+    while (!done) {
+        ret = scan_directory_step(&session, 8U, &done);
+        if (ret != ESP_OK) {
+            cancel_directory_scan(&session);
+            return ret;
+        }
+    }
+    ret = finish_directory_scan(&session, out_snapshot);
+    if (ret != ESP_OK) cancel_directory_scan(&session);
+    return ret;
 }
 
 void release_directory(DirectorySnapshot *snapshot)
 {
     if (snapshot == nullptr) return;
-    if (snapshot->entries != nullptr) {
-        heap_caps_free(snapshot->entries);
-    }
+    if (snapshot->entries != nullptr) heap_caps_free(snapshot->entries);
+    if (snapshot->string_pool != nullptr) heap_caps_free(snapshot->string_pool);
     *snapshot = {};
 }
 
-static esp_err_t load_text_page_internal(
-    const char *path,
-    uint64_t offset,
-    const PageLayout &layout,
-    TextPage *out_page)
+const DirectoryEntryIndex *directory_entry_at(
+    const DirectorySnapshot *snapshot, size_t index)
 {
-    if (path == nullptr || out_page == nullptr || !path_is_inside_root(path) || !is_txt_name(path) ||
-        layout.text_width_px == 0 || layout.max_lines == 0 || layout.glyph_width == nullptr) {
+    if (snapshot == nullptr || snapshot->entries == nullptr ||
+        snapshot->string_pool == nullptr || index >= snapshot->count) {
+        return nullptr;
+    }
+    const DirectoryEntryIndex *entry = &snapshot->entries[index];
+    return directory_pool_string(snapshot->string_pool, snapshot->pool_size, entry->name_off) != nullptr
+        ? entry
+        : nullptr;
+}
+
+const char *directory_entry_name(const DirectorySnapshot *snapshot, size_t index)
+{
+    const DirectoryEntryIndex *entry = directory_entry_at(snapshot, index);
+    if (entry == nullptr) return nullptr;
+    return directory_pool_string(snapshot->string_pool, snapshot->pool_size, entry->name_off);
+}
+
+bool directory_entry_is_directory(const DirectoryEntryIndex *entry)
+{
+    return entry != nullptr && directory_index_is_directory(*entry);
+}
+
+static esp_err_t read_page_window(
+    FILE *file,
+    uint64_t file_size,
+    uint64_t offset,
+    uint8_t *raw,
+    size_t *out_loaded,
+    uint8_t *out_previous_source_byte,
+    bool *out_have_previous_source_byte)
+{
+    if (file == nullptr || raw == nullptr || out_loaded == nullptr ||
+        out_previous_source_byte == nullptr || out_have_previous_source_byte == nullptr ||
+        offset >= file_size || offset > static_cast<uint64_t>(LONG_MAX)) {
         return ESP_ERR_INVALID_ARG;
     }
-    release_text_page(out_page);
 
-    struct stat info = {};
+    *out_loaded = 0;
+    *out_previous_source_byte = 0;
+    *out_have_previous_source_byte = false;
+
     {
         StorageSdLockGuard guard(kStorageLockTimeout);
         if (!guard) return ESP_ERR_TIMEOUT;
-        if (stat(path, &info) != 0 || !S_ISREG(info.st_mode)) return ESP_ERR_NOT_FOUND;
-    }
-    if (info.st_size <= 0) return ESP_ERR_INVALID_SIZE;
-
-    const uint64_t file_size = static_cast<uint64_t>(info.st_size);
-    if (offset >= file_size || offset > static_cast<uint64_t>(LONG_MAX)) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    FILE *file = nullptr;
-    uint8_t previous_source_byte = 0;
-    bool have_previous_source_byte = false;
-    {
-        StorageSdLockGuard guard(kStorageLockTimeout);
-        if (!guard) return ESP_ERR_TIMEOUT;
-        file = fopen(path, "rb");
-        if (file != nullptr && offset > 0) {
+        clearerr(file);
+        if (offset > 0) {
             if (fseek(file, static_cast<long>(offset - 1U), SEEK_SET) == 0 &&
-                fread(&previous_source_byte, 1, 1, file) == 1) {
-                have_previous_source_byte = true;
+                fread(out_previous_source_byte, 1, 1, file) == 1) {
+                *out_have_previous_source_byte = true;
             }
+            clearerr(file);
         }
-        if (file != nullptr && fseek(file, static_cast<long>(offset), SEEK_SET) != 0) {
-            fclose(file);
-            file = nullptr;
+        if (fseek(file, static_cast<long>(offset), SEEK_SET) != 0) {
+            return ESP_FAIL;
         }
     }
-    if (file == nullptr) return ESP_ERR_NOT_FOUND;
 
-    uint8_t *raw = static_cast<uint8_t *>(heap_caps_malloc(
-        kPageReadBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    char *page_text = static_cast<char *>(heap_caps_malloc(
-        kPageReadBytes * 2U + 64U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (raw == nullptr || page_text == nullptr) {
-        if (raw != nullptr) heap_caps_free(raw);
-        if (page_text != nullptr) heap_caps_free(page_text);
-        StorageSdLockGuard guard(portMAX_DELAY);
-        if (guard) fclose(file);
-        return ESP_ERR_NO_MEM;
-    }
-
-    size_t loaded = 0;
-    esp_err_t result = ESP_OK;
     const size_t wanted = static_cast<size_t>(
         (file_size - offset) > kPageReadBytes ? kPageReadBytes : (file_size - offset));
-    while (loaded < wanted) {
-        const size_t chunk = (wanted - loaded) > kReadChunkBytes
+    while (*out_loaded < wanted) {
+        const size_t chunk = (wanted - *out_loaded) > kReadChunkBytes
             ? kReadChunkBytes
-            : (wanted - loaded);
+            : (wanted - *out_loaded);
         size_t got = 0;
         {
             StorageSdLockGuard guard(kStorageLockTimeout);
-            if (!guard) {
-                result = ESP_ERR_TIMEOUT;
-                break;
-            }
-            got = fread(raw + loaded, 1, chunk, file);
+            if (!guard) return ESP_ERR_TIMEOUT;
+            got = fread(raw + *out_loaded, 1, chunk, file);
         }
         if (got == 0) {
             if (feof(file)) break;
-            result = ESP_FAIL;
-            break;
+            return ESP_FAIL;
         }
-        loaded += got;
+        *out_loaded += got;
         taskYIELD();
     }
-    {
-        StorageSdLockGuard guard(portMAX_DELAY);
-        if (guard) fclose(file);
+    return *out_loaded > 0 ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t paginate_loaded_page(
+    const uint8_t *raw,
+    size_t loaded,
+    char *page_text,
+    uint64_t offset,
+    uint64_t file_size,
+    uint8_t previous_source_byte,
+    bool have_previous_source_byte,
+    const PageLayout &layout,
+    TextPage *out_page)
+{
+    if (raw == nullptr || loaded == 0 || page_text == nullptr || out_page == nullptr ||
+        layout.text_width_px == 0 || layout.max_lines == 0 || layout.glyph_width == nullptr) {
+        return ESP_ERR_INVALID_ARG;
     }
-    if (result != ESP_OK || loaded == 0) {
-        heap_caps_free(raw);
-        heap_caps_free(page_text);
-        return result != ESP_OK ? result : ESP_FAIL;
-    }
+    *out_page = {};
 
     size_t source = 0;
     bool line_started_midway = offset > 0 &&
@@ -649,10 +901,10 @@ static esp_err_t load_text_page_internal(
     if (offset == 0) {
         line_started_midway = false;
         if (loaded >= 2 && raw[0] == 0xFFU && raw[1] == 0xFEU) {
-            heap_caps_free(raw); heap_caps_free(page_text); return ESP_ERR_NOT_SUPPORTED;
+            return ESP_ERR_NOT_SUPPORTED;
         }
         if (loaded >= 2 && raw[0] == 0xFEU && raw[1] == 0xFFU) {
-            heap_caps_free(raw); heap_caps_free(page_text); return ESP_ERR_NOT_SUPPORTED;
+            return ESP_ERR_NOT_SUPPORTED;
         }
         if (loaded >= 3 && raw[0] == 0xEFU && raw[1] == 0xBBU && raw[2] == 0xBFU) {
             source = 3;
@@ -661,8 +913,6 @@ static esp_err_t load_text_page_internal(
 
     const size_t valid_size = source + trim_incomplete_utf8_tail(raw + source, loaded - source);
     if (valid_size <= source) {
-        heap_caps_free(raw);
-        heap_caps_free(page_text);
         return ESP_ERR_INVALID_RESPONSE;
     }
 
@@ -692,8 +942,6 @@ static esp_err_t load_text_page_internal(
 
         const LineMetrics physical_metrics = line_metrics(raw, physical);
         if (!physical_metrics.valid_utf8) {
-            heap_caps_free(raw);
-            heap_caps_free(page_text);
             return ESP_ERR_INVALID_RESPONSE;
         }
         const bool current_is_title = line_is_chapter_title(raw, physical, physical_metrics);
@@ -725,8 +973,6 @@ static esp_err_t load_text_page_internal(
                 const PhysicalLine blank = physical_line_at(raw, valid_size, source);
                 const LineMetrics blank_metrics = line_metrics(raw, blank);
                 if (!blank_metrics.valid_utf8) {
-                    heap_caps_free(raw);
-                    heap_caps_free(page_text);
                     return ESP_ERR_INVALID_RESPONSE;
                 }
                 if (blank_metrics.codepoints != 0) break;
@@ -757,8 +1003,6 @@ static esp_err_t load_text_page_internal(
                 break;
             }
             if (decode != Utf8DecodeResult::Ok) {
-                heap_caps_free(raw);
-                heap_caps_free(page_text);
                 return ESP_ERR_INVALID_RESPONSE;
             }
 
@@ -844,8 +1088,6 @@ static esp_err_t load_text_page_internal(
     }
 
     if (source <= page_source_start) {
-        heap_caps_free(raw);
-        heap_caps_free(page_text);
         return ESP_ERR_INVALID_RESPONSE;
     }
 
@@ -864,14 +1106,166 @@ static esp_err_t load_text_page_internal(
     out_page->file_size = file_size;
     out_page->at_start = offset == 0;
     out_page->at_end = out_page->next_offset >= file_size;
-    heap_caps_free(raw);
     return ESP_OK;
+}
+
+static esp_err_t load_text_page_internal(
+    const char *path,
+    uint64_t offset,
+    const PageLayout &layout,
+    TextPage *out_page)
+{
+    if (path == nullptr || out_page == nullptr || !path_is_inside_root(path) || !is_txt_name(path) ||
+        layout.text_width_px == 0 || layout.max_lines == 0 || layout.glyph_width == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    release_text_page(out_page);
+
+    struct stat info = {};
+    {
+        StorageSdLockGuard guard(kStorageLockTimeout);
+        if (!guard) return ESP_ERR_TIMEOUT;
+        if (stat(path, &info) != 0 || !S_ISREG(info.st_mode)) return ESP_ERR_NOT_FOUND;
+    }
+    if (info.st_size <= 0) return ESP_ERR_INVALID_SIZE;
+
+    const uint64_t file_size = static_cast<uint64_t>(info.st_size);
+    if (offset >= file_size || offset > static_cast<uint64_t>(LONG_MAX)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    FILE *file = nullptr;
+    {
+        StorageSdLockGuard guard(kStorageLockTimeout);
+        if (!guard) return ESP_ERR_TIMEOUT;
+        file = fopen(path, "rb");
+    }
+    if (file == nullptr) return ESP_ERR_NOT_FOUND;
+
+    uint8_t *raw = static_cast<uint8_t *>(heap_caps_malloc(
+        kPageReadBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    char *page_text = static_cast<char *>(heap_caps_malloc(
+        kPageReadBytes * 2U + 64U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (raw == nullptr || page_text == nullptr) {
+        if (raw != nullptr) heap_caps_free(raw);
+        if (page_text != nullptr) heap_caps_free(page_text);
+        StorageSdLockGuard guard(portMAX_DELAY);
+        if (guard) fclose(file);
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t loaded = 0;
+    uint8_t previous_source_byte = 0;
+    bool have_previous_source_byte = false;
+    esp_err_t result = read_page_window(
+        file, file_size, offset, raw, &loaded,
+        &previous_source_byte, &have_previous_source_byte);
+    {
+        StorageSdLockGuard guard(portMAX_DELAY);
+        if (guard) fclose(file);
+    }
+    if (result == ESP_OK) {
+        result = paginate_loaded_page(
+            raw, loaded, page_text, offset, file_size,
+            previous_source_byte, have_previous_source_byte, layout, out_page);
+    }
+    heap_caps_free(raw);
+    if (result != ESP_OK) {
+        heap_caps_free(page_text);
+        *out_page = {};
+    }
+    return result;
 }
 
 esp_err_t load_text_page(
     const char *path, uint64_t offset, const PageLayout &layout, TextPage *out_page)
 {
     return load_text_page_internal(path, offset, layout, out_page);
+}
+
+esp_err_t begin_page_scan(const char *path, PageScanSession *session)
+{
+    if (path == nullptr || session == nullptr || !path_is_inside_root(path) || !is_txt_name(path)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    end_page_scan(session);
+
+    struct stat info = {};
+    {
+        StorageSdLockGuard guard(kStorageLockTimeout);
+        if (!guard) return ESP_ERR_TIMEOUT;
+        if (stat(path, &info) != 0 || !S_ISREG(info.st_mode)) return ESP_ERR_NOT_FOUND;
+    }
+    if (info.st_size <= 0) return ESP_ERR_INVALID_SIZE;
+
+    FILE *file = nullptr;
+    {
+        StorageSdLockGuard guard(kStorageLockTimeout);
+        if (!guard) return ESP_ERR_TIMEOUT;
+        file = fopen(path, "rb");
+    }
+    if (file == nullptr) return ESP_ERR_NOT_FOUND;
+
+    uint8_t *raw = static_cast<uint8_t *>(heap_caps_malloc(
+        kPageReadBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    char *page_text = static_cast<char *>(heap_caps_malloc(
+        kPageReadBytes * 2U + 64U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (raw == nullptr || page_text == nullptr) {
+        if (raw != nullptr) heap_caps_free(raw);
+        if (page_text != nullptr) heap_caps_free(page_text);
+        StorageSdLockGuard guard(portMAX_DELAY);
+        if (guard) fclose(file);
+        return ESP_ERR_NO_MEM;
+    }
+
+    session->file = file;
+    session->raw = raw;
+    session->page_text = page_text;
+    session->file_size = static_cast<uint64_t>(info.st_size);
+    return ESP_OK;
+}
+
+esp_err_t scan_page(
+    PageScanSession *session, uint64_t offset, const PageLayout &layout, PageScanResult *out_result)
+{
+    if (session == nullptr || session->file == nullptr || session->raw == nullptr ||
+        session->page_text == nullptr || session->file_size == 0 || out_result == nullptr ||
+        offset >= session->file_size) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_result = {};
+
+    size_t loaded = 0;
+    uint8_t previous_source_byte = 0;
+    bool have_previous_source_byte = false;
+    esp_err_t ret = read_page_window(
+        static_cast<FILE *>(session->file), session->file_size, offset, session->raw, &loaded,
+        &previous_source_byte, &have_previous_source_byte);
+    if (ret != ESP_OK) return ret;
+
+    TextPage page = {};
+    ret = paginate_loaded_page(
+        session->raw, loaded, session->page_text, offset, session->file_size,
+        previous_source_byte, have_previous_source_byte, layout, &page);
+    if (ret != ESP_OK) return ret;
+
+    out_result->start_offset = page.start_offset;
+    out_result->next_offset = page.next_offset;
+    out_result->at_end = page.at_end;
+    return ESP_OK;
+}
+
+void end_page_scan(PageScanSession *session)
+{
+    if (session == nullptr) return;
+    FILE *file = static_cast<FILE *>(session->file);
+    if (file != nullptr) {
+        StorageSdLockGuard guard(portMAX_DELAY);
+        if (guard) fclose(file);
+    }
+    if (session->raw != nullptr) heap_caps_free(session->raw);
+    if (session->page_text != nullptr) heap_caps_free(session->page_text);
+    *session = {};
 }
 
 void release_text_page(TextPage *page)

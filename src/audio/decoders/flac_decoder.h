@@ -162,6 +162,13 @@ struct FlacStorageWindowSnapshot
     uint32_t sample_rate_hz = 0;
     uint32_t buffered_bytes = 0;
     uint32_t capacity_bytes = 0;
+
+    // 低优先级后台 I/O 只需要当前 QoS 状态；故障快照由 FlacPrefetchRuntimeSnapshot 单独提供。
+    bool pressure_active = false;
+    uint8_t qos_level = 2;  // 0=Emergency,1=Recovery,2=Normal,3=Plenty
+    uint32_t min_buffered_bytes = 0;
+    uint32_t emergency_entries = 0;
+    uint32_t recovered_count = 0;
 };
 
 // 只读获取最近一次预取/消费更新后的 ring 水位。无活动 FLAC 时 active=false。

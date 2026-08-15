@@ -9,6 +9,7 @@ idf_component_register(
         "app/music_app_adapter.cpp"
         "app/ebook_app.cpp"
         "app/ebook_bookmark_store.cpp"
+        "app/ebook_page_index_cache.cpp"
         "app/ebook_reader_model.cpp"
 
         "system/system_loop.cpp"
@@ -129,16 +130,17 @@ idf_component_register(
         fatfs
 )
 
-# SRAM.1.2：LVGL 仍使用内置 TLSF，但其 64KB backing pool 直接由 PSRAM allocator 提供。
-# LVGL 9.2.2 的 ESP-IDF Kconfig 默认 CONFIG_LV_CONF_SKIP=y，因此这里不再依赖 lv_conf.h。
-# 直接给 LVGL component 定义 LV_MEM_POOL_INCLUDE / LV_MEM_POOL_ALLOC，避免配置被 Kconfig 跳过。
+# SRAM.1.3：LVGL 仍使用内置 TLSF，但把固定 pool 扩容到 128KB，并继续全部放在 PSRAM。
+# 64KB 在 Music PreserveBackground + Ebook 39 行目录 + 隐藏 Reader 控件同时存在时会逼近上限，
+# 第一帧刷新还需要临时 draw task，lv_malloc_zeroed() 失败会在 LVGL 9.2.2 draw 链里触发 StoreProhibited。
+# 这里显式定义 LV_MEM_SIZE=128KB，同时保留 PSRAM backing；不增加 INTERNAL SRAM 占用。
 # 显示 DMA buffer 仍由 esp_lvgl_port 按 INTERNAL/DMA 能力分配，不受本配置影响。
 if(NOT TARGET __idf_lvgl__lvgl)
-    message(FATAL_ERROR "FakePod SRAM.1.2: LVGL component target 不可用，拒绝静默退回 64KB INTERNAL pool")
+    message(FATAL_ERROR "FakePod SRAM.1.3: LVGL component target 不可用，拒绝静默退回 INTERNAL pool")
 endif()
 
 if(NOT TARGET idf::heap)
-    message(FATAL_ERROR "FakePod SRAM.1.2: ESP-IDF heap component target 不可用")
+    message(FATAL_ERROR "FakePod SRAM.1.3: ESP-IDF heap component target 不可用")
 endif()
 
 target_include_directories(
@@ -150,14 +152,15 @@ target_include_directories(
 target_compile_definitions(
     __idf_lvgl__lvgl
     PRIVATE
+        LV_MEM_SIZE=131072U
         LV_MEM_POOL_INCLUDE=\"fakepod_lvgl_pool.h\"
         LV_MEM_POOL_ALLOC=fakepod_lvgl_psram_pool_alloc
 )
 
-# fakepod_lvgl_pool.h 使用 heap_caps_malloc(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)。
+# 128KB LVGL pool 由 fakepod_lvgl_pool.h 使用 heap_caps_malloc(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) 分配。
 target_link_libraries(__idf_lvgl__lvgl PRIVATE idf::heap)
 
-message(STATUS "FakePod: LVGL 64KB builtin TLSF pool 强制使用 PSRAM backing store")
+message(STATUS "FakePod: LVGL 128KB builtin TLSF pool 强制使用 PSRAM backing store")
 
 # ESP-IDF 的 RGB LCD 驱动在 Windows + Xtensa GCC 14.2.0 上可能在 IRA 阶段触发编译器内部错误。
 # FakePod 实际使用 QSPI CO5300，不走 RGB LCD 数据路径，但 esp_lvgl_port 链接时仍需要该驱动导出的符号。

@@ -186,6 +186,11 @@ static void flac_storage_window_publish(const FlacPrefetchContext *context)
         snapshot.sample_rate_hz = context->sample_rate_hz;
         snapshot.buffered_bytes = static_cast<uint32_t>(xStreamBufferBytesAvailable(context->stream));
         snapshot.capacity_bytes = static_cast<uint32_t>(context->ring_bytes);
+        snapshot.pressure_active = context->qos_pressure_active;
+        snapshot.qos_level = static_cast<uint8_t>(context->qos_state);
+        snapshot.min_buffered_bytes = static_cast<uint32_t>(context->qos_min_buffered_bytes);
+        snapshot.emergency_entries = context->qos_emergency_entries;
+        snapshot.recovered_count = context->qos_recovered_count;
     }
 
     portENTER_CRITICAL(&g_flac_storage_window_mux);
@@ -681,7 +686,11 @@ static void flac_prefetch_task(void *arg)
             &bytes_read
         );
 #if APP_DIAG_FLAC_PERFORMANCE
-        const uint32_t read_us = static_cast<uint32_t>(esp_timer_get_time() - read_begin_us);
+        const int64_t read_end_us = esp_timer_get_time();
+        const uint64_t read_us64 = read_end_us >= read_begin_us
+            ? static_cast<uint64_t>(read_end_us - read_begin_us)
+            : 0ULL;
+        const uint32_t read_us = read_us64 > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(read_us64);
         flac_prefetch_record_read(context, read_us);
 #endif
 
@@ -1643,8 +1652,8 @@ static esp_err_t flac_prepare_input_window(FlacDecoder *decoder, bool *out_recei
             break;
         }
         if (must_wait) {
-            ESP_LOGE(TAG, "FLAC 预取环形缓冲等待超时：%ums",
-                static_cast<unsigned>(pdTICKS_TO_MS(receive_wait)));
+            // 瞬时欠载属于播放策略，不代表 decoder 已损坏。由 AudioTask 根据 PrefetchTask
+            // 的 active/io_error/eof 状态决定是否进入有界恢复，或升级为真实 AUDIO_FAULT。
             return ESP_ERR_TIMEOUT;
         }
 
@@ -2091,6 +2100,12 @@ esp_err_t flac_decoder_read_pcm32(
         if (decoder->decoded_offset >= decoder->decoded_size) {
             esp_err_t ret = flac_decode_next_output(decoder);
             if (ret != ESP_OK) {
+                // 本次调用若已经复制出有效 PCM，不能因为下一压缩块暂时迟到就把这些帧丢掉。
+                // 先把已产出的 PCM 交给 AudioTask；若下一轮仍欠载，再进入统一的有界恢复。
+                if (ret == ESP_ERR_TIMEOUT && produced > 0) {
+                    *out_frames = produced;
+                    return ESP_OK;
+                }
                 return ret;
             }
             if (decoder->decoded_offset >= decoder->decoded_size) {

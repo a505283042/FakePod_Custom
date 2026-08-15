@@ -8,6 +8,7 @@
 #include "freertos/task.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "cs43131.h"
 #include "i2s_output.h"
 #include "pcm_decoder.h"
@@ -65,6 +66,11 @@ static constexpr uint32_t AUDIO_PCM_FADE_IN_MS = 30;
 static constexpr uint8_t AUDIO_PCM_UNMUTE_PRIME_BLOCKS = 4;
 static constexpr uint32_t AUDIO_I2S_WRITE_TIMEOUT_MS = 100;
 static constexpr uint32_t AUDIO_PCM_MUTE_SETTLE_MS = 150;
+// R.39.6.4.4：FLAC 压缩 ring 瞬时耗空不等于真实 I/O 故障。只要 PrefetchTask 仍存活、
+// 未报告 io_error 且尚未 EOF，就用短静音块维持 I2S 时钟，并给预取一个有硬上限的恢复窗口；
+// 不再把第一个 20ms 等待超时直接升级成 AUDIO_FAULT。
+static constexpr uint32_t AUDIO_FLAC_STARVE_GRACE_MAX_MS = 1000;
+static constexpr uint32_t AUDIO_FLAC_STARVE_GRACE_MAX_ATTEMPTS = 32;
 // 常规 codec workspace 跨曲保留复用；若异常文件把 PCM 工作区推到超大尺寸，
 // 关闭该曲后释放，避免一次特殊文件永久占住大量 PSRAM。
 static constexpr size_t AUDIO_DECODE_WORKSPACE_RETAIN_INPUT_BYTES = 32 * 1024;
@@ -164,6 +170,8 @@ static uint32_t g_pcm_fade_in_done_frames = 0;
 static bool g_pcm_fade_in_logged_done = true;
 static uint8_t g_task_volume_percent = 50U;
 static bool g_task_user_muted = false;
+static uint32_t g_flac_starve_grace_attempts = 0;
+static int64_t g_flac_starve_grace_started_us = 0;
 
 // 正式播放资源也只属于 AudioTask。
 // WAV/FLAC/MP3 都通过统一 PcmDecoder 产出 32bit stereo PCM，I2S/DAC 不关心源格式。
@@ -356,6 +364,85 @@ static void audio_task_set_state(AudioPlaybackState state, esp_err_t error = ESP
     audio_task_publish_snapshot();
 }
 
+static void audio_task_reset_flac_starve_grace()
+{
+    g_flac_starve_grace_attempts = 0;
+    g_flac_starve_grace_started_us = 0;
+}
+
+static void audio_task_log_flac_starve_recovered()
+{
+    if (g_flac_starve_grace_attempts == 0) {
+        return;
+    }
+
+    FlacPrefetchRuntimeSnapshot flac = {};
+    (void)flac_decoder_get_prefetch_runtime(&g_decoder.flac, &flac);
+    const int64_t now_us = esp_timer_get_time();
+    const uint32_t elapsed_ms = g_flac_starve_grace_started_us > 0 && now_us > g_flac_starve_grace_started_us
+        ? static_cast<uint32_t>((now_us - g_flac_starve_grace_started_us) / 1000LL)
+        : 0U;
+    ESP_LOGI(TAG,
+        "FLAC欠载已恢复：attempts=%u elapsed=%ums ring=%u/%uB",
+        static_cast<unsigned>(g_flac_starve_grace_attempts),
+        static_cast<unsigned>(elapsed_ms),
+        static_cast<unsigned>(flac.buffered_bytes),
+        static_cast<unsigned>(flac.capacity_bytes));
+    audio_task_reset_flac_starve_grace();
+}
+
+static bool audio_task_try_recover_flac_starvation(esp_err_t decoder_error)
+{
+    if (decoder_error != ESP_ERR_TIMEOUT || g_task_format != MediaFormat::FLAC ||
+        !flac_decoder_is_open(&g_decoder.flac)) {
+        return false;
+    }
+
+    FlacPrefetchRuntimeSnapshot flac = {};
+    if (!flac_decoder_get_prefetch_runtime(&g_decoder.flac, &flac) ||
+        !flac.active || flac.io_error || flac.eof) {
+        return false;
+    }
+
+    const int64_t now_us = esp_timer_get_time();
+    if (g_flac_starve_grace_attempts == 0) {
+        g_flac_starve_grace_started_us = now_us;
+        ESP_LOGW(TAG,
+            "FLAC欠载进入有界恢复：ring=%u/%uB ioerr=0 eof=0，最多%ums/%u次；期间以静音维持I2S",
+            static_cast<unsigned>(flac.buffered_bytes),
+            static_cast<unsigned>(flac.capacity_bytes),
+            static_cast<unsigned>(AUDIO_FLAC_STARVE_GRACE_MAX_MS),
+            static_cast<unsigned>(AUDIO_FLAC_STARVE_GRACE_MAX_ATTEMPTS));
+    }
+
+    const uint32_t elapsed_ms = g_flac_starve_grace_started_us > 0 && now_us > g_flac_starve_grace_started_us
+        ? static_cast<uint32_t>((now_us - g_flac_starve_grace_started_us) / 1000LL)
+        : 0U;
+    if (elapsed_ms >= AUDIO_FLAC_STARVE_GRACE_MAX_MS ||
+        g_flac_starve_grace_attempts >= AUDIO_FLAC_STARVE_GRACE_MAX_ATTEMPTS) {
+        ESP_LOGE(TAG,
+            "FLAC欠载恢复超限：attempts=%u elapsed=%ums ring=%u/%uB；升级为真实播放故障",
+            static_cast<unsigned>(g_flac_starve_grace_attempts),
+            static_cast<unsigned>(elapsed_ms),
+            static_cast<unsigned>(flac.buffered_bytes),
+            static_cast<unsigned>(flac.capacity_bytes));
+        audio_task_reset_flac_starve_grace();
+        return false;
+    }
+
+    ++g_flac_starve_grace_attempts;
+    const esp_err_t silence_ret = i2s_output_stream_write_silence(
+        AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
+    if (silence_ret != ESP_OK) {
+        ESP_LOGE(TAG, "FLAC欠载恢复期间I2S静音写入失败：%s", esp_err_to_name(silence_ret));
+        audio_task_reset_flac_starve_grace();
+        return false;
+    }
+
+    // 静音只负责维持硬件时钟，不属于媒体 PCM，因此绝不能推进正式播放时钟。
+    return true;
+}
+
 static void audio_task_reset_media_fields()
 {
     g_task_sample_rate_hz = 0;
@@ -364,6 +451,7 @@ static void audio_task_reset_media_fields()
     audio_playback_clock_reset(&g_playback_clock);
     g_task_total_frames = 0;
     g_last_progress_publish_frame = 0;
+    audio_task_reset_flac_starve_grace();
 }
 
 static void audio_request_complete(AudioRequest *request, bool success, esp_err_t result)
@@ -621,6 +709,7 @@ static esp_err_t audio_task_unmute_when_pcm_ready()
 
 static esp_err_t audio_task_shutdown_pipeline()
 {
+    audio_task_reset_flac_starve_grace();
     esp_err_t first_error = ESP_OK;
 
     audio_task_log_ram("shutdown_begin");
@@ -1254,9 +1343,14 @@ static void audio_task_service_pcm_playback()
         &frames
     );
     if (ret != ESP_OK) {
+        if (audio_task_try_recover_flac_starvation(ret)) {
+            return;
+        }
+        audio_task_reset_flac_starve_grace();
         audio_task_fail_stream(ret, "读取PCM");
         return;
     }
+    audio_task_log_flac_starve_recovered();
 
     // decoder 位置只用于诊断；正式播放时钟必须等真实 PCM 成功进入 I2S 后才推进。
     audio_playback_clock_note_decoder(

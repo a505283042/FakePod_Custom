@@ -326,7 +326,6 @@ void system_loop_update()
     // 只编排当前曲封面；不读取/预热 next。压缩原图成功转成 Surface 后立即释放。
     system_artwork_current_update();
 
-
     // ========================================================
     // 以后这里负责调用：
     //
