@@ -550,8 +550,11 @@ void release_directory(DirectorySnapshot *snapshot)
     *snapshot = {};
 }
 
-esp_err_t load_text_page(
-    const char *path, uint64_t offset, const PageLayout &layout, TextPage *out_page)
+static esp_err_t load_text_page_internal(
+    const char *path,
+    uint64_t offset,
+    const PageLayout &layout,
+    TextPage *out_page)
 {
     if (path == nullptr || out_page == nullptr || !path_is_inside_root(path) || !is_txt_name(path) ||
         layout.text_width_px == 0 || layout.max_lines == 0 || layout.glyph_width == nullptr) {
@@ -666,6 +669,7 @@ esp_err_t load_text_page(
     const size_t page_source_start = source;
     size_t write = 0;
     uint8_t visual_line = 0;
+    uint8_t consecutive_hard_breaks = 0; // 最多保留两个显示换行，也就是一行空行
     uint16_t line_width_px = 0;
     uint8_t current_line_glyphs = 0;
     uint8_t previous_visual_line_glyphs = 0;
@@ -709,6 +713,38 @@ esp_err_t load_text_page(
         }
         previous_noise = false;
         previous_title = current_is_title;
+
+        // 空物理行按“整段 run”处理：正常段落结尾已经贡献第一个换行，
+        // 连续空行只再贡献一个换行，因此视觉上最多保留一行空行。
+        // run 内其余 CR/LF 仍一次性消费，避免页尾截断后在下一页重新冒出来。
+        if (physical_metrics.codepoints == 0) {
+            source = physical.end;
+            if (!physical.complete) break;
+            source += physical.newline_bytes;
+            while (source < valid_size) {
+                const PhysicalLine blank = physical_line_at(raw, valid_size, source);
+                const LineMetrics blank_metrics = line_metrics(raw, blank);
+                if (!blank_metrics.valid_utf8) {
+                    heap_caps_free(raw);
+                    heap_caps_free(page_text);
+                    return ESP_ERR_INVALID_RESPONSE;
+                }
+                if (blank_metrics.codepoints != 0) break;
+                source = blank.end;
+                if (!blank.complete) break;
+                source += blank.newline_bytes;
+            }
+            line_started_midway = false;
+            line_width_px = 0;
+            current_line_glyphs = 0;
+            if (consecutive_hard_breaks < 2U) {
+                ++consecutive_hard_breaks;
+                if (visual_line + 1U >= layout.max_lines) break;
+                page_text[write++] = '\n';
+                ++visual_line;
+            }
+            continue;
+        }
 
         size_t cursor = physical.start;
         while (cursor < physical.end) {
@@ -789,8 +825,11 @@ esp_err_t load_text_page(
         source += physical.newline_bytes; // 无论显示方式如何，源 CR/LF 都必须被精确消费。
         line_started_midway = false;
         if (soft_join) {
+            consecutive_hard_breaks = 0;
             continue;
         }
+
+        consecutive_hard_breaks = 1U;
 
         rebalance_single_glyph_tail(
             page_text, write, last_auto_wrap_index,
@@ -827,6 +866,12 @@ esp_err_t load_text_page(
     out_page->at_end = out_page->next_offset >= file_size;
     heap_caps_free(raw);
     return ESP_OK;
+}
+
+esp_err_t load_text_page(
+    const char *path, uint64_t offset, const PageLayout &layout, TextPage *out_page)
+{
+    return load_text_page_internal(path, offset, layout, out_page);
 }
 
 void release_text_page(TextPage *page)

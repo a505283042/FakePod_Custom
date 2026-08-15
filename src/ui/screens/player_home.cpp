@@ -274,6 +274,7 @@ static lv_timer_t *g_artwork_timer = nullptr;
 static lv_timer_t *g_gesture_timer = nullptr;
 static bool g_background_timers_running = true;
 static bool g_app_foreground = true;
+static bool g_launcher_open_after_foreground = false;
 // BoundedSPI 退出已把当前封面恢复到 GRAM 时，下一次 Artwork resume 只同步 lease/source，
 // 不再产生一笔 460x460 LVGL invalidation。
 static bool g_artwork_resume_without_invalidation = false;
@@ -1922,16 +1923,14 @@ static void player_home_launcher_apply_selection()
     }
 }
 
-static int8_t player_home_launcher_hit_test(int32_t screen_x, int32_t screen_y)
+static int8_t player_home_launcher_hit_test_geometry(
+    int32_t screen_x,
+    int32_t screen_y,
+    int32_t panel_x,
+    int32_t panel_y)
 {
-    if (g_launcher_panel == nullptr || g_launcher_motion != LauncherMotionState::Shown) {
-        return -1;
-    }
-
-    lv_area_t coords = {};
-    lv_obj_get_coords(g_launcher_panel, &coords);
-    const int32_t dx = screen_x - (coords.x1 + kLauncherCenterX);
-    const int32_t dy = screen_y - (coords.y1 + kLauncherCenterY);
+    const int32_t dx = screen_x - (panel_x + kLauncherCenterX);
+    const int32_t dy = screen_y - (panel_y + kLauncherCenterY);
     const int32_t radius_sq = dx * dx + dy * dy;
     const int32_t min_radius_sq = kLauncherTouchInnerRadius * kLauncherTouchInnerRadius;
     const int32_t max_radius_sq = kLauncherTouchOuterRadius * kLauncherTouchOuterRadius;
@@ -1939,7 +1938,8 @@ static int8_t player_home_launcher_hit_test(int32_t screen_x, int32_t screen_y)
         return -1;
     }
 
-    // atan2(x, y) 刻意交换参数，使角度系与 lv_draw_arc 完全一致：
+    // 纯几何命中核心：不读取 Music Launcher 的可见态、对象指针或动画状态。
+    // atan2(x, y) 刻意交换参数，使角度系与 Launcher 绘制定义一致：
     // 0°=下、90°=右、180°=上、270°=左。
     constexpr float kRadToDeg = 57.295779513082320876f;
     int16_t angle = static_cast<int16_t>(lroundf(atan2f(
@@ -1957,6 +1957,19 @@ static int8_t player_home_launcher_hit_test(int32_t screen_x, int32_t screen_y)
         }
     }
     return static_cast<int8_t>(best_index);
+}
+
+static int8_t player_home_launcher_hit_test(int32_t screen_x, int32_t screen_y)
+{
+    // Music 自己的事件入口仍保留生命周期门禁；只有 Music 原生 Launcher 完全展开时接收点击。
+    if (g_launcher_panel == nullptr || g_launcher_motion != LauncherMotionState::Shown) {
+        return -1;
+    }
+
+    lv_area_t coords = {};
+    lv_obj_get_coords(g_launcher_panel, &coords);
+    return player_home_launcher_hit_test_geometry(
+        screen_x, screen_y, coords.x1, coords.y1);
 }
 
 static void player_home_launcher_progress_anim_exec(void *var, int32_t value)
@@ -2114,6 +2127,13 @@ static void player_home_launcher_show()
         return;
     }
 
+    // 选中项以 AppManager 发布的目标为准；从 Ebook 返回时中心图标直接指向“电子书”。
+    const AppId launcher_target = app_manager_launcher_target();
+    if (launcher_target != AppId::None &&
+        static_cast<uint8_t>(launcher_target) < kLauncherItemCount) {
+        g_launcher_selected_index = static_cast<uint8_t>(launcher_target);
+    }
+
     player_home_overlay_hide();
     now_playing_artwork_set_bounded_present_allowed(false);
     if (!g_launcher_visible) {
@@ -2225,13 +2245,13 @@ static void player_home_launcher_activate_index(
     int32_t touch_x,
     int32_t touch_y)
 {
-    if (index >= kLauncherItemCount) {
+    bool should_launch = false;
+    const AppId target = player_home_launcher_shared_select_index(index, &should_launch);
+    if (target == AppId::None) {
         return;
     }
 
     g_launcher_selected_index = index;
-    const AppId target = kLauncherItems[index].app_id;
-    app_manager_set_launcher_target(target);
     player_home_launcher_apply_selection();
     HOME_INTERACTION_LOGI("Launcher径向命中：index=%u name=%s touch=(%ld,%ld)",
         static_cast<unsigned>(index),
@@ -2239,9 +2259,8 @@ static void player_home_launcher_activate_index(
         static_cast<long>(touch_x),
         static_cast<long>(touch_y));
 
-    // APP.2 起 Launcher 对已注册的非 Music APP 直接发起前台切换。
-    // Music 用 PreserveBackground 离场，因此 AudioTask/PlayerState 继续工作；未注册扇区仍只做选择。
-    if (target == AppId::Music || !app_manager_is_registered(target)) {
+    // Music/Ebook 统一语义：所有扇区都先选中；当前 APP 或未注册 APP 不跳转。
+    if (!should_launch) {
         return;
     }
 
@@ -3517,6 +3536,10 @@ esp_err_t player_home_app_leave_background()
 esp_err_t player_home_app_enter_foreground()
 {
     if (g_app_foreground) {
+        if (g_launcher_open_after_foreground) {
+            g_launcher_open_after_foreground = false;
+            player_home_launcher_show();
+        }
         return ESP_OK;
     }
 
@@ -3533,13 +3556,42 @@ esp_err_t player_home_app_enter_foreground()
     if (screen != nullptr) {
         lv_obj_invalidate(screen);
     }
-    ESP_LOGI(TAG, "Music恢复前台：Home/Artwork/手势timer恢复");
+
+    const bool open_launcher = g_launcher_open_after_foreground;
+    g_launcher_open_after_foreground = false;
+    if (open_launcher) {
+        player_home_launcher_show();
+        ESP_LOGI(TAG, "Music恢复前台：复用原生Launcher自动展开");
+    } else {
+        ESP_LOGI(TAG, "Music恢复前台：Home/Artwork/手势timer恢复");
+    }
     return ESP_OK;
 }
 
 bool player_home_app_is_foreground()
 {
     return g_app_foreground;
+}
+
+esp_err_t player_home_request_launcher_foreground()
+{
+    if (!app_manager_is_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (app_manager_foreground() == AppId::Music && g_app_foreground) {
+        player_home_launcher_show();
+        return ESP_OK;
+    }
+
+    // AppManager 会同步调用 Music enter()，因此必须在切换前置位；失败则立即撤销。
+    g_launcher_open_after_foreground = true;
+    const esp_err_t ret = app_manager_request_foreground(
+        AppId::Music, AppTransitionMode::Exclusive);
+    if (ret != ESP_OK) {
+        g_launcher_open_after_foreground = false;
+    }
+    return ret;
 }
 
 void player_home_create(lv_obj_t *screen)
@@ -3583,6 +3635,7 @@ void player_home_create(lv_obj_t *screen)
     g_gesture_timer = nullptr;
     g_background_timers_running = true;
     g_app_foreground = true;
+    g_launcher_open_after_foreground = false;
     g_artwork_resume_without_invalidation = false;
     g_last_artwork_bound_track = UINT32_MAX;
     gesture_router_reset();
@@ -3892,4 +3945,310 @@ bool player_home_launcher_is_animating()
     return g_launcher_visible &&
         (g_launcher_motion == LauncherMotionState::Entering ||
          g_launcher_motion == LauncherMotionState::Leaving);
+}
+
+// -----------------------------------------------------------------------------
+// R.39.5.6 Shared Launcher Visual Core
+// 非 Music APP 只消费这里导出的像素结果/命中结果；视觉定义仍只有 player_home 一份。
+// -----------------------------------------------------------------------------
+
+uint8_t player_home_launcher_shared_frame_for_progress(int32_t progress)
+{
+    return player_home_launcher_frame_for_progress(progress);
+}
+
+int32_t player_home_launcher_shared_frame_progress(uint8_t frame_index)
+{
+    if (frame_index >= kLauncherAnimationAssetFrameCount) return 0;
+    return g_launcher_animation_frames[frame_index].progress;
+}
+
+static int8_t player_home_launcher_index_for_app(AppId app)
+{
+    for (uint8_t i = 0U; i < kLauncherItemCount; ++i) {
+        if (kLauncherItems[i].app_id == app) return static_cast<int8_t>(i);
+    }
+    return -1;
+}
+
+esp_err_t player_home_launcher_shared_render_i4(
+    AppId selected,
+    uint8_t frame_index,
+    uint8_t *buffer,
+    size_t buffer_size,
+    lv_image_dsc_t *out_dsc)
+{
+    if (buffer == nullptr || out_dsc == nullptr ||
+        buffer_size < PLAYER_HOME_LAUNCHER_I4_IMAGE_BYTES ||
+        frame_index >= kLauncherAnimationAssetFrameCount) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const int8_t selected_index = player_home_launcher_index_for_app(selected);
+    if (selected_index < 0) return ESP_ERR_INVALID_ARG;
+
+    // LVGL I4 数据前 64B 是 16 项 ARGB8888 palette；后面就是 4bpp packed pixels。
+    lv_color32_t palette[16] = {};
+    palette[0] = lv_color_to_32(lv_color_hex(0x000000), LV_OPA_TRANSP);
+    for (uint8_t i = 0U; i < kLauncherItemCount; ++i) {
+        const uint32_t rgb = i == static_cast<uint8_t>(selected_index)
+            ? kLauncherSelectedSectorRgb
+            : kLauncherItems[i].idle_rgb;
+        palette[1U + i] = lv_color_to_32(lv_color_hex(rgb), LV_OPA_COVER);
+        palette[8U + i] = lv_color_to_32(lv_color_hex(rgb), kLauncherSectorAaOpa);
+    }
+    palette[15U] = lv_color_to_32(lv_color_hex(0xF8FAFF), LV_OPA_COVER);
+    memcpy(buffer, palette, sizeof(palette));
+
+    uint8_t *pixels = buffer + sizeof(palette);
+    const LauncherAnimationFrameAsset &asset = g_launcher_animation_frames[frame_index];
+    const uint8_t *src = asset.data;
+    const uint8_t *src_end = asset.data + asset.size;
+    uint32_t written = 0U;
+    while (src < src_end && written < kLauncherAnimationAssetPixelBytes) {
+        const uint8_t control = *src++;
+        uint32_t count = static_cast<uint32_t>(control & 0x7FU) + 1U;
+        const bool repeat = (control & 0x80U) != 0U;
+        if (repeat) {
+            if (src >= src_end || written + count > kLauncherAnimationAssetPixelBytes) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+            memset(pixels + written, *src++, count);
+            written += count;
+        }
+        else {
+            if (count > static_cast<uint32_t>(src_end - src) ||
+                written + count > kLauncherAnimationAssetPixelBytes) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+            memcpy(pixels + written, src, count);
+            src += count;
+            written += count;
+        }
+    }
+    if (written != kLauncherAnimationAssetPixelBytes || src != src_end) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    *out_dsc = {};
+    out_dsc->header.magic = LV_IMAGE_HEADER_MAGIC;
+    out_dsc->header.cf = LV_COLOR_FORMAT_I4;
+    out_dsc->header.flags = 0U;
+    out_dsc->header.w = kLauncherPanelSize;
+    out_dsc->header.h = kLauncherPanelSize;
+    out_dsc->header.stride = kLauncherAnimationAssetStride;
+    out_dsc->data_size = PLAYER_HOME_LAUNCHER_I4_IMAGE_BYTES;
+    out_dsc->data = buffer;
+    return ESP_OK;
+}
+
+struct SharedLauncherI2Target {
+    uint8_t *pixels = nullptr;
+    int32_t size = 0;
+    int32_t stride = 0;
+    int32_t origin_x = 0;
+    int32_t origin_y = 0;
+};
+
+static void player_home_launcher_shared_i2_pixel(
+    const SharedLauncherI2Target &target,
+    int32_t x,
+    int32_t y,
+    uint8_t index)
+{
+    const int32_t local_x = x - target.origin_x;
+    const int32_t local_y = y - target.origin_y;
+    if (target.pixels == nullptr || local_x < 0 || local_y < 0 ||
+        local_x >= target.size || local_y >= target.size || index > 3U) return;
+    uint8_t &packed = target.pixels[static_cast<size_t>(local_y) * target.stride + local_x / 4];
+    const uint8_t shift = static_cast<uint8_t>(6 - (local_x & 3) * 2);
+    packed = static_cast<uint8_t>((packed & ~(0x03U << shift)) | ((index & 0x03U) << shift));
+}
+
+static void player_home_launcher_shared_i2_disk(
+    const SharedLauncherI2Target &target,
+    int32_t cx, int32_t cy, int32_t diameter, uint8_t index)
+{
+    if (diameter <= 0) return;
+    const int32_t radius = diameter / 2;
+    const int32_t radius_sq = radius * radius;
+    for (int32_t y = cy - radius; y <= cy + radius; ++y) {
+        const int32_t dy = y - cy;
+        for (int32_t x = cx - radius; x <= cx + radius; ++x) {
+            const int32_t dx = x - cx;
+            if (dx * dx + dy * dy <= radius_sq) {
+                player_home_launcher_shared_i2_pixel(target, x, y, index);
+            }
+        }
+    }
+}
+
+static void player_home_launcher_shared_i2_line(
+    const SharedLauncherI2Target &target,
+    int32_t x0, int32_t y0, int32_t x1, int32_t y1,
+    int32_t width, uint8_t index)
+{
+    int32_t dx = abs(x1 - x0);
+    const int32_t sx = x0 < x1 ? 1 : -1;
+    int32_t dy = -abs(y1 - y0);
+    const int32_t sy = y0 < y1 ? 1 : -1;
+    int32_t err = dx + dy;
+    const int32_t diameter = width < 2 ? 2 : width;
+    while (true) {
+        player_home_launcher_shared_i2_disk(target, x0, y0, diameter, index);
+        if (x0 == x1 && y0 == y1) break;
+        const int32_t e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+static void player_home_launcher_shared_i2_icon(
+    const SharedLauncherI2Target &target,
+    LauncherIconKind icon,
+    int32_t cx,
+    int32_t cy,
+    int32_t scale_percent,
+    uint8_t index)
+{
+    auto scale = [scale_percent](int32_t value) -> int32_t {
+        const int32_t scaled = (value * scale_percent + (value >= 0 ? 50 : -50)) / 100;
+        if (value != 0 && scaled == 0) return value > 0 ? 1 : -1;
+        return scaled;
+    };
+    const int32_t line_width = scale_percent >= 120 ? 4 : (scale_percent >= 70 ? 3 : 2);
+    auto line = [&](int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
+        player_home_launcher_shared_i2_line(
+            target, cx + scale(x0), cy + scale(y0), cx + scale(x1), cy + scale(y1),
+            line_width, index);
+    };
+    auto dot = [&](int32_t x, int32_t y, int32_t diameter) {
+        const int32_t d = scale(diameter) < 3 ? 3 : scale(diameter);
+        player_home_launcher_shared_i2_disk(
+            target, cx + scale(x), cy + scale(y), d, index);
+    };
+
+    switch (icon) {
+        case LauncherIconKind::Music:
+            line(-4,-16,-4,7); line(-4,-16,15,-20); line(15,-20,15,2); dot(-11,10,10); dot(8,4,10); break;
+        case LauncherIconKind::Nsf:
+            line(-13,-13,13,-13); line(13,-13,13,13); line(13,13,-13,13); line(-13,13,-13,-13);
+            line(-8,-18,-8,-13); line(0,-18,0,-13); line(8,-18,8,-13); line(-8,13,-8,18); line(0,13,0,18); line(8,13,8,18);
+            line(-18,-8,-13,-8); line(-18,0,-13,0); line(-18,8,-13,8); line(13,-8,18,-8); line(13,0,18,0); line(13,8,18,8);
+            line(-7,4,-2,-4); line(-2,-4,3,4); line(3,4,8,-4); break;
+        case LauncherIconKind::MicSpectrum:
+            line(-11,-14,-11,6); line(-11,-14,-4,-18); line(-4,-18,3,-14); line(3,-14,3,6); line(3,6,-4,10); line(-4,10,-11,6);
+            line(-15,4,-15,7); line(-15,7,-9,13); line(-9,13,-4,14); line(-4,14,2,12); line(-4,14,-4,19); line(-10,19,2,19);
+            line(8,10,8,17); line(13,4,13,17); line(18,-3,18,17); break;
+        case LauncherIconKind::Mjpg:
+            line(-18,-13,11,-13); line(11,-13,11,13); line(11,13,-18,13); line(-18,13,-18,-13); line(11,-7,18,-12); line(18,-12,18,12); line(18,12,11,7);
+            line(-6,-7,-6,7); line(-6,-7,5,0); line(5,0,-6,7); break;
+        case LauncherIconKind::Picture:
+            line(-18,-15,18,-15); line(18,-15,18,15); line(18,15,-18,15); line(-18,15,-18,-15); line(-14,10,-5,0); line(-5,0,1,6); line(1,6,8,-4); line(8,-4,15,10); dot(9,-9,6); break;
+        case LauncherIconKind::Ebook:
+            line(0,-14,0,15); line(-1,-12,-7,-15); line(-7,-15,-18,-12); line(-18,-12,-18,12); line(-18,12,-7,10); line(-7,10,-1,13);
+            line(1,-12,7,-15); line(7,-15,18,-12); line(18,-12,18,12); line(18,12,7,10); line(7,10,1,13); break;
+        case LauncherIconKind::Settings:
+            dot(0,0,10); line(0,-18,0,-11); line(0,11,0,18); line(-18,0,-11,0); line(11,0,18,0);
+            line(-13,-13,-8,-8); line(8,8,13,13); line(13,-13,8,-8); line(-8,8,-13,13); break;
+    }
+}
+
+esp_err_t player_home_launcher_shared_render_center_i2(
+    AppId selected,
+    int32_t progress,
+    uint8_t *buffer,
+    size_t buffer_size,
+    lv_image_dsc_t *out_dsc)
+{
+    if (buffer == nullptr || out_dsc == nullptr ||
+        buffer_size < PLAYER_HOME_LAUNCHER_CENTER_IMAGE_BYTES) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const int8_t selected_index = player_home_launcher_index_for_app(selected);
+    if (selected_index < 0) return ESP_ERR_INVALID_ARG;
+    progress = std::max<int32_t>(0, std::min<int32_t>(progress, kLauncherAnimProgressMax));
+
+    lv_color32_t palette[4] = {};
+    palette[0] = lv_color_to_32(lv_color_hex(0x000000), LV_OPA_TRANSP);
+    palette[1] = lv_color_to_32(lv_color_hex(0x05070B), static_cast<uint8_t>(245U));
+    palette[2] = lv_color_to_32(lv_color_hex(0x161B27), LV_OPA_COVER);
+    palette[3] = lv_color_to_32(lv_color_hex(kLauncherAccentRgb), LV_OPA_COVER);
+    memcpy(buffer, palette, sizeof(palette));
+    memset(buffer + sizeof(palette), 0,
+        PLAYER_HOME_LAUNCHER_CENTER_IMAGE_BYTES - sizeof(palette));
+
+    constexpr int32_t image_size = PLAYER_HOME_LAUNCHER_CENTER_IMAGE_SIZE;
+    constexpr int32_t origin = kLauncherCenterX - image_size / 2;
+    SharedLauncherI2Target target = {
+        buffer + sizeof(palette), image_size,
+        PLAYER_HOME_LAUNCHER_CENTER_I2_STRIDE, origin, origin};
+
+    if (progress > 0) {
+        auto lerp = [progress](int32_t from, int32_t to) -> int32_t {
+            return from + ((to - from) * progress + kLauncherAnimProgressMax / 2) /
+                kLauncherAnimProgressMax;
+        };
+        const int32_t diameter = lerp(kLauncherCollapsedCenterDiameter, kLauncherCenterDiameter);
+        const int32_t radius = diameter / 2;
+        const int32_t border_width = progress >= 500 ? 2 : 1;
+        const int32_t inner_radius = radius - border_width;
+        const int32_t radius_sq = radius * radius;
+        const int32_t inner_sq = inner_radius * inner_radius;
+        for (int32_t y = kLauncherCenterY - radius; y <= kLauncherCenterY + radius; ++y) {
+            const int32_t dy = y - kLauncherCenterY;
+            for (int32_t x = kLauncherCenterX - radius; x <= kLauncherCenterX + radius; ++x) {
+                const int32_t dx = x - kLauncherCenterX;
+                const int32_t d2 = dx * dx + dy * dy;
+                if (d2 > radius_sq) continue;
+                player_home_launcher_shared_i2_pixel(target, x, y, d2 >= inner_sq ? 2U : 1U);
+            }
+        }
+        const LauncherMenuItemDef &item = kLauncherItems[static_cast<uint8_t>(selected_index)];
+        const int32_t icon_scale = 78 + (54 * progress) / kLauncherAnimProgressMax;
+        player_home_launcher_shared_i2_icon(
+            target, item.icon,
+            kLauncherCenterX + (item.optical_x * progress) / kLauncherAnimProgressMax,
+            kLauncherCenterY + (item.optical_y * progress) / kLauncherAnimProgressMax,
+            icon_scale, 3U);
+    }
+
+    *out_dsc = {};
+    out_dsc->header.magic = LV_IMAGE_HEADER_MAGIC;
+    out_dsc->header.cf = LV_COLOR_FORMAT_I2;
+    out_dsc->header.flags = 0U;
+    out_dsc->header.w = image_size;
+    out_dsc->header.h = image_size;
+    out_dsc->header.stride = PLAYER_HOME_LAUNCHER_CENTER_I2_STRIDE;
+    out_dsc->data_size = PLAYER_HOME_LAUNCHER_CENTER_IMAGE_BYTES;
+    out_dsc->data = buffer;
+    return ESP_OK;
+}
+
+int8_t player_home_launcher_shared_hit_test(
+    int32_t screen_x, int32_t screen_y, int32_t panel_x, int32_t panel_y)
+{
+    // 非 Music APP 只共享纯几何命中；panel 原点由调用方自己的 LVGL 对象提供。
+    // 这样共享算法既不依赖 Music 私有生命周期，也不假设父对象永远位于 (0,0)。
+    return player_home_launcher_hit_test_geometry(
+        screen_x, screen_y, panel_x, panel_y);
+}
+
+AppId player_home_launcher_shared_app_for_index(uint8_t index)
+{
+    return index < kLauncherItemCount ? kLauncherItems[index].app_id : AppId::None;
+}
+
+AppId player_home_launcher_shared_select_index(uint8_t index, bool *out_should_launch)
+{
+    if (out_should_launch != nullptr) *out_should_launch = false;
+    const AppId target = player_home_launcher_shared_app_for_index(index);
+    if (target == AppId::None) return AppId::None;
+
+    // 选中与启动彻底分离：未实现 APP 也能选中，只是不发起 AppManager 跳转。
+    app_manager_set_launcher_target(target);
+    if (out_should_launch != nullptr) {
+        *out_should_launch = target != app_manager_foreground() &&
+            app_manager_is_registered(target);
+    }
+    return target;
 }
