@@ -9,7 +9,7 @@ enum class AppId : uint8_t {
     Music = 0,
     Nsf,
     MicSpectrum,
-    Mjpg,
+    Video,
     Picture,
     Ebook,
     Settings,

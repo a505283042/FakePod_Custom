@@ -19,6 +19,13 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 2.6.0
+  espressif/esp_extractor:
+    component_hash: d67b055c65fa04db1b36dcb466673b923fe880e1bffddf71db372d2bd15912d4
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.0.4
   espressif/esp_lcd_co5300:
     component_hash: 7004162c496b65a5e0ee7c92800c33c12b373ea70d07199318a182cb16c741b7
     dependencies:
@@ -137,12 +144,13 @@ dependencies:
     version: 9.2.2
 direct_dependencies:
 - espressif/esp_audio_codec
+- espressif/esp_extractor
 - espressif/esp_lcd_co5300
 - espressif/esp_lv_decoder
 - espressif/esp_lvgl_port
 - espressif/esp_new_jpeg
 - espressif/libpng
 - lvgl/lvgl
-manifest_hash: 34511b49d798b264b13142d419bfe486bad522f289c080ccbb49cb174ba83e77
+manifest_hash: fb7aa9c4fe39eb0f8bd86f491eeb589544521c68f3c57d4f4b72de847c2bee47
 target: esp32s3
 version: 2.0.0

@@ -11,6 +11,11 @@ idf_component_register(
         "app/ebook_bookmark_store.cpp"
         "app/ebook_page_index_cache.cpp"
         "app/ebook_reader_model.cpp"
+        "app/video_app.cpp"
+        "app/video_browser_model.cpp"
+        "app/video_media_io.cpp"
+        "app/video_benchmark.cpp"
+        "app/video_probe.cpp"
 
         "system/system_loop.cpp"
         "system/system_runtime.cpp"

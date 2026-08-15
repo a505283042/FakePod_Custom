@@ -25,7 +25,7 @@ static constexpr const char *kBuiltinNames[static_cast<size_t>(AppId::Count)] = 
     "音乐",
     "NSF播放",
     "拾音频谱",
-    "MJPG播放",
+    "视频",
     "图片播放",
     "电子书",
     "设置",

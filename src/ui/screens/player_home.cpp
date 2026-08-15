@@ -171,7 +171,7 @@ static constexpr LauncherMenuItemDef kLauncherItems[kLauncherItemCount] = {
     {LauncherIconKind::Music,       AppId::Music,       "音乐",     180, 0x3C527F, -5,  0,     0, -10000},
     {LauncherIconKind::Nsf,         AppId::Nsf,         "NSF播放",  129, 0x334A78,  0,  0,  7771,  -6293},
     {LauncherIconKind::MicSpectrum, AppId::MicSpectrum, "拾音频谱",  77, 0x2B426F, -2,  0,  9744,   2250},
-    {LauncherIconKind::Mjpg,        AppId::Mjpg,        "MJPG播放",  26, 0x263D69,  0,  0,  4384,   8988},
+    {LauncherIconKind::Mjpg,        AppId::Video,       "视频",      26, 0x263D69,  0,  0,  4384,   8988},
     {LauncherIconKind::Picture,     AppId::Picture,     "图片播放", 334, 0x233861,  0,  0, -4384,   8988},
     {LauncherIconKind::Ebook,       AppId::Ebook,       "电子书",   283, 0x2A406C,  0,  0, -9744,   2250},
     {LauncherIconKind::Settings,    AppId::Settings,    "设置",     231, 0x354B77,  0,  0, -7771,  -6293},
