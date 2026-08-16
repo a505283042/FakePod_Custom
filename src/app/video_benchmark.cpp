@@ -43,7 +43,6 @@ static constexpr uint32_t kDeadlineSafetyBaseUs = 5000U;
 static constexpr uint32_t kDeadlineSafetyMaxUs = 12000U;
 static constexpr uint32_t kDecodeJitterReserveMaxUs = 10000U;
 static constexpr uint8_t kDecodeTimingEwmaShift = 3U; // alpha = 1/8
-static constexpr uint32_t kPreDecodeLogEveryDrops = 32U;
 static constexpr size_t kAudioBridgeBytes = 32U * 1024U;
 static constexpr size_t kAudioPrebufferBytes = 4U * 1024U;
 static constexpr uint32_t kAudioPrebufferTimeoutMs = 1500U;
@@ -551,19 +550,10 @@ static void extract_task(void *arg)
         if (frame.stream_type == ESP_EXTRACTOR_STREAM_TYPE_AUDIO) {
             esp_err_t audio_push_ret = ESP_OK;
             if (frame.frame_buffer != nullptr && frame.frame_size != 0U) {
-                const bool first_audio = record_audio_probe(
+                (void)record_audio_probe(
                     frame, extract_us, storage_us, args->generation);
                 audio_push_ret = avi_mp3_bridge_push(
                     frame.frame_buffer, frame.frame_size, kAudioBridgePushTimeoutMs);
-                if (first_audio) {
-                    ESP_LOGI(TAG,
-                        "AVI MP3首帧入Bridge：stream=%u pts=%lums bytes=%lu pos=%lu capacity=%uKB",
-                        static_cast<unsigned>(frame.stream_idx),
-                        static_cast<unsigned long>(frame.pts),
-                        static_cast<unsigned long>(frame.frame_size),
-                        static_cast<unsigned long>(frame.frame_pos),
-                        static_cast<unsigned>(kAudioBridgeBytes / 1024U));
-                }
             }
             (void)esp_extractor_release_frame(args->extractor, &frame);
             return_compressed_to_free(compressed_slot_index);
@@ -853,14 +843,9 @@ static void benchmark_task(void *arg)
             avi_mp3_bridge_cancel();
             stop_generation(args->generation);
         } else {
-            ESP_LOGI(TAG,
-                "AVI MP3 Realtime Prefetch就绪：buffered=%u/%uB high=%uB wait=%lums video_slots=%u（约%lums@24fps）；现在才启动AudioTask",
+            ESP_LOGI(TAG, "视频音频预取完成：%uB，等待%lums",
                 static_cast<unsigned>(prebuffer.buffered_bytes),
-                static_cast<unsigned>(prebuffer.capacity_bytes),
-                static_cast<unsigned>(prebuffer.high_water_bytes),
-                static_cast<unsigned long>(prebuffer_wait_ms),
-                static_cast<unsigned>(kCompressedSlotCount),
-                static_cast<unsigned long>((kCompressedSlotCount * 1000U) / 24U));
+                static_cast<unsigned long>(prebuffer_wait_ms));
         }
     }
 
@@ -882,26 +867,11 @@ static void benchmark_task(void *arg)
         result.state = State::Running;
         result.result = ESP_OK;
         publish(result);
-        ESP_LOGI(TAG,
-            "MJPEG Benchmark启动：native=%ux%u canvas<=460x460 fps_hint=%u AVI_index=OFF extractor_pool=%uKB RGB565=BE 双帧PSRAM(max)=%uKB pipeline=ExtractCore%d/P%u->DecodeCore%d/P%u compressed=%ux%uKB；extract_mask=AV，VIDEO->JPEG Pipeline，MP3->32KB Bridge(>=4KB prebuffer)->AudioTask Start Barrier",
-            static_cast<unsigned>(result.width), static_cast<unsigned>(result.height),
-            static_cast<unsigned>(result.fps_hint), static_cast<unsigned>(kExtractorPoolBytes / 1024U),
-            static_cast<unsigned>((kRgb565Bytes * kFrameSlotCount) / 1024U),
-            static_cast<int>(kExtractTaskCore), static_cast<unsigned>(kExtractTaskPriority),
-            static_cast<int>(kTaskCore), static_cast<unsigned>(kTaskPriority),
-            static_cast<unsigned>(kCompressedSlotCount),
-            static_cast<unsigned>(kCompressedSlotBytes / 1024U));
-        ESP_LOGI(TAG,
-            "MJPEG Pipeline A/B：Extractor/TF与JPEG Decode并行；VIDEO压缩队列8帧；AUDIO先建立>=4KB预取并完成decoder/I2S/DAC静音预备，Dedicated Presenter首帧准备完成后才解除Barrier提交真实PCM；AudioTask唯一拥有MP3/PCM/I2S/DAC");
-        ESP_LOGI(TAG,
-            "Decode Scheduler Safety：每%u帧主动Block %u tick，为IDLE0/TWDT留出CPU0运行窗口",
-            static_cast<unsigned>(kDecodeYieldEveryFrames),
-            static_cast<unsigned>(kDecodeYieldTicks));
-        ESP_LOGI(TAG,
-            "Audio Master + Adaptive PreDecode：有AVI MP3时以AudioTask submitted PCM Clock判断late/drop；无音轨/PCM尚未启动时回退Unified Timer；UI emergency=%lldms deadline=%lu..%lums",
-            static_cast<long long>(kUiEmergencyLateUs / 1000LL),
-            static_cast<unsigned long>((kUiEmergencyLateUs - kDeadlineSafetyMaxUs) / 1000LL),
-            static_cast<unsigned long>((kUiEmergencyLateUs - kDeadlineSafetyBaseUs) / 1000LL));
+        ESP_LOGI(TAG, "视频解码启动：%ux%u %u帧/秒 音轨=%s",
+            static_cast<unsigned>(result.width),
+            static_cast<unsigned>(result.height),
+            static_cast<unsigned>(result.fps_hint),
+            result.audio_streams != 0U ? "MP3" : "无");
 
         bool done = false;
         while (!done && generation_current(args->generation)) {
@@ -973,18 +943,6 @@ static void benchmark_task(void *arg)
                     catchup_active = true;
                 }
                 if (projected_late_us > projected_late_us_max) projected_late_us_max = projected_late_us;
-                if (predecode_drops == 1U || (predecode_drops % kPreDecodeLogEveryDrops) == 0U) {
-                    ESP_LOGW(TAG,
-                        "PreDecode Deadline丢帧：drop=%lu event=%lu pts=%lums late=%lldms projected=%lldms deadline=%lldms jpeg_est=%luus clock=%s",
-                        static_cast<unsigned long>(predecode_drops),
-                        static_cast<unsigned long>(catchup_events),
-                        static_cast<unsigned long>(compressed.pts_ms),
-                        static_cast<long long>(late_us / 1000LL),
-                        static_cast<long long>(projected_late_us / 1000LL),
-                        static_cast<long long>(deadline_us / 1000LL),
-                        static_cast<unsigned long>(estimated_decode_us),
-                        predecode_audio_master ? "AudioPCM" : "FallbackTimer");
-                }
                 return_compressed_to_free(message.slot);
                 if ((result.frames_read % kPublishEveryFrames) == 0U) publish(result);
                 continue;
@@ -1009,18 +967,6 @@ static void benchmark_task(void *arg)
                     catchup_active = true;
                 }
                 if (projected_late_us > projected_late_us_max) projected_late_us_max = projected_late_us;
-                if (predecode_drops == 1U || (predecode_drops % kPreDecodeLogEveryDrops) == 0U) {
-                    ESP_LOGW(TAG,
-                        "PreDecode Deadline丢帧：drop=%lu event=%lu pts=%lums late=%lldms projected=%lldms deadline=%lldms jpeg_est=%luus clock=%s（等待RGB槽后）",
-                        static_cast<unsigned long>(predecode_drops),
-                        static_cast<unsigned long>(catchup_events),
-                        static_cast<unsigned long>(compressed.pts_ms),
-                        static_cast<long long>(late_us / 1000LL),
-                        static_cast<long long>(projected_late_us / 1000LL),
-                        static_cast<long long>(deadline_us / 1000LL),
-                        static_cast<unsigned long>(estimated_decode_us),
-                        predecode_audio_master ? "AudioPCM" : "FallbackTimer");
-                }
                 return_slot_to_free(slot_index);
                 return_compressed_to_free(message.slot);
                 if ((result.frames_read % kPublishEveryFrames) == 0U) publish(result);
@@ -1115,42 +1061,21 @@ static void benchmark_task(void *arg)
     snapshot_audio_probe(&result);
 
     if (generation_matches(args->generation)) {
-        const int32_t av0_delta_ms = (result.audio_frames_read != 0U && result.frames_decoded != 0U)
-            ? static_cast<int32_t>(result.audio_first_pts_ms) - static_cast<int32_t>(result.first_pts_ms)
-            : 0;
+        const uint32_t decode_avg_us = result.frames_decoded != 0U
+            ? static_cast<uint32_t>(result.decode_us_total / result.frames_decoded) : 0U;
+        const uint32_t extract_avg_us = result.frames_read != 0U
+            ? static_cast<uint32_t>(result.extract_us_total / result.frames_read) : 0U;
         ESP_LOGI(TAG,
-            "MJPEG Benchmark解码端结束：state=%s read=%lu decoded=%lu pre_drop=%lu catchup=%lu pool_skip=%lu decode_fail=%lu jpeg_avg=%luB max=%luB extract_avg=%luus max=%luus storage_avg=%luus max=%luus decode_avg=%luus max=%luus jpeg_ewma=%luus jitter=%luus copy_avg=%luus max=%luus pipe_qmax=%lu deadline_now=%lldms projected_late_max=%lldms gate=%lu次/%lums audio_frames=%lu audio_avg=%luB max=%luB audio_pts=%lu..%lu av0_delta=%ldms",
+            "视频解码结束：状态=%s 读取=%lu 解码=%lu 预丢帧=%lu JPEG平均=%lu.%03lums 提取平均=%lu.%03lums 音频帧=%lu",
             state_name(result.state),
             static_cast<unsigned long>(result.frames_read),
             static_cast<unsigned long>(result.frames_decoded),
             static_cast<unsigned long>(predecode_drops),
-            static_cast<unsigned long>(catchup_events),
-            static_cast<unsigned long>(result.frames_pool_skipped),
-            static_cast<unsigned long>(result.decode_failures),
-            static_cast<unsigned long>(result.frames_decoded ? result.compressed_bytes / result.frames_decoded : 0ULL),
-            static_cast<unsigned long>(result.compressed_bytes_max),
-            static_cast<unsigned long>(result.frames_read ? result.extract_us_total / result.frames_read : 0ULL),
-            static_cast<unsigned long>(result.extract_us_max),
-            static_cast<unsigned long>(result.frames_read ? result.storage_us_total / result.frames_read : 0ULL),
-            static_cast<unsigned long>(result.storage_us_max),
-            static_cast<unsigned long>(result.frames_decoded ? result.decode_us_total / result.frames_decoded : 0ULL),
-            static_cast<unsigned long>(result.decode_us_max),
-            static_cast<unsigned long>(decode_timing.ewma_us),
-            static_cast<unsigned long>(decode_timing.jitter_ewma_us),
-            static_cast<unsigned long>(result.frames_read ? copy_us_total / result.frames_read : 0ULL),
-            static_cast<unsigned long>(copy_us_max),
-            static_cast<unsigned long>(pipe_qmax),
-            static_cast<long long>(adaptive_predecode_deadline_us(decode_timing) / 1000LL),
-            static_cast<long long>(projected_late_us_max / 1000LL),
-            static_cast<unsigned long>(result.storage_gate_wait_count),
-            static_cast<unsigned long>(result.storage_gate_wait_us / 1000ULL),
-            static_cast<unsigned long>(result.audio_frames_read),
-            static_cast<unsigned long>(result.audio_frames_read
-                ? result.audio_compressed_bytes / result.audio_frames_read : 0ULL),
-            static_cast<unsigned long>(result.audio_compressed_bytes_max),
-            static_cast<unsigned long>(result.audio_first_pts_ms),
-            static_cast<unsigned long>(result.audio_last_pts_ms),
-            static_cast<long>(av0_delta_ms));
+            static_cast<unsigned long>(decode_avg_us / 1000U),
+            static_cast<unsigned long>(decode_avg_us % 1000U),
+            static_cast<unsigned long>(extract_avg_us / 1000U),
+            static_cast<unsigned long>(extract_avg_us % 1000U),
+            static_cast<unsigned long>(result.audio_frames_read));
     }
 
     publish_task_exit(result);
@@ -1298,10 +1223,7 @@ bool set_presentation_clock(uint32_t first_pts_ms, int64_t clock_base_us)
     if (clock_base_us <= 0LL) return false;
 
     bool published = false;
-    bool first_publish = false;
-    uint32_t generation = 0U;
     portENTER_CRITICAL(&g_mux);
-    generation = g_generation;
     if (g_task != nullptr && g_stop_generation != g_generation) {
         if (!g_presentation_clock.started ||
             g_presentation_clock.generation != g_generation) {
@@ -1310,7 +1232,6 @@ bool set_presentation_clock(uint32_t first_pts_ms, int64_t clock_base_us)
             g_presentation_clock.first_pts_ms = first_pts_ms;
             g_presentation_clock.base_us = clock_base_us;
             published = true;
-            first_publish = true;
         } else if (g_presentation_clock.first_pts_ms == first_pts_ms &&
                    g_presentation_clock.base_us == clock_base_us) {
             published = true;
@@ -1318,13 +1239,6 @@ bool set_presentation_clock(uint32_t first_pts_ms, int64_t clock_base_us)
     }
     portEXIT_CRITICAL(&g_mux);
 
-    if (first_publish) {
-        ESP_LOGI(TAG,
-            "Fallback PTS时钟已锚定：generation=%lu first_pts=%lums base=%lldus；仅在Audio PCM Master不可用时使用",
-            static_cast<unsigned long>(generation),
-            static_cast<unsigned long>(first_pts_ms),
-            static_cast<long long>(clock_base_us));
-    }
     return published;
 }
 

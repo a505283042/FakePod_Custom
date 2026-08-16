@@ -41,6 +41,13 @@ enum class BrowserLoadPhase : uint8_t
     Scanning,
 };
 
+enum class EofTransition : uint8_t
+{
+    None = 0,
+    AutoNext,
+    ReturnBrowser,
+};
+
 static constexpr int32_t kHeaderHeight = 68;
 static constexpr int32_t kContentMargin = 12;
 static constexpr int32_t kRowHeight = 58;
@@ -59,7 +66,6 @@ static constexpr int64_t kBenchmarkTeArmLeadUs = 14000LL;
 // R.40.3.3.3.2 不再按 frame_y 追加 2~4ms 扫描等待，所有尺寸统一只保留 300us。
 // 仅改 TE 后 stream 微相位，不改 PTS/Presenter/Decode 行为。
 static constexpr uint32_t kScanPhaseSafetyUs = 300U;
-static constexpr int64_t kBenchmarkReportIntervalUs = 5000000LL;
 static constexpr uint32_t kDestroyCleanupWaitMs = 300U;
 static constexpr uint32_t kBrowserTimerPeriodMs = 20U;
 static constexpr uint32_t kBenchmarkTimerPeriodMs = 5U;
@@ -68,6 +74,10 @@ static constexpr UBaseType_t kPresenterTaskPriority = 2U;
 static constexpr BaseType_t kPresenterTaskCore = 1;
 static constexpr uint32_t kPresenterFrameWaitMs = 20U;
 static constexpr uint32_t kPresenterStopWaitMs = 250U;
+// R.40.5 实机验证阶段：设置页接入前临时开启，便于验证自然结束连续播放。
+// 下一阶段由“自动播放下一个视频”设置项接管，不在视频画面增加浮动UI。
+static constexpr bool kAutoPlayNextBringUpEnabled = true;
+static constexpr size_t kInvalidEntryIndex = static_cast<size_t>(-1);
 
 struct RowUi
 {
@@ -125,7 +135,6 @@ struct BenchmarkUiState
     bool bounded_session = false;
     bool clock_started = false;
     bool audio_master_active = false;
-    uint32_t audio_master_revision = 0U;
     uint32_t audio_first_pts_ms = 0U;
     bool terminal_shown = false;
     bool cleanup_pending = false;
@@ -133,7 +142,6 @@ struct BenchmarkUiState
     int64_t clock_base_us = 0LL;
     int64_t first_present_us = 0LL;
     int64_t last_present_us = 0LL;
-    int64_t last_report_us = 0LL;
     uint32_t presented = 0U;
     uint32_t dropped = 0U;
     uint32_t display_failures = 0U;
@@ -145,9 +153,6 @@ struct BenchmarkUiState
     uint64_t stream_us_total = 0ULL;
     uint32_t stream_us_max = 0U;
 
-    int64_t held_acquired_us = 0LL;
-    int64_t probe_last_tick_us = 0LL;
-    int64_t probe_last_present_done_us = 0LL;
     CadenceProbeWindow probe = {};
 };
 
@@ -183,6 +188,11 @@ static bool g_music_paused_for_benchmark = false;
 static bool g_fullcanvas_risk_authorized = false;
 static bool g_profile_probe_pending = false;
 static bool g_risk_prompt_active = false;
+static size_t g_selected_index = kInvalidEntryIndex;
+static EofTransition g_eof_transition = EofTransition::None;
+
+static bool start_profile_probe_selected();
+static void benchmark_show_terminal(const VideoBenchmark::Snapshot &snapshot);
 
 static esp_err_t cleanup_create_failure(esp_err_t err)
 {
@@ -208,6 +218,8 @@ static esp_err_t cleanup_create_failure(esp_err_t err)
     g_current_dir = nullptr;
     g_scratch_path = nullptr;
     g_selected_path = nullptr;
+    g_selected_index = kInvalidEntryIndex;
+    g_eof_transition = EofTransition::None;
     g_page = VideoPage::Browser;
     return err;
 }
@@ -401,6 +413,7 @@ static void begin_browser_load()
     cancel_browser_load();
     VideoBrowser::release_directory(&g_directory);
     g_first_index = 0U;
+    g_selected_index = kInvalidEntryIndex;
     g_browser_load.phase = BrowserLoadPhase::WaitingForAudioWindow;
     show_status("正在加载视频目录…", 0x8E9AAA);
     ESP_LOGI(TAG, "Video目录协作加载已排队：%s", g_current_dir != nullptr ? g_current_dir : "(null)");
@@ -687,10 +700,7 @@ static void benchmark_presenter_task(void *arg)
     int64_t last_wake_us = 0LL;
     uint32_t presented_local = 0U;
 
-    ESP_LOGI(TAG,
-        "Dedicated Presenter启动：Core%d/P%u stack=%uB frame_wait=%ums；阻塞等待RGB ready queue，LVGL不再提交视频帧",
-        static_cast<int>(kPresenterTaskCore), static_cast<unsigned>(kPresenterTaskPriority),
-        static_cast<unsigned>(kPresenterTaskStack), static_cast<unsigned>(kPresenterFrameWaitMs));
+    ESP_LOGI(TAG, "视频显示任务已启动");
 
     while (!benchmark_presenter_should_stop()) {
         VideoBenchmark::FrameView frame = {};
@@ -740,7 +750,6 @@ static void benchmark_presenter_task(void *arg)
             g_benchmark_ui.clock_started = true;
             g_benchmark_ui.first_pts_ms = first_pts_ms;
             g_benchmark_ui.clock_base_us = clock_base_us;
-            g_benchmark_ui.last_report_us = clock_base_us;
             portEXIT_CRITICAL(&g_benchmark_ui_mux);
             if (!VideoBenchmark::set_presentation_clock(first_pts_ms, clock_base_us)) {
                 ESP_LOGW(TAG, "Fallback PTS时钟发布失败；Audio PCM Master不可用时Decode将暂不做PreDecode时钟判断");
@@ -765,16 +774,8 @@ static void benchmark_presenter_task(void *arg)
             audio_master_logged = true;
             portENTER_CRITICAL(&g_benchmark_ui_mux);
             g_benchmark_ui.audio_master_active = true;
-            g_benchmark_ui.audio_master_revision = audio_clock.revision;
             g_benchmark_ui.audio_first_pts_ms = audio_first_pts_ms;
             portEXIT_CRITICAL(&g_benchmark_ui_mux);
-            ESP_LOGI(TAG,
-                "Audio Master A/V Sync已接管：clock_rev=%lu audio_pts0=%lums video_pts0=%lums av0_delta=%ldms pcm=%lluus；Presenter等待/late/drop以AudioTask submitted PCM为准",
-                static_cast<unsigned long>(audio_clock.revision),
-                static_cast<unsigned long>(audio_first_pts_ms),
-                static_cast<unsigned long>(first_pts_ms),
-                static_cast<long>(static_cast<int32_t>(audio_first_pts_ms) - static_cast<int32_t>(first_pts_ms)),
-                static_cast<unsigned long long>(audio_clock.position_us));
         }
 
         portENTER_CRITICAL(&g_benchmark_ui_mux);
@@ -882,12 +883,8 @@ static void benchmark_presenter_task(void *arg)
                 break;
             }
 
-            ESP_LOGI(TAG,
-                "MJPEG Benchmark进入Dedicated Presenter局部GRAM：video=%ux%u window=(%u,%u) canvas=460x460；TE-aware arm=14ms；Minimal Tear Guard=ON phase=%uus@Y=%u；LVGL Present=OFF",
-                static_cast<unsigned>(frame_width), static_cast<unsigned>(frame_height),
-                static_cast<unsigned>(frame_x), static_cast<unsigned>(frame_y),
-                static_cast<unsigned>(scan_phase_delay_us),
-                static_cast<unsigned>(frame_y));
+            ESP_LOGI(TAG, "视频显示准备完成：%ux%u",
+                static_cast<unsigned>(frame_width), static_cast<unsigned>(frame_height));
         }
 
         if (audio_master_expected && !audio_start_barrier_released) {
@@ -998,8 +995,7 @@ static void benchmark_presenter_task(void *arg)
 
     if (bounded_session) display_launcher_bounded_spi_session_end();
     const BenchmarkUiState ui = benchmark_ui_snapshot();
-    ESP_LOGI(TAG,
-        "Dedicated Presenter结束：present=%lu drop=%lu display_fail=%lu",
+    ESP_LOGI(TAG, "视频显示结束：显示=%lu 丢帧=%lu 显示错误=%lu",
         static_cast<unsigned long>(ui.presented),
         static_cast<unsigned long>(ui.dropped),
         static_cast<unsigned long>(ui.display_failures));
@@ -1068,6 +1064,78 @@ static void benchmark_cleanup_tick()
     }
 }
 
+static bool select_next_video_in_current_directory()
+{
+    if (g_selected_index == kInvalidEntryIndex || g_directory.entries == nullptr ||
+        g_selected_index >= g_directory.count || g_current_dir == nullptr ||
+        g_selected_path == nullptr || g_scratch_path == nullptr) return false;
+
+    for (size_t index = g_selected_index + 1U; index < g_directory.count; ++index) {
+        const VideoBrowser::EntryIndex *entry = VideoBrowser::entry_at(&g_directory, index);
+        const char *name = VideoBrowser::entry_name(&g_directory, index);
+        if (entry == nullptr || name == nullptr || VideoBrowser::entry_is_directory(entry)) continue;
+        if (VideoBrowser::join_child_path(
+                g_current_dir, name, g_scratch_path, VideoBrowser::kPathBytes) != ESP_OK) continue;
+        snprintf(g_selected_path, VideoBrowser::kPathBytes, "%s", g_scratch_path);
+        g_selected_index = index;
+        ESP_LOGI(TAG, "自动下一视频：已选择目录项 %u/%u：%s",
+            static_cast<unsigned>(index + 1U), static_cast<unsigned>(g_directory.count), name);
+        return true;
+    }
+    return false;
+}
+
+static void eof_transition_begin(const VideoBenchmark::Snapshot &snapshot)
+{
+    if (g_eof_transition != EofTransition::None) return;
+
+    const BenchmarkUiState ui = benchmark_ui_snapshot();
+    const bool has_next = kAutoPlayNextBringUpEnabled && select_next_video_in_current_directory();
+    const char *reason = has_next ? "auto_next" : "eof";
+    if (!benchmark_stop_avi_audio(reason)) {
+        ESP_LOGE(TAG, "视频自然结束后停止AVI音频失败，回退终止页");
+        benchmark_show_terminal(snapshot);
+        return;
+    }
+
+    g_benchmark_ui.terminal_shown = true;
+    g_benchmark_ui.cleanup_pending = true;
+    g_eof_transition = has_next ? EofTransition::AutoNext : EofTransition::ReturnBrowser;
+    ESP_LOGI(TAG,
+        "视频自然播放完成：present=%lu drop=%lu 自动下一视频=%s%s",
+        static_cast<unsigned long>(ui.presented), static_cast<unsigned long>(ui.dropped),
+        has_next ? "是" : "否",
+        has_next ? "；保持视频独占，不恢复Music播放" : "；准备返回视频列表并恢复Music");
+}
+
+static void eof_transition_tick()
+{
+    if (g_eof_transition == EofTransition::None || g_benchmark_ui.cleanup_pending ||
+        benchmark_presenter_is_running()) return;
+
+    const EofTransition transition = g_eof_transition;
+    g_eof_transition = EofTransition::None;
+    if (transition == EofTransition::ReturnBrowser) {
+        benchmark_restore_music_after_exclusive("eof");
+        show_browser();
+        ESP_LOGI(TAG, "视频已播放到当前目录末尾：返回视频列表");
+        return;
+    }
+
+    // 下一条先走与手动点击完全相同的规格预检。Music播放状态始终保持暂停，
+    // 因此不会出现“视频A结束 -> Music短暂出声 -> 视频B再暂停”的听感断点。
+    g_page = VideoPage::Browser;
+    if (g_timer != nullptr) lv_timer_set_period(g_timer, kBrowserTimerPeriodMs);
+    set_visible(g_root, false);
+    g_fullcanvas_risk_authorized = false;
+    g_risk_prompt_active = false;
+    if (!start_profile_probe_selected()) {
+        ESP_LOGW(TAG, "自动下一视频：规格预检启动失败，已返回视频列表");
+        return;
+    }
+    ESP_LOGI(TAG, "自动下一视频：保持视频独占，正在预检下一AVI规格");
+}
+
 static uint32_t benchmark_fps_milli(const BenchmarkUiState &ui)
 {
     if (ui.presented < 2U || ui.first_present_us == 0LL ||
@@ -1075,139 +1143,6 @@ static uint32_t benchmark_fps_milli(const BenchmarkUiState &ui)
     const uint64_t elapsed_us = static_cast<uint64_t>(ui.last_present_us - ui.first_present_us);
     const uint64_t intervals = static_cast<uint64_t>(ui.presented - 1U);
     return static_cast<uint32_t>((intervals * 1000000000ULL + elapsed_us / 2ULL) / elapsed_us);
-}
-
-static bool benchmark_take_report_snapshot(int64_t now_us, BenchmarkUiState *out_ui)
-{
-    if (out_ui == nullptr) return false;
-    bool ready = false;
-    portENTER_CRITICAL(&g_benchmark_ui_mux);
-    if (g_benchmark_ui.presented != 0U &&
-        (g_benchmark_ui.last_report_us == 0LL ||
-         now_us - g_benchmark_ui.last_report_us >= kBenchmarkReportIntervalUs)) {
-        g_benchmark_ui.last_report_us = now_us;
-        *out_ui = g_benchmark_ui;
-        g_benchmark_ui.probe = {};
-        ready = true;
-    }
-    portEXIT_CRITICAL(&g_benchmark_ui_mux);
-    return ready;
-}
-
-static void benchmark_log_realtime(const VideoBenchmark::Snapshot &snapshot, int64_t now_us)
-{
-    BenchmarkUiState ui = {};
-    if (!benchmark_take_report_snapshot(now_us, &ui)) return;
-
-    const uint32_t fps_milli = benchmark_fps_milli(ui);
-    const uint32_t decode_avg_us = snapshot.frames_decoded != 0U
-        ? static_cast<uint32_t>(snapshot.decode_us_total / snapshot.frames_decoded) : 0U;
-    const uint32_t storage_avg_us = snapshot.frames_read != 0U
-        ? static_cast<uint32_t>(snapshot.storage_us_total / snapshot.frames_read) : 0U;
-    const uint32_t extract_avg_us = snapshot.frames_read != 0U
-        ? static_cast<uint32_t>(snapshot.extract_us_total / snapshot.frames_read) : 0U;
-    const uint32_t display_avg_us = ui.presented != 0U
-        ? static_cast<uint32_t>(ui.display_us_total / ui.presented) : 0U;
-    const uint32_t te_avg_us = ui.presented != 0U
-        ? static_cast<uint32_t>(ui.te_us_total / ui.presented) : 0U;
-
-    ESP_LOGI(TAG,
-        "VideoBenchUI: present=%lu drop=%lu fps=%lu.%03lu src_decoded=%lu pool_skip=%lu jpeg_avg=%luus max=%luus TF_avg=%luus extract_avg=%luus display_avg=%luus max=%luus TE_avg=%luus PSRAM_free=%uKB",
-        static_cast<unsigned long>(ui.presented),
-        static_cast<unsigned long>(ui.dropped),
-        static_cast<unsigned long>(fps_milli / 1000U),
-        static_cast<unsigned long>(fps_milli % 1000U),
-        static_cast<unsigned long>(snapshot.frames_decoded),
-        static_cast<unsigned long>(snapshot.frames_pool_skipped),
-        static_cast<unsigned long>(decode_avg_us),
-        static_cast<unsigned long>(snapshot.decode_us_max),
-        static_cast<unsigned long>(storage_avg_us),
-        static_cast<unsigned long>(extract_avg_us),
-        static_cast<unsigned long>(display_avg_us),
-        static_cast<unsigned long>(ui.display_us_max),
-        static_cast<unsigned long>(te_avg_us),
-        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) / 1024U));
-
-    if (snapshot.audio_streams != 0U) {
-        const uint32_t audio_avg_bytes = snapshot.audio_frames_read != 0U
-            ? static_cast<uint32_t>(snapshot.audio_compressed_bytes / snapshot.audio_frames_read) : 0U;
-        const uint32_t audio_extract_avg_us = snapshot.audio_frames_read != 0U
-            ? static_cast<uint32_t>(snapshot.audio_extract_us_total / snapshot.audio_frames_read) : 0U;
-        const uint32_t audio_storage_avg_us = snapshot.audio_frames_read != 0U
-            ? static_cast<uint32_t>(snapshot.audio_storage_us_total / snapshot.audio_frames_read) : 0U;
-        const int32_t av0_delta_ms = (snapshot.audio_frames_read != 0U && snapshot.frames_decoded != 0U)
-            ? static_cast<int32_t>(snapshot.audio_first_pts_ms) - static_cast<int32_t>(snapshot.first_pts_ms)
-            : 0;
-        ESP_LOGI(TAG,
-            "AVIAudio: MP3 %luHz/%uch bits=%u bitrate=%lu frames=%lu avg=%luB max=%luB pts=%lu..%lu av0_delta=%ldms extract_avg=%luus TF_avg=%luus output=AudioTask",
-            static_cast<unsigned long>(snapshot.audio_sample_rate),
-            static_cast<unsigned>(snapshot.audio_channels),
-            static_cast<unsigned>(snapshot.audio_bits_per_sample),
-            static_cast<unsigned long>(snapshot.audio_bitrate),
-            static_cast<unsigned long>(snapshot.audio_frames_read),
-            static_cast<unsigned long>(audio_avg_bytes),
-            static_cast<unsigned long>(snapshot.audio_compressed_bytes_max),
-            static_cast<unsigned long>(snapshot.audio_first_pts_ms),
-            static_cast<unsigned long>(snapshot.audio_last_pts_ms),
-            static_cast<long>(av0_delta_ms),
-            static_cast<unsigned long>(audio_extract_avg_us),
-            static_cast<unsigned long>(audio_storage_avg_us));
-    }
-
-    if (ui.audio_master_active) {
-        AudioVideoClockSnapshot audio_clock = {};
-        if (audio_service_video_mp3_get_clock(&audio_clock) && audio_clock.active) {
-            ESP_LOGI(TAG,
-                "AVMaster: source=AudioPCM rev=%lu pcm=%llums submitted=%lluf audio_pts0=%lums probe_late_ref=AudioPCM eof=%u",
-                static_cast<unsigned long>(audio_clock.revision),
-                static_cast<unsigned long long>(audio_clock.position_us / 1000ULL),
-                static_cast<unsigned long long>(audio_clock.submitted_frames),
-                static_cast<unsigned long>(ui.audio_first_pts_ms),
-                static_cast<unsigned>(audio_clock.eof));
-        }
-    }
-
-    const CadenceProbeWindow &probe = ui.probe;
-    const uint32_t wake_gap_avg_us = probe.tick_gap_samples != 0U
-        ? static_cast<uint32_t>(probe.tick_gap_us_total / probe.tick_gap_samples) : 0U;
-    const int32_t ready_late_avg_us = probe.ready_samples != 0U
-        ? benchmark_probe_clamp_i32(probe.ready_late_us_total / probe.ready_samples) : 0;
-    const uint32_t held_wait_avg_us = probe.held_samples != 0U
-        ? static_cast<uint32_t>(probe.held_wait_us_total / probe.held_samples) : 0U;
-    const int32_t start_late_avg_us = probe.present_start_samples != 0U
-        ? benchmark_probe_clamp_i32(probe.present_start_late_us_total / probe.present_start_samples) : 0;
-    const int32_t done_late_avg_us = probe.present_done_samples != 0U
-        ? benchmark_probe_clamp_i32(probe.present_done_late_us_total / probe.present_done_samples) : 0;
-    const uint32_t present_gap_avg_us = probe.present_gap_samples != 0U
-        ? static_cast<uint32_t>(probe.present_gap_us_total / probe.present_gap_samples) : 0U;
-    const uint32_t post_idle_avg_us = probe.post_idle_samples != 0U
-        ? static_cast<uint32_t>(probe.post_idle_us_total / probe.post_idle_samples) : 0U;
-
-    ESP_LOGI(TAG,
-        "PresenterProbeA: wakes=%lu wake_gap=%lu/%luus wait_timeout=%lu pts_wait=%lu ready_late=%ldus[%ld..%ld] held_wait=%lu/%luus",
-        static_cast<unsigned long>(probe.ticks),
-        static_cast<unsigned long>(wake_gap_avg_us),
-        static_cast<unsigned long>(probe.tick_gap_us_max),
-        static_cast<unsigned long>(probe.take_miss),
-        static_cast<unsigned long>(probe.arm_wait),
-        static_cast<long>(ready_late_avg_us),
-        static_cast<long>(probe.ready_late_us_min),
-        static_cast<long>(probe.ready_late_us_max),
-        static_cast<unsigned long>(held_wait_avg_us),
-        static_cast<unsigned long>(probe.held_wait_us_max));
-    ESP_LOGI(TAG,
-        "PresenterProbeB: start_late=%ldus[%ld..%ld] done_late=%ldus[%ld..%ld] present_gap=%lu/%luus post_idle=%lu/%luus samples=%lu",
-        static_cast<long>(start_late_avg_us),
-        static_cast<long>(probe.present_start_late_us_min),
-        static_cast<long>(probe.present_start_late_us_max),
-        static_cast<long>(done_late_avg_us),
-        static_cast<long>(probe.present_done_late_us_min),
-        static_cast<long>(probe.present_done_late_us_max),
-        static_cast<unsigned long>(present_gap_avg_us),
-        static_cast<unsigned long>(probe.present_gap_us_max),
-        static_cast<unsigned long>(post_idle_avg_us),
-        static_cast<unsigned long>(probe.post_idle_us_max),
-        static_cast<unsigned long>(probe.present_done_samples));
 }
 
 static void benchmark_show_terminal(const VideoBenchmark::Snapshot &snapshot)
@@ -1293,31 +1228,28 @@ static void benchmark_show_terminal(const VideoBenchmark::Snapshot &snapshot)
     }
 
     ESP_LOGI(TAG,
-        "MJPEG Benchmark UI结束：state=%s result=%s present=%lu drop=%lu fps=%lu.%03lu display_avg=%luus max=%luus stream_max=%luus TEmax=%luus display_fail=%lu",
+        "视频播放结束：状态=%s 结果=%s 显示=%lu 丢帧=%lu 实测=%lu.%03lu帧/秒",
         VideoBenchmark::state_name(snapshot.state), esp_err_to_name(terminal_error),
         static_cast<unsigned long>(ui.presented),
         static_cast<unsigned long>(ui.dropped),
         static_cast<unsigned long>(fps_milli / 1000U),
-        static_cast<unsigned long>(fps_milli % 1000U),
-        static_cast<unsigned long>(display_avg_us),
-        static_cast<unsigned long>(ui.display_us_max),
-        static_cast<unsigned long>(ui.stream_us_max),
-        static_cast<unsigned long>(ui.te_us_max),
-        static_cast<unsigned long>(ui.display_failures));
+        static_cast<unsigned long>(fps_milli % 1000U));
 }
 
 static void benchmark_tick()
 {
     benchmark_cleanup_tick();
+    eof_transition_tick();
     if (g_page != VideoPage::Benchmark || g_benchmark_ui.terminal_shown) return;
 
     VideoBenchmark::Snapshot snapshot = {};
     if (!VideoBenchmark::get_snapshot(&snapshot)) return;
-    benchmark_log_realtime(snapshot, esp_timer_get_time());
-
+    if (!benchmark_presenter_is_running() && snapshot.state == VideoBenchmark::State::Eof) {
+        eof_transition_begin(snapshot);
+        return;
+    }
     if (!benchmark_presenter_is_running() &&
-        (snapshot.state == VideoBenchmark::State::Eof ||
-         snapshot.state == VideoBenchmark::State::Stopped ||
+        (snapshot.state == VideoBenchmark::State::Stopped ||
          snapshot.state == VideoBenchmark::State::Failed)) {
         benchmark_show_terminal(snapshot);
     }
@@ -1335,7 +1267,8 @@ static void go_back()
 {
     if (g_page == VideoPage::Benchmark) {
         if (g_risk_prompt_active) {
-            ESP_LOGI(TAG, "用户关闭高负载视频提示；Music未暂停，直接返回Video Browser");
+            ESP_LOGI(TAG, "用户关闭高负载视频提示；返回视频列表");
+            benchmark_restore_music_after_exclusive("risk_back");
             show_browser();
             lv_obj_invalidate(g_root);
             return;
@@ -1411,6 +1344,7 @@ static bool benchmark_start_selected(bool allow_fullcanvas_over20)
         if (g_timer != nullptr) lv_timer_set_period(g_timer, kBrowserTimerPeriodMs);
         return false;
     }
+    g_eof_transition = EofTransition::None;
     return true;
 }
 
@@ -1440,8 +1374,9 @@ static void show_fullcanvas_risk_prompt(const VideoProbe::Snapshot &snapshot)
     lv_obj_invalidate(g_root);
 
     ESP_LOGW(TAG,
-        "Video播放前风险确认：460x460/%uFPS > 稳定档位20FPS；VideoProbe仅查metadata，Music保持连续，等待用户选择",
-        static_cast<unsigned>(snapshot.fps));
+        "视频播放前风险确认：460x460/%uFPS > 稳定档位20FPS；规格预检只读取信息，Music%s，等待用户选择",
+        static_cast<unsigned>(snapshot.fps),
+        g_music_paused_for_benchmark ? "保持暂停" : "保持连续");
 }
 
 static void profile_probe_tick()
@@ -1458,6 +1393,8 @@ static void profile_probe_tick()
     if (snapshot.state != VideoProbe::State::Ready || snapshot.result != ESP_OK) {
         char line[96] = {};
         snprintf(line, sizeof(line), "视频规格读取失败：%s", esp_err_to_name(snapshot.result));
+        benchmark_restore_music_after_exclusive("profile_probe_failed");
+        show_browser();
         show_status(line, 0xE18A8A);
         ESP_LOGW(TAG, "Video播放前Profile Probe失败：%s", esp_err_to_name(snapshot.result));
         return;
@@ -1466,6 +1403,8 @@ static void profile_probe_tick()
     if (!snapshot.has_video || !snapshot.video_is_mjpeg ||
         snapshot.width == 0U || snapshot.height == 0U ||
         snapshot.width > VideoBenchmark::kWidth || snapshot.height > VideoBenchmark::kHeight) {
+        benchmark_restore_music_after_exclusive("profile_not_supported");
+        show_browser();
         show_status("视频规格不支持", 0xE18A8A);
         ESP_LOGW(TAG,
             "Video Profile不支持：%ux%u video=%s",
@@ -1474,6 +1413,8 @@ static void profile_probe_tick()
         return;
     }
     if (snapshot.has_audio && !snapshot.audio_is_mp3) {
+        benchmark_restore_music_after_exclusive("audio_profile_not_supported");
+        show_browser();
         show_status("音轨需为MP3", 0xE18A8A);
         ESP_LOGW(TAG, "Video Profile不支持：AVI存在音轨但不是MP3");
         return;
@@ -1492,9 +1433,15 @@ static void profile_probe_tick()
         "Video Profile预检通过：%ux%u/%uFPS%s；现在进入Video Exclusive",
         static_cast<unsigned>(snapshot.width), static_cast<unsigned>(snapshot.height),
         static_cast<unsigned>(snapshot.fps), snapshot.has_audio ? " + MP3" : "");
+    const bool chained_from_video = g_music_paused_for_benchmark;
     g_fullcanvas_risk_authorized = true;
     if (!benchmark_start_selected(true)) {
         g_fullcanvas_risk_authorized = false;
+        if (chained_from_video) {
+            show_browser();
+            show_status("下一个视频启动失败", 0xE18A8A);
+            ESP_LOGW(TAG, "自动下一视频：启动失败，已返回视频列表");
+        }
     }
 }
 
@@ -1506,13 +1453,19 @@ static bool start_profile_probe_selected()
     if (ret != ESP_OK) {
         char line[96] = {};
         snprintf(line, sizeof(line), "视频规格读取失败：%s", esp_err_to_name(ret));
+        benchmark_restore_music_after_exclusive("profile_probe_start_failed");
+        show_browser();
         show_status(line, 0xE18A8A);
         ESP_LOGW(TAG, "Video Profile Probe启动失败：%s", esp_err_to_name(ret));
         return false;
     }
     g_profile_probe_pending = true;
     show_status("正在检查视频规格…", 0x8E9AAA);
-    ESP_LOGI(TAG, "Video播放前Profile Probe启动：Music保持后台，不暂停AudioTask");
+    if (g_music_paused_for_benchmark) {
+        ESP_LOGI(TAG, "自动下一视频规格预检启动：保持视频独占，Music继续暂停");
+    } else {
+        ESP_LOGI(TAG, "Video播放前Profile Probe启动：Music保持后台，不暂停AudioTask");
+    }
     return true;
 }
 
@@ -1522,11 +1475,16 @@ static void risk_continue_clicked_cb(lv_event_t *event)
         gesture_router_should_suppress_click() || g_page != VideoPage::Benchmark ||
         !g_risk_prompt_active || g_fullcanvas_risk_authorized) return;
 
+    const bool chained_from_video = g_music_paused_for_benchmark;
     g_risk_prompt_active = false;
     g_fullcanvas_risk_authorized = true;
-    ESP_LOGW(TAG, "用户选择继续播放高负载FullCanvas AVI；保持源FPS，不自动降帧");
+    ESP_LOGW(TAG, "用户选择继续播放高负载460x460 AVI；保持源FPS，不自动降帧");
     if (!benchmark_start_selected(true)) {
         g_fullcanvas_risk_authorized = false;
+        if (chained_from_video) {
+            show_browser();
+            show_status("下一个视频启动失败", 0xE18A8A);
+        }
     }
     gesture_router_reset();
 }
@@ -1536,9 +1494,10 @@ static void risk_cancel_clicked_cb(lv_event_t *event)
     if (event == nullptr || lv_event_get_code(event) != LV_EVENT_CLICKED ||
         gesture_router_should_suppress_click() || g_page != VideoPage::Benchmark ||
         !g_risk_prompt_active) return;
-    ESP_LOGI(TAG, "用户取消高负载FullCanvas AVI播放；Music未暂停，返回Video Browser");
+    ESP_LOGI(TAG, "用户取消高负载460x460 AVI播放；返回视频列表");
     g_fullcanvas_risk_authorized = false;
     g_risk_prompt_active = false;
+    benchmark_restore_music_after_exclusive("risk_cancel");
     show_browser();
     gesture_router_reset();
 }
@@ -1565,6 +1524,7 @@ static void row_clicked_cb(lv_event_t *event)
     }
 
     snprintf(g_selected_path, VideoBrowser::kPathBytes, "%s", g_scratch_path);
+    g_selected_index = index;
     g_fullcanvas_risk_authorized = false;
     g_risk_prompt_active = false;
     (void)start_profile_probe_selected();
@@ -1798,6 +1758,7 @@ static esp_err_t video_leave(AppRunState next_state)
     if (g_page == VideoPage::Benchmark && !g_risk_prompt_active &&
         !benchmark_request_stop("leave")) return ESP_ERR_TIMEOUT;
     g_risk_prompt_active = false;
+    g_eof_transition = EofTransition::None;
     cancel_browser_load();
     if (g_timer != nullptr) lv_timer_pause(g_timer);
     gesture_router_reset();
@@ -1852,6 +1813,8 @@ static void video_destroy()
     g_current_dir = nullptr;
     g_scratch_path = nullptr;
     g_selected_path = nullptr;
+    g_selected_index = kInvalidEntryIndex;
+    g_eof_transition = EofTransition::None;
     g_page = VideoPage::Browser;
     g_risk_prompt_active = false;
     if (!benchmark_presenter_is_running()) benchmark_restore_music_after_exclusive("destroy");
@@ -1878,7 +1841,7 @@ esp_err_t video_app_register()
     descriptor.lifecycle.destroy = video_destroy;
     const esp_err_t ret = app_manager_register(descriptor);
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Video APP已注册：AVI Browser + Native MJPEG Dedicated Presenter + Audio Master A/V Sync V1");
+        ESP_LOGI(TAG, "Video APP已注册：AVI Browser + Dedicated Presenter + Audio Master + 自动下一视频核心");
     }
     return ret;
 }

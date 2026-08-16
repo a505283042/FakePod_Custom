@@ -199,7 +199,6 @@ static bool g_video_restore_paused_music_hardware = false;
 static uint32_t g_video_mp3_sample_rate_hz = 0U;
 static uint16_t g_video_mp3_channels = 0U;
 static uint16_t g_video_mp3_bits_per_sample = 0U;
-static uint64_t g_video_mp3_last_log_frame = 0ULL;
 
 // R.40.4.2：AudioTask 单写、Video Presenter/Decode 多读的 PCM 主时钟发布槽。
 // 不让 Video 直接读取 AudioTask 内部 decoder/clock，避免跨核撕裂 64-bit 计数。
@@ -1601,7 +1600,6 @@ static esp_err_t audio_task_stop_video_mp3_internal(bool restore_music_hardware,
     g_video_mp3_sample_rate_hz = 0U;
     g_video_mp3_channels = 0U;
     g_video_mp3_bits_per_sample = 0U;
-    g_video_mp3_last_log_frame = 0ULL;
     audio_playback_clock_reset(&g_video_playback_clock, 0U);
     audio_task_publish_video_clock_snapshot();
 
@@ -1611,10 +1609,8 @@ static esp_err_t audio_task_stop_video_mp3_internal(bool restore_music_hardware,
     }
     g_video_restore_paused_music_hardware = false;
 
-    ESP_LOGI(TAG, "AVI MP3 Audio Pipeline已停止：reason=%s restore_music=%u ret=%s",
-        reason != nullptr ? reason : "unknown",
-        static_cast<unsigned>(should_restore),
-        esp_err_to_name(first_error));
+    ESP_LOGI(TAG, "视频音频已停止：恢复Music硬件=%u 结果=%s",
+        static_cast<unsigned>(should_restore), esp_err_to_name(first_error));
     return first_error;
 }
 
@@ -1693,7 +1689,6 @@ static void audio_task_handle_video_mp3_start(AudioRequest *request)
     g_video_mp3_bits_per_sample = g_video_mp3_decoder.bits_per_sample;
     audio_playback_clock_reset(&g_video_playback_clock, g_video_mp3_sample_rate_hz);
     g_video_mp3_eof = false;
-    g_video_mp3_last_log_frame = 0ULL;
 
     ret = audio_task_start_output_hardware(
         g_video_mp3_sample_rate_hz,
@@ -1718,14 +1713,10 @@ static void audio_task_handle_video_mp3_start(AudioRequest *request)
     g_video_mp3_active = true;
     g_video_mp3_start_released = !request->video_start_barrier_armed;
     audio_task_publish_video_clock_snapshot();
-    ESP_LOGI(TAG,
-        "AVI MP3 Audio Pipeline已%s：%luHz/%ubit/%uch；Music decoder保持%s，AudioTask继续唯一持有I2S/CS43131；A/V PCM Clock rev=%lu",
-        g_video_mp3_start_released ? "启动" : "预备并等待A/V Start Barrier",
+    ESP_LOGI(TAG, "视频音频已%s：%luHz/%uch",
+        g_video_mp3_start_released ? "启动" : "预备",
         static_cast<unsigned long>(g_video_mp3_sample_rate_hz),
-        static_cast<unsigned>(g_video_mp3_bits_per_sample),
-        static_cast<unsigned>(g_video_mp3_channels),
-        g_video_restore_paused_music_hardware ? "Paused原位" : "无活动Music",
-        static_cast<unsigned long>(g_video_clock_revision));
+        static_cast<unsigned>(g_video_mp3_channels));
     audio_request_complete(request, true, ESP_OK);
 }
 
@@ -1743,7 +1734,7 @@ static void audio_task_handle_video_mp3_release_start(AudioRequest *request)
     if (!g_video_mp3_start_released) {
         g_video_mp3_start_released = true;
         audio_task_publish_video_clock_snapshot();
-        ESP_LOGI(TAG, "AVI MP3 A/V Start Barrier已解除：真实PCM现在开始提交I2S");
+        ESP_LOGI(TAG, "视频音频同步闸门已解除");
     }
     audio_request_complete(request, true, ESP_OK);
 }
@@ -1828,33 +1819,6 @@ static void audio_task_service_video_mp3()
     }
     audio_playback_clock_commit_pcm(&g_video_playback_clock, frames);
     audio_task_publish_video_clock_snapshot();
-
-    const uint64_t log_step = static_cast<uint64_t>(g_video_mp3_sample_rate_hz) * 5ULL;
-    if (log_step != 0ULL &&
-        g_video_playback_clock.submitted_frames - g_video_mp3_last_log_frame >= log_step) {
-        g_video_mp3_last_log_frame = g_video_playback_clock.submitted_frames;
-        AviMp3BridgeSnapshot bridge = {};
-        (void)avi_mp3_bridge_get_snapshot(&bridge);
-        const uint32_t read_wait_avg_us = bridge.read_wait_count != 0U
-            ? static_cast<uint32_t>(bridge.read_wait_us_total / bridge.read_wait_count)
-            : 0U;
-        ESP_LOGI(TAG,
-            "AVI MP3 Audio：pcm=%llums submitted=%lluf decoder=%lluf bridge=%u/%uB high=%uB push_wait=%lu read_wait=%lu avg=%luus max=%luus >1ms=%lu >5ms=%lu >10ms=%lu timeout20ms=%lu",
-            static_cast<unsigned long long>(audio_playback_clock_position_ms(&g_video_playback_clock)),
-            static_cast<unsigned long long>(g_video_playback_clock.submitted_frames),
-            static_cast<unsigned long long>(g_video_playback_clock.decoder_frames),
-            static_cast<unsigned>(bridge.buffered_bytes),
-            static_cast<unsigned>(bridge.capacity_bytes),
-            static_cast<unsigned>(bridge.high_water_bytes),
-            static_cast<unsigned long>(bridge.push_wait_count),
-            static_cast<unsigned long>(bridge.read_wait_count),
-            static_cast<unsigned long>(read_wait_avg_us),
-            static_cast<unsigned long>(bridge.read_wait_us_max),
-            static_cast<unsigned long>(bridge.read_wait_over_1ms),
-            static_cast<unsigned long>(bridge.read_wait_over_5ms),
-            static_cast<unsigned long>(bridge.read_wait_over_10ms),
-            static_cast<unsigned long>(bridge.read_wait_timeout_count));
-    }
 }
 
 static bool audio_task_pipeline_has_resources()
