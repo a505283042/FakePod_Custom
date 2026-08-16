@@ -49,6 +49,17 @@ bool audio_service_video_mp3_start(
     uint8_t bits_per_sample,
     bool wait = true
 );
+
+// R.40.4.3：A/V Start Barrier。prepare 只完成 MP3 decoder + I2S/DAC 预备并保持静音零PCM，
+// 不消费/提交真实 PCM；Dedicated Presenter 在首帧窗口和黑场准备完成后调用 release_start，
+// 让首个真实 PCM 与首个视频帧从同一启动边界并行前进。
+bool audio_service_video_mp3_prepare(
+    uint32_t sample_rate_hz,
+    uint8_t channels,
+    uint8_t bits_per_sample,
+    bool wait = true
+);
+bool audio_service_video_mp3_release_start(bool wait = true);
 bool audio_service_video_mp3_stop(bool wait = true);
 
 // R.40.4.2：Video Presenter / PreDecode 只读的 AVI MP3 PCM 主时钟快照。
@@ -58,6 +69,7 @@ struct AudioVideoClockSnapshot
 {
     bool active = false;
     bool eof = false;
+    bool start_released = true;
     uint32_t revision = 0U;
     uint32_t sample_rate_hz = 0U;
     uint64_t submitted_frames = 0ULL;

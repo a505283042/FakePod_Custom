@@ -165,6 +165,8 @@ static lv_obj_t *g_probe_title = nullptr;
 static lv_obj_t *g_probe_video = nullptr;
 static lv_obj_t *g_probe_audio = nullptr;
 static lv_obj_t *g_probe_misc = nullptr;
+static lv_obj_t *g_risk_continue = nullptr;
+static lv_obj_t *g_risk_cancel = nullptr;
 static lv_timer_t *g_timer = nullptr;
 static VideoPage g_page = VideoPage::Browser;
 static VideoBrowser::DirectorySnapshot g_directory = {};
@@ -178,6 +180,9 @@ static TaskHandle_t g_present_task = nullptr;
 static bool g_present_running = false;
 static bool g_present_stop_requested = false;
 static bool g_music_paused_for_benchmark = false;
+static bool g_fullcanvas_risk_authorized = false;
+static bool g_profile_probe_pending = false;
+static bool g_risk_prompt_active = false;
 
 static esp_err_t cleanup_create_failure(esp_err_t err)
 {
@@ -195,6 +200,8 @@ static esp_err_t cleanup_create_failure(esp_err_t err)
     g_probe_video = nullptr;
     g_probe_audio = nullptr;
     g_probe_misc = nullptr;
+    g_risk_continue = nullptr;
+    g_risk_cancel = nullptr;
     if (g_current_dir != nullptr) heap_caps_free(g_current_dir);
     if (g_scratch_path != nullptr) heap_caps_free(g_scratch_path);
     if (g_selected_path != nullptr) heap_caps_free(g_selected_path);
@@ -295,7 +302,7 @@ static void update_header()
 {
     if (g_header_title == nullptr) return;
     if (g_page == VideoPage::Benchmark) {
-        lv_label_set_text(g_header_title, "MJPEG Benchmark");
+        lv_label_set_text(g_header_title, g_risk_prompt_active ? "视频" : "MJPEG Benchmark");
     } else if (g_current_dir != nullptr && strcmp(g_current_dir, VideoBrowser::kRootDirectory) != 0) {
         lv_label_set_text(g_header_title, basename_of(g_current_dir));
     } else {
@@ -462,11 +469,17 @@ static void browser_load_tick()
 static void show_browser()
 {
     g_page = VideoPage::Browser;
+    g_fullcanvas_risk_authorized = false;
+    g_risk_prompt_active = false;
     if (g_timer != nullptr) lv_timer_set_period(g_timer, kBrowserTimerPeriodMs);
     set_visible(g_root, true);
     set_visible(g_browser_host, true);
     set_visible(g_probe_host, false);
+    set_visible(g_risk_continue, false);
+    set_visible(g_risk_cancel, false);
     update_header();
+    // Profile Probe 状态页会隐藏5行列表和位置标签；返回Browser时必须恢复列表可见状态。
+    update_rows();
     gesture_router_reset();
 }
 
@@ -666,6 +679,7 @@ static void benchmark_presenter_task(void *arg)
     bool clock_started = false;
     bool audio_master_expected = false;
     bool audio_master_logged = false;
+    bool audio_start_barrier_released = false;
     uint32_t first_pts_ms = 0U;
     uint32_t audio_first_pts_ms = 0U;
     int64_t clock_base_us = 0LL;
@@ -874,6 +888,26 @@ static void benchmark_presenter_task(void *arg)
                 static_cast<unsigned>(frame_x), static_cast<unsigned>(frame_y),
                 static_cast<unsigned>(scan_phase_delay_us),
                 static_cast<unsigned>(frame_y));
+        }
+
+        if (audio_master_expected && !audio_start_barrier_released) {
+            // 首张RGB已经ready，BoundedSPI session/黑场也准备完毕；到这里才允许AudioTask
+            // 消费Bridge并提交第一块真实PCM。Presenter/Core1 与 AudioTask/Core0 从同一边界并行启动。
+            const int64_t release_started_us = esp_timer_get_time();
+            if (!audio_service_video_mp3_release_start(true)) {
+                ESP_LOGE(TAG, "A/V Start Barrier解除失败；停止本次Video");
+                benchmark_presenter_set_error(ESP_FAIL);
+                VideoBenchmark::release_frame(frame.slot);
+                VideoBenchmark::stop();
+                break;
+            }
+            const int64_t release_wait_us = esp_timer_get_time() - release_started_us;
+            audio_start_barrier_released = true;
+            ESP_LOGI(TAG,
+                "A/V同步启动：Barrier=%lldus master=AudioPCM compensation=0ms video_pts0=%lums audio_pts0=%lums",
+                static_cast<long long>(release_wait_us),
+                static_cast<unsigned long>(first_pts_ms),
+                static_cast<unsigned long>(audio_first_pts_ms));
         }
 
         BenchmarkFrameStripContext strip_context = {};
@@ -1185,7 +1219,15 @@ static void benchmark_show_terminal(const VideoBenchmark::Snapshot &snapshot)
     g_benchmark_ui.cleanup_pending = true;
     const char *terminal_reason =
         snapshot.state == VideoBenchmark::State::Eof ? "eof" : "terminal";
-    if (benchmark_stop_avi_audio(terminal_reason)) {
+    const bool profile_risk_prompt =
+        !g_fullcanvas_risk_authorized && snapshot.result == ESP_ERR_NOT_SUPPORTED &&
+        snapshot.width == VideoBenchmark::kWidth && snapshot.height == VideoBenchmark::kHeight &&
+        snapshot.fps_hint > 20U;
+    if (profile_risk_prompt) {
+        // 风险探测在 AVI Audio/JPEG 真正启动前就退出；不要把“没有AVI Audio可停”记成错误。
+        // 这里只恢复刚才为了探测而暂停的Music，让用户在确认界面期间继续听原歌曲。
+        benchmark_restore_music_after_exclusive("profile_risk_prompt");
+    } else if (benchmark_stop_avi_audio(terminal_reason)) {
         benchmark_restore_music_after_exclusive(terminal_reason);
     }
 
@@ -1201,10 +1243,17 @@ static void benchmark_show_terminal(const VideoBenchmark::Snapshot &snapshot)
     const bool pass = terminal_error == ESP_OK && snapshot.state == VideoBenchmark::State::Eof &&
         snapshot.decode_failures == 0U && ui.display_failures == 0U;
 
+    const bool risky_fullcanvas = profile_risk_prompt && terminal_error == ESP_ERR_NOT_SUPPORTED;
+
     char line1[180] = {};
     char line2[180] = {};
     char line3[200] = {};
-    if (pass) {
+    if (risky_fullcanvas) {
+        snprintf(line1, sizeof(line1), "460x460 / %uFPS",
+            static_cast<unsigned>(snapshot.fps_hint));
+        snprintf(line2, sizeof(line2), "高帧率可能掉帧或断音");
+        snprintf(line3, sizeof(line3), "建议转为20FPS");
+    } else if (pass) {
         snprintf(line1, sizeof(line1), "Native MJPEG Benchmark PASS\n显示 %lu 帧  丢帧 %lu",
             static_cast<unsigned long>(ui.presented),
             static_cast<unsigned long>(ui.dropped));
@@ -1212,25 +1261,36 @@ static void benchmark_show_terminal(const VideoBenchmark::Snapshot &snapshot)
         snprintf(line1, sizeof(line1), "Benchmark结束：%s\n错误：%s",
             VideoBenchmark::state_name(snapshot.state), esp_err_to_name(terminal_error));
     }
-    snprintf(line2, sizeof(line2), "实测 %lu.%03lu fps\nJPEG %lu.%03lu ms avg / %lu.%03lu max",
-        static_cast<unsigned long>(fps_milli / 1000U),
-        static_cast<unsigned long>(fps_milli % 1000U),
-        static_cast<unsigned long>(decode_avg_us / 1000U),
-        static_cast<unsigned long>(decode_avg_us % 1000U),
-        static_cast<unsigned long>(snapshot.decode_us_max / 1000U),
-        static_cast<unsigned long>(snapshot.decode_us_max % 1000U));
-    snprintf(line3, sizeof(line3), "TF %lu.%03lu ms avg  Display %lu.%03lu ms avg\npool_skip=%lu gate=%lu次  Dedicated Presenter",
-        static_cast<unsigned long>(storage_avg_us / 1000U),
-        static_cast<unsigned long>(storage_avg_us % 1000U),
-        static_cast<unsigned long>(display_avg_us / 1000U),
-        static_cast<unsigned long>(display_avg_us % 1000U),
-        static_cast<unsigned long>(snapshot.frames_pool_skipped),
-        static_cast<unsigned long>(snapshot.storage_gate_wait_count));
+    if (!risky_fullcanvas) {
+        snprintf(line2, sizeof(line2), "实测 %lu.%03lu fps\nJPEG %lu.%03lu ms avg / %lu.%03lu max",
+            static_cast<unsigned long>(fps_milli / 1000U),
+            static_cast<unsigned long>(fps_milli % 1000U),
+            static_cast<unsigned long>(decode_avg_us / 1000U),
+            static_cast<unsigned long>(decode_avg_us % 1000U),
+            static_cast<unsigned long>(snapshot.decode_us_max / 1000U),
+            static_cast<unsigned long>(snapshot.decode_us_max % 1000U));
+        snprintf(line3, sizeof(line3), "TF %lu.%03lu ms avg  Display %lu.%03lu ms avg\npool_skip=%lu gate=%lu次  Dedicated Presenter",
+            static_cast<unsigned long>(storage_avg_us / 1000U),
+            static_cast<unsigned long>(storage_avg_us % 1000U),
+            static_cast<unsigned long>(display_avg_us / 1000U),
+            static_cast<unsigned long>(display_avg_us % 1000U),
+            static_cast<unsigned long>(snapshot.frames_pool_skipped),
+            static_cast<unsigned long>(snapshot.storage_gate_wait_count));
+    }
 
+    if (risky_fullcanvas) lv_label_set_text(g_probe_title, "播放提示");
     lv_label_set_text(g_probe_video, line1);
     lv_label_set_text(g_probe_audio, line2);
     lv_label_set_text(g_probe_misc, line3);
+    set_visible(g_risk_continue, risky_fullcanvas);
+    set_visible(g_risk_cancel, risky_fullcanvas);
     lv_obj_invalidate(g_root);
+
+    if (risky_fullcanvas) {
+        ESP_LOGW(TAG,
+            "Video播放前风险确认：460x460/%uFPS > 稳定档位20FPS；Music已恢复，等待用户选择继续播放或取消",
+            static_cast<unsigned>(snapshot.fps_hint));
+    }
 
     ESP_LOGI(TAG,
         "MJPEG Benchmark UI结束：state=%s result=%s present=%lu drop=%lu fps=%lu.%03lu display_avg=%luus max=%luus stream_max=%luus TEmax=%luus display_fail=%lu",
@@ -1274,6 +1334,12 @@ static void show_launcher()
 static void go_back()
 {
     if (g_page == VideoPage::Benchmark) {
+        if (g_risk_prompt_active) {
+            ESP_LOGI(TAG, "用户关闭高负载视频提示；Music未暂停，直接返回Video Browser");
+            show_browser();
+            lv_obj_invalidate(g_root);
+            return;
+        }
         if (!benchmark_request_stop("back")) return;
         show_browser();
         lv_obj_invalidate(g_root);
@@ -1289,11 +1355,199 @@ static void go_back()
     begin_browser_load();
 }
 
+static bool benchmark_start_selected(bool allow_fullcanvas_over20)
+{
+    const esp_err_t cleanup_ret = VideoBenchmark::cleanup();
+    if (cleanup_ret != ESP_OK && cleanup_ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "Video启动前资源清理失败：%s", esp_err_to_name(cleanup_ret));
+        return false;
+    }
+    if (!benchmark_pause_music_for_exclusive()) {
+        show_status("无法暂停当前Music，Video Exclusive未启动", 0xE18A8A);
+        return false;
+    }
+
+    g_page = VideoPage::Benchmark;
+    if (g_timer != nullptr) lv_timer_set_period(g_timer, kBenchmarkTimerPeriodMs);
+    set_visible(g_browser_host, false);
+    set_visible(g_probe_host, true);
+    set_visible(g_risk_continue, false);
+    set_visible(g_risk_cancel, false);
+    update_header();
+    lv_label_set_text(g_probe_title, basename_of(g_selected_path));
+    lv_label_set_text(g_probe_video, "正在准备AVI播放…");
+    lv_label_set_text(g_probe_audio, "Dedicated Presenter + Audio PCM Master");
+    lv_label_set_text(g_probe_misc, "MJPEG + MP3 / CO5300");
+
+    // 高负载风险已在VideoProbe预检阶段完成；真正进入这里才暂停Music并启动AVI。
+    set_visible(g_root, false);
+    g_benchmark_ui = {};
+    const esp_err_t ret = VideoBenchmark::start(g_selected_path, allow_fullcanvas_over20);
+    if (ret != ESP_OK) {
+        char line[128] = {};
+        snprintf(line, sizeof(line), "Benchmark启动失败：%s", esp_err_to_name(ret));
+        lv_label_set_text(g_probe_video, line);
+        g_benchmark_ui.terminal_shown = true;
+        g_benchmark_ui.cleanup_pending = true;
+        (void)benchmark_stop_avi_audio("benchmark_start_failed");
+        benchmark_restore_music_after_exclusive("benchmark_start_failed");
+        set_visible(g_root, true);
+        if (g_timer != nullptr) lv_timer_set_period(g_timer, kBrowserTimerPeriodMs);
+        return false;
+    }
+
+    const esp_err_t presenter_ret = benchmark_presenter_start();
+    if (presenter_ret != ESP_OK) {
+        VideoBenchmark::stop();
+        g_benchmark_ui.display_error = presenter_ret;
+        g_benchmark_ui.cleanup_pending = true;
+        if (benchmark_stop_avi_audio("presenter_start_failed")) {
+            benchmark_restore_music_after_exclusive("presenter_start_failed");
+        }
+        char line[128] = {};
+        snprintf(line, sizeof(line), "Presenter启动失败：%s", esp_err_to_name(presenter_ret));
+        lv_label_set_text(g_probe_video, line);
+        set_visible(g_root, true);
+        if (g_timer != nullptr) lv_timer_set_period(g_timer, kBrowserTimerPeriodMs);
+        return false;
+    }
+    return true;
+}
+
+static void show_fullcanvas_risk_prompt(const VideoProbe::Snapshot &snapshot)
+{
+    g_profile_probe_pending = false;
+    g_fullcanvas_risk_authorized = false;
+    g_risk_prompt_active = true;
+    g_page = VideoPage::Benchmark;
+    g_benchmark_ui = {};
+    // 当前没有VideoBenchmark在运行，防止benchmark_tick读取上一轮terminal snapshot覆盖提示。
+    g_benchmark_ui.terminal_shown = true;
+    if (g_timer != nullptr) lv_timer_set_period(g_timer, kBrowserTimerPeriodMs);
+    set_visible(g_root, true);
+    set_visible(g_browser_host, false);
+    set_visible(g_probe_host, true);
+    set_visible(g_risk_cancel, true);
+    set_visible(g_risk_continue, true);
+    update_header();
+
+    char profile[64] = {};
+    snprintf(profile, sizeof(profile), "460x460 / %uFPS", static_cast<unsigned>(snapshot.fps));
+    lv_label_set_text(g_probe_title, "播放提示");
+    lv_label_set_text(g_probe_video, profile);
+    lv_label_set_text(g_probe_audio, "高帧率可能掉帧或断音");
+    lv_label_set_text(g_probe_misc, "建议转为20FPS");
+    lv_obj_invalidate(g_root);
+
+    ESP_LOGW(TAG,
+        "Video播放前风险确认：460x460/%uFPS > 稳定档位20FPS；VideoProbe仅查metadata，Music保持连续，等待用户选择",
+        static_cast<unsigned>(snapshot.fps));
+}
+
+static void profile_probe_tick()
+{
+    if (!g_profile_probe_pending || g_page != VideoPage::Browser) return;
+
+    VideoProbe::Snapshot snapshot = {};
+    if (!VideoProbe::get_snapshot(&snapshot)) return;
+    if (snapshot.state == VideoProbe::State::Running || snapshot.state == VideoProbe::State::Idle) return;
+
+    g_profile_probe_pending = false;
+    VideoProbe::cancel();
+
+    if (snapshot.state != VideoProbe::State::Ready || snapshot.result != ESP_OK) {
+        char line[96] = {};
+        snprintf(line, sizeof(line), "视频规格读取失败：%s", esp_err_to_name(snapshot.result));
+        show_status(line, 0xE18A8A);
+        ESP_LOGW(TAG, "Video播放前Profile Probe失败：%s", esp_err_to_name(snapshot.result));
+        return;
+    }
+
+    if (!snapshot.has_video || !snapshot.video_is_mjpeg ||
+        snapshot.width == 0U || snapshot.height == 0U ||
+        snapshot.width > VideoBenchmark::kWidth || snapshot.height > VideoBenchmark::kHeight) {
+        show_status("视频规格不支持", 0xE18A8A);
+        ESP_LOGW(TAG,
+            "Video Profile不支持：%ux%u video=%s",
+            static_cast<unsigned>(snapshot.width), static_cast<unsigned>(snapshot.height),
+            snapshot.video_is_mjpeg ? "MJPEG" : "非MJPEG");
+        return;
+    }
+    if (snapshot.has_audio && !snapshot.audio_is_mp3) {
+        show_status("音轨需为MP3", 0xE18A8A);
+        ESP_LOGW(TAG, "Video Profile不支持：AVI存在音轨但不是MP3");
+        return;
+    }
+
+    const bool risky_fullcanvas =
+        snapshot.width == VideoBenchmark::kWidth &&
+        snapshot.height == VideoBenchmark::kHeight && snapshot.fps > 20U;
+    if (risky_fullcanvas) {
+        show_fullcanvas_risk_prompt(snapshot);
+        return;
+    }
+
+    // Profile安全：到这里才进入Video Exclusive，Music只暂停一次，不再发生“探测->恢复->再暂停”的卡顿。
+    ESP_LOGI(TAG,
+        "Video Profile预检通过：%ux%u/%uFPS%s；现在进入Video Exclusive",
+        static_cast<unsigned>(snapshot.width), static_cast<unsigned>(snapshot.height),
+        static_cast<unsigned>(snapshot.fps), snapshot.has_audio ? " + MP3" : "");
+    g_fullcanvas_risk_authorized = true;
+    if (!benchmark_start_selected(true)) {
+        g_fullcanvas_risk_authorized = false;
+    }
+}
+
+static bool start_profile_probe_selected()
+{
+    if (g_selected_path == nullptr || g_selected_path[0] == '\0' || g_profile_probe_pending) return false;
+    VideoProbe::cancel();
+    const esp_err_t ret = VideoProbe::start(g_selected_path);
+    if (ret != ESP_OK) {
+        char line[96] = {};
+        snprintf(line, sizeof(line), "视频规格读取失败：%s", esp_err_to_name(ret));
+        show_status(line, 0xE18A8A);
+        ESP_LOGW(TAG, "Video Profile Probe启动失败：%s", esp_err_to_name(ret));
+        return false;
+    }
+    g_profile_probe_pending = true;
+    show_status("正在检查视频规格…", 0x8E9AAA);
+    ESP_LOGI(TAG, "Video播放前Profile Probe启动：Music保持后台，不暂停AudioTask");
+    return true;
+}
+
+static void risk_continue_clicked_cb(lv_event_t *event)
+{
+    if (event == nullptr || lv_event_get_code(event) != LV_EVENT_CLICKED ||
+        gesture_router_should_suppress_click() || g_page != VideoPage::Benchmark ||
+        !g_risk_prompt_active || g_fullcanvas_risk_authorized) return;
+
+    g_risk_prompt_active = false;
+    g_fullcanvas_risk_authorized = true;
+    ESP_LOGW(TAG, "用户选择继续播放高负载FullCanvas AVI；保持源FPS，不自动降帧");
+    if (!benchmark_start_selected(true)) {
+        g_fullcanvas_risk_authorized = false;
+    }
+    gesture_router_reset();
+}
+
+static void risk_cancel_clicked_cb(lv_event_t *event)
+{
+    if (event == nullptr || lv_event_get_code(event) != LV_EVENT_CLICKED ||
+        gesture_router_should_suppress_click() || g_page != VideoPage::Benchmark ||
+        !g_risk_prompt_active) return;
+    ESP_LOGI(TAG, "用户取消高负载FullCanvas AVI播放；Music未暂停，返回Video Browser");
+    g_fullcanvas_risk_authorized = false;
+    g_risk_prompt_active = false;
+    show_browser();
+    gesture_router_reset();
+}
+
 static void row_clicked_cb(lv_event_t *event)
 {
     if (event == nullptr || lv_event_get_code(event) != LV_EVENT_CLICKED ||
         gesture_router_should_suppress_click() || g_page != VideoPage::Browser ||
-        g_browser_load.phase != BrowserLoadPhase::Idle) return;
+        g_profile_probe_pending || g_browser_load.phase != BrowserLoadPhase::Idle) return;
     const uintptr_t encoded = reinterpret_cast<uintptr_t>(lv_event_get_user_data(event));
     if (encoded == 0U) return;
     const size_t slot = static_cast<size_t>(encoded - 1U);
@@ -1311,51 +1565,9 @@ static void row_clicked_cb(lv_event_t *event)
     }
 
     snprintf(g_selected_path, VideoBrowser::kPathBytes, "%s", g_scratch_path);
-    if (!benchmark_pause_music_for_exclusive()) {
-        show_status("无法暂停当前Music，Video Exclusive未启动", 0xE18A8A);
-        gesture_router_reset();
-        return;
-    }
-    g_page = VideoPage::Benchmark;
-    if (g_timer != nullptr) lv_timer_set_period(g_timer, kBenchmarkTimerPeriodMs);
-    set_visible(g_browser_host, false);
-    set_visible(g_probe_host, true);
-    update_header();
-    lv_label_set_text(g_probe_title, name);
-    lv_label_set_text(g_probe_video, "准备 460x460 MJPEG 解码…");
-    lv_label_set_text(g_probe_audio, "Dedicated Presenter + Unified PTS + CO5300 BoundedSPI");
-    lv_label_set_text(g_probe_misc, "R.40.4.1：AVI MJPEG + MP3 Audio Pipeline V1；启动AVI前暂停Music\nMP3->32KB Bridge->AudioTask->PCM/CS43131，右滑停止后恢复Music");
-    // 物理 GRAM 即将由 BoundedSPI 视频帧接管。提前隐藏 Video LVGL root，留出至少一个
-    // decoder warm-up 窗口让 LVGL 消化隐藏 invalidation；播放期间不再产生覆盖视频的 repaint。
-    set_visible(g_root, false);
-    g_benchmark_ui = {};
-    const esp_err_t ret = VideoBenchmark::start(g_selected_path);
-    if (ret != ESP_OK) {
-        char line[128] = {};
-        snprintf(line, sizeof(line), "Benchmark启动失败：%s", esp_err_to_name(ret));
-        lv_label_set_text(g_probe_video, line);
-        g_benchmark_ui.terminal_shown = true;
-        g_benchmark_ui.cleanup_pending = true;
-        (void)benchmark_stop_avi_audio("benchmark_start_failed");
-        benchmark_restore_music_after_exclusive("benchmark_start_failed");
-        set_visible(g_root, true);
-        if (g_timer != nullptr) lv_timer_set_period(g_timer, kBrowserTimerPeriodMs);
-    } else {
-        const esp_err_t presenter_ret = benchmark_presenter_start();
-        if (presenter_ret != ESP_OK) {
-            VideoBenchmark::stop();
-            g_benchmark_ui.display_error = presenter_ret;
-            g_benchmark_ui.cleanup_pending = true;
-            if (benchmark_stop_avi_audio("presenter_start_failed")) {
-                benchmark_restore_music_after_exclusive("presenter_start_failed");
-            }
-            char line[128] = {};
-            snprintf(line, sizeof(line), "Presenter启动失败：%s", esp_err_to_name(presenter_ret));
-            lv_label_set_text(g_probe_video, line);
-            set_visible(g_root, true);
-            if (g_timer != nullptr) lv_timer_set_period(g_timer, kBrowserTimerPeriodMs);
-        }
-    }
+    g_fullcanvas_risk_authorized = false;
+    g_risk_prompt_active = false;
+    (void)start_profile_probe_selected();
     gesture_router_reset();
 }
 
@@ -1371,6 +1583,7 @@ static void timer_cb(lv_timer_t *timer)
     (void)timer;
     if (g_root == nullptr || app_manager_foreground() != AppId::Video) return;
     browser_load_tick();
+    profile_probe_tick();
     benchmark_tick();
 
     UiGestureAction action = UiGestureAction::None;
@@ -1518,7 +1731,34 @@ static esp_err_t video_create()
     lv_obj_set_width(g_probe_title, 388); lv_label_set_long_mode(g_probe_title, LV_LABEL_LONG_DOT); lv_obj_align(g_probe_title, LV_ALIGN_TOP_LEFT, 0, 0);
     lv_obj_set_width(g_probe_video, 388); lv_label_set_long_mode(g_probe_video, LV_LABEL_LONG_WRAP); lv_obj_align(g_probe_video, LV_ALIGN_TOP_LEFT, 0, 62);
     lv_obj_set_width(g_probe_audio, 388); lv_label_set_long_mode(g_probe_audio, LV_LABEL_LONG_WRAP); lv_obj_align(g_probe_audio, LV_ALIGN_TOP_LEFT, 0, 150);
-    lv_obj_set_width(g_probe_misc, 388); lv_label_set_long_mode(g_probe_misc, LV_LABEL_LONG_WRAP); lv_obj_align(g_probe_misc, LV_ALIGN_TOP_LEFT, 0, 238);
+    lv_obj_set_width(g_probe_misc, 388); lv_label_set_long_mode(g_probe_misc, LV_LABEL_LONG_WRAP); lv_obj_align(g_probe_misc, LV_ALIGN_TOP_LEFT, 0, 226);
+
+    g_risk_cancel = lv_button_create(g_probe_host);
+    g_risk_continue = lv_button_create(g_probe_host);
+    if (g_risk_cancel == nullptr || g_risk_continue == nullptr) return cleanup_create_failure(ESP_ERR_NO_MEM);
+    ui_common_lock_object(g_risk_cancel);
+    ui_common_lock_object(g_risk_continue);
+    lv_obj_set_size(g_risk_cancel, 174, 46);
+    lv_obj_set_size(g_risk_continue, 174, 46);
+    lv_obj_align(g_risk_cancel, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_align(g_risk_continue, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_radius(g_risk_cancel, 12, 0);
+    lv_obj_set_style_radius(g_risk_continue, 12, 0);
+    lv_obj_set_style_border_width(g_risk_cancel, 0, 0);
+    lv_obj_set_style_border_width(g_risk_continue, 0, 0);
+    lv_obj_set_style_bg_color(g_risk_cancel, lv_color_hex(0x232B36), 0);
+    lv_obj_set_style_bg_color(g_risk_continue, lv_color_hex(0x7B2D2D), 0);
+    lv_obj_set_style_bg_opa(g_risk_cancel, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_opa(g_risk_continue, LV_OPA_COVER, 0);
+    lv_obj_add_event_cb(g_risk_cancel, risk_cancel_clicked_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(g_risk_continue, risk_continue_clicked_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *cancel_label = make_label(g_risk_cancel, "取消", 0xE8EDF4, LV_TEXT_ALIGN_CENTER);
+    lv_obj_t *continue_label = make_label(g_risk_continue, "继续播放", 0xFFFFFF, LV_TEXT_ALIGN_CENTER);
+    if (cancel_label == nullptr || continue_label == nullptr) return cleanup_create_failure(ESP_ERR_NO_MEM);
+    lv_obj_center(cancel_label);
+    lv_obj_center(continue_label);
+    set_visible(g_risk_cancel, false);
+    set_visible(g_risk_continue, false);
     set_visible(g_probe_host, false);
 
     g_timer = lv_timer_create(timer_cb, kBrowserTimerPeriodMs, nullptr);
@@ -1551,7 +1791,13 @@ static esp_err_t video_enter()
 static esp_err_t video_leave(AppRunState next_state)
 {
     (void)next_state;
-    if (g_page == VideoPage::Benchmark && !benchmark_request_stop("leave")) return ESP_ERR_TIMEOUT;
+    if (g_profile_probe_pending) {
+        VideoProbe::cancel();
+        g_profile_probe_pending = false;
+    }
+    if (g_page == VideoPage::Benchmark && !g_risk_prompt_active &&
+        !benchmark_request_stop("leave")) return ESP_ERR_TIMEOUT;
+    g_risk_prompt_active = false;
     cancel_browser_load();
     if (g_timer != nullptr) lv_timer_pause(g_timer);
     gesture_router_reset();
@@ -1564,7 +1810,9 @@ static esp_err_t video_leave(AppRunState next_state)
 
 static void video_destroy()
 {
-    if (g_page == VideoPage::Benchmark || g_benchmark_ui.cleanup_pending) {
+    VideoProbe::cancel();
+    g_profile_probe_pending = false;
+    if ((g_page == VideoPage::Benchmark && !g_risk_prompt_active) || g_benchmark_ui.cleanup_pending) {
         benchmark_request_stop("destroy");
         const TickType_t wait_tick = pdMS_TO_TICKS(10);
         const uint32_t attempts = kDestroyCleanupWaitMs / 10U;
@@ -1595,6 +1843,8 @@ static void video_destroy()
     g_probe_video = nullptr;
     g_probe_audio = nullptr;
     g_probe_misc = nullptr;
+    g_risk_continue = nullptr;
+    g_risk_cancel = nullptr;
     if (g_root != nullptr) { lv_obj_delete(g_root); g_root = nullptr; }
     if (g_current_dir != nullptr) heap_caps_free(g_current_dir);
     if (g_scratch_path != nullptr) heap_caps_free(g_scratch_path);
@@ -1603,6 +1853,7 @@ static void video_destroy()
     g_scratch_path = nullptr;
     g_selected_path = nullptr;
     g_page = VideoPage::Browser;
+    g_risk_prompt_active = false;
     if (!benchmark_presenter_is_running()) benchmark_restore_music_after_exclusive("destroy");
     g_benchmark_ui = {};
     ESP_LOGI(TAG, "Video destroy完成：LVGL/目录索引/路径PSRAM已释放；Benchmark已请求回收，Exclusive Music状态已处理");

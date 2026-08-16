@@ -92,6 +92,7 @@ struct TaskArgs
 {
     char *path = nullptr; // PSRAM
     uint32_t generation = 0U;
+    bool allow_fullcanvas_over20 = false;
 };
 
 struct ExtractTaskArgs
@@ -349,7 +350,10 @@ static esp_err_t wait_audio_prebuffer(
     return ESP_ERR_INVALID_STATE;
 }
 
-static esp_err_t validate_stream(esp_extractor_handle_t extractor, Snapshot *snapshot)
+static esp_err_t validate_stream(
+    esp_extractor_handle_t extractor,
+    Snapshot *snapshot,
+    bool allow_fullcanvas_over20)
 {
     if (extractor == nullptr || snapshot == nullptr) return ESP_ERR_INVALID_ARG;
     uint16_t video_num = 0U;
@@ -372,6 +376,22 @@ static esp_err_t validate_stream(esp_extractor_handle_t extractor, Snapshot *sna
             static_cast<unsigned>(snapshot->width), static_cast<unsigned>(snapshot->height),
             static_cast<unsigned>(kWidth), static_cast<unsigned>(kHeight));
         return ESP_ERR_INVALID_SIZE;
+    }
+
+    // 460x460 + >20FPS 在实机上可能因 JPEG 解码长期超过帧预算，最终反压 AVI Demux 并造成 MP3 断音。
+    // 不做运行时自动降帧：首次启动只返回风险信号，由 UI 让用户决定是否仍按源FPS播放。
+    const bool fullcanvas_over20 =
+        snapshot->width == kWidth && snapshot->height == kHeight && snapshot->fps_hint > 20U;
+    if (fullcanvas_over20 && !allow_fullcanvas_over20) {
+        ESP_LOGW(TAG,
+            "Video高负载风险提示：460x460/%uFPS 超过稳定档位20FPS；本次只完成Profile探测，等待用户决定是否继续（可能断音/掉帧）",
+            static_cast<unsigned>(snapshot->fps_hint));
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (fullcanvas_over20) {
+        ESP_LOGW(TAG,
+            "Video高负载风险已由用户确认：继续460x460/%uFPS原速播放；不做运行时降帧，可能断音/掉帧",
+            static_cast<unsigned>(snapshot->fps_hint));
     }
 
     uint16_t audio_num = 0U;
@@ -768,7 +788,9 @@ static void benchmark_task(void *arg)
                 &no_indexing, sizeof(no_indexing)));
         }
         if (ret == ESP_OK) ret = VideoMediaIo::map_extractor_error(esp_extractor_parse_stream(extractor));
-        if (ret == ESP_OK) ret = validate_stream(extractor, &result);
+        if (ret == ESP_OK) {
+            ret = validate_stream(extractor, &result, args->allow_fullcanvas_over20);
+        }
     }
 
     if (ret == ESP_OK && generation_current(args->generation)) {
@@ -843,13 +865,13 @@ static void benchmark_task(void *arg)
     }
 
     if (ret == ESP_OK && generation_current(args->generation) && result.audio_streams != 0U) {
-        const bool audio_started = audio_service_video_mp3_start(
+        const bool audio_prepared = audio_service_video_mp3_prepare(
             result.audio_sample_rate,
             result.audio_channels,
             result.audio_bits_per_sample,
             true);
-        if (!audio_started) {
-            ESP_LOGE(TAG, "AVI MP3 AudioTask启动失败；取消本次Video，避免无声状态继续占用Bridge");
+        if (!audio_prepared) {
+            ESP_LOGE(TAG, "AVI MP3 AudioTask预备失败；取消本次Video，避免无声状态继续占用Bridge");
             avi_mp3_bridge_cancel();
             stop_generation(args->generation);
             ret = ESP_FAIL;
@@ -861,7 +883,7 @@ static void benchmark_task(void *arg)
         result.result = ESP_OK;
         publish(result);
         ESP_LOGI(TAG,
-            "MJPEG Benchmark启动：native=%ux%u canvas<=460x460 fps_hint=%u AVI_index=OFF extractor_pool=%uKB RGB565=BE 双帧PSRAM(max)=%uKB pipeline=ExtractCore%d/P%u->DecodeCore%d/P%u compressed=%ux%uKB；extract_mask=AV，VIDEO->JPEG Pipeline，MP3->32KB Bridge(>=4KB prebuffer)->AudioTask",
+            "MJPEG Benchmark启动：native=%ux%u canvas<=460x460 fps_hint=%u AVI_index=OFF extractor_pool=%uKB RGB565=BE 双帧PSRAM(max)=%uKB pipeline=ExtractCore%d/P%u->DecodeCore%d/P%u compressed=%ux%uKB；extract_mask=AV，VIDEO->JPEG Pipeline，MP3->32KB Bridge(>=4KB prebuffer)->AudioTask Start Barrier",
             static_cast<unsigned>(result.width), static_cast<unsigned>(result.height),
             static_cast<unsigned>(result.fps_hint), static_cast<unsigned>(kExtractorPoolBytes / 1024U),
             static_cast<unsigned>((kRgb565Bytes * kFrameSlotCount) / 1024U),
@@ -870,7 +892,7 @@ static void benchmark_task(void *arg)
             static_cast<unsigned>(kCompressedSlotCount),
             static_cast<unsigned>(kCompressedSlotBytes / 1024U));
         ESP_LOGI(TAG,
-            "MJPEG Pipeline A/B：Extractor/TF与JPEG Decode并行；VIDEO压缩队列扩为8帧以给AUDIO建立约1/3秒预取；AUDIO payload复制进32KB PSRAM Bridge后立即release；AudioTask唯一拥有MP3/PCM/I2S/DAC");
+            "MJPEG Pipeline A/B：Extractor/TF与JPEG Decode并行；VIDEO压缩队列8帧；AUDIO先建立>=4KB预取并完成decoder/I2S/DAC静音预备，Dedicated Presenter首帧准备完成后才解除Barrier提交真实PCM；AudioTask唯一拥有MP3/PCM/I2S/DAC");
         ESP_LOGI(TAG,
             "Decode Scheduler Safety：每%u帧主动Block %u tick，为IDLE0/TWDT留出CPU0运行窗口",
             static_cast<unsigned>(kDecodeYieldEveryFrames),
@@ -1162,7 +1184,7 @@ static void free_resources_unlocked()
 
 } // namespace
 
-esp_err_t start(const char *path)
+esp_err_t start(const char *path, bool allow_fullcanvas_over20)
 {
     if (path == nullptr || path[0] == '\0') return ESP_ERR_INVALID_ARG;
     const esp_err_t clean_ret = cleanup();
@@ -1219,6 +1241,7 @@ esp_err_t start(const char *path)
     if (g_generation == 0U) ++g_generation;
     args->generation = g_generation;
     args->path = path_copy;
+    args->allow_fullcanvas_over20 = allow_fullcanvas_over20;
     g_snapshot = {};
     g_snapshot.state = State::Starting;
     g_snapshot.generation = g_generation;

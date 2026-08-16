@@ -96,6 +96,7 @@ enum class AudioCommandType : uint8_t
     SetVolume,
     SetMute,
     VideoMp3Start,
+    VideoMp3ReleaseStart,
     VideoMp3Stop
 };
 
@@ -113,6 +114,7 @@ struct AudioRequest
     uint32_t video_sample_rate_hz = 0U;
     uint8_t video_channels = 0U;
     uint8_t video_bits_per_sample = 0U;
+    bool video_start_barrier_armed = false;
     uint32_t expected_playback_revision = 0;
     uint64_t seek_target_ms = 0;
     char path[AUDIO_INLINE_PATH_SIZE] = {};
@@ -192,6 +194,7 @@ static AviMp3AudioSource g_video_mp3_source_storage = {};
 static AudioPlaybackClock g_video_playback_clock = {};
 static bool g_video_mp3_active = false;
 static bool g_video_mp3_eof = false;
+static bool g_video_mp3_start_released = true;
 static bool g_video_restore_paused_music_hardware = false;
 static uint32_t g_video_mp3_sample_rate_hz = 0U;
 static uint16_t g_video_mp3_channels = 0U;
@@ -209,6 +212,7 @@ static void audio_task_publish_video_clock_snapshot()
     AudioVideoClockSnapshot snapshot = {};
     snapshot.active = g_video_mp3_active;
     snapshot.eof = g_video_mp3_eof;
+    snapshot.start_released = g_video_mp3_start_released;
     snapshot.revision = g_video_clock_revision;
     snapshot.sample_rate_hz = g_video_playback_clock.sample_rate_hz;
     snapshot.submitted_frames = g_video_playback_clock.submitted_frames;
@@ -540,6 +544,7 @@ static const char *audio_command_name(AudioCommandType type)
         case AudioCommandType::SetVolume: return "VOLUME";
         case AudioCommandType::SetMute: return "MUTE";
         case AudioCommandType::VideoMp3Start: return "VIDEO_MP3_START";
+        case AudioCommandType::VideoMp3ReleaseStart: return "VIDEO_MP3_RELEASE_START";
         case AudioCommandType::VideoMp3Stop: return "VIDEO_MP3_STOP";
     }
     return "UNKNOWN";
@@ -1592,6 +1597,7 @@ static esp_err_t audio_task_stop_video_mp3_internal(bool restore_music_hardware,
     const bool should_restore = restore_music_hardware && g_video_restore_paused_music_hardware;
     g_video_mp3_active = false;
     g_video_mp3_eof = false;
+    g_video_mp3_start_released = true;
     g_video_mp3_sample_rate_hz = 0U;
     g_video_mp3_channels = 0U;
     g_video_mp3_bits_per_sample = 0U;
@@ -1710,14 +1716,35 @@ static void audio_task_handle_video_mp3_start(AudioRequest *request)
     ++g_video_clock_revision;
     if (g_video_clock_revision == 0U) ++g_video_clock_revision;
     g_video_mp3_active = true;
+    g_video_mp3_start_released = !request->video_start_barrier_armed;
     audio_task_publish_video_clock_snapshot();
     ESP_LOGI(TAG,
-        "AVI MP3 Audio Pipeline已启动：%luHz/%ubit/%uch；Music decoder保持%s，AudioTask继续唯一持有I2S/CS43131；A/V PCM Clock rev=%lu",
+        "AVI MP3 Audio Pipeline已%s：%luHz/%ubit/%uch；Music decoder保持%s，AudioTask继续唯一持有I2S/CS43131；A/V PCM Clock rev=%lu",
+        g_video_mp3_start_released ? "启动" : "预备并等待A/V Start Barrier",
         static_cast<unsigned long>(g_video_mp3_sample_rate_hz),
         static_cast<unsigned>(g_video_mp3_bits_per_sample),
         static_cast<unsigned>(g_video_mp3_channels),
         g_video_restore_paused_music_hardware ? "Paused原位" : "无活动Music",
         static_cast<unsigned long>(g_video_clock_revision));
+    audio_request_complete(request, true, ESP_OK);
+}
+
+static void audio_task_handle_video_mp3_release_start(AudioRequest *request)
+{
+    if (request == nullptr) return;
+    g_task_last_request_id = request->request_id;
+
+    if (!g_video_mp3_active || !mp3_decoder_is_open(&g_video_mp3_decoder)) {
+        ESP_LOGE(TAG, "AVI MP3 A/V Start Barrier解除失败：Video Audio pipeline未预备");
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+
+    if (!g_video_mp3_start_released) {
+        g_video_mp3_start_released = true;
+        audio_task_publish_video_clock_snapshot();
+        ESP_LOGI(TAG, "AVI MP3 A/V Start Barrier已解除：真实PCM现在开始提交I2S");
+    }
     audio_request_complete(request, true, ESP_OK);
 }
 
@@ -1737,6 +1764,17 @@ static void audio_task_handle_video_mp3_stop(AudioRequest *request)
 static void audio_task_service_video_mp3()
 {
     if (!g_video_mp3_active || !mp3_decoder_is_open(&g_video_mp3_decoder)) return;
+
+    if (!g_video_mp3_start_released) {
+        // Start Barrier期间只维持稳定的静音I2S时钟，不读取Bridge、不推进decoder/submitted clock。
+        // 这样Video可以先准备首张RGB和BoundedSPI窗口，同时避免AudioTask零等待自旋。
+        const esp_err_t silence_ret =
+            i2s_output_stream_write_silence(AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
+        if (silence_ret != ESP_OK) {
+            ESP_LOGE(TAG, "AVI MP3 Start Barrier静音维持失败：%s", esp_err_to_name(silence_ret));
+        }
+        return;
+    }
 
     if (g_video_mp3_eof) {
         const esp_err_t silence_ret =
@@ -2265,6 +2303,9 @@ static void audio_task_process_request(AudioRequest *request)
             break;
         case AudioCommandType::VideoMp3Start:
             audio_task_handle_video_mp3_start(request);
+            break;
+        case AudioCommandType::VideoMp3ReleaseStart:
+            audio_task_handle_video_mp3_release_start(request);
             break;
         case AudioCommandType::VideoMp3Stop:
             audio_task_handle_video_mp3_stop(request);
@@ -2801,10 +2842,11 @@ bool audio_service_set_mute(bool mute, bool wait)
     return audio_service_submit(request, wait);
 }
 
-bool audio_service_video_mp3_start(
+static bool audio_service_video_mp3_submit_start(
     uint32_t sample_rate_hz,
     uint8_t channels,
     uint8_t bits_per_sample,
+    bool start_barrier_armed,
     bool wait)
 {
     AudioRequest *request = audio_request_create(AudioCommandType::VideoMp3Start, wait);
@@ -2812,6 +2854,33 @@ bool audio_service_video_mp3_start(
     request->video_sample_rate_hz = sample_rate_hz;
     request->video_channels = channels;
     request->video_bits_per_sample = bits_per_sample;
+    request->video_start_barrier_armed = start_barrier_armed;
+    return audio_service_submit(request, wait);
+}
+
+bool audio_service_video_mp3_start(
+    uint32_t sample_rate_hz,
+    uint8_t channels,
+    uint8_t bits_per_sample,
+    bool wait)
+{
+    return audio_service_video_mp3_submit_start(
+        sample_rate_hz, channels, bits_per_sample, false, wait);
+}
+
+bool audio_service_video_mp3_prepare(
+    uint32_t sample_rate_hz,
+    uint8_t channels,
+    uint8_t bits_per_sample,
+    bool wait)
+{
+    return audio_service_video_mp3_submit_start(
+        sample_rate_hz, channels, bits_per_sample, true, wait);
+}
+
+bool audio_service_video_mp3_release_start(bool wait)
+{
+    AudioRequest *request = audio_request_create(AudioCommandType::VideoMp3ReleaseStart, wait);
     return audio_service_submit(request, wait);
 }
 
