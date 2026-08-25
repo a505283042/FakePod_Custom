@@ -43,15 +43,18 @@ static constexpr uint8_t  kBrightnessOff    = 0U;
 static constexpr uint32_t kJitterIntervalMs = 30000U; // 30s 防烧屏抖动
 static constexpr int8_t   kJitterMaxPx      = 1;     // ±1px
 
-// 颜色常量（与 player_home 统一）
+// 颜色常量（菜单胶囊用曲库「专辑」主题的紫色调，和 library_view Albums 同系）
+//   同源色板：library_view.cpp Albums 主题
+//     列表页 header=0xB5A0DD  accent=0xA28ACC  row_current_bg=0x332744
+//     详情页 header=0x8E79B1  accent=0x806DA5  row_current_bg=0x2B2138
 static constexpr uint32_t kC_BgScreen         = 0x000000;  // 背景纯黑
 static constexpr uint32_t kC_CardPanel        = 0x05070B;  // 同 Launcher 中心圆
 static constexpr uint32_t kC_CardPanelBorder  = 0x161B27;  // 同 Launcher 中心圆边框
-static constexpr uint32_t kC_RowUnselBg       = 0x05070B;  // 深色胶囊底（同 Launcher 中心圆，不要白色）
-static constexpr uint8_t  kC_RowUnselBgOpa    = 225U;      // ≈88%：非常实的深底，既不穿底也不扎眼
-static constexpr uint32_t kC_RowSelBg         = 0x1A2236;  // 选中：稍微亮一点的深蓝灰（#161B27 描边再提亮半阶）
+static constexpr uint32_t kC_RowUnselBg       = 0x332744;  // 专辑主题深紫底（row_current_bg）
+static constexpr uint8_t  kC_RowUnselBgOpa    = 225U;      // ≈88%：非常实的紫底
+static constexpr uint32_t kC_RowSelBg         = 0x806DA5;  // 选中：专辑详情页 accent 紫
 static constexpr uint8_t  kC_RowSelBgOpa      = 240U;      // ≈94%：一眼能辨识选中状态
-static constexpr uint32_t kC_RowUnselText     = 0xC4CAD8;  // 中亮灰（深色底上的浅色字）
+static constexpr uint32_t kC_RowUnselText     = 0xB5A0DD;  // 专辑列表页 header 紫文字
 static constexpr uint32_t kC_RowSelText       = 0xFFFFFF;  // 选中：纯白加粗字
 static constexpr uint32_t kC_TipText          = 0x8890A3;  // 底部提示
 
