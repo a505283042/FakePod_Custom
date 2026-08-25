@@ -8,7 +8,7 @@
 namespace VideoBrowser
 {
 
-static constexpr const char *kRootDirectory = "/sdcard/VIDEO";
+static constexpr const char *kRootDirectory = "/sdcard/video";
 static constexpr size_t kEntryNameBytes = 256;
 static constexpr size_t kPathBytes = 512;
 

@@ -345,7 +345,7 @@ static void show_status(const char *text, uint32_t color)
 static void update_rows()
 {
     if (g_directory.entries == nullptr || g_directory.count == 0U) {
-        show_status("/VIDEO 中没有 AVI", 0x7F8A99);
+        show_status("/video 中没有 AVI", 0x7F8A99);
         return;
     }
     if (g_browser_status != nullptr) set_visible(g_browser_status, false);
@@ -459,7 +459,7 @@ static void browser_load_tick()
         const esp_err_t ret = VideoBrowser::begin_directory_scan(g_current_dir, &g_browser_load.scan);
         if (ret != ESP_OK) {
             g_browser_load = {};
-            show_status(ret == ESP_ERR_NOT_FOUND ? "请在TF卡根目录创建 VIDEO 文件夹" : "视频目录打开失败", 0xE18A8A);
+            show_status(ret == ESP_ERR_NOT_FOUND ? "请在TF卡根目录创建 video 文件夹" : "视频目录打开失败", 0xE18A8A);
             ESP_LOGW(TAG, "Video目录打开失败：path=%s ret=%s", g_current_dir, esp_err_to_name(ret));
             return;
         }
@@ -1744,7 +1744,7 @@ static esp_err_t video_enter()
         lv_timer_resume(g_timer);
     }
     begin_browser_load();
-    ESP_LOGI(TAG, "Video进入Foreground：/VIDEO AVI Browser已显示；目录页Music保持后台，启动AVI时暂停Music并由AudioTask接管AVI MP3");
+    ESP_LOGI(TAG, "Video进入Foreground：/video AVI Browser已显示；目录页Music保持后台，启动AVI时暂停Music并由AudioTask接管AVI MP3");
     return ESP_OK;
 }
 
