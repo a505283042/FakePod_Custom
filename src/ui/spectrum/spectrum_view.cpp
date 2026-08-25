@@ -150,6 +150,7 @@ lv_obj_t *g_time = nullptr;
 lv_obj_t *g_spectrum_widget = nullptr;
 lv_obj_t *g_lyric = nullptr;
 lv_timer_t *g_timer = nullptr;
+lv_timer_t *g_delayed_start_timer = nullptr;
 bool g_visible = false;
 uint32_t g_frame = 0U;
 uint32_t g_last_pcm_revision = 0U;
@@ -1338,6 +1339,18 @@ static void spectrum_timer_cb(lv_timer_t *timer)
         }
     }
 }
+
+// 延迟启动频谱定时器：让 LVGL 先完成页面切换首帧渲染，再开始频谱动画。
+static void spectrum_delayed_start_cb(lv_timer_t *timer)
+{
+    if (timer != nullptr) {
+        lv_timer_del(timer);
+    }
+    g_delayed_start_timer = nullptr;
+    if (g_visible && g_timer != nullptr) {
+        lv_timer_resume(g_timer);
+    }
+}
 } // namespace
 
 void spectrum_view_create(lv_obj_t *screen)
@@ -1455,8 +1468,16 @@ void spectrum_view_open()
         g_last_displayed_second = audio.position_ms / 1000ULL;
     }
     spectrum_update_bars();
+    // 延迟 100ms 启动频谱定时器，让 LVGL 先完成页面切换首帧渲染，
+    // 避免首帧渲染与频谱自绘叠加造成卡顿。
     if (g_timer != nullptr) {
-        lv_timer_resume(g_timer);
+        if (g_delayed_start_timer != nullptr) {
+            lv_timer_del(g_delayed_start_timer);
+        }
+        g_delayed_start_timer = lv_timer_create(spectrum_delayed_start_cb, 100, nullptr);
+        if (g_delayed_start_timer != nullptr) {
+            lv_timer_set_repeat_count(g_delayed_start_timer, 1);
+        }
     }
     audio_service_set_spectrum_enabled(true);
     UI_PAGE_INTERACTION_LOGI("打开频谱页：style=%u %s",
@@ -1471,6 +1492,10 @@ void spectrum_view_close()
 
     g_visible = false;
     audio_service_set_spectrum_enabled(false);
+    if (g_delayed_start_timer != nullptr) {
+        lv_timer_del(g_delayed_start_timer);
+        g_delayed_start_timer = nullptr;
+    }
     if (g_timer != nullptr) {
         lv_timer_pause(g_timer);
     }

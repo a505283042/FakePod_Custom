@@ -939,7 +939,9 @@ esp_err_t ui_manager_bootstrap_init()
         static_cast<unsigned>(dma_largest_after));
 #endif
 
-    g_te_sync_runtime_enabled = display_te_is_ready();
+    // TE 同步只在视频播放（BoundedSPI 路径，自有 wait_for_te 参数）时使用。
+    // LVGL 刷新路径默认关闭 TE 等待，避免频谱/主页/歌词等页面每帧额外等待 16-20ms vsync。
+    g_te_sync_runtime_enabled = false;
     g_te_sync_pending = false;
     g_te_sync_consecutive_timeouts = 0U;
     g_te_sync_success_count = 0U;
