@@ -112,6 +112,13 @@ void screen_action_menu_confirm_and_close(void);
 void screen_lock_simple_render(void);
 
 // ============================================================
+// 锁图标显式重绘（BoundedSPI 直接写屏覆盖整帧后调用）
+// BoundedSPI 封面呈现会绕过 LVGL 把整屏写入 GRAM，右上角 [锁] 会被覆盖。
+// 该接口把锁图标（连同胶囊底板）重新标脏并置顶，让下一帧 LVGL flush 把它画回来。
+// ============================================================
+void screen_lock_simple_invalidate_lock_icon(void);
+
+// ============================================================
 // 层级置顶（其它页面 move_foreground 之后调用）
 // ============================================================
 void screen_lock_simple_raise(void);

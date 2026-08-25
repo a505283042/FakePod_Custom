@@ -1100,6 +1100,27 @@ void screen_lock_simple_render(void)
     lvgl_port_unlock();
 }
 
+// ----------- 锁图标显式重绘 -----------
+void screen_lock_simple_invalidate_lock_icon(void)
+{
+    if (!g_ready) return;
+    // 只有 Normal + Locked 才有需要重绘的右上角 [锁]
+    if (g_lock != ScreenLockLocked || g_power != ScreenPowerNormal) return;
+    if (g_lock_icon == nullptr) return;
+    if (!lvgl_port_lock(10)) return;
+
+    // BoundedSPI 封面直写整屏覆盖了锁图标：重新标脏 + 置顶，让下一帧 LVGL flush 画回来
+    lv_obj_t *cap = lv_obj_get_parent(g_lock_icon);
+    lv_obj_invalidate(g_lock_icon);
+    if (cap != nullptr) {
+        lv_obj_move_foreground(cap);
+        lv_obj_invalidate(cap);
+    } else {
+        lv_obj_move_foreground(g_lock_icon);
+    }
+    lvgl_port_unlock();
+}
+
 // ----------- 菜单 API -----------
 void screen_action_menu_set_highlight(ScreenActionRow row)
 {

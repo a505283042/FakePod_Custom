@@ -2573,6 +2573,10 @@ static void player_home_repaint_controls_after_bounded_present()
         return;
     }
 
+    // BoundedSPI 直写整屏时，右上角 [锁]（Normal+Locked）也被覆盖，
+    // 必须显式标脏重绘，否则新歌封面会把锁图标盖住且不再回来。
+    screen_lock_simple_invalidate_lock_icon();
+
     // BoundedSPI 已经把整张 dimmed/normal Surface 写入 GRAM，因此会暂时覆盖
     // Home Overlay 的控件像素。LVGL image source 已在禁止 invalidation 的窗口内同步更新，
     // 这里只把真正有视觉内容的控件小区域重新标脏，避免再次无效化 460x460 封面。
