@@ -103,9 +103,9 @@ constexpr uint8_t SPECTRUM_RIDGE_TRAIL_PERCENT = 28U;
 constexpr int16_t SPECTRUM_RIDGE_MAIN_W = 3;
 constexpr int16_t SPECTRUM_RIDGE_TRAIL_W = 3;
 constexpr int16_t SPECTRUM_RIDGE_PEAK_DOT = 3;
-// P1.5.3.2：每隔一个山脊采样点绘制一根细竖线，从基线连到主山脊。
+// P1.5.3.2：在每个山脊采样点位置绘制一根细竖线，从基线连到主山脊。
 // 竖线只做辅助结构，颜色压暗，避免重新变成密集传统均衡器。
-constexpr uint8_t SPECTRUM_RIDGE_STEM_STEP = 2U;
+constexpr uint8_t SPECTRUM_RIDGE_STEM_STEP = 1U; // 加密：每个山脊采样点都画一根竖线
 constexpr uint8_t SPECTRUM_RIDGE_STEM_PERCENT = 46U;
 constexpr int16_t SPECTRUM_RIDGE_STEM_W = 1;
 
@@ -153,6 +153,8 @@ lv_obj_t *g_lyric = nullptr;
 lv_timer_t *g_timer = nullptr;
 lv_timer_t *g_delayed_start_timer = nullptr;
 bool g_visible = false;
+// 防烧屏：暂停/停止时频谱整体收起（高度0不画），避免固定亮色条长期定格在屏上。
+bool g_idle_collapsed = true;
 uint32_t g_frame = 0U;
 uint32_t g_last_pcm_revision = 0U;
 uint32_t g_last_track = UINT32_MAX;
@@ -761,6 +763,11 @@ static void spectrum_draw_horizontal(lv_layer_t *layer, lv_obj_t *obj)
     baseline_area.y2 = baseline_y + 1;
     lv_draw_rect(layer, &baseline_dsc, &baseline_area);
 
+    // 防烧屏：暂停/停止时音柱整体收起（不画），只保留暗基线。
+    if (g_idle_collapsed) {
+        return;
+    }
+
     lv_draw_rect_dsc_t bar_dsc = {};
     lv_draw_rect_dsc_init(&bar_dsc);
     bar_dsc.bg_opa = LV_OPA_COVER;
@@ -915,7 +922,12 @@ static void spectrum_draw_neon_ridge(lv_layer_t *layer, lv_obj_t *obj)
     baseline.p2.y = baseline_y;
     lv_draw_line(layer, &baseline);
 
-    // P1.5.3.2：先画约20根细竖向 stems，从基线连到实时山脊高度。
+    // 防烧屏：暂停/停止时山脊/竖线整体收起（不画），只保留暗基线。
+    if (g_idle_collapsed) {
+        return;
+    }
+
+    // P1.5.3.2：先画细竖向 stems（每个山脊采样点一根），从基线连到实时山脊高度。
     // 它们与主山脊使用同一横向渐变，但固定压暗，既补足“频谱”结构感，
     // 又不重新创建独立LVGL bar对象。
     lv_draw_line_dsc_t stem = {};
@@ -1074,6 +1086,11 @@ static void spectrum_draw_segmented_columns(lv_layer_t *layer, lv_obj_t *obj)
         bars_left - 4, baseline_y, bars_left + bars_total_w + 3, baseline_y
     };
     lv_draw_rect(layer, &baseline, &baseline_area);
+
+    // 防烧屏：暂停/停止时柱段整体收起（不画），只保留暗基线。
+    if (g_idle_collapsed) {
+        return;
+    }
 
     lv_draw_rect_dsc_t segment = {};
     lv_draw_rect_dsc_init(&segment);
@@ -1308,6 +1325,8 @@ static void spectrum_timer_cb(lv_timer_t *timer)
     }
 
     const bool playing = audio.state == AudioPlaybackState::Playing;
+    // 防烧屏：真正停止/暂停时整组音柱收起；播放中保留最小高度防闪烁。
+    g_idle_collapsed = !playing;
     if (playing) {
         AudioSpectrumSnapshot spectrum = {};
         if (
@@ -1439,6 +1458,7 @@ void spectrum_view_open()
     g_last_displayed_second = UINT64_MAX;
     spectrum_clear_current_lyric(true);
     spectrum_set_idle_targets();
+    g_idle_collapsed = true; // 打开页面先收起，等首个播放快照到达后再显示
     spectrum_apply_style_layout();
     for (uint8_t i = 0U; i < SPECTRUM_VISUAL_BAR_COUNT; ++i) {
         g_peak_height[i] = SPECTRUM_MIN_H;
