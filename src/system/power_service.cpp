@@ -8,6 +8,7 @@
 
 #include "board_pins.h"
 #include "persistent_state.h"
+#include "player/player_control.h"
 
 static const char *TAG = "电源";
 
@@ -17,6 +18,11 @@ static const char *TAG = "电源";
 static constexpr int POWER_KEY_ACTIVE_LEVEL = 0;
 static constexpr TickType_t POWER_KEY_DEBOUNCE_TICKS = pdMS_TO_TICKS(40);
 static constexpr TickType_t POWER_KEY_SAVE_HOLD_TICKS = pdMS_TO_TICKS(1000);
+
+// 释放分级：0 ~ 500ms 的稳定按压 → 音量 +1
+//           ≥ 1000ms 按压 → NVS 保存（接着硬件 EC190707 ~2s 自动断电）
+// 500~1000ms 之间的释放不动作（留给关机长按的判定间隔，避免临界误操作）
+static constexpr uint32_t VOL_UP_MAX_HOLD_MS = 500U;
 
 static bool g_ready = false;
 static bool g_armed = false;
@@ -102,8 +108,15 @@ void power_service_update()
                 g_armed = true;
                 ESP_LOGI(TAG, "GPIO48 已检测到首次松键，关机长按检测正式布防");
             } else if (g_press_started_tick != 0 && !g_save_attempted_this_press) {
-                ESP_LOGI(TAG, "电源键短按释放：hold=%lums，未触发NVS保存",
-                    static_cast<unsigned long>(held_ms));
+                if (held_ms <= VOL_UP_MAX_HOLD_MS) {
+                    // 短按释放：音量 +1
+                    ESP_LOGI(TAG, "电源键短按释放：hold=%lums → 音量+1",
+                        (unsigned long)held_ms);
+                    (void)player_control_volume_up(1U);
+                } else {
+                    ESP_LOGI(TAG, "电源键中按释放：hold=%lums，未触发NVS保存，不做动作",
+                        (unsigned long)held_ms);
+                }
             }
 
             g_press_started_tick = 0;

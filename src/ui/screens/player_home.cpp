@@ -27,6 +27,7 @@
 #include "library_view.h"
 #include "lyrics/lyrics_view.h"
 #include "spectrum/spectrum_view.h"
+#include "system/screen_lock_simple.h"
 #include "ui_common.h"
 
 static const char *TAG = "首页";
@@ -1568,6 +1569,7 @@ static void player_home_launcher_switch_to_lvgl_fallback()
     if (g_launcher != nullptr) {
         lv_obj_remove_flag(g_launcher, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(g_launcher);
+        screen_lock_simple_raise();
         lv_obj_invalidate(g_launcher);
     }
     ESP_LOGW(TAG, "Launcher BoundedSPI 已降级到 LVGL 实时圆弧安全路径");
@@ -2202,6 +2204,7 @@ static void player_home_launcher_show()
         } else {
             lv_obj_remove_flag(g_launcher, LV_OBJ_FLAG_HIDDEN);
             lv_obj_move_foreground(g_launcher);
+            screen_lock_simple_raise();
         }
     }
 

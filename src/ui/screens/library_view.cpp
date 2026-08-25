@@ -17,6 +17,7 @@
 #include "player_playlist.h"
 #include "player_state.h"
 #include "search/search_key_builder.h"
+#include "system/screen_lock_simple.h"
 #include "ui_common.h"
 #include "widgets/quick_index_keyboard.h"
 
@@ -2068,6 +2069,7 @@ void library_view_open()
     library_view_render(true);
     lv_obj_remove_flag(g_root, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(g_root);
+    screen_lock_simple_raise();
     UI_PAGE_INTERACTION_LOGI("打开曲库：generation=%lu list=%s scroll=%ld",
         static_cast<unsigned long>(media_catalog_v2_generation()),
         player_playlist_type_name(player_state_get_list_type()),

@@ -14,6 +14,7 @@
 #include "cover_surface_cache.h"
 #include "lyrics/lyrics_service.h"
 #include "power_service.h"
+#include "gpio0_service.h"
 
 static const char *TAG = "运行期";
 
@@ -67,6 +68,11 @@ void system_runtime_update()
         ESP_LOGW(TAG, "GPIO48 关机保存不可用：%s；硬件3秒断电仍保持原行为", esp_err_to_name(power_ret));
     }
 
+    const esp_err_t auxkey_ret = gpio0_service_init();
+    if (auxkey_ret != ESP_OK) {
+        ESP_LOGW(TAG, "GPIO0 辅助键（音量-/锁/AOD/熄屏）不可用：%s", esp_err_to_name(auxkey_ret));
+    }
+
     const esp_err_t spectrum_ret = audio_spectrum_snapshot_start();
     if (spectrum_ret != ESP_OK) {
         ESP_LOGW(TAG, "SpectrumFFTTask 启动失败，频谱功能降级：%s", esp_err_to_name(spectrum_ret));
@@ -97,12 +103,13 @@ void system_runtime_update()
 
     ESP_LOGI(
         TAG,
-        "READY 后台服务：Apps=%s MusicAdapter=%s Ebook=%s Video=%s PowerKey=%s Spectrum=%s Artwork=%s CoverSurface=%s Lyrics=%s",
+        "READY 后台服务：Apps=%s MusicAdapter=%s Ebook=%s Video=%s PowerKey=%s AuxKey=%s Spectrum=%s Artwork=%s CoverSurface=%s Lyrics=%s",
         esp_err_to_name(app_ret),
         esp_err_to_name(music_adapter_ret),
         esp_err_to_name(ebook_ret),
         esp_err_to_name(video_ret),
         esp_err_to_name(power_ret),
+        esp_err_to_name(auxkey_ret),
         esp_err_to_name(spectrum_ret),
         storage_services_available ? esp_err_to_name(artwork_ret) : "SKIPPED",
         storage_services_available && artwork_ret == ESP_OK ? esp_err_to_name(surface_ret) : "SKIPPED",

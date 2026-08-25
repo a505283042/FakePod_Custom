@@ -10,6 +10,8 @@
 #include "system_runtime.h"
 #include "persistent_state.h"
 #include "power_service.h"
+#include "gpio0_service.h"
+#include "screen_lock_simple.h"
 #include "player_control.h"
 #include "player_state.h"
 #include "media_catalog_v2.h"
@@ -308,6 +310,13 @@ void system_loop_update()
     // GPIO48 与 EC190707 共用电源键：放在 Player/持久化 RAM 快照更新之后，
     // 长按触发时可以 flush 本轮最新状态；不用 ISR，也不提前接管硬件最终断电。
     power_service_update();
+
+    // GPIO0(K1) 辅助按键：音量- / 锁/解锁 / AOD / 熄屏（释放分级）。
+    // 完全轮询实现，无 ISR；与 GPIO48 独立。
+    gpio0_service_update();
+
+    // 屏态渲染心跳：AOD 时钟每秒更新、防烧屏 30s ±1px 抖动。
+    screen_lock_simple_render();
 
     AudioStateSnapshot audio_state = {};
     if (audio_service_get_snapshot(&audio_state) && audio_state.state == AudioPlaybackState::Error) {

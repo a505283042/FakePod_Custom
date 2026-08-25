@@ -19,6 +19,8 @@
 #include "ui_manager.h"
 #include "system_runtime.h"
 #include "persistent_state.h"
+#include "power_service.h"
+#include "gpio0_service.h"
 
 
 static const char *TAG =

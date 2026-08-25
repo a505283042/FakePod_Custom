@@ -21,6 +21,8 @@ idf_component_register(
         "system/system_runtime.cpp"
         "system/persistent_state.cpp"
         "system/power_service.cpp"
+        "system/gpio0_service.cpp"
+        "system/screen_lock_simple.cpp"
 
         "drivers/i2c/i2c_bus.cpp"
 

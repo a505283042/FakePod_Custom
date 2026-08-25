@@ -900,3 +900,8 @@ bool display_present_set_output(bool enabled)
     }
     return true;
 }
+
+esp_lcd_panel_handle_t display_get_panel_handle(void)
+{
+    return g_ready ? g_panel : nullptr;
+}

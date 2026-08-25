@@ -13,6 +13,7 @@
 #include "media/library/media_catalog_v2.h"
 #include "lyrics_service.h"
 #include "player/player_playlist.h"
+#include "system/screen_lock_simple.h"
 #include "ui_common.h"
 
 namespace
@@ -1446,6 +1447,7 @@ void spectrum_view_open()
     spectrum_rebuild_style_geometry_cache();
     lv_obj_remove_flag(g_root, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(g_root);
+    screen_lock_simple_raise();
 
     AudioStateSnapshot audio = {};
     if (audio_service_get_snapshot(&audio)) {

@@ -24,6 +24,7 @@
 #include "spectrum/spectrum_view.h"
 #include "screens/player_home.h"
 #include "screens/library_view.h"
+#include "system/screen_lock_simple.h"
 
 static const char *TAG = "界面";
 
@@ -816,6 +817,73 @@ static void ui_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
     (void)indev;
 
+    // ===================== 屏幕动作菜单优先 =====================
+    // 打开菜单时：触摸完全由这里处理（不进入 LVGL），
+    // 用 press(x,y)/release(x,y) 的行矩形命中（纯坐标）直接执行，
+    // 完全绕开 LVGL 对象的 CLICKABLE/CLICKED 事件链（之前因顶层 root 是 CLICKABLE
+    // 导致子行永远收不到点击）。
+    if (screen_action_menu_is_open()) {
+        UiTouchEdgeEvent edge = {};
+        const bool got_edge = ui_touch_input_take_edge(&edge);
+        UiTouchSnapshot snapshot = {};
+        const bool got_snap = !got_edge && ui_touch_input_get_snapshot(&snapshot);
+
+        int x = g_touch_last_x;
+        int y = g_touch_last_y;
+
+        if (got_edge) {
+            x = edge.x; y = edge.y;
+            g_touch_last_x = x; g_touch_last_y = y;
+            if (edge.pressed) {
+                // DOWN 边沿：按下记录 + 高亮
+                (void)screen_action_menu_on_touch_press(x, y);
+            } else {
+                // UP 边沿：按 press/release 同行规则决定是否执行
+                (void)screen_action_menu_on_touch_release(x, y);
+            }
+        } else if (got_snap) {
+            if (snapshot.pressed) {
+                x = snapshot.x; y = snapshot.y;
+                g_touch_last_x = x; g_touch_last_y = y;
+                // MOVE 期间：如果手指在移动，支持上下滑来切换高亮
+                screen_action_menu_handle_drag(y);
+            }
+        } else {
+            // 降级同步路径
+            CST820Point pt = {};
+            if (cst820_read_point(&pt) == ESP_OK && pt.pressed) {
+                x = ui_clamp_coord(pt.x, FAKEPOD_LCD_WIDTH - 1);
+                y = ui_clamp_coord(pt.y, FAKEPOD_LCD_HEIGHT - 1);
+                g_touch_last_x = x; g_touch_last_y = y;
+                screen_action_menu_handle_drag(y);
+            }
+        }
+
+        // 始终吞掉（不再传给 LVGL 分发）
+        data->state = LV_INDEV_STATE_RELEASED;
+        data->point.x = g_touch_last_x;
+        data->point.y = g_touch_last_y;
+        data->continue_reading = false;
+        return;
+    }
+
+    // ===================== 屏幕锁拦截 =====================
+    // Locked 状态：屏显保持，但把所有触摸都报告为 RELEASED，
+    // LVGL / gesture_router / 各视图的 ui_touch_dispatch_pointer 都不会响应。
+    // ScreenPowerOff 下同样拦截（屏幕全黑，没有任何点击的意义）。
+    if (screen_lock_should_block_touch()) {
+        data->state = LV_INDEV_STATE_RELEASED;
+        data->point.x = g_touch_last_x;
+        data->point.y = g_touch_last_y;
+        data->continue_reading = false;
+        // 清空一下边沿队列，避免解锁瞬间“积压事件”触发误操作
+        UiTouchEdgeEvent drain = {};
+        while (ui_touch_input_take_edge(&drain)) { /* 丢弃 */ }
+        // 同时把 gesture_router 也重置，避免残留上次的手势状态
+        gesture_router_reset();
+        return;
+    }
+
     UiTouchEdgeEvent edge = {};
     if (ui_touch_input_take_edge(&edge)) {
         data->state = edge.pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
@@ -1100,6 +1168,16 @@ esp_err_t ui_manager_init()
     lyrics_view_create(lv_screen_active());
     spectrum_view_create(lv_screen_active());
     library_view_create(lv_screen_active());
+
+    // AOD / 锁屏悬浮层：挂在 lv_screen_active() 顶层，放在所有业务视图之后。
+    // 每次页面 move_foreground 后会再调用 screen_lock_simple_raise（可选），
+    // 这里保证至少创建时是最上层。
+    {
+        const esp_err_t sl_ret = screen_lock_simple_create();
+        if (sl_ret != ESP_OK) {
+            ESP_LOGW(TAG, "AOD/锁屏悬浮层创建失败：%s", esp_err_to_name(sl_ret));
+        }
+    }
 
     // 存储/曲库降级时仍进入正式 LVGL，但用内置 ASCII 字体给出明确状态。
     // 这里不依赖 TF 字体，因此“无卡启动”不会再次被资源文件反向阻塞。

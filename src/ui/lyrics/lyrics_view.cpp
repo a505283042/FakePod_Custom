@@ -15,6 +15,7 @@
 #include "media_catalog_v2.h"
 #include "player_control.h"
 #include "player_state.h"
+#include "system/screen_lock_simple.h"
 #include "ui_common.h"
 
 namespace {
@@ -1390,6 +1391,7 @@ void lyrics_view_open()
     }
     lv_obj_remove_flag(g_root, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(g_root);
+    screen_lock_simple_raise();
     const uint32_t track = lyrics_view_current_track();
     lyrics_view_refresh_header(track);
     lyrics_view_request_if_needed(track);
