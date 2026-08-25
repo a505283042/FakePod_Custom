@@ -9,6 +9,7 @@
 #include "board_pins.h"
 #include "screen_lock_simple.h"
 #include "player/player_control.h"
+#include "app/app_manager.h"
 
 static const char *TAG = "GPIO0按键";
 
@@ -158,10 +159,15 @@ void gpio0_service_update()
         screen_action_menu_close(false);
     } else {
         // ② 正常亮屏 + 未锁定：打开 / 关闭 菜单（循环）
+        // 锁屏 / AOD / 熄屏 只应在音乐 APP 生效；其他 APP 前台时长按不响应
         if (screen_action_menu_is_open()) {
             ESP_LOGI(TAG, "GPIO0 长按 %lums → 菜单已开：关闭（取消不执行）",
                 (unsigned long)held);
             screen_action_menu_close(false);
+        } else if (app_manager_foreground() != AppId::Music) {
+            ESP_LOGI(TAG, "GPIO0 长按 %lums → 当前为 %s，非音乐 APP，不打开锁屏菜单",
+                (unsigned long)held,
+                app_manager_name(app_manager_foreground()));
         } else {
             ESP_LOGI(TAG, "GPIO0 长按 %lums → 打开屏幕动作菜单（松手后保留，点击行才执行）",
                 (unsigned long)held);
