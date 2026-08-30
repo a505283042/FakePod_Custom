@@ -1602,6 +1602,29 @@ static esp_err_t audio_task_stop_video_mp3_internal(bool restore_music_hardware,
     audio_task_remember_first_error(
         audio_task_shutdown_output_hardware(video_rate, "AVI-MP3"), &first_error);
 
+#if APP_DIAG_MP3_PERFORMANCE
+    AviMp3BridgeSnapshot bridge_perf = {};
+    if (avi_mp3_bridge_get_snapshot(&bridge_perf)) {
+        const uint32_t read_wait_avg_us = bridge_perf.read_wait_count != 0U
+            ? static_cast<uint32_t>(bridge_perf.read_wait_us_total / bridge_perf.read_wait_count)
+            : 0U;
+        ESP_LOGI(TAG,
+            "AVI MP3 Bridge汇总：high=%u/%uB pushed=%lluB read=%lluB push_wait=%lu；read_wait avg=%luus max=%luus >1/5/10ms=%lu/%lu/%lu timeout=%lu calls=%lu",
+            static_cast<unsigned>(bridge_perf.high_water_bytes),
+            static_cast<unsigned>(bridge_perf.capacity_bytes),
+            static_cast<unsigned long long>(bridge_perf.bytes_pushed),
+            static_cast<unsigned long long>(bridge_perf.bytes_read),
+            static_cast<unsigned long>(bridge_perf.push_wait_count),
+            static_cast<unsigned long>(read_wait_avg_us),
+            static_cast<unsigned long>(bridge_perf.read_wait_us_max),
+            static_cast<unsigned long>(bridge_perf.read_wait_over_1ms),
+            static_cast<unsigned long>(bridge_perf.read_wait_over_5ms),
+            static_cast<unsigned long>(bridge_perf.read_wait_over_10ms),
+            static_cast<unsigned long>(bridge_perf.read_wait_timeout_count),
+            static_cast<unsigned long>(bridge_perf.read_wait_count));
+    }
+#endif
+
     audio_task_video_mp3_close_decoder();
     const bool should_restore = restore_music_hardware && g_video_restore_paused_music_hardware;
     g_video_mp3_active = false;

@@ -32,8 +32,10 @@ static constexpr uint32_t kTaskStack = 8192U;
 static constexpr uint32_t kExtractTaskStack = 6144U;
 static constexpr UBaseType_t kTaskPriority = 2U;
 static constexpr UBaseType_t kExtractTaskPriority = 2U;
-static constexpr BaseType_t kTaskCore = 0;
-static constexpr BaseType_t kExtractTaskCore = 1;
+// 视频播放双核调度：JPEG Decode=P2 固定在 Core1，避免 Core0/P5 AudioTask 对持续 CPU 解码的高频抢占。
+// Extractor=P2 固定在 Core0，主要等待 SD/I/O，可让位给 AudioTask=P5 与 Presenter=P3。
+static constexpr BaseType_t kTaskCore = 1;
+static constexpr BaseType_t kExtractTaskCore = 0;
 static constexpr TickType_t kQueuePollTicks = pdMS_TO_TICKS(20);
 static constexpr uint32_t kPublishEveryFrames = 8U;
 static constexpr uint32_t kDecodeYieldEveryFrames = 8U;
@@ -558,15 +560,17 @@ static void extract_task(void *arg)
             (void)esp_extractor_release_frame(args->extractor, &frame);
             return_compressed_to_free(compressed_slot_index);
             if (audio_push_ret != ESP_OK) {
+                const bool generation_alive = generation_current(args->generation);
                 PipelineMessage message = {};
-                message.type = generation_current(args->generation)
+                message.type = generation_alive
                     ? PipelineMessageType::Failed : PipelineMessageType::Stopped;
-                message.result = generation_current(args->generation)
-                    ? audio_push_ret : ESP_OK;
-                ESP_LOGE(TAG, "AVI MP3 Bridge写入失败：ret=%s pts=%lums bytes=%lu",
-                    esp_err_to_name(audio_push_ret),
-                    static_cast<unsigned long>(frame.pts),
-                    static_cast<unsigned long>(frame.frame_size));
+                message.result = generation_alive ? audio_push_ret : ESP_OK;
+                if (generation_alive) {
+                    ESP_LOGE(TAG, "AVI MP3 Bridge写入失败：ret=%s pts=%lums bytes=%lu",
+                        esp_err_to_name(audio_push_ret),
+                        static_cast<unsigned long>(frame.pts),
+                        static_cast<unsigned long>(frame.frame_size));
+                }
                 (void)send_pipeline_message(message, args->generation);
                 break;
             }
@@ -1065,17 +1069,42 @@ static void benchmark_task(void *arg)
             ? static_cast<uint32_t>(result.decode_us_total / result.frames_decoded) : 0U;
         const uint32_t extract_avg_us = result.frames_read != 0U
             ? static_cast<uint32_t>(result.extract_us_total / result.frames_read) : 0U;
+        const uint32_t storage_avg_us = result.frames_read != 0U
+            ? static_cast<uint32_t>(result.storage_us_total / result.frames_read) : 0U;
+        const uint32_t copy_avg_us = result.frames_read != 0U
+            ? static_cast<uint32_t>(copy_us_total / result.frames_read) : 0U;
+        const uint32_t compressed_avg_bytes = result.frames_decoded != 0U
+            ? static_cast<uint32_t>(result.compressed_bytes / result.frames_decoded) : 0U;
         ESP_LOGI(TAG,
-            "视频解码结束：状态=%s 读取=%lu 解码=%lu 预丢帧=%lu JPEG平均=%lu.%03lums 提取平均=%lu.%03lums 音频帧=%lu",
+            "视频解码结束：状态=%s 读取=%lu 解码=%lu 预丢帧=%lu JPEG平均=%lu.%03lums 最大=%lu.%03lums 音频帧=%lu",
             state_name(result.state),
             static_cast<unsigned long>(result.frames_read),
             static_cast<unsigned long>(result.frames_decoded),
             static_cast<unsigned long>(predecode_drops),
             static_cast<unsigned long>(decode_avg_us / 1000U),
             static_cast<unsigned long>(decode_avg_us % 1000U),
+            static_cast<unsigned long>(result.decode_us_max / 1000U),
+            static_cast<unsigned long>(result.decode_us_max % 1000U),
+            static_cast<unsigned long>(result.audio_frames_read));
+        ESP_LOGI(TAG,
+            "视频性能分解：提取=%lu.%03lu/%lu.%03lums SD=%lu.%03lu/%lu.%03lums PSRAM复制=%lu.%03lu/%lu.%03lums 压缩帧=%lu/%luB queue_max=%lu catchup=%lu projected_late_max=%lldus",
             static_cast<unsigned long>(extract_avg_us / 1000U),
             static_cast<unsigned long>(extract_avg_us % 1000U),
-            static_cast<unsigned long>(result.audio_frames_read));
+            static_cast<unsigned long>(result.extract_us_max / 1000U),
+            static_cast<unsigned long>(result.extract_us_max % 1000U),
+            static_cast<unsigned long>(storage_avg_us / 1000U),
+            static_cast<unsigned long>(storage_avg_us % 1000U),
+            static_cast<unsigned long>(result.storage_us_max / 1000U),
+            static_cast<unsigned long>(result.storage_us_max % 1000U),
+            static_cast<unsigned long>(copy_avg_us / 1000U),
+            static_cast<unsigned long>(copy_avg_us % 1000U),
+            static_cast<unsigned long>(copy_us_max / 1000U),
+            static_cast<unsigned long>(copy_us_max % 1000U),
+            static_cast<unsigned long>(compressed_avg_bytes),
+            static_cast<unsigned long>(result.compressed_bytes_max),
+            static_cast<unsigned long>(pipe_qmax),
+            static_cast<unsigned long>(catchup_events),
+            static_cast<long long>(projected_late_us_max));
     }
 
     publish_task_exit(result);

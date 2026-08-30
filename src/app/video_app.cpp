@@ -70,7 +70,9 @@ static constexpr uint32_t kDestroyCleanupWaitMs = 300U;
 static constexpr uint32_t kBrowserTimerPeriodMs = 20U;
 static constexpr uint32_t kBenchmarkTimerPeriodMs = 5U;
 static constexpr uint32_t kPresenterTaskStack = 4096U;
-static constexpr UBaseType_t kPresenterTaskPriority = 2U;
+// 视频播放双核调度：Core0 保留 AudioTask=P5 + Extractor=P2，避免Presenter抢占AVI顺序供数。
+// Core1 上 Presenter=P3 仅在PTS截止窗口短时抢占 JPEG Decode=P2，兼顾显示Deadline与解码吞吐。
+static constexpr UBaseType_t kPresenterTaskPriority = 3U;
 static constexpr BaseType_t kPresenterTaskCore = 1;
 static constexpr uint32_t kPresenterFrameWaitMs = 20U;
 static constexpr uint32_t kPresenterStopWaitMs = 250U;
@@ -889,7 +891,8 @@ static void benchmark_presenter_task(void *arg)
 
         if (audio_master_expected && !audio_start_barrier_released) {
             // 首张RGB已经ready，BoundedSPI session/黑场也准备完毕；到这里才允许AudioTask
-            // 消费Bridge并提交第一块真实PCM。Presenter/Core1 与 AudioTask/Core0 从同一边界并行启动。
+            // 消费Bridge并提交第一块真实PCM。Presenter 与 AudioTask 同在 Core0，AudioTask/P5 优先；
+            // JPEG Decode 独占 Core1，从同一边界并行启动。
             const int64_t release_started_us = esp_timer_get_time();
             if (!audio_service_video_mp3_release_start(true)) {
                 ESP_LOGE(TAG, "A/V Start Barrier解除失败；停止本次Video");
@@ -1061,6 +1064,30 @@ static void benchmark_cleanup_tick()
     if (ret == ESP_OK) {
         g_benchmark_ui.cleanup_pending = false;
         ESP_LOGI(TAG, "MJPEG Benchmark资源已释放：双RGB565 PSRAM + Extractor queues");
+    }
+}
+
+static esp_err_t benchmark_wait_cleanup(uint32_t timeout_ms)
+{
+    const int64_t deadline_us = esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 1000LL;
+    TickType_t wait_tick = pdMS_TO_TICKS(10);
+    if (wait_tick == 0) wait_tick = 1;
+
+    while (true) {
+        if (!benchmark_presenter_is_running()) {
+            const esp_err_t ret = VideoBenchmark::cleanup();
+            if (ret == ESP_OK) {
+                g_benchmark_ui.cleanup_pending = false;
+                return ESP_OK;
+            }
+            if (ret != ESP_ERR_INVALID_STATE) {
+                return ret;
+            }
+        }
+        if (esp_timer_get_time() >= deadline_us) {
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(wait_tick);
     }
 }
 
@@ -1755,8 +1782,20 @@ static esp_err_t video_leave(AppRunState next_state)
         VideoProbe::cancel();
         g_profile_probe_pending = false;
     }
-    if (g_page == VideoPage::Benchmark && !g_risk_prompt_active &&
-        !benchmark_request_stop("leave")) return ESP_ERR_TIMEOUT;
+    if (g_page == VideoPage::Benchmark && !g_risk_prompt_active) {
+        if (!benchmark_request_stop("leave")) return ESP_ERR_TIMEOUT;
+    }
+    if (g_benchmark_ui.cleanup_pending) {
+        const esp_err_t cleanup_ret = benchmark_wait_cleanup(kDestroyCleanupWaitMs);
+        if (cleanup_ret != ESP_OK) {
+            // AppManager 会保持 Video 为当前前台；Presenter 已停时恢复 Browser，避免留在隐藏的视频画面。
+            if (!benchmark_presenter_is_running()) show_browser();
+            ESP_LOGW(TAG, "Video离开延后：Benchmark资源尚未安全回收 ret=%s",
+                esp_err_to_name(cleanup_ret));
+            return cleanup_ret;
+        }
+    }
+    g_page = VideoPage::Browser;
     g_risk_prompt_active = false;
     g_eof_transition = EofTransition::None;
     cancel_browser_load();
@@ -1774,18 +1813,12 @@ static void video_destroy()
     VideoProbe::cancel();
     g_profile_probe_pending = false;
     if ((g_page == VideoPage::Benchmark && !g_risk_prompt_active) || g_benchmark_ui.cleanup_pending) {
-        benchmark_request_stop("destroy");
-        const TickType_t wait_tick = pdMS_TO_TICKS(10);
-        const uint32_t attempts = kDestroyCleanupWaitMs / 10U;
-        for (uint32_t i = 0U; i < attempts; ++i) {
-            if (VideoBenchmark::cleanup() == ESP_OK) {
-                g_benchmark_ui.cleanup_pending = false;
-                break;
-            }
-            vTaskDelay(wait_tick);
-        }
-        if (g_benchmark_ui.cleanup_pending) {
-            ESP_LOGW(TAG, "Video destroy：Benchmark task仍在退出，PSRAM由下次Video create/start继续回收");
+        (void)benchmark_request_stop("destroy");
+        const esp_err_t cleanup_ret = benchmark_wait_cleanup(kDestroyCleanupWaitMs);
+        if (cleanup_ret != ESP_OK) {
+            // 正常 AppManager 路径会在 leave() 阶段就拦住未完成的回收；这里只是防御兜底。
+            ESP_LOGW(TAG, "Video destroy：Benchmark资源回收异常 ret=%s",
+                esp_err_to_name(cleanup_ret));
         }
     }
     cancel_browser_load();
