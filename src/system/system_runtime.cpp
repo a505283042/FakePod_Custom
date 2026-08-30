@@ -7,6 +7,7 @@
 #include "app_manager.h"
 #include "music_app_adapter.h"
 #include "ebook_app.h"
+#include "visual_music_app.h"
 #include "video_app.h"
 #include "sdcard.h"
 #include "media_catalog_v2.h"
@@ -54,6 +55,13 @@ void system_runtime_update()
     if (ebook_ret != ESP_OK) {
         ESP_LOGW(TAG, "Ebook APP 注册失败：%s；Launcher仍保持选择但不会进入",
             esp_err_to_name(ebook_ret));
+    }
+    const esp_err_t visual_music_ret = app_ret == ESP_OK
+        ? visual_music_app_register()
+        : ESP_ERR_INVALID_STATE;
+    if (visual_music_ret != ESP_OK) {
+        ESP_LOGW(TAG, "电子音流 APP 注册失败：%s；Launcher仍保持选择但不会进入",
+            esp_err_to_name(visual_music_ret));
     }
     const esp_err_t video_ret = app_ret == ESP_OK
         ? video_app_register()
@@ -103,10 +111,11 @@ void system_runtime_update()
 
     ESP_LOGI(
         TAG,
-        "READY 后台服务：Apps=%s MusicAdapter=%s Ebook=%s Video=%s PowerKey=%s AuxKey=%s Spectrum=%s Artwork=%s CoverSurface=%s Lyrics=%s",
+        "READY 后台服务：Apps=%s MusicAdapter=%s Ebook=%s VisualMusic=%s Video=%s PowerKey=%s AuxKey=%s Spectrum=%s Artwork=%s CoverSurface=%s Lyrics=%s",
         esp_err_to_name(app_ret),
         esp_err_to_name(music_adapter_ret),
         esp_err_to_name(ebook_ret),
+        esp_err_to_name(visual_music_ret),
         esp_err_to_name(video_ret),
         esp_err_to_name(power_ret),
         esp_err_to_name(auxkey_ret),

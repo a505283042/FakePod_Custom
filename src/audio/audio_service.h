@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include "esp_err.h"
 #include "audio_types.h"
+#include "midi_synth.h"
+#include "nsf_synth.h"
 
 // 启动唯一的 AudioTask。运行期所有 DAC/I2S 控制都必须由该任务执行。
 esp_err_t audio_service_start();
@@ -77,6 +79,61 @@ struct AudioVideoClockSnapshot
     uint64_t position_us = 0ULL;
 };
 bool audio_service_video_mp3_get_clock(AudioVideoClockSnapshot *out_snapshot);
+
+// VM07：电子音流 MIDI 使用 AudioTask 内置轻量 GM-Lite Synth 直接产出 48kHz stereo PCM。
+// notes 会在提交时复制到 AudioTask 自有 PSRAM，调用返回后原数组可立即释放/复用。
+bool audio_service_midi_start(
+    const MidiSynthNoteEvent *notes,
+    size_t note_count,
+    uint32_t duration_ms,
+    bool wait = true);
+bool audio_service_midi_pause(bool wait = true);
+bool audio_service_midi_resume(bool wait = true);
+bool audio_service_midi_restart(bool wait = true);
+// restore_music_hardware=false 用于同一电子音流 APP 内切换下一首，避免中途恢复 Music DAC 再立即关闭。
+bool audio_service_midi_stop(bool restore_music_hardware = true, bool wait = true);
+
+struct AudioMidiClockSnapshot
+{
+    bool active = false;
+    bool paused = false;
+    bool eof = false;
+    uint32_t revision = 0U;
+    uint32_t sample_rate_hz = 0U;
+    uint64_t submitted_frames = 0ULL;
+    uint64_t position_ms = 0ULL;
+    uint32_t duration_ms = 0U;
+};
+bool audio_service_midi_get_clock(AudioMidiClockSnapshot *out_snapshot);
+
+// VM10：传统 NESM NSF 由 AudioTask 内置 6502/2A03 Core 产出 48kHz stereo PCM。
+// prg 会在提交时复制到 AudioTask 自有 PSRAM；第一阶段只支持 NTSC + 基础五通道。
+bool audio_service_nsf_start(
+    const uint8_t *prg,
+    size_t prg_size,
+    const NsfSynthConfig *config,
+    bool wait = true);
+bool audio_service_nsf_pause(bool wait = true);
+bool audio_service_nsf_resume(bool wait = true);
+bool audio_service_nsf_set_track(uint8_t track, bool wait = true);
+// restore_music_hardware=false 用于同一 NSF 内切 Subsong，正常列表/退出路径应传 true。
+bool audio_service_nsf_stop(bool restore_music_hardware = true, bool wait = true);
+
+struct AudioNsfClockSnapshot
+{
+    bool active = false;
+    bool paused = false;
+    bool eof = false;
+    bool failed = false;
+    uint32_t revision = 0U;
+    uint32_t sample_rate_hz = 0U;
+    uint64_t submitted_frames = 0ULL;
+    uint64_t position_ms = 0ULL;
+    uint64_t duration_ms = 0ULL; // 自动识别到循环后给出预计结束时间；未知时为0
+    uint8_t track = 0U;       // 0-based
+    uint8_t track_count = 0U;
+};
+bool audio_service_nsf_get_clock(AudioNsfClockSnapshot *out_snapshot);
 
 // Stage 11.x：对当前选中 Track 发起 Seek。Play/Seek 共用 latest-intent 单槽；
 // 路径/技术索引仍复制进请求，AudioTask 会核对 track + playback_revision，并丢弃被更新意图覆盖的旧请求。

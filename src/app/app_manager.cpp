@@ -23,7 +23,7 @@ static AppId g_launcher_target = AppId::Music;
 
 static constexpr const char *kBuiltinNames[static_cast<size_t>(AppId::Count)] = {
     "音乐",
-    "NSF播放",
+    "电子音流",
     "拾音频谱",
     "视频",
     "图片播放",

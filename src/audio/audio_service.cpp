@@ -15,6 +15,8 @@
 #include "audio_decode_workspace.h"
 #include "audio_playback_clock.h"
 #include "audio_spectrum_snapshot.h"
+#include "midi_synth.h"
+#include "nsf_synth.h"
 #include "sources/avi_mp3_audio_source.h"
 #include "app_diag_config.h"
 
@@ -97,7 +99,17 @@ enum class AudioCommandType : uint8_t
     SetMute,
     VideoMp3Start,
     VideoMp3ReleaseStart,
-    VideoMp3Stop
+    VideoMp3Stop,
+    MidiStart,
+    MidiPause,
+    MidiResume,
+    MidiRestart,
+    MidiStop,
+    NsfStart,
+    NsfPause,
+    NsfResume,
+    NsfSetTrack,
+    NsfStop
 };
 
 struct AudioRequest
@@ -115,6 +127,15 @@ struct AudioRequest
     uint8_t video_channels = 0U;
     uint8_t video_bits_per_sample = 0U;
     bool video_start_barrier_armed = false;
+    MidiSynthNoteEvent *midi_notes = nullptr;
+    size_t midi_note_count = 0U;
+    uint32_t midi_duration_ms = 0U;
+    bool midi_restore_music_hardware = true;
+    uint8_t *nsf_prg = nullptr;
+    size_t nsf_prg_size = 0U;
+    NsfSynthConfig nsf_config = {};
+    bool nsf_restore_music_hardware = true;
+    uint8_t nsf_track = 0U;
     uint32_t expected_playback_revision = 0;
     uint64_t seek_target_ms = 0;
     char path[AUDIO_INLINE_PATH_SIZE] = {};
@@ -201,11 +222,96 @@ static uint32_t g_video_mp3_sample_rate_hz = 0U;
 static uint16_t g_video_mp3_channels = 0U;
 static uint16_t g_video_mp3_bits_per_sample = 0U;
 
+// VM07：MIDI Synth 与 Music decoder 互斥占用同一 AudioTask/I2S。Music 保持 Paused 原位，
+// Synth 结束后可只恢复 Paused Music 硬件，是否真正 resume 由电子音流 APP 生命周期决定。
+static MidiSynth g_midi_synth = {};
+static AudioPlaybackClock g_midi_playback_clock = {};
+static bool g_midi_active = false;
+static bool g_midi_paused = false;
+static bool g_midi_eof = false;
+static bool g_midi_restore_paused_music_hardware = false;
+
+// VM10：NSF 6502/2A03 与 MIDI 一样由 AudioTask 独占输出硬件；
+// VM11：传统 NSF v1 没有 Subsong 时长。优先依据2A03 PLAY状态序列识别循环，
+// 其次使用真实PCM静音结束；识别失败时才使用150s固定上限。Track结束统一5s淡出。
+static constexpr uint32_t NSF_SILENCE_END_MS = 6000U;
+static constexpr uint32_t NSF_FALLBACK_PLAY_MS = 150000U;
+static constexpr uint32_t NSF_TRACK_FADE_MS = 5000U;
+static constexpr int32_t NSF_SILENCE_PEAK_PCM16 = 32;
+static NsfSynth g_nsf_synth = {};
+static AudioPlaybackClock g_nsf_playback_clock = {};
+static bool g_nsf_active = false;
+static bool g_nsf_paused = false;
+static bool g_nsf_eof = false;
+static bool g_nsf_failed = false;
+static bool g_nsf_seen_audible = false;
+static uint64_t g_nsf_silence_frames = 0ULL;
+static bool g_nsf_loop_end_active = false;
+static uint64_t g_nsf_loop_fade_start_frame = 0ULL;
+static bool g_nsf_restore_paused_music_hardware = false;
+
 // R.40.4.2：AudioTask 单写、Video Presenter/Decode 多读的 PCM 主时钟发布槽。
 // 不让 Video 直接读取 AudioTask 内部 decoder/clock，避免跨核撕裂 64-bit 计数。
 static portMUX_TYPE g_video_clock_snapshot_mux = portMUX_INITIALIZER_UNLOCKED;
 static AudioVideoClockSnapshot g_video_clock_snapshot = {};
 static uint32_t g_video_clock_revision = 0U;
+
+// VM07：瀑布 UI 只读取 I2S 已提交 PCM 对应的 MIDI 主时钟，不再依赖 LVGL tick 猜播放进度。
+static portMUX_TYPE g_midi_clock_snapshot_mux = portMUX_INITIALIZER_UNLOCKED;
+static AudioMidiClockSnapshot g_midi_clock_snapshot = {};
+static uint32_t g_midi_clock_revision = 0U;
+
+static portMUX_TYPE g_nsf_clock_snapshot_mux = portMUX_INITIALIZER_UNLOCKED;
+static AudioNsfClockSnapshot g_nsf_clock_snapshot = {};
+static uint32_t g_nsf_clock_revision = 0U;
+
+static void audio_task_publish_midi_clock_snapshot()
+{
+    AudioMidiClockSnapshot snapshot = {};
+    snapshot.active = g_midi_active;
+    snapshot.paused = g_midi_paused;
+    snapshot.eof = g_midi_eof;
+    snapshot.revision = g_midi_clock_revision;
+    snapshot.sample_rate_hz = g_midi_playback_clock.sample_rate_hz;
+    snapshot.submitted_frames = g_midi_playback_clock.submitted_frames;
+    snapshot.position_ms = audio_playback_clock_position_ms(&g_midi_playback_clock);
+    snapshot.duration_ms = g_midi_synth.duration_ms;
+
+    portENTER_CRITICAL(&g_midi_clock_snapshot_mux);
+    g_midi_clock_snapshot = snapshot;
+    portEXIT_CRITICAL(&g_midi_clock_snapshot_mux);
+}
+
+static void audio_task_publish_nsf_clock_snapshot()
+{
+    AudioNsfClockSnapshot snapshot = {};
+    snapshot.active = g_nsf_active;
+    snapshot.paused = g_nsf_paused;
+    snapshot.eof = g_nsf_eof;
+    snapshot.failed = g_nsf_failed;
+    snapshot.revision = g_nsf_clock_revision;
+    snapshot.sample_rate_hz = g_nsf_playback_clock.sample_rate_hz;
+    snapshot.submitted_frames = g_nsf_playback_clock.submitted_frames;
+    snapshot.position_ms = audio_playback_clock_position_ms(&g_nsf_playback_clock);
+    NsfSynthLoopInfo loop = {};
+    if (nsf_synth_get_loop_info(&g_nsf_synth, &loop) && loop.detected &&
+        g_nsf_synth.sample_rate_hz != 0U) {
+        uint64_t fade_start = loop.start_frame + loop.length_frames * 2ULL;
+        if (g_nsf_loop_end_active && g_nsf_loop_fade_start_frame > fade_start) {
+            fade_start = g_nsf_loop_fade_start_frame;
+        }
+        const uint64_t fade_frames =
+            static_cast<uint64_t>(g_nsf_synth.sample_rate_hz) * NSF_TRACK_FADE_MS / 1000ULL;
+        snapshot.duration_ms =
+            (fade_start + fade_frames) * 1000ULL / g_nsf_synth.sample_rate_hz;
+    }
+    snapshot.track = nsf_synth_track(&g_nsf_synth);
+    snapshot.track_count = g_nsf_synth.track_count;
+
+    portENTER_CRITICAL(&g_nsf_clock_snapshot_mux);
+    g_nsf_clock_snapshot = snapshot;
+    portEXIT_CRITICAL(&g_nsf_clock_snapshot_mux);
+}
 
 static void audio_task_publish_video_clock_snapshot()
 {
@@ -276,6 +382,14 @@ static void audio_request_release(AudioRequest *request)
     if (request->extended_path != nullptr) {
         heap_caps_free(request->extended_path);
         request->extended_path = nullptr;
+    }
+    if (request->midi_notes != nullptr) {
+        heap_caps_free(request->midi_notes);
+        request->midi_notes = nullptr;
+    }
+    if (request->nsf_prg != nullptr) {
+        heap_caps_free(request->nsf_prg);
+        request->nsf_prg = nullptr;
     }
     heap_caps_free(request);
 }
@@ -546,6 +660,16 @@ static const char *audio_command_name(AudioCommandType type)
         case AudioCommandType::VideoMp3Start: return "VIDEO_MP3_START";
         case AudioCommandType::VideoMp3ReleaseStart: return "VIDEO_MP3_RELEASE_START";
         case AudioCommandType::VideoMp3Stop: return "VIDEO_MP3_STOP";
+        case AudioCommandType::MidiStart: return "MIDI_START";
+        case AudioCommandType::MidiPause: return "MIDI_PAUSE";
+        case AudioCommandType::MidiResume: return "MIDI_RESUME";
+        case AudioCommandType::MidiRestart: return "MIDI_RESTART";
+        case AudioCommandType::MidiStop: return "MIDI_STOP";
+        case AudioCommandType::NsfStart: return "NSF_START";
+        case AudioCommandType::NsfPause: return "NSF_PAUSE";
+        case AudioCommandType::NsfResume: return "NSF_RESUME";
+        case AudioCommandType::NsfSetTrack: return "NSF_SET_TRACK";
+        case AudioCommandType::NsfStop: return "NSF_STOP";
     }
     return "UNKNOWN";
 }
@@ -1657,6 +1781,12 @@ static void audio_task_handle_video_mp3_start(AudioRequest *request)
         audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
         return;
     }
+    if (g_midi_active || midi_synth_is_open(&g_midi_synth) ||
+        g_nsf_active || nsf_synth_is_open(&g_nsf_synth)) {
+        ESP_LOGE(TAG, "AVI MP3启动被拒绝：电子音流仍占用AudioTask输出");
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
     if (g_task_state == AudioPlaybackState::Playing ||
         g_task_state == AudioPlaybackState::Preparing ||
         g_task_state == AudioPlaybackState::Seeking) {
@@ -1854,6 +1984,702 @@ static void audio_task_service_video_mp3()
     audio_task_publish_video_clock_snapshot();
 }
 
+static esp_err_t audio_task_restore_paused_music_hardware_for_midi(const char *reason)
+{
+    if (!g_midi_restore_paused_music_hardware) return ESP_OK;
+    if (g_task_state != AudioPlaybackState::Paused || !pcm_decoder_is_open(&g_decoder) ||
+        g_task_sample_rate_hz == 0U) {
+        ESP_LOGE(TAG, "MIDI恢复Music硬件失败：Music pipeline不再处于Paused reason=%s",
+            reason != nullptr ? reason : "unknown");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const esp_err_t ret = audio_task_start_output_hardware(
+        g_task_sample_rate_hz,
+        g_task_bits_per_sample,
+        g_task_channels,
+        "Music-Restore",
+        nullptr,
+        false,
+        nullptr);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "MIDI已恢复Paused Music硬件：%luHz/%ubit/%uch reason=%s；等待电子音流决定是否resume",
+            static_cast<unsigned long>(g_task_sample_rate_hz),
+            static_cast<unsigned>(g_task_bits_per_sample),
+            static_cast<unsigned>(g_task_channels),
+            reason != nullptr ? reason : "unknown");
+    }
+    return ret;
+}
+
+static esp_err_t audio_task_stop_midi_internal(bool restore_music_hardware, const char *reason)
+{
+    const bool should_restore = restore_music_hardware && g_midi_restore_paused_music_hardware;
+    if (!g_midi_active && !midi_synth_is_open(&g_midi_synth)) {
+        esp_err_t ret = ESP_OK;
+        if (should_restore) {
+            ret = audio_task_restore_paused_music_hardware_for_midi(reason);
+        }
+        // restore=false 用于同 APP 切 MIDI：保留“Paused Music硬件待恢复”所有权，
+        // 这样下一首解析失败/用户返回列表时仍能先重建 Music 硬件再 Resume。
+        if (restore_music_hardware && ret == ESP_OK) {
+            g_midi_restore_paused_music_hardware = false;
+        }
+        g_midi_paused = false;
+        g_midi_eof = false;
+        audio_task_publish_midi_clock_snapshot();
+        return ret;
+    }
+
+    esp_err_t first_error = ESP_OK;
+    const uint32_t rate = g_midi_synth.sample_rate_hz > 0U
+        ? g_midi_synth.sample_rate_hz : 48000U;
+    audio_task_remember_first_error(
+        audio_task_shutdown_output_hardware(rate, "MIDI-Synth"), &first_error);
+
+    midi_synth_close(&g_midi_synth);
+    g_midi_active = false;
+    g_midi_paused = false;
+    g_midi_eof = false;
+    audio_playback_clock_reset(&g_midi_playback_clock, 0U);
+    audio_task_publish_midi_clock_snapshot();
+
+    if (should_restore) {
+        audio_task_remember_first_error(
+            audio_task_restore_paused_music_hardware_for_midi(reason), &first_error);
+    }
+    if (restore_music_hardware && first_error == ESP_OK) {
+        g_midi_restore_paused_music_hardware = false;
+    }
+
+    ESP_LOGI(TAG, "MIDI Synth已停止：恢复Music硬件=%u 结果=%s",
+        static_cast<unsigned>(should_restore), esp_err_to_name(first_error));
+    return first_error;
+}
+
+static void audio_task_handle_midi_start(AudioRequest *request)
+{
+    if (request == nullptr) return;
+    g_task_last_request_id = request->request_id;
+
+    if (g_midi_active || midi_synth_is_open(&g_midi_synth) || request->midi_notes == nullptr ||
+        request->midi_note_count == 0U || request->midi_duration_ms == 0U) {
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+    if (g_video_mp3_active || mp3_decoder_is_open(&g_video_mp3_decoder)) {
+        ESP_LOGE(TAG, "MIDI启动被拒绝：Video Audio仍在活动");
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+    if (g_nsf_active || nsf_synth_is_open(&g_nsf_synth)) {
+        ESP_LOGE(TAG, "MIDI启动被拒绝：NSF仍在活动");
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+    if (g_task_state == AudioPlaybackState::Playing ||
+        g_task_state == AudioPlaybackState::Preparing ||
+        g_task_state == AudioPlaybackState::Seeking) {
+        ESP_LOGE(TAG, "MIDI启动要求Music先暂停：当前state=%s",
+            audio_playback_state_name_cn(g_task_state));
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+
+    g_midi_restore_paused_music_hardware =
+        g_task_state == AudioPlaybackState::Paused && pcm_decoder_is_open(&g_decoder);
+
+    if (g_pipeline_headphone_enabled || g_pipeline_clock_prepared ||
+        g_pipeline_i2s_started || i2s_output_is_started()) {
+        const uint32_t active_rate = g_task_sample_rate_hz > 0U ? g_task_sample_rate_hz : 48000U;
+        const esp_err_t shutdown_ret = audio_task_shutdown_output_hardware(active_rate, "Music-Paused");
+        if (shutdown_ret != ESP_OK) {
+            g_midi_restore_paused_music_hardware = false;
+            audio_request_complete(request, false, shutdown_ret);
+            return;
+        }
+    }
+
+    MidiSynthNoteEvent *owned_notes = request->midi_notes;
+    esp_err_t ret = midi_synth_open_owned(
+        &g_midi_synth,
+        owned_notes,
+        request->midi_note_count,
+        request->midi_duration_ms,
+        48000U);
+    if (ret != ESP_OK) {
+        if (g_midi_restore_paused_music_hardware) {
+            const esp_err_t restore_ret =
+                audio_task_restore_paused_music_hardware_for_midi("midi_open_failed");
+            if (restore_ret == ESP_OK) g_midi_restore_paused_music_hardware = false;
+        }
+        audio_request_complete(request, false, ret);
+        return;
+    }
+    request->midi_notes = nullptr; // 所有权已转移给 MidiSynth
+
+    audio_playback_clock_reset(&g_midi_playback_clock, g_midi_synth.sample_rate_hz);
+    ret = audio_task_start_output_hardware(
+        g_midi_synth.sample_rate_hz,
+        16U,
+        2U,
+        "MIDI-Synth",
+        nullptr,
+        true,
+        "midi");
+    if (ret != ESP_OK) {
+        midi_synth_close(&g_midi_synth);
+        if (g_midi_restore_paused_music_hardware) {
+            const esp_err_t restore_ret =
+                audio_task_restore_paused_music_hardware_for_midi("midi_hw_failed");
+            if (restore_ret == ESP_OK) g_midi_restore_paused_music_hardware = false;
+        }
+        audio_request_complete(request, false, ret);
+        return;
+    }
+
+    ++g_midi_clock_revision;
+    if (g_midi_clock_revision == 0U) ++g_midi_clock_revision;
+    g_midi_active = true;
+    g_midi_paused = false;
+    g_midi_eof = false;
+    audio_task_publish_midi_clock_snapshot();
+    ESP_LOGI(TAG, "MIDI Synth已启动：48000Hz/16bit/2ch notes=%u duration=%lums voices=32",
+        static_cast<unsigned>(g_midi_synth.note_count),
+        static_cast<unsigned long>(g_midi_synth.duration_ms));
+    audio_request_complete(request, true, ESP_OK);
+}
+
+static void audio_task_handle_midi_pause(AudioRequest *request)
+{
+    if (request == nullptr) return;
+    g_task_last_request_id = request->request_id;
+    if (!g_midi_active || g_midi_paused || g_midi_eof) {
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+    const esp_err_t ret = cs43131_set_pcm_mute(true);
+    if (ret != ESP_OK) {
+        audio_request_complete(request, false, ret);
+        return;
+    }
+    g_pcm_unmute_pending = false;
+    audio_task_reset_pcm_fade_in();
+    g_midi_paused = true;
+    audio_task_publish_midi_clock_snapshot();
+    audio_request_complete(request, true, ESP_OK);
+}
+
+static void audio_task_handle_midi_resume(AudioRequest *request)
+{
+    if (request == nullptr) return;
+    g_task_last_request_id = request->request_id;
+    if (!g_midi_active || !g_midi_paused || g_midi_eof) {
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+    esp_err_t ret = i2s_output_stream_write_silence(
+        AUDIO_STREAM_FRAMES * 2U, AUDIO_I2S_WRITE_TIMEOUT_MS);
+    if (ret == ESP_OK) {
+        audio_task_begin_pcm_fade_in("midi_resume", g_midi_synth.sample_rate_hz);
+        g_pcm_unmute_pending = true;
+        g_midi_paused = false;
+        audio_task_publish_midi_clock_snapshot();
+    }
+    audio_request_complete(request, ret == ESP_OK, ret);
+}
+
+static void audio_task_handle_midi_restart(AudioRequest *request)
+{
+    if (request == nullptr) return;
+    g_task_last_request_id = request->request_id;
+    if (!g_midi_active || !midi_synth_is_open(&g_midi_synth)) {
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+    midi_synth_restart(&g_midi_synth);
+    audio_playback_clock_reset(&g_midi_playback_clock, g_midi_synth.sample_rate_hz);
+    g_midi_eof = false;
+    g_midi_paused = false;
+    audio_task_begin_pcm_fade_in("midi_restart", g_midi_synth.sample_rate_hz);
+    g_pcm_unmute_pending = true;
+    audio_task_publish_midi_clock_snapshot();
+    audio_request_complete(request, true, ESP_OK);
+}
+
+static void audio_task_handle_midi_stop(AudioRequest *request)
+{
+    if (request == nullptr) return;
+    g_task_last_request_id = request->request_id;
+    const esp_err_t ret = audio_task_stop_midi_internal(
+        request->midi_restore_music_hardware,
+        "midi_stop_command");
+    audio_request_complete(request, ret == ESP_OK, ret);
+}
+
+static void audio_task_service_midi()
+{
+    if (!g_midi_active || !midi_synth_is_open(&g_midi_synth)) return;
+
+    if (g_midi_paused || g_midi_eof) {
+        const esp_err_t silence_ret =
+            i2s_output_stream_write_silence(AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
+        if (silence_ret != ESP_OK) {
+            ESP_LOGE(TAG, "MIDI静音时钟维持失败：%s", esp_err_to_name(silence_ret));
+        }
+        return;
+    }
+
+    size_t frames = 0U;
+    esp_err_t ret = midi_synth_render_pcm32(
+        &g_midi_synth,
+        g_pcm_block,
+        AUDIO_STREAM_FRAMES,
+        &frames);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "MIDI Synth渲染失败：%s；后续保持静音", esp_err_to_name(ret));
+        (void)cs43131_set_pcm_mute(true);
+        g_midi_eof = true;
+        audio_task_publish_midi_clock_snapshot();
+        return;
+    }
+
+    audio_playback_clock_note_decoder(
+        &g_midi_playback_clock, midi_synth_position_frames(&g_midi_synth));
+    if (frames == 0U) {
+        if (midi_synth_is_eof(&g_midi_synth)) {
+            g_midi_eof = true;
+            audio_task_publish_midi_clock_snapshot();
+            ESP_LOGI(TAG, "MIDI Synth EOS：PCM=%lluf/%llums",
+                static_cast<unsigned long long>(g_midi_playback_clock.submitted_frames),
+                static_cast<unsigned long long>(audio_playback_clock_position_ms(&g_midi_playback_clock)));
+        }
+        return;
+    }
+
+    audio_task_apply_pcm_fade_in(g_pcm_block, frames);
+    ret = audio_task_unmute_when_pcm_ready();
+    if (ret == ESP_OK) {
+        ret = i2s_output_stream_write_pcm32(g_pcm_block, frames, AUDIO_I2S_WRITE_TIMEOUT_MS);
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "MIDI I2S发送失败：%s；后续保持静音", esp_err_to_name(ret));
+        (void)cs43131_set_pcm_mute(true);
+        g_midi_eof = true;
+        audio_task_publish_midi_clock_snapshot();
+        return;
+    }
+
+    audio_playback_clock_commit_pcm(&g_midi_playback_clock, frames);
+    audio_task_publish_midi_clock_snapshot();
+}
+
+static esp_err_t audio_task_restore_paused_music_hardware_for_nsf(const char *reason)
+{
+    if (!g_nsf_restore_paused_music_hardware) return ESP_OK;
+    if (g_task_state != AudioPlaybackState::Paused || !pcm_decoder_is_open(&g_decoder) ||
+        g_task_sample_rate_hz == 0U) {
+        ESP_LOGE(TAG, "NSF恢复Music硬件失败：Music pipeline不再处于Paused reason=%s",
+            reason != nullptr ? reason : "unknown");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const esp_err_t ret = audio_task_start_output_hardware(
+        g_task_sample_rate_hz,
+        g_task_bits_per_sample,
+        g_task_channels,
+        "Music-Restore",
+        nullptr,
+        false,
+        nullptr);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "NSF已恢复Paused Music硬件：%luHz/%ubit/%uch reason=%s；等待电子音流决定是否resume",
+            static_cast<unsigned long>(g_task_sample_rate_hz),
+            static_cast<unsigned>(g_task_bits_per_sample),
+            static_cast<unsigned>(g_task_channels),
+            reason != nullptr ? reason : "unknown");
+    }
+    return ret;
+}
+
+static void audio_task_reset_nsf_end_policy()
+{
+    g_nsf_eof = false;
+    g_nsf_seen_audible = false;
+    g_nsf_silence_frames = 0ULL;
+    g_nsf_loop_end_active = false;
+    g_nsf_loop_fade_start_frame = 0ULL;
+}
+
+static int32_t audio_task_nsf_block_peak_pcm16(const int32_t *pcm, size_t frames)
+{
+    int32_t peak = 0;
+    for (size_t i = 0U; i < frames; ++i) {
+        int32_t sample = pcm[i * 2U] >> 16;
+        if (sample < 0) sample = -sample;
+        if (sample > peak) peak = sample;
+    }
+    return peak;
+}
+
+static bool audio_task_update_nsf_silence_end(const int32_t *pcm, size_t frames)
+{
+    if (g_nsf_synth.sample_rate_hz == 0U || frames == 0U) return false;
+    const int32_t peak = audio_task_nsf_block_peak_pcm16(pcm, frames);
+    if (peak > NSF_SILENCE_PEAK_PCM16) {
+        g_nsf_seen_audible = true;
+        g_nsf_silence_frames = 0ULL;
+        return false;
+    }
+    if (!g_nsf_seen_audible) return false;
+
+    g_nsf_silence_frames += frames;
+    const uint64_t silence_limit =
+        static_cast<uint64_t>(g_nsf_synth.sample_rate_hz) * NSF_SILENCE_END_MS / 1000ULL;
+    return g_nsf_silence_frames >= silence_limit;
+}
+
+enum class NsfTimedEndReason : uint8_t
+{
+    None = 0U,
+    LoopDetected,
+    Fallback,
+};
+
+static NsfTimedEndReason audio_task_apply_nsf_timed_fade(int32_t *pcm, size_t frames)
+{
+    if (g_nsf_synth.sample_rate_hz == 0U || frames == 0U) return NsfTimedEndReason::None;
+    const uint64_t rate = g_nsf_synth.sample_rate_hz;
+    const uint64_t current_frame = nsf_synth_position_frames(&g_nsf_synth);
+    const uint64_t block_start = current_frame >= frames ? current_frame - frames : 0ULL;
+    const uint64_t fade_frames = rate * NSF_TRACK_FADE_MS / 1000ULL;
+
+    NsfSynthLoopInfo loop = {};
+    const bool loop_detected =
+        nsf_synth_get_loop_info(&g_nsf_synth, &loop) && loop.detected && loop.length_frames > 0ULL;
+
+    uint64_t fade_start = rate * NSF_FALLBACK_PLAY_MS / 1000ULL;
+    NsfTimedEndReason reason = NsfTimedEndReason::Fallback;
+    if (loop_detected) {
+        const uint64_t target = loop.start_frame + loop.length_frames * 2ULL;
+        if (!g_nsf_loop_end_active) {
+            // 若检测比目标稍晚，仍从“现在”开始完整5秒淡出，避免突然截断。
+            g_nsf_loop_fade_start_frame = target > current_frame ? target : current_frame;
+            g_nsf_loop_end_active = true;
+            ESP_LOGI(TAG, "NSF循环结束计划：start=%llums loop=%llums fade_at=%llums",
+                static_cast<unsigned long long>(loop.start_frame * 1000ULL / rate),
+                static_cast<unsigned long long>(loop.length_frames * 1000ULL / rate),
+                static_cast<unsigned long long>(g_nsf_loop_fade_start_frame * 1000ULL / rate));
+        }
+        fade_start = g_nsf_loop_fade_start_frame;
+        reason = NsfTimedEndReason::LoopDetected;
+    }
+
+    const uint64_t fade_end = fade_start + fade_frames;
+    if (current_frame <= fade_start) return NsfTimedEndReason::None;
+
+    for (size_t frame = 0U; frame < frames; ++frame) {
+        const uint64_t absolute_frame = block_start + frame;
+        int32_t gain_q15 = 32767;
+        if (absolute_frame >= fade_start) {
+            const uint64_t remaining = absolute_frame < fade_end ? fade_end - absolute_frame : 0ULL;
+            gain_q15 = fade_frames != 0ULL
+                ? static_cast<int32_t>((remaining * 32767ULL) / fade_frames)
+                : 0;
+        }
+        pcm[frame * 2U] = static_cast<int32_t>(
+            (static_cast<int64_t>(pcm[frame * 2U]) * gain_q15) >> 15);
+        pcm[frame * 2U + 1U] = static_cast<int32_t>(
+            (static_cast<int64_t>(pcm[frame * 2U + 1U]) * gain_q15) >> 15);
+    }
+    return current_frame >= fade_end ? reason : NsfTimedEndReason::None;
+}
+
+static void audio_task_finish_nsf_track(const char *reason)
+{
+    if (g_nsf_eof) return;
+    g_nsf_eof = true;
+    g_pcm_unmute_pending = false;
+    audio_task_reset_pcm_fade_in();
+    (void)cs43131_set_pcm_mute(true);
+    audio_task_publish_nsf_clock_snapshot();
+    ESP_LOGI(TAG, "NSF Track结束：reason=%s track=%u/%u position=%llums",
+        reason != nullptr ? reason : "unknown",
+        static_cast<unsigned>(g_nsf_synth.track + 1U),
+        static_cast<unsigned>(g_nsf_synth.track_count),
+        static_cast<unsigned long long>(audio_playback_clock_position_ms(&g_nsf_playback_clock)));
+}
+
+static esp_err_t audio_task_stop_nsf_internal(bool restore_music_hardware, const char *reason)
+{
+    const bool should_restore = restore_music_hardware && g_nsf_restore_paused_music_hardware;
+    if (!g_nsf_active && !nsf_synth_is_open(&g_nsf_synth)) {
+        esp_err_t ret = ESP_OK;
+        if (should_restore) ret = audio_task_restore_paused_music_hardware_for_nsf(reason);
+        if (restore_music_hardware && ret == ESP_OK) {
+            g_nsf_restore_paused_music_hardware = false;
+        }
+        g_nsf_paused = false;
+        g_nsf_failed = false;
+        audio_task_reset_nsf_end_policy();
+        audio_task_publish_nsf_clock_snapshot();
+        return ret;
+    }
+
+    esp_err_t first_error = ESP_OK;
+    const uint32_t rate = g_nsf_synth.sample_rate_hz > 0U ? g_nsf_synth.sample_rate_hz : 48000U;
+    audio_task_remember_first_error(
+        audio_task_shutdown_output_hardware(rate, "NSF-2A03"), &first_error);
+
+    nsf_synth_close(&g_nsf_synth);
+    g_nsf_active = false;
+    g_nsf_paused = false;
+    g_nsf_failed = false;
+    audio_task_reset_nsf_end_policy();
+    audio_playback_clock_reset(&g_nsf_playback_clock, 0U);
+    audio_task_publish_nsf_clock_snapshot();
+
+    if (should_restore) {
+        audio_task_remember_first_error(
+            audio_task_restore_paused_music_hardware_for_nsf(reason), &first_error);
+    }
+    if (restore_music_hardware && first_error == ESP_OK) {
+        g_nsf_restore_paused_music_hardware = false;
+    }
+
+    ESP_LOGI(TAG, "NSF 2A03已停止：恢复Music硬件=%u 结果=%s",
+        static_cast<unsigned>(should_restore), esp_err_to_name(first_error));
+    return first_error;
+}
+
+static void audio_task_handle_nsf_start(AudioRequest *request)
+{
+    if (request == nullptr) return;
+    g_task_last_request_id = request->request_id;
+
+    if (g_nsf_active || nsf_synth_is_open(&g_nsf_synth) || request->nsf_prg == nullptr ||
+        request->nsf_prg_size == 0U || request->nsf_config.track_count == 0U) {
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+    if (g_video_mp3_active || mp3_decoder_is_open(&g_video_mp3_decoder) ||
+        g_midi_active || midi_synth_is_open(&g_midi_synth)) {
+        ESP_LOGE(TAG, "NSF启动被拒绝：其它临时音频仍在活动");
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+    if (g_task_state == AudioPlaybackState::Playing ||
+        g_task_state == AudioPlaybackState::Preparing ||
+        g_task_state == AudioPlaybackState::Seeking) {
+        ESP_LOGE(TAG, "NSF启动要求Music先暂停：当前state=%s",
+            audio_playback_state_name_cn(g_task_state));
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+
+    g_nsf_restore_paused_music_hardware =
+        g_task_state == AudioPlaybackState::Paused && pcm_decoder_is_open(&g_decoder);
+
+    if (g_pipeline_headphone_enabled || g_pipeline_clock_prepared ||
+        g_pipeline_i2s_started || i2s_output_is_started()) {
+        const uint32_t active_rate = g_task_sample_rate_hz > 0U ? g_task_sample_rate_hz : 48000U;
+        const esp_err_t shutdown_ret = audio_task_shutdown_output_hardware(active_rate, "Music-Paused");
+        if (shutdown_ret != ESP_OK) {
+            g_nsf_restore_paused_music_hardware = false;
+            audio_request_complete(request, false, shutdown_ret);
+            return;
+        }
+    }
+
+    uint8_t *owned_prg = request->nsf_prg;
+    esp_err_t ret = nsf_synth_open_owned(
+        &g_nsf_synth,
+        owned_prg,
+        request->nsf_prg_size,
+        &request->nsf_config,
+        48000U);
+    if (ret != ESP_OK) {
+        if (g_nsf_restore_paused_music_hardware) {
+            const esp_err_t restore_ret =
+                audio_task_restore_paused_music_hardware_for_nsf("nsf_open_failed");
+            if (restore_ret == ESP_OK) g_nsf_restore_paused_music_hardware = false;
+        }
+        audio_request_complete(request, false, ret);
+        return;
+    }
+    request->nsf_prg = nullptr; // 所有权已转移给 NsfSynth
+
+    audio_playback_clock_reset(&g_nsf_playback_clock, g_nsf_synth.sample_rate_hz);
+    ret = audio_task_start_output_hardware(
+        g_nsf_synth.sample_rate_hz,
+        16U,
+        2U,
+        "NSF-2A03",
+        nullptr,
+        true,
+        "nsf");
+    if (ret != ESP_OK) {
+        nsf_synth_close(&g_nsf_synth);
+        if (g_nsf_restore_paused_music_hardware) {
+            const esp_err_t restore_ret =
+                audio_task_restore_paused_music_hardware_for_nsf("nsf_hw_failed");
+            if (restore_ret == ESP_OK) g_nsf_restore_paused_music_hardware = false;
+        }
+        audio_request_complete(request, false, ret);
+        return;
+    }
+
+    ++g_nsf_clock_revision;
+    if (g_nsf_clock_revision == 0U) ++g_nsf_clock_revision;
+    g_nsf_active = true;
+    g_nsf_paused = false;
+    g_nsf_failed = false;
+    audio_task_reset_nsf_end_policy();
+    audio_task_publish_nsf_clock_snapshot();
+    ESP_LOGI(TAG, "NSF 2A03已启动：48000Hz/16bit/2ch track=%u/%u 基础5通道",
+        static_cast<unsigned>(g_nsf_synth.track + 1U),
+        static_cast<unsigned>(g_nsf_synth.track_count));
+    audio_request_complete(request, true, ESP_OK);
+}
+
+static void audio_task_handle_nsf_pause(AudioRequest *request)
+{
+    if (request == nullptr) return;
+    g_task_last_request_id = request->request_id;
+    if (!g_nsf_active || g_nsf_paused || g_nsf_eof || g_nsf_failed) {
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+    const esp_err_t ret = cs43131_set_pcm_mute(true);
+    if (ret == ESP_OK) {
+        g_pcm_unmute_pending = false;
+        audio_task_reset_pcm_fade_in();
+        g_nsf_paused = true;
+        audio_task_publish_nsf_clock_snapshot();
+    }
+    audio_request_complete(request, ret == ESP_OK, ret);
+}
+
+static void audio_task_handle_nsf_resume(AudioRequest *request)
+{
+    if (request == nullptr) return;
+    g_task_last_request_id = request->request_id;
+    if (!g_nsf_active || !g_nsf_paused || g_nsf_eof || g_nsf_failed) {
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+    esp_err_t ret = i2s_output_stream_write_silence(
+        AUDIO_STREAM_FRAMES * 2U, AUDIO_I2S_WRITE_TIMEOUT_MS);
+    if (ret == ESP_OK) {
+        audio_task_begin_pcm_fade_in("nsf_resume", g_nsf_synth.sample_rate_hz);
+        g_pcm_unmute_pending = true;
+        g_nsf_paused = false;
+        audio_task_publish_nsf_clock_snapshot();
+    }
+    audio_request_complete(request, ret == ESP_OK, ret);
+}
+
+static void audio_task_handle_nsf_set_track(AudioRequest *request)
+{
+    if (request == nullptr) return;
+    g_task_last_request_id = request->request_id;
+    if (!g_nsf_active || !nsf_synth_is_open(&g_nsf_synth) ||
+        request->nsf_track >= g_nsf_synth.track_count) {
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+
+    const bool was_paused = g_nsf_paused;
+    esp_err_t ret = cs43131_set_pcm_mute(true);
+    if (ret == ESP_OK) ret = nsf_synth_set_track(&g_nsf_synth, request->nsf_track);
+    if (ret == ESP_OK) {
+        audio_playback_clock_reset(&g_nsf_playback_clock, g_nsf_synth.sample_rate_hz);
+        g_nsf_failed = false;
+        audio_task_reset_nsf_end_policy();
+        g_nsf_paused = was_paused;
+        if (!was_paused) {
+            ret = i2s_output_stream_write_silence(
+                AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
+            if (ret == ESP_OK) {
+                audio_task_begin_pcm_fade_in("nsf_track", g_nsf_synth.sample_rate_hz);
+                g_pcm_unmute_pending = true;
+            }
+        } else {
+            g_pcm_unmute_pending = false;
+            audio_task_reset_pcm_fade_in();
+        }
+        audio_task_publish_nsf_clock_snapshot();
+    }
+    audio_request_complete(request, ret == ESP_OK, ret);
+}
+
+static void audio_task_handle_nsf_stop(AudioRequest *request)
+{
+    if (request == nullptr) return;
+    g_task_last_request_id = request->request_id;
+    const esp_err_t ret = audio_task_stop_nsf_internal(
+        request->nsf_restore_music_hardware,
+        "nsf_stop_command");
+    audio_request_complete(request, ret == ESP_OK, ret);
+}
+
+static void audio_task_service_nsf()
+{
+    if (!g_nsf_active || !nsf_synth_is_open(&g_nsf_synth)) return;
+
+    if (g_nsf_paused || g_nsf_eof || g_nsf_failed) {
+        const esp_err_t silence_ret =
+            i2s_output_stream_write_silence(AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
+        if (silence_ret != ESP_OK) {
+            ESP_LOGE(TAG, "NSF静音时钟维持失败：%s", esp_err_to_name(silence_ret));
+        }
+        return;
+    }
+
+    size_t frames = 0U;
+    esp_err_t ret = nsf_synth_render_pcm32(
+        &g_nsf_synth,
+        g_pcm_block,
+        AUDIO_STREAM_FRAMES,
+        &frames);
+    if (ret != ESP_OK || frames == 0U) {
+        ESP_LOGE(TAG, "NSF 2A03渲染失败：%s；后续保持静音", esp_err_to_name(ret));
+        (void)cs43131_set_pcm_mute(true);
+        g_nsf_failed = true;
+        audio_task_publish_nsf_clock_snapshot();
+        return;
+    }
+
+    const bool silence_eof = audio_task_update_nsf_silence_end(g_pcm_block, frames);
+    const NsfTimedEndReason timed_end = audio_task_apply_nsf_timed_fade(g_pcm_block, frames);
+
+    audio_playback_clock_note_decoder(
+        &g_nsf_playback_clock, nsf_synth_position_frames(&g_nsf_synth));
+    audio_task_apply_pcm_fade_in(g_pcm_block, frames);
+    ret = audio_task_unmute_when_pcm_ready();
+    if (ret == ESP_OK) {
+        ret = i2s_output_stream_write_pcm32(g_pcm_block, frames, AUDIO_I2S_WRITE_TIMEOUT_MS);
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "NSF I2S发送失败：%s；后续保持静音", esp_err_to_name(ret));
+        (void)cs43131_set_pcm_mute(true);
+        g_nsf_failed = true;
+        audio_task_publish_nsf_clock_snapshot();
+        return;
+    }
+
+    audio_playback_clock_commit_pcm(&g_nsf_playback_clock, frames);
+    if (silence_eof) {
+        audio_task_finish_nsf_track("silence_6s");
+    } else if (timed_end == NsfTimedEndReason::LoopDetected) {
+        audio_task_finish_nsf_track("loop_2x_fade5s");
+    } else if (timed_end == NsfTimedEndReason::Fallback) {
+        audio_task_finish_nsf_track("fallback_150s_fade5s");
+    } else {
+        audio_task_publish_nsf_clock_snapshot();
+    }
+}
+
 static bool audio_task_pipeline_has_resources()
 {
     return
@@ -1862,7 +2688,9 @@ static bool audio_task_pipeline_has_resources()
         g_pipeline_asp_enabled ||
         g_pipeline_headphone_enabled ||
         i2s_output_is_started() ||
-        pcm_decoder_is_open(&g_decoder);
+        pcm_decoder_is_open(&g_decoder) ||
+        midi_synth_is_open(&g_midi_synth) ||
+        nsf_synth_is_open(&g_nsf_synth);
 }
 
 static PcmDecoderType audio_decoder_type_for_format(MediaFormat format)
@@ -1880,6 +2708,15 @@ static void audio_task_handle_play(AudioRequest *request)
     if (g_video_mp3_active || mp3_decoder_is_open(&g_video_mp3_decoder)) {
         (void)audio_task_stop_video_mp3_internal(false, "music_play_override");
     }
+    if (g_midi_active || midi_synth_is_open(&g_midi_synth)) {
+        (void)audio_task_stop_midi_internal(false, "music_play_override");
+    }
+    if (g_nsf_active || nsf_synth_is_open(&g_nsf_synth)) {
+        (void)audio_task_stop_nsf_internal(false, "music_play_override");
+    }
+    // 新 Music Play 会完整重建自己的 pipeline，不再需要临时音源恢复旧 Paused 硬件。
+    g_midi_restore_paused_music_hardware = false;
+    g_nsf_restore_paused_music_hardware = false;
     const char *path = audio_request_path(request);
 
     // 队列中的 transport 唤醒项可能已经被更新 intent 覆盖；这种请求不能触碰当前 pipeline。
@@ -2120,6 +2957,14 @@ static void audio_task_handle_stop(AudioRequest *request)
     if (g_video_mp3_active || mp3_decoder_is_open(&g_video_mp3_decoder)) {
         (void)audio_task_stop_video_mp3_internal(false, "global_stop");
     }
+    if (g_midi_active || midi_synth_is_open(&g_midi_synth)) {
+        (void)audio_task_stop_midi_internal(false, "global_stop");
+    }
+    if (g_nsf_active || nsf_synth_is_open(&g_nsf_synth)) {
+        (void)audio_task_stop_nsf_internal(false, "global_stop");
+    }
+    g_midi_restore_paused_music_hardware = false;
+    g_nsf_restore_paused_music_hardware = false;
     esp_err_t ret = audio_task_shutdown_pipeline();
     audio_task_advance_playback_revision();
     g_task_track_index = UINT32_MAX;
@@ -2146,8 +2991,8 @@ static void audio_task_handle_stop(AudioRequest *request)
 static void audio_task_handle_pause(AudioRequest *request)
 {
     g_task_last_request_id = request->request_id;
-    if (g_video_mp3_active) {
-        ESP_LOGW(TAG, "Video Audio活动期间拒绝Music Pause重复请求");
+    if (g_video_mp3_active || g_midi_active || g_nsf_active) {
+        ESP_LOGW(TAG, "临时音频活动期间拒绝Music Pause重复请求");
         audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
         return;
     }
@@ -2181,8 +3026,8 @@ static void audio_task_handle_pause(AudioRequest *request)
 static void audio_task_handle_resume(AudioRequest *request)
 {
     g_task_last_request_id = request->request_id;
-    if (g_video_mp3_active) {
-        ESP_LOGW(TAG, "Video Audio活动期间拒绝Music Resume；必须先停止AVI MP3");
+    if (g_video_mp3_active || g_midi_active || g_nsf_active) {
+        ESP_LOGW(TAG, "临时音频活动期间拒绝Music Resume；必须先停止当前临时音频");
         audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
         return;
     }
@@ -2306,6 +3151,36 @@ static void audio_task_process_request(AudioRequest *request)
             break;
         case AudioCommandType::VideoMp3Stop:
             audio_task_handle_video_mp3_stop(request);
+            break;
+        case AudioCommandType::MidiStart:
+            audio_task_handle_midi_start(request);
+            break;
+        case AudioCommandType::MidiPause:
+            audio_task_handle_midi_pause(request);
+            break;
+        case AudioCommandType::MidiResume:
+            audio_task_handle_midi_resume(request);
+            break;
+        case AudioCommandType::MidiRestart:
+            audio_task_handle_midi_restart(request);
+            break;
+        case AudioCommandType::MidiStop:
+            audio_task_handle_midi_stop(request);
+            break;
+        case AudioCommandType::NsfStart:
+            audio_task_handle_nsf_start(request);
+            break;
+        case AudioCommandType::NsfPause:
+            audio_task_handle_nsf_pause(request);
+            break;
+        case AudioCommandType::NsfResume:
+            audio_task_handle_nsf_resume(request);
+            break;
+        case AudioCommandType::NsfSetTrack:
+            audio_task_handle_nsf_set_track(request);
+            break;
+        case AudioCommandType::NsfStop:
+            audio_task_handle_nsf_stop(request);
             break;
     }
 }
@@ -2439,6 +3314,8 @@ static void audio_task_main(void *arg)
         AudioRequest *request = nullptr;
         const bool stream_needs_service =
             g_video_mp3_active ||
+            g_midi_active ||
+            g_nsf_active ||
             g_task_state == AudioPlaybackState::Playing ||
             g_task_state == AudioPlaybackState::Paused;
         const TickType_t wait_ticks = stream_needs_service ? 0 : portMAX_DELAY;
@@ -2450,6 +3327,10 @@ static void audio_task_main(void *arg)
 
         if (g_video_mp3_active) {
             audio_task_service_video_mp3();
+        } else if (g_midi_active) {
+            audio_task_service_midi();
+        } else if (g_nsf_active) {
+            audio_task_service_nsf();
         } else if (g_task_state == AudioPlaybackState::Playing) {
             audio_task_service_pcm_playback();
         } else if (g_task_state == AudioPlaybackState::Paused) {
@@ -2908,6 +3789,131 @@ bool audio_service_video_mp3_get_clock(AudioVideoClockSnapshot *out_snapshot)
     portENTER_CRITICAL(&g_video_clock_snapshot_mux);
     *out_snapshot = g_video_clock_snapshot;
     portEXIT_CRITICAL(&g_video_clock_snapshot_mux);
+    return true;
+}
+
+bool audio_service_midi_start(
+    const MidiSynthNoteEvent *notes,
+    size_t note_count,
+    uint32_t duration_ms,
+    bool wait)
+{
+    if (notes == nullptr || note_count == 0U || duration_ms == 0U ||
+        note_count > SIZE_MAX / sizeof(MidiSynthNoteEvent)) {
+        return false;
+    }
+
+    AudioRequest *request = audio_request_create(AudioCommandType::MidiStart, wait);
+    if (request == nullptr) return false;
+    const size_t bytes = note_count * sizeof(MidiSynthNoteEvent);
+    request->midi_notes = static_cast<MidiSynthNoteEvent *>(heap_caps_malloc(
+        bytes,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (request->midi_notes == nullptr) {
+        audio_request_release(request);
+        return false;
+    }
+    memcpy(request->midi_notes, notes, bytes);
+    request->midi_note_count = note_count;
+    request->midi_duration_ms = duration_ms;
+    return audio_service_submit(request, wait);
+}
+
+bool audio_service_midi_pause(bool wait)
+{
+    AudioRequest *request = audio_request_create(AudioCommandType::MidiPause, wait);
+    return audio_service_submit(request, wait);
+}
+
+bool audio_service_midi_resume(bool wait)
+{
+    AudioRequest *request = audio_request_create(AudioCommandType::MidiResume, wait);
+    return audio_service_submit(request, wait);
+}
+
+bool audio_service_midi_restart(bool wait)
+{
+    AudioRequest *request = audio_request_create(AudioCommandType::MidiRestart, wait);
+    return audio_service_submit(request, wait);
+}
+
+bool audio_service_midi_stop(bool restore_music_hardware, bool wait)
+{
+    AudioRequest *request = audio_request_create(AudioCommandType::MidiStop, wait);
+    if (request == nullptr) return false;
+    request->midi_restore_music_hardware = restore_music_hardware;
+    return audio_service_submit(request, wait);
+}
+
+bool audio_service_midi_get_clock(AudioMidiClockSnapshot *out_snapshot)
+{
+    if (out_snapshot == nullptr) return false;
+    portENTER_CRITICAL(&g_midi_clock_snapshot_mux);
+    *out_snapshot = g_midi_clock_snapshot;
+    portEXIT_CRITICAL(&g_midi_clock_snapshot_mux);
+    return true;
+}
+
+bool audio_service_nsf_start(
+    const uint8_t *prg,
+    size_t prg_size,
+    const NsfSynthConfig *config,
+    bool wait)
+{
+    if (prg == nullptr || prg_size == 0U || config == nullptr ||
+        config->track_count == 0U || config->track >= config->track_count) {
+        return false;
+    }
+
+    AudioRequest *request = audio_request_create(AudioCommandType::NsfStart, wait);
+    if (request == nullptr) return false;
+    request->nsf_prg = static_cast<uint8_t *>(heap_caps_malloc(
+        prg_size,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (request->nsf_prg == nullptr) {
+        audio_request_release(request);
+        return false;
+    }
+    memcpy(request->nsf_prg, prg, prg_size);
+    request->nsf_prg_size = prg_size;
+    request->nsf_config = *config;
+    return audio_service_submit(request, wait);
+}
+
+bool audio_service_nsf_pause(bool wait)
+{
+    AudioRequest *request = audio_request_create(AudioCommandType::NsfPause, wait);
+    return audio_service_submit(request, wait);
+}
+
+bool audio_service_nsf_resume(bool wait)
+{
+    AudioRequest *request = audio_request_create(AudioCommandType::NsfResume, wait);
+    return audio_service_submit(request, wait);
+}
+
+bool audio_service_nsf_set_track(uint8_t track, bool wait)
+{
+    AudioRequest *request = audio_request_create(AudioCommandType::NsfSetTrack, wait);
+    if (request == nullptr) return false;
+    request->nsf_track = track;
+    return audio_service_submit(request, wait);
+}
+
+bool audio_service_nsf_stop(bool restore_music_hardware, bool wait)
+{
+    AudioRequest *request = audio_request_create(AudioCommandType::NsfStop, wait);
+    if (request == nullptr) return false;
+    request->nsf_restore_music_hardware = restore_music_hardware;
+    return audio_service_submit(request, wait);
+}
+
+bool audio_service_nsf_get_clock(AudioNsfClockSnapshot *out_snapshot)
+{
+    if (out_snapshot == nullptr) return false;
+    portENTER_CRITICAL(&g_nsf_clock_snapshot_mux);
+    *out_snapshot = g_nsf_clock_snapshot;
+    portEXIT_CRITICAL(&g_nsf_clock_snapshot_mux);
     return true;
 }
 

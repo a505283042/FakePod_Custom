@@ -170,7 +170,7 @@ struct LauncherMenuItemDef {
 static_assert(kLauncherItemCount == static_cast<uint8_t>(AppId::Count));
 static constexpr LauncherMenuItemDef kLauncherItems[kLauncherItemCount] = {
     {LauncherIconKind::Music,       AppId::Music,       "音乐",     180, 0x3C527F, -5,  0,     0, -10000},
-    {LauncherIconKind::Nsf,         AppId::Nsf,         "NSF播放",  129, 0x334A78,  0,  0,  7771,  -6293},
+    {LauncherIconKind::Nsf,         AppId::Nsf,         "电子音流",  129, 0x334A78,  0,  0,  7771,  -6293},
     {LauncherIconKind::MicSpectrum, AppId::MicSpectrum, "拾音频谱",  77, 0x2B426F, -2,  0,  9744,   2250},
     {LauncherIconKind::Mjpg,        AppId::Video,       "视频",      26, 0x263D69,  0,  0,  4384,   8988},
     {LauncherIconKind::Picture,     AppId::Picture,     "图片播放", 334, 0x233861,  0,  0, -4384,   8988},
@@ -2262,7 +2262,7 @@ static void player_home_launcher_activate_index(
         static_cast<long>(touch_x),
         static_cast<long>(touch_y));
 
-    // Music/Ebook 统一语义：所有扇区都先选中；当前 APP 或未注册 APP 不跳转。
+    // 共享Launcher统一语义：所有扇区都先选中；当前 APP 或未注册 APP 不跳转。
     if (!should_launch) {
         return;
     }
