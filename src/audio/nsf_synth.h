@@ -19,6 +19,7 @@ struct NsfSynthConfig
     uint8_t track = 0U; // 0-based
     uint8_t pal_ntsc_bits = 0U;
     uint8_t expansion_chips = 0U;
+    bool enable_loop_detection = false; // 仅后台分析实例开启，实时播放路径不承担循环搜索
 };
 
 struct NsfSynth
@@ -37,6 +38,15 @@ struct NsfSynthLoopInfo
     bool detected = false;
     uint64_t start_frame = 0ULL;
     uint64_t length_frames = 0ULL;
+    bool hint_available = false; // 两个完整结构周期一致时即可用于提前显示时长；不能直接驱动 EOF
+    uint64_t hint_start_frame = 0ULL;
+    uint64_t hint_length_frames = 0ULL;
+};
+
+struct NsfSynthActivityInfo
+{
+    bool seen_audible = false;
+    uint64_t silent_frames = 0ULL; // 仅后台分析实例累计的连续无可听通道活动帧数
 };
 
 // owned_prg 所有权在成功后转移给 NsfSynth；失败时调用方仍负责释放。
@@ -50,6 +60,13 @@ esp_err_t nsf_synth_open_owned(
 void nsf_synth_close(NsfSynth *synth);
 esp_err_t nsf_synth_set_track(NsfSynth *synth, uint8_t track);
 
+// 为后台分析复制当前 NSF 源数据和配置；返回的 PRG 由调用方负责释放或转交给 NsfSynth。
+esp_err_t nsf_synth_copy_source(
+    const NsfSynth *synth,
+    uint8_t **out_prg,
+    size_t *out_prg_size,
+    NsfSynthConfig *out_config);
+
 esp_err_t nsf_synth_render_pcm32(
     NsfSynth *synth,
     int32_t *out_interleaved_stereo,
@@ -61,3 +78,4 @@ bool nsf_synth_has_failed(const NsfSynth *synth);
 uint64_t nsf_synth_position_frames(const NsfSynth *synth);
 uint8_t nsf_synth_track(const NsfSynth *synth);
 bool nsf_synth_get_loop_info(const NsfSynth *synth, NsfSynthLoopInfo *out_info);
+bool nsf_synth_get_activity_info(const NsfSynth *synth, NsfSynthActivityInfo *out_info);

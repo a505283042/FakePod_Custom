@@ -687,17 +687,14 @@ static void update_nsf_time_label()
             static_cast<unsigned long long>(duration_seconds / 60ULL),
             static_cast<unsigned long long>(duration_seconds % 60ULL));
     }
-    char text[96] = {};
+    char text[48] = {};
     snprintf(
         text,
         sizeof(text),
-        "%llu:%02llu / %s · Track %u/%u%s",
+        "%llu:%02llu / %s",
         static_cast<unsigned long long>(seconds / 60ULL),
         static_cast<unsigned long long>(seconds % 60ULL),
-        duration_text,
-        static_cast<unsigned>(g_nsf_track + 1U),
-        static_cast<unsigned>(g_nsf_image.track_count),
-        g_nsf_eof ? "  已结束" : (g_nsf_paused && !g_nsf_failed ? "  已暂停" : ""));
+        duration_text);
     lv_label_set_text(g_player_time, text);
 }
 
@@ -719,10 +716,9 @@ static void update_nsf_ready_ui()
         snprintf(
             format,
             sizeof(format),
-            "NSF · Track %u/%u%s",
+            "Track %u/%u",
             static_cast<unsigned>(g_nsf_track + 1U),
-            static_cast<unsigned>(g_nsf_image.track_count),
-            g_nsf_image.expansion_chips == 0U ? " · 2A03" : " · Expansion");
+            static_cast<unsigned>(g_nsf_image.track_count));
         lv_label_set_text(g_player_format, format);
     }
     update_nsf_time_label();
@@ -1523,7 +1519,7 @@ static void timer_cb(lv_timer_t *timer)
                 g_nsf_failed = true;
                 update_nsf_ready_ui();
             } else if (clock.eof) {
-                // NSF v1 没有 Track 时长：AudioTask 依据静音/有界 fallback 发布 EOF。
+                // NSF v1 没有 Track 时长：AudioTask 依据持续静音或3分钟附近完整循环边界发布 EOF。
                 // UI 只消费一次 EOF，并按当前循环模式切换 Subsong。
                 if (!g_nsf_eof_action_handled) {
                     g_nsf_eof_action_handled = true;
@@ -1788,11 +1784,11 @@ static esp_err_t visual_music_create()
     lv_obj_set_width(g_player_title, 420);
     lv_label_set_long_mode(g_player_title, LV_LABEL_LONG_DOT);
     lv_obj_align(g_player_title, LV_ALIGN_TOP_MID, 0, 8);
-    lv_obj_set_width(g_player_format, 210);
+    lv_obj_set_width(g_player_format, 180);
     lv_label_set_long_mode(g_player_format, LV_LABEL_LONG_DOT);
     lv_obj_set_pos(g_player_format, 14, 39);
-    lv_obj_set_width(g_player_time, 210);
-    lv_obj_set_pos(g_player_time, 236, 39);
+    lv_obj_set_width(g_player_time, 240);
+    lv_obj_set_pos(g_player_time, 206, 39);
 
     lv_obj_t *title_line = lv_obj_create(title_bar);
     if (title_line == nullptr) return cleanup_create_failure(ESP_ERR_NO_MEM);

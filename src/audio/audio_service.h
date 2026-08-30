@@ -129,7 +129,7 @@ struct AudioNsfClockSnapshot
     uint32_t sample_rate_hz = 0U;
     uint64_t submitted_frames = 0ULL;
     uint64_t position_ms = 0ULL;
-    uint64_t duration_ms = 0ULL; // 自动识别到循环后给出预计结束时间；未知时为0
+    uint64_t duration_ms = 0ULL; // 两轮结构一致可提前显示时长；自动结束仍等待后台可靠确认，无Loop/未知时为0
     uint8_t track = 0U;       // 0-based
     uint8_t track_count = 0U;
 };
