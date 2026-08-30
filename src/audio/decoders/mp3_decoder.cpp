@@ -15,9 +15,9 @@
 
 static const char *TAG = "MP3";
 
-// MP3 压缩输入工作区放 PSRAM。320kbps/44.1k 对比实测：8KB 窗口虽然 fread 更频繁，
-// 但同步阻塞峰值约 6.9ms、refill 峰值约 11.2ms，优于 12KB 窗口的约 10.7/15.0ms。
-// 正式配置保留 8KB，优先保证 AudioTask 最坏实时延迟；MP3 无需额外预取任务。
+// MP3 压缩输入工作区放 PSRAM。保留既有实机验证过的 8KB parser 窗口，
+// 运行期字节由统一 BUFFERED_SD Source 提供；这里的窗口大小只负责解码器输入整理，
+// 不再决定 AudioTask 的 FATFS 单次读取大小。
 static constexpr size_t MP3_INPUT_BUFFER_BYTES = 8 * 1024;
 // 继续保留 2KB 低水位。它高于常见 320kbps/44.1k 单帧约 1KB 的压缩尺寸，
 // 可避免 parser 面对不完整帧时在“尚未低于补读阈值”的窗口中反复无进度。
@@ -1161,7 +1161,7 @@ esp_err_t mp3_decoder_open(
         mp3_decoder_close(decoder);
         return ret != ESP_OK ? ret : ESP_ERR_NO_MEM;
     }
-    // 保持 Stage 9.5 实机验证的逻辑窗口大小，不因 workspace 曾被 FLAC 扩大而变成 32KB fread。
+    // 保持 Stage 9.5 实机验证的逻辑窗口大小，不因 workspace 曾被 FLAC 扩大而变成 32KB Source 读取。
     decoder->input_capacity = MP3_INPUT_BUFFER_BYTES;
     decoder->decoded_capacity = MP3_DECODED_BUFFER_BYTES;
 

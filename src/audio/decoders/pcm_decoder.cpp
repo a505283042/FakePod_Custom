@@ -2,6 +2,7 @@
 
 #include "esp_log.h"
 #include "app_diag_config.h"
+#include "../sources/buffered_sd_audio_source.h"
 
 static const char *TAG = "PCM解码";
 
@@ -31,7 +32,7 @@ esp_err_t pcm_decoder_open(
     }
     pcm_decoder_close(decoder);
 
-    // Stage 10.9 第一版只有本地 SD Source。Codec 不再 fopen(path)，只消费统一 AudioSource。
+    // 格式解析和 Seek 准备阶段先使用同步 SD Source；Codec 不直接 fopen(path)，只消费统一 AudioSource。
     esp_err_t ret = sd_file_audio_source_open(&decoder->source, &decoder->sd_file_source, path);
     if (ret != ESP_OK) {
         return ret;
@@ -87,6 +88,56 @@ esp_err_t pcm_decoder_open(
     return ESP_OK;
 }
 
+esp_err_t pcm_decoder_enable_runtime_read_ahead(PcmDecoder *decoder, const char *path)
+{
+    if (decoder == nullptr || path == nullptr || path[0] == '\0' || !pcm_decoder_is_open(decoder)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // FLAC 的高采样率预取已经经过专项验证，本轮不改变其运行时 I/O 模型。
+    if (decoder->type == PcmDecoderType::Flac) {
+        return ESP_OK;
+    }
+    if (decoder->type != PcmDecoderType::Mp3 && decoder->type != PcmDecoderType::Wav) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    uint64_t source_offset = 0;
+    esp_err_t ret = audio_source_tell(&decoder->source, &source_offset);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    // 先让新的预读 Source 完整启动，再替换旧同步 Source。这样即使 PSRAM/任务创建失败，
+    // 原 Codec 仍保持完整可关闭状态，不会因为 Source 被提前清空而漏掉 Codec 清理。
+    AudioSource buffered_source = {};
+    ret = buffered_sd_audio_source_open(
+        &buffered_source,
+        path,
+        source_offset);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    // Codec 持有的是 &decoder->source 指针。只替换该对象的内容，不改变对象地址，
+    // 因此无需重建 Codec，也不会丢失已经预解出的首块 PCM。
+    ret = audio_source_close(&decoder->source);
+    if (ret != ESP_OK) {
+        (void)audio_source_close(&buffered_source);
+        return ret;
+    }
+    decoder->sd_file_source = {};
+    decoder->source = buffered_source;
+
+#if APP_DIAG_AUDIO_SOURCE
+    ESP_LOGI(TAG, "SOURCE_TRACE: runtime read-ahead enabled format=%s offset=%llu source=%s",
+        pcm_decoder_type_name(decoder->type),
+        static_cast<unsigned long long>(source_offset),
+        audio_source_name(&decoder->source));
+#endif
+    return ESP_OK;
+}
+
 esp_err_t pcm_decoder_read_pcm32(
     PcmDecoder *decoder,
     int32_t *out_interleaved_stereo,
@@ -123,7 +174,7 @@ void pcm_decoder_close(PcmDecoder *decoder)
         mp3_decoder_close(&decoder->mp3);
     }
 
-    // FLAC close 会先停止 Core1 PrefetchTask；确认所有 Codec 都不再访问 Source 后，最后关闭底层文件。
+    // 先关闭 Codec，再关闭当前 Source；若运行期启用了顺序预读，Source close 会负责停止 Core1 任务。
     if (audio_source_is_open(&decoder->source)) {
 #if APP_DIAG_AUDIO_SOURCE
         const AudioSourceStats *stats = audio_source_stats(&decoder->source);

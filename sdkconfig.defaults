@@ -8,6 +8,13 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
 
 # ------------------------------------------------------------
+# 编译优化
+# 正式固件使用性能优化；保留断言，避免为了性能牺牲运行期错误检查。
+# ------------------------------------------------------------
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_ENABLE=y
+
+# ------------------------------------------------------------
 # External SPI Flash
 # 原厂固件：DIO / 80MHz / 16MB
 # ------------------------------------------------------------

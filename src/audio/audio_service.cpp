@@ -1170,10 +1170,28 @@ static esp_err_t audio_task_start_pcm_pipeline(
         return ESP_ERR_INVALID_STATE;
     }
 
+    // 格式解析和可选 Seek 均已完成；从这里开始才进入连续播放阶段。
+    // MP3/WAV 切换到 Core1 顺序预读，避免 AudioTask 在 I2S 运行期间直接等待 FATFS。
+    ret = pcm_decoder_enable_runtime_read_ahead(&g_decoder, path);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "启用运行期音频预读失败：format=%s ret=%s",
+            pcm_decoder_type_name(decoder_type), esp_err_to_name(ret));
+        pcm_decoder_close(&g_decoder);
+        return ret;
+    }
+    if (request != nullptr && audio_task_transport_request_superseded(request, "after_read_ahead")) {
+        pcm_decoder_close(&g_decoder);
+        audio_decode_workspace_trim(
+            &g_decode_workspace,
+            AUDIO_DECODE_WORKSPACE_RETAIN_INPUT_BYTES,
+            AUDIO_DECODE_WORKSPACE_RETAIN_PCM_BYTES);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     audio_task_log_ram("after_decoder_open");
 #if APP_DIAG_AUDIO_WORKSPACE
     ESP_LOGI(TAG,
-        "WORKSPACE_TRACE: codec=%s input=%uB pcm=%uB total=%uB（PSRAM共享，FLAC ring独立）",
+        "WORKSPACE_TRACE: codec=%s input=%uB pcm=%uB total=%uB（PSRAM共享，压缩预读ring独立）",
         pcm_decoder_type_name(decoder_type),
         static_cast<unsigned>(g_decode_workspace.input_capacity),
         static_cast<unsigned>(g_decode_workspace.decoded_capacity),
@@ -2351,7 +2369,7 @@ static void audio_task_main(void *arg)
         static_cast<unsigned>(AUDIO_TASK_STACK_BYTES));
 #endif
 
-    // 高采样率播放依赖双核流水线：AudioTask 固定 Core 0，SD/FLAC 预取固定 Core 1。
+    // 音频播放依赖双核流水线：AudioTask 固定 Core 0，SD 顺序预取固定 Core 1。
     // 如果运行环境没有遵守绑核约束，宁可拒绝初始化，也不让音频实时任务和阻塞 I/O 混在同一核心。
     if (current_core != AUDIO_TASK_CORE) {
         g_start_result = ESP_ERR_INVALID_STATE;

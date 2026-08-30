@@ -52,7 +52,8 @@ struct PcmDecoderInfo
 // AudioTask -> I2S -> CS43131 的播放链路不因源格式复制。
 struct PcmDecoder
 {
-    // Source 生命周期归统一 PCM Decoder 所有；各 codec 只借用 AudioSource*。
+    // Source 生命周期归统一 PCM Decoder 所有；各 codec 只借用同一个 AudioSource*。
+    // 打开/Seek 阶段使用同步 SD 存储，MP3/WAV 连续播放前切换为顺序预读存储。
     AudioSource source = {};
     SdFileAudioSource sd_file_source = {};
 
@@ -70,6 +71,10 @@ esp_err_t pcm_decoder_open(
     const char *path,
     AudioDecodeWorkspace *workspace = nullptr
 );
+// MP3/WAV 完成格式解析和可选 Seek 后，将后续连续读取切换到 Core1 预读。
+// 必须在 I2S/DAC 启动前调用；FLAC 已有独立预取，本阶段保持原实现。
+esp_err_t pcm_decoder_enable_runtime_read_ahead(PcmDecoder *decoder, const char *path);
+
 esp_err_t pcm_decoder_read_pcm32(
     PcmDecoder *decoder,
     int32_t *out_interleaved_stereo,
