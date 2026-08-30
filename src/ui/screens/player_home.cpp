@@ -2993,13 +2993,6 @@ static bool player_home_snapshot_can_scrub(const AudioStateSnapshot &snapshot)
         return false;
     }
 
-    // P1.3.5.4.2：FLAC 的任意位置 Seek 会完整重建 decoder/prefetch/I2S pipeline。
-    // 实机已确认“播放中拖动”会在 UI 刷新与预取竞争下出现卡顿甚至进入 Error。
-    // 稳定模式下 FLAC 必须先暂停再拖进度条；MP3/WAV 仍允许播放中 Seek。
-    if (snapshot.format == MediaFormat::FLAC) {
-        return snapshot.state == AudioPlaybackState::Paused;
-    }
-
     return snapshot.state == AudioPlaybackState::Playing ||
         snapshot.state == AudioPlaybackState::Paused ||
         snapshot.state == AudioPlaybackState::Seeking;

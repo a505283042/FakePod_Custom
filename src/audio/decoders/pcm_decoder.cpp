@@ -88,6 +88,87 @@ esp_err_t pcm_decoder_open(
     return ESP_OK;
 }
 
+esp_err_t pcm_decoder_open_for_seek(
+    PcmDecoder *decoder,
+    PcmDecoderType type,
+    const char *path,
+    AudioDecodeWorkspace *workspace,
+    uint64_t target_ms,
+    const MediaTechnicalInfo *technical_info,
+    PcmSeekResult *out_result)
+{
+    if (out_result != nullptr) {
+        *out_result = {};
+    }
+    if (decoder == nullptr || path == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // FLAC 的目标帧依赖文件自身采样率。直接解析一次 STREAMINFO 后从目标 seekpoint
+    // 建立运行时，避免先按曲首启动 Prefetch/预解码，再立刻关闭并重建。
+    if (type == PcmDecoderType::Flac && target_ms > 0) {
+        pcm_decoder_close(decoder);
+        esp_err_t ret = sd_file_audio_source_open(&decoder->source, &decoder->sd_file_source, path);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+
+        uint64_t target_frame = 0;
+        uint64_t source_offset = 0;
+        ret = flac_decoder_open_at_ms(
+            &decoder->flac,
+            &decoder->source,
+            workspace,
+            target_ms,
+            &target_frame,
+            &source_offset);
+        if (ret != ESP_OK) {
+            pcm_decoder_close(decoder);
+            return ret;
+        }
+
+        decoder->type = PcmDecoderType::Flac;
+        decoder->info.sample_rate_hz = decoder->flac.sample_rate_hz;
+        decoder->info.channels = decoder->flac.channels;
+        decoder->info.bits_per_sample = decoder->flac.bits_per_sample;
+        decoder->info.total_frames = decoder->flac.total_frames;
+        if (out_result != nullptr) {
+            out_result->requested_frame = target_frame;
+            out_result->actual_frame = target_frame;
+            out_result->source_offset = source_offset;
+            out_result->method = PcmSeekMethod::FlacSeektable;
+        }
+        return ESP_OK;
+    }
+
+    esp_err_t ret = pcm_decoder_open(decoder, type, path, workspace);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    const uint64_t target_frame = decoder->info.sample_rate_hz > 0
+        ? (target_ms * static_cast<uint64_t>(decoder->info.sample_rate_hz)) / 1000ULL
+        : 0ULL;
+    if (target_frame == 0) {
+        if (out_result != nullptr) {
+            out_result->requested_frame = 0;
+            out_result->actual_frame = 0;
+            out_result->method = PcmSeekMethod::RestartFromBeginning;
+        }
+        return ESP_OK;
+    }
+
+    ret = pcm_decoder_seek_frame(
+        decoder,
+        target_frame,
+        technical_info,
+        out_result);
+    if (ret != ESP_OK) {
+        pcm_decoder_close(decoder);
+    }
+    return ret;
+}
+
 esp_err_t pcm_decoder_enable_runtime_read_ahead(PcmDecoder *decoder, const char *path)
 {
     if (decoder == nullptr || path == nullptr || path[0] == '\0' || !pcm_decoder_is_open(decoder)) {

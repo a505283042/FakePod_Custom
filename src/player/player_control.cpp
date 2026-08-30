@@ -76,6 +76,11 @@ bool player_control_toggle_play_pause()
         snapshot.track_index != UINT32_MAX && snapshot.track_index == selected_track;
 
     bool ok = false;
+    if (audio_is_selected_track && snapshot.state == AudioPlaybackState::Seeking) {
+        ESP_LOGW(TAG, "Seek进行中，忽略播放/暂停操作");
+        player_control_unlock();
+        return false;
+    }
     if (audio_is_selected_track && snapshot.state == AudioPlaybackState::Playing) {
         ok = audio_service_pause(false);
     } else if (audio_is_selected_track && snapshot.state == AudioPlaybackState::Paused) {

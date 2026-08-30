@@ -71,6 +71,17 @@ esp_err_t pcm_decoder_open(
     const char *path,
     AudioDecodeWorkspace *workspace = nullptr
 );
+// 在硬件启动前直接建立到目标位置的解码器。FLAC 会从目标 seekpoint 一次性建立运行时，
+// 避免普通 open 后再 seek 造成重复 Prefetch；MP3/WAV 保持原有 open + seek 行为。
+esp_err_t pcm_decoder_open_for_seek(
+    PcmDecoder *decoder,
+    PcmDecoderType type,
+    const char *path,
+    AudioDecodeWorkspace *workspace,
+    uint64_t target_ms,
+    const MediaTechnicalInfo *technical_info,
+    PcmSeekResult *out_result
+);
 // MP3/WAV 完成格式解析和可选 Seek 后，将后续连续读取切换到 Core1 预读。
 // 必须在 I2S/DAC 启动前调用；FLAC 已有独立预取，本阶段保持原实现。
 esp_err_t pcm_decoder_enable_runtime_read_ahead(PcmDecoder *decoder, const char *path);

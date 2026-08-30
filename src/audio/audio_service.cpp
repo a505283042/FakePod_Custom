@@ -1111,39 +1111,30 @@ static esp_err_t audio_task_start_pcm_pipeline(
 )
 {
     audio_task_log_ram("before_decoder_open");
-    esp_err_t ret = pcm_decoder_open(&g_decoder, decoder_type, path, &g_decode_workspace);
+    PcmSeekResult seek_result = {};
+    esp_err_t ret = apply_seek
+        ? pcm_decoder_open_for_seek(
+            &g_decoder,
+            decoder_type,
+            path,
+            &g_decode_workspace,
+            seek_target_ms,
+            request != nullptr && request->has_technical_info ? &request->technical_info : nullptr,
+            &seek_result)
+        : pcm_decoder_open(&g_decoder, decoder_type, path, &g_decode_workspace);
     if (ret != ESP_OK) {
         audio_task_log_ram("decoder_open_failed");
+        if (apply_seek) {
+            ESP_LOGE(TAG, "SEEK_TRACE: codec定位失败 format=%s target=%llums ret=%s",
+                pcm_decoder_type_name(decoder_type),
+                static_cast<unsigned long long>(seek_target_ms),
+                esp_err_to_name(ret));
+        }
         return ret;
     }
     audio_task_verify_index_snapshot(request, decoder_type);
 
-    PcmSeekResult seek_result = {};
     if (apply_seek) {
-        const uint64_t target_frame = g_decoder.info.sample_rate_hz > 0
-            ? (seek_target_ms * static_cast<uint64_t>(g_decoder.info.sample_rate_hz)) / 1000ULL
-            : 0ULL;
-        seek_result.requested_frame = target_frame;
-        if (target_frame == 0) {
-            // Decoder open 本身已经在曲首完成首块预解码，不再做一次重复 reopen。
-            seek_result.actual_frame = 0;
-            seek_result.method = PcmSeekMethod::RestartFromBeginning;
-        } else {
-            ret = pcm_decoder_seek_frame(
-                &g_decoder,
-                target_frame,
-                request != nullptr && request->has_technical_info ? &request->technical_info : nullptr,
-                &seek_result);
-            if (ret != ESP_OK) {
-                ESP_LOGE(TAG, "SEEK_TRACE: codec定位失败 format=%s target=%llums frame=%llu ret=%s",
-                    pcm_decoder_type_name(decoder_type),
-                    static_cast<unsigned long long>(seek_target_ms),
-                    static_cast<unsigned long long>(target_frame),
-                    esp_err_to_name(ret));
-                pcm_decoder_close(&g_decoder);
-                return ret;
-            }
-        }
         if (out_seek_result != nullptr) {
             *out_seek_result = seek_result;
         }

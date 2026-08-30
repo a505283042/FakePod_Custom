@@ -489,10 +489,6 @@ static bool lyrics_view_snapshot_can_scrub(const AudioStateSnapshot &snapshot)
         snapshot.total_frames == 0U) {
         return false;
     }
-    // 沿用首页稳定策略：FLAC 只允许暂停态 Seek，避免播放中重建 pipeline 导致卡顿/错误。
-    if (snapshot.format == MediaFormat::FLAC) {
-        return snapshot.state == AudioPlaybackState::Paused;
-    }
     return snapshot.state == AudioPlaybackState::Playing ||
         snapshot.state == AudioPlaybackState::Paused ||
         snapshot.state == AudioPlaybackState::Seeking;

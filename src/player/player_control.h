@@ -15,7 +15,8 @@ void player_control_update();
 // 显式播放当前 Player List 选中的歌曲。
 bool player_control_play_current();
 
-// 播放/暂停键：只有 AudioTask 正在播放当前选中 Track 时才执行暂停/恢复；
+// 播放/暂停键：只有 AudioTask 当前会话对应选中 Track 时才执行暂停/恢复；
+// Seek 期间忽略播放/暂停操作，等定位完成后再根据最新状态操作；
 // 若 Player 已切到另一首，则直接播放当前选中歌曲。
 bool player_control_toggle_play_pause();
 

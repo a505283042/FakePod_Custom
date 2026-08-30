@@ -24,7 +24,7 @@ static constexpr TickType_t BUFFERED_SD_COOPERATIVE_BLOCK_TICKS = 1;
 static constexpr TickType_t BUFFERED_SD_SEND_WAIT = pdMS_TO_TICKS(20);
 static constexpr TickType_t BUFFERED_SD_RECEIVE_WAIT = pdMS_TO_TICKS(20);
 static constexpr TickType_t BUFFERED_SD_START_WAIT = pdMS_TO_TICKS(750);
-static constexpr TickType_t BUFFERED_SD_STOP_WAIT = pdMS_TO_TICKS(1000);
+static constexpr TickType_t BUFFERED_SD_STOP_WARN_WAIT = pdMS_TO_TICKS(1000);
 
 struct BufferedSdContext
 {
@@ -214,9 +214,12 @@ static void buffered_sd_destroy_context(BufferedSdContext *context)
 
     context->stop_requested = true;
     if (context->task != nullptr && context->done != nullptr) {
-        if (xSemaphoreTake(context->done, BUFFERED_SD_STOP_WAIT) != pdTRUE) {
-            ESP_LOGE(TAG, "等待顺序预读任务退出超时，强制结束任务");
-            vTaskDelete(context->task);
+        if (xSemaphoreTake(context->done, BUFFERED_SD_STOP_WARN_WAIT) != pdTRUE) {
+            // 预读任务可能正在持有全局 SD 递归锁执行 fread。外部强删任务不会执行
+            // StorageSdLockGuard 析构，可能把全局 SD 锁永久留在已删除任务名下。
+            // 超过正常退出窗口后只告警，并继续等待任务自行离开 I/O 临界区。
+            ESP_LOGW(TAG, "顺序预读任务退出超过1000ms；继续等待安全退出，禁止在SD I/O中强删任务");
+            (void)xSemaphoreTake(context->done, portMAX_DELAY);
         }
         context->task = nullptr;
     }

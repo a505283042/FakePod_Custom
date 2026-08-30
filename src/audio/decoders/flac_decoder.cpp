@@ -54,12 +54,11 @@ static constexpr uint32_t FLAC_PREFETCH_QOS_BATCH_NORMAL = 4;
 static constexpr uint32_t FLAC_PREFETCH_QOS_BATCH_PLENTY = 2;
 static constexpr TickType_t FLAC_PREFETCH_SEND_WAIT = pdMS_TO_TICKS(20);
 static constexpr TickType_t FLAC_PREFETCH_RECEIVE_WAIT = pdMS_TO_TICKS(20);
-// 首块 PCM 预解码发生在 I2S 启动前，不受实时播放预算约束。
-// 允许等待完整一次较慢的 SD 读取，避免较大的 Vorbis Comment/PICTURE 元数据
-// 在 64KB 起播预充后把 ring 短暂耗空时直接判定失败。
-static constexpr TickType_t FLAC_PREFETCH_STARTUP_RECEIVE_WAIT = pdMS_TO_TICKS(100);
+// I2S 启动前的首块预解码和 Seek discard 都不受实时播放预算约束。
+// 允许等待完整一次较慢的 SD 读取，避免预取环的短暂空窗被误判为解码失败。
+static constexpr TickType_t FLAC_PREFETCH_PREPLAY_RECEIVE_WAIT = pdMS_TO_TICKS(100);
 static constexpr TickType_t FLAC_PREFETCH_START_WAIT = pdMS_TO_TICKS(750);
-static constexpr TickType_t FLAC_PREFETCH_STOP_WAIT = pdMS_TO_TICKS(1000);
+static constexpr TickType_t FLAC_PREFETCH_STOP_WARN_WAIT = pdMS_TO_TICKS(1000);
 static constexpr size_t FLAC_MIN_DECODED_BUFFER_BYTES = 16384;
 static constexpr size_t FLAC_MAX_DECODED_BUFFER_BYTES = 1024 * 1024;
 
@@ -773,9 +772,12 @@ static void flac_prefetch_destroy(FlacDecoder *decoder)
 
     context->stop_requested = true;
     if (context->task != nullptr && context->done != nullptr) {
-        if (xSemaphoreTake(context->done, FLAC_PREFETCH_STOP_WAIT) != pdTRUE) {
-            ESP_LOGE(TAG, "等待 FLAC 预取任务退出超时，强制结束任务");
-            vTaskDelete(context->task);
+        if (xSemaphoreTake(context->done, FLAC_PREFETCH_STOP_WARN_WAIT) != pdTRUE) {
+            // 预取任务可能正在持有全局 SD 递归锁执行 Source read。外部强删任务不会执行
+            // StorageSdLockGuard 析构，可能把全局 SD 锁永久留在已删除任务名下。
+            // 超过正常退出窗口后只告警，并继续等待任务自行离开 I/O 临界区。
+            ESP_LOGW(TAG, "FLAC预取任务退出超过1000ms；继续等待安全退出，禁止在SD I/O中强删任务");
+            (void)xSemaphoreTake(context->done, portMAX_DELAY);
         }
         context->task = nullptr;
     }
@@ -1256,17 +1258,27 @@ static void flac_apply_stream_descriptor(
     decoder->total_frames = descriptor.total_frames;
 }
 
-static esp_err_t flac_parse_streaminfo(FlacDecoder *decoder)
+static void flac_capture_stream_descriptor(
+    const FlacDecoder *decoder,
+    FlacStreamDescriptor *out_descriptor)
 {
-    if (decoder == nullptr || decoder->source == nullptr) {
-        return ESP_ERR_INVALID_ARG;
+    if (decoder == nullptr || out_descriptor == nullptr) {
+        return;
     }
-    FlacStreamDescriptor descriptor = {};
-    const esp_err_t ret = flac_parse_stream_descriptor(decoder->source, &descriptor);
-    if (ret == ESP_OK) {
-        flac_apply_stream_descriptor(decoder, descriptor);
-    }
-    return ret;
+    *out_descriptor = {};
+    out_descriptor->file_size_bytes = decoder->file_size_bytes;
+    out_descriptor->flac_offset_bytes = decoder->flac_offset_bytes;
+    out_descriptor->audio_data_offset_bytes = decoder->audio_data_offset_bytes;
+    out_descriptor->seektable_offset_bytes = decoder->seektable_offset_bytes;
+    out_descriptor->seektable_length_bytes = decoder->seektable_length_bytes;
+    memcpy(out_descriptor->streaminfo_payload, decoder->streaminfo_payload, FLAC_STREAMINFO_BYTES);
+    out_descriptor->max_block_size = decoder->max_block_size;
+    out_descriptor->min_frame_size = decoder->min_frame_size;
+    out_descriptor->max_frame_size = decoder->max_frame_size;
+    out_descriptor->sample_rate_hz = decoder->sample_rate_hz;
+    out_descriptor->channels = decoder->channels;
+    out_descriptor->bits_per_sample = decoder->bits_per_sample;
+    out_descriptor->total_frames = decoder->total_frames;
 }
 
 static esp_err_t flac_select_seekpoint(
@@ -1461,10 +1473,10 @@ static esp_err_t flac_verify_runtime_info(FlacDecoder *decoder)
 
 static TickType_t flac_prefetch_receive_wait(const FlacDecoder *decoder)
 {
-    // 首块 PCM 尚未交给 I2S 时不存在 DMA underrun 截止时间。此阶段若 64KB 起播预充
-    // 被 FLAC 元数据/parser 消耗完，允许等待后台完成下一次 SD 读取，而不是立即失败。
-    if (decoder != nullptr && decoder->startup_predecode_active) {
-        return FLAC_PREFETCH_STARTUP_RECEIVE_WAIT;
+    // 硬件启动前的预解码/Seek discard 不存在 DMA underrun 截止时间。此阶段若预取环耗尽，
+    // 允许等待后台完成下一次 SD 读取，而不是套用正式播放的短实时预算。
+    if (decoder != nullptr && decoder->preplay_decode_active) {
+        return FLAC_PREFETCH_PREPLAY_RECEIVE_WAIT;
     }
 
     // 正式播放后仍按单个 FLAC 块播放预算的约 1/4 缩放等待：
@@ -1967,9 +1979,9 @@ static esp_err_t flac_decoder_prepare_runtime(
     decoder->simple_handle = handle;
 
     // 在触碰 I2S/DAC 之前先解出第一块 PCM。Seek 路径中的合成头也在这里完成实机验证。
-    decoder->startup_predecode_active = true;
+    decoder->preplay_decode_active = true;
     ret = flac_decode_next_output(decoder);
-    decoder->startup_predecode_active = false;
+    decoder->preplay_decode_active = false;
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "FLAC 首块 PCM 预解码失败：%s", esp_err_to_name(ret));
         flac_decoder_close(decoder);
@@ -2036,9 +2048,12 @@ esp_err_t flac_decoder_register_backend()
     return ESP_OK;
 }
 
-esp_err_t flac_decoder_open(FlacDecoder *decoder, AudioSource *source, AudioDecodeWorkspace *workspace)
+static esp_err_t flac_decoder_prepare_open_descriptor(
+    FlacDecoder *decoder,
+    AudioSource *source,
+    FlacStreamDescriptor *out_descriptor)
 {
-    if (decoder == nullptr || !audio_source_is_open(source)) {
+    if (decoder == nullptr || !audio_source_is_open(source) || out_descriptor == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
     flac_decoder_close(decoder);
@@ -2057,9 +2072,20 @@ esp_err_t flac_decoder_open(FlacDecoder *decoder, AudioSource *source, AudioDeco
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    ret = flac_parse_streaminfo(decoder);
+    ret = flac_parse_stream_descriptor(source, out_descriptor);
     if (ret != ESP_OK) {
         flac_decoder_close(decoder);
+        return ret;
+    }
+    flac_apply_stream_descriptor(decoder, *out_descriptor);
+    return ESP_OK;
+}
+
+esp_err_t flac_decoder_open(FlacDecoder *decoder, AudioSource *source, AudioDecodeWorkspace *workspace)
+{
+    FlacStreamDescriptor descriptor = {};
+    esp_err_t ret = flac_decoder_prepare_open_descriptor(decoder, source, &descriptor);
+    if (ret != ESP_OK) {
         return ret;
     }
 
@@ -2067,7 +2093,7 @@ esp_err_t flac_decoder_open(FlacDecoder *decoder, AudioSource *source, AudioDeco
     return flac_decoder_prepare_runtime(
         decoder,
         workspace,
-        decoder->flac_offset_bytes,
+        descriptor.flac_offset_bytes,
         nullptr,
         0,
         0);
@@ -2189,6 +2215,138 @@ static esp_err_t flac_decoder_discard_to_frame(FlacDecoder *decoder, uint64_t ta
     return ESP_OK;
 }
 
+static esp_err_t flac_decoder_prepare_seek_runtime(
+    FlacDecoder *decoder,
+    AudioDecodeWorkspace *workspace,
+    const FlacStreamDescriptor &descriptor,
+    uint64_t target_frame,
+    uint64_t *out_source_offset)
+{
+    if (decoder == nullptr || decoder->source == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (descriptor.seektable_length_bytes < FLAC_SEEKPOINT_BYTES) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    FlacSeekPoint point = {};
+    esp_err_t ret = flac_select_seekpoint(decoder->source, descriptor, target_frame, &point);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    if (descriptor.audio_data_offset_bytes > descriptor.file_size_bytes ||
+        point.stream_offset > descriptor.file_size_bytes - descriptor.audio_data_offset_bytes) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    const uint64_t absolute_source_offset = descriptor.audio_data_offset_bytes + point.stream_offset;
+    if (absolute_source_offset >= descriptor.file_size_bytes) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    uint8_t synthetic_header[FLAC_SYNTHETIC_HEADER_BYTES] = {};
+    flac_build_synthetic_header(descriptor, synthetic_header);
+
+    flac_apply_stream_descriptor(decoder, descriptor);
+    ret = flac_decoder_prepare_runtime(
+        decoder,
+        workspace,
+        absolute_source_offset,
+        synthetic_header,
+        sizeof(synthetic_header),
+        point.sample_number);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    // SEEKTABLE 只负责跳到目标之前的合法帧；剩余距离在 I2S/DAC 启动前直接丢弃 PCM。
+    // 此阶段没有 DMA underrun 截止时间，允许在预取环暂时耗尽时按起播预算等待后台补充。
+    decoder->preplay_decode_active = true;
+    ret = flac_decoder_discard_to_frame(decoder, target_frame);
+    decoder->preplay_decode_active = false;
+    if (ret != ESP_OK) {
+        flac_decoder_close(decoder);
+        return ret;
+    }
+
+#if APP_DIAG_AUDIO_SEEK
+    ESP_LOGI(TAG,
+        "FLAC_SEEK_TRACE: target=%llu seekpoint=%llu stream_offset=%llu absolute=%llu discard=%llu seekpoints=%lu",
+        static_cast<unsigned long long>(target_frame),
+        static_cast<unsigned long long>(point.sample_number),
+        static_cast<unsigned long long>(point.stream_offset),
+        static_cast<unsigned long long>(absolute_source_offset),
+        static_cast<unsigned long long>(target_frame - point.sample_number),
+        static_cast<unsigned long>(descriptor.seektable_length_bytes / FLAC_SEEKPOINT_BYTES));
+#endif
+
+    if (out_source_offset != nullptr) {
+        *out_source_offset = absolute_source_offset;
+    }
+    return ESP_OK;
+}
+
+esp_err_t flac_decoder_open_at_ms(
+    FlacDecoder *decoder,
+    AudioSource *source,
+    AudioDecodeWorkspace *workspace,
+    uint64_t target_ms,
+    uint64_t *out_target_frame,
+    uint64_t *out_source_offset)
+{
+    if (out_target_frame != nullptr) {
+        *out_target_frame = 0;
+    }
+    if (out_source_offset != nullptr) {
+        *out_source_offset = 0;
+    }
+
+    FlacStreamDescriptor descriptor = {};
+    esp_err_t ret = flac_decoder_prepare_open_descriptor(decoder, source, &descriptor);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    if (descriptor.sample_rate_hz == 0 ||
+        target_ms > UINT64_MAX / static_cast<uint64_t>(descriptor.sample_rate_hz)) {
+        flac_decoder_close(decoder);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const uint64_t target_frame =
+        (target_ms * static_cast<uint64_t>(descriptor.sample_rate_hz)) / 1000ULL;
+    if (descriptor.total_frames != 0 && target_frame >= descriptor.total_frames) {
+        flac_decoder_close(decoder);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (target_frame == 0) {
+        ret = flac_decoder_prepare_runtime(
+            decoder,
+            workspace,
+            descriptor.flac_offset_bytes,
+            nullptr,
+            0,
+            0);
+        if (ret == ESP_OK && out_source_offset != nullptr) {
+            *out_source_offset = descriptor.flac_offset_bytes;
+        }
+    } else {
+        ret = flac_decoder_prepare_seek_runtime(
+            decoder,
+            workspace,
+            descriptor,
+            target_frame,
+            out_source_offset);
+    }
+    if (ret != ESP_OK) {
+        flac_decoder_close(decoder);
+        return ret;
+    }
+    if (out_target_frame != nullptr) {
+        *out_target_frame = target_frame;
+    }
+    return ESP_OK;
+}
+
 esp_err_t flac_decoder_seek_frame(
     FlacDecoder *decoder,
     uint64_t target_frame,
@@ -2227,74 +2385,27 @@ esp_err_t flac_decoder_seek_frame(
 
     AudioSource *source = decoder->source;
     AudioDecodeWorkspace *workspace = decoder->workspace;
-
-    // 先停止旧 Core1 Prefetch 和旧 Simple Decoder，再读取同一个 Source 的 SEEKTABLE。
-    // 任何时刻都只有一个任务拥有底层 Source 的文件位置。
-    flac_decoder_close(decoder);
-
     FlacStreamDescriptor descriptor = {};
-    esp_err_t ret = flac_parse_stream_descriptor(source, &descriptor);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    if (descriptor.seektable_length_bytes < FLAC_SEEKPOINT_BYTES) {
-        return ESP_ERR_NOT_SUPPORTED;
-    }
+    flac_capture_stream_descriptor(decoder, &descriptor);
 
-    FlacSeekPoint point = {};
-    ret = flac_select_seekpoint(source, descriptor, target_frame, &point);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    if (descriptor.audio_data_offset_bytes > descriptor.file_size_bytes ||
-        point.stream_offset > descriptor.file_size_bytes - descriptor.audio_data_offset_bytes) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-    const uint64_t absolute_source_offset = descriptor.audio_data_offset_bytes + point.stream_offset;
-    if (absolute_source_offset >= descriptor.file_size_bytes) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    uint8_t synthetic_header[FLAC_SYNTHETIC_HEADER_BYTES] = {};
-    flac_build_synthetic_header(descriptor, synthetic_header);
-
+    // 先安全停止旧 Prefetch，再直接复用已经解析过的 STREAMINFO/SEEKTABLE 描述。
+    // 不重新扫描 metadata，也不在同一次 Seek 内建立两套 Prefetch。
+    flac_decoder_close(decoder);
     decoder->source = source;
-    flac_apply_stream_descriptor(decoder, descriptor);
-    ret = flac_decoder_prepare_runtime(
+
+    const esp_err_t ret = flac_decoder_prepare_seek_runtime(
         decoder,
         workspace,
-        absolute_source_offset,
-        synthetic_header,
-        sizeof(synthetic_header),
-        point.sample_number);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    // SEEKTABLE 只负责跳到目标之前的合法帧；剩余距离在 I2S/DAC 启动前直接丢弃 PCM，
-    // 因此旧位置和预滚 PCM 都不会进入硬件，Playback Clock 可精确落在 target_frame。
-    ret = flac_decoder_discard_to_frame(decoder, target_frame);
+        descriptor,
+        target_frame,
+        out_source_offset);
     if (ret != ESP_OK) {
         flac_decoder_close(decoder);
         return ret;
     }
 
-#if APP_DIAG_AUDIO_SEEK
-    ESP_LOGI(TAG,
-        "FLAC_SEEK_TRACE: target=%llu seekpoint=%llu stream_offset=%llu absolute=%llu discard=%llu seekpoints=%lu",
-        static_cast<unsigned long long>(target_frame),
-        static_cast<unsigned long long>(point.sample_number),
-        static_cast<unsigned long long>(point.stream_offset),
-        static_cast<unsigned long long>(absolute_source_offset),
-        static_cast<unsigned long long>(target_frame - point.sample_number),
-        static_cast<unsigned long>(descriptor.seektable_length_bytes / FLAC_SEEKPOINT_BYTES));
-#endif
-
     if (out_actual_frame != nullptr) {
         *out_actual_frame = target_frame;
-    }
-    if (out_source_offset != nullptr) {
-        *out_source_offset = absolute_source_offset;
     }
     return ESP_OK;
 }

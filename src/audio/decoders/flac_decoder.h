@@ -88,9 +88,9 @@ struct FlacDecoder
 
 #endif
 
-    // 首块 PCM 在 I2S 启动前预解码，此阶段没有实时播放截止时间；
-    // 若 64KB 起播预充被较大的 FLAC 元数据耗尽，可允许等待后台预取继续补充。
-    bool startup_predecode_active = false;
+    // I2S 启动前的预解码与 Seek 丢弃阶段都没有实时播放截止时间；
+    // 若预取环暂时被消费完，可允许等待后台预取继续补充。
+    bool preplay_decode_active = false;
     bool runtime_info_verified = false;
     bool eof = false;
 };
@@ -206,6 +206,17 @@ esp_err_t flac_decoder_register_backend();
 // 从统一 AudioSource 打开 FLAC 并读取 STREAMINFO。支持标准 fLaC，也兼容前置 ID3v2 标签。
 // 当前 PCM sink 支持：44.1/48/88.2/96/176.4/192kHz、单/双声道、16/24/32bit。
 esp_err_t flac_decoder_open(FlacDecoder *decoder, AudioSource *source, AudioDecodeWorkspace *workspace = nullptr);
+
+// 直接从指定毫秒位置建立 FLAC 运行时。Seek 请求使用该入口可避免先按曲首建立一次
+// Prefetch/首块 PCM，随后又立即关闭并重建到 seekpoint 的重复工作。
+esp_err_t flac_decoder_open_at_ms(
+    FlacDecoder *decoder,
+    AudioSource *source,
+    AudioDecodeWorkspace *workspace,
+    uint64_t target_ms,
+    uint64_t *out_target_frame,
+    uint64_t *out_source_offset
+);
 
 // 按需流式解码并统一转换成 32bit I2S 立体声容器。
 // 单声道会复制到左右声道；16/24bit 会左对齐到 32bit。
