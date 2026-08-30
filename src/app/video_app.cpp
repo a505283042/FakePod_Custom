@@ -70,10 +70,10 @@ static constexpr uint32_t kDestroyCleanupWaitMs = 300U;
 static constexpr uint32_t kBrowserTimerPeriodMs = 20U;
 static constexpr uint32_t kBenchmarkTimerPeriodMs = 5U;
 static constexpr uint32_t kPresenterTaskStack = 4096U;
-// 视频播放双核调度：Core0 保留 AudioTask=P5 + Extractor=P2，避免Presenter抢占AVI顺序供数。
-// Core1 上 Presenter=P3 仅在PTS截止窗口短时抢占 JPEG Decode=P2，兼顾显示Deadline与解码吞吐。
-static constexpr UBaseType_t kPresenterTaskPriority = 3U;
-static constexpr BaseType_t kPresenterTaskCore = 1;
+// 视频播放双核调度：Core0 保留 AudioTask=P5，Presenter=P2 与 Extractor=P2 同级分享时间片。
+// Presenter 大量时间在PTS/TE/SPI等待，不再用P3抢占Extractor；Core1 仅保留 JPEG Decode=P2 持续CPU计算。
+static constexpr UBaseType_t kPresenterTaskPriority = 2U;
+static constexpr BaseType_t kPresenterTaskCore = 0;
 static constexpr uint32_t kPresenterFrameWaitMs = 20U;
 static constexpr uint32_t kPresenterStopWaitMs = 250U;
 // R.40.5 实机验证阶段：设置页接入前临时开启，便于验证自然结束连续播放。

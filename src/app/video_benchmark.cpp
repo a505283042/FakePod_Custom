@@ -33,7 +33,7 @@ static constexpr uint32_t kExtractTaskStack = 6144U;
 static constexpr UBaseType_t kTaskPriority = 2U;
 static constexpr UBaseType_t kExtractTaskPriority = 2U;
 // 视频播放双核调度：JPEG Decode=P2 固定在 Core1，避免 Core0/P5 AudioTask 对持续 CPU 解码的高频抢占。
-// Extractor=P2 固定在 Core0，主要等待 SD/I/O，可让位给 AudioTask=P5 与 Presenter=P3。
+// Extractor=P2 固定在 Core0，主要等待 SD/I/O，优先级低于 AudioTask=P5，与 Presenter=P2 同级公平调度。
 static constexpr BaseType_t kTaskCore = 1;
 static constexpr BaseType_t kExtractTaskCore = 0;
 static constexpr TickType_t kQueuePollTicks = pdMS_TO_TICKS(20);
