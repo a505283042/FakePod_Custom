@@ -28,6 +28,11 @@ esp_err_t i2c_bus_add_device_at_speed(
     i2c_master_dev_handle_t *handle
 );
 
+// 注销已经注册的 I2C 设备；成功后把调用方句柄清空。
+esp_err_t i2c_bus_remove_device(
+    i2c_master_dev_handle_t *handle
+);
+
 // 探测指定 7 位 I2C 地址是否有设备响应
 esp_err_t i2c_bus_probe_address(
     uint8_t address,

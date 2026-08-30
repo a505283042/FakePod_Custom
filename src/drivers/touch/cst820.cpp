@@ -29,12 +29,28 @@ static constexpr uint8_t REG_GESTURE = 0x01;
 static constexpr uint8_t REG_FINGER_NUM = 0x02;
 
 
+static void cst820_rollback_device()
+{
+    g_ready = false;
+    g_chip_id = 0;
+
+    const esp_err_t cleanup_ret = i2c_bus_remove_device(&g_device);
+    if (cleanup_ret != ESP_OK) {
+        ESP_LOGW(TAG, "回滚 CST820 I2C 设备失败：%s", esp_err_to_name(cleanup_ret));
+    }
+}
+
+
 // ============================================================
 // 初始化 CST820
 // ============================================================
 
 esp_err_t cst820_init()
 {
+    if (g_ready) {
+        return ESP_OK;
+    }
+
 #if APP_DIAG_BOOT_VERBOSE
     ESP_LOGI(
         TAG,
@@ -78,6 +94,7 @@ esp_err_t cst820_init()
             esp_err_to_name(ret)
         );
 
+        cst820_rollback_device();
         return ret;
     }
 

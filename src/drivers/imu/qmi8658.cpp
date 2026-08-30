@@ -30,12 +30,29 @@ static constexpr uint8_t REG_REVISION_ID =
     0x01;
 
 
+static void qmi8658_rollback_device()
+{
+    g_ready = false;
+    g_device_id = 0;
+    g_revision = 0;
+
+    const esp_err_t cleanup_ret = i2c_bus_remove_device(&g_device);
+    if (cleanup_ret != ESP_OK) {
+        ESP_LOGW(TAG, "回滚 QMI8658 I2C 设备失败：%s", esp_err_to_name(cleanup_ret));
+    }
+}
+
+
 // ============================================================
 // 初始化 QMI8658
 // ============================================================
 
 esp_err_t qmi8658_init()
 {
+    if (g_ready) {
+        return ESP_OK;
+    }
+
 #if APP_DIAG_BOOT_VERBOSE
     ESP_LOGI(
         TAG,
@@ -79,6 +96,7 @@ esp_err_t qmi8658_init()
             esp_err_to_name(ret)
         );
 
+        qmi8658_rollback_device();
         return ret;
     }
 
@@ -99,6 +117,7 @@ esp_err_t qmi8658_init()
             esp_err_to_name(ret)
         );
 
+        qmi8658_rollback_device();
         return ret;
     }
 

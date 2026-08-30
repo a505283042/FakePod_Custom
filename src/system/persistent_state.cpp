@@ -263,11 +263,11 @@ esp_err_t persistent_state_init()
         return init_ret;
     }
 
-    g_state.ready = true;
-
     nvs_handle_t system_handle = 0;
     esp_err_t ret = nvs_open(kSystemNamespace, NVS_READONLY, &system_handle);
     if (ret == ESP_ERR_NVS_NOT_FOUND) {
+        // NVS 驱动已就绪，只是尚无本项目的 namespace；持久化能力可用。
+        g_state.ready = true;
         ESP_LOGI(TAG, "NVS V1 尚无持久化数据，使用运行时默认值");
         return ESP_OK;
     }
@@ -279,6 +279,7 @@ esp_err_t persistent_state_init()
     ret = nvs_get_u16(system_handle, "schema_ver", &schema);
     nvs_close(system_handle);
     if (ret == ESP_ERR_NVS_NOT_FOUND) {
+        g_state.ready = true;
         ESP_LOGI(TAG, "NVS V1 尚无 schema，使用运行时默认值");
         return ESP_OK;
     }
@@ -286,6 +287,7 @@ esp_err_t persistent_state_init()
         return ret;
     }
     if (schema != kSchemaVersion) {
+        g_state.ready = true;
         ESP_LOGW(TAG, "NVS schema 不匹配：stored=%u expected=%u，忽略旧状态",
             static_cast<unsigned>(schema), static_cast<unsigned>(kSchemaVersion));
         return ESP_OK;
@@ -301,6 +303,7 @@ esp_err_t persistent_state_init()
         ESP_LOGW(TAG, "NVS resume namespace 读取失败：%s", esp_err_to_name(resume_ret));
     }
 
+    g_state.ready = true;
     ESP_LOGI(TAG, "NVS V1 已加载：volume=%s loop=%s resume=%s",
         g_state.has_volume ? "YES" : "NO",
         g_state.has_loop_mode ? "YES" : "NO",

@@ -128,6 +128,7 @@ struct AudioRequest
 
 static QueueHandle_t g_command_queue = nullptr;
 static TaskHandle_t g_audio_task = nullptr;
+static StaticSemaphore_t g_start_done_storage = {};
 static SemaphoreHandle_t g_start_done = nullptr;
 static esp_err_t g_start_result = ESP_ERR_INVALID_STATE;
 
@@ -2371,6 +2372,8 @@ static void audio_task_main(void *arg)
         ESP_LOGE(TAG, "AudioTask 核心绑定异常：当前=%d，期望=%d",
             static_cast<int>(current_core),
             static_cast<int>(AUDIO_TASK_CORE));
+        // 失败任务在通知启动方之前先清空全局 handle，避免调用方重试时误认为旧任务仍在运行。
+        g_audio_task = nullptr;
         if (g_start_done != nullptr) {
             xSemaphoreGive(g_start_done);
         }
@@ -2396,12 +2399,15 @@ static void audio_task_main(void *arg)
         ESP_LOGE(TAG, "AudioTask 初始化播放器后端失败：%s", esp_err_to_name(g_start_result));
     }
 
+    if (g_start_result != ESP_OK) {
+        // 与启动握手保持同一生命周期顺序：失败结果发布前先宣布任务不再可用。
+        g_audio_task = nullptr;
+    }
     if (g_start_done != nullptr) {
         xSemaphoreGive(g_start_done);
     }
 
     if (g_start_result != ESP_OK) {
-        g_audio_task = nullptr;
         vTaskDelete(nullptr);
         return;
     }
@@ -2602,18 +2608,32 @@ esp_err_t audio_service_start()
         }
     }
 
-    if (g_start_done != nullptr) {
-        vSemaphoreDelete(g_start_done);
-        g_start_done = nullptr;
-    }
-    g_start_done = xSemaphoreCreateBinary();
+    // 启动握手使用静态信号量并贯穿服务整个生命周期。若调用方等待超时，AudioTask 仍可能
+    // 稍后完成初始化并 give；此时绝不能删除信号量，否则任务会访问已经释放的内核对象。
     if (g_start_done == nullptr) {
-        ESP_LOGE(TAG, "创建 AudioTask 启动信号量失败");
-        return ESP_ERR_NO_MEM;
+        g_start_done = xSemaphoreCreateBinaryStatic(&g_start_done_storage);
+        if (g_start_done == nullptr) {
+            ESP_LOGE(TAG, "创建 AudioTask 启动信号量失败");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    // 上一次调用可能只是等待超时，AudioTask 本身仍在初始化。复用同一个握手等待它结束，
+    // 禁止在旧任务尚未明确退出时再创建第二个 AudioTask。
+    if (g_audio_task != nullptr) {
+        if (xSemaphoreTake(g_start_done, AUDIO_START_WAIT_TIMEOUT) != pdTRUE) {
+            ESP_LOGE(TAG, "等待已存在的 AudioTask 初始化超时");
+            return ESP_ERR_TIMEOUT;
+        }
+        return g_start_result;
+    }
+
+    // 失败任务可能在上一次调用超时后才发出完成信号；创建新任务前清掉这枚陈旧 token。
+    while (xSemaphoreTake(g_start_done, 0) == pdTRUE) {
     }
 
     g_start_result = ESP_ERR_INVALID_STATE;
-    BaseType_t task_ret = xTaskCreatePinnedToCore(
+    const BaseType_t task_ret = xTaskCreatePinnedToCore(
         audio_task_main,
         "AudioTask",
         AUDIO_TASK_STACK_BYTES,
@@ -2625,18 +2645,14 @@ esp_err_t audio_service_start()
     if (task_ret != pdPASS) {
         ESP_LOGE(TAG, "创建 AudioTask 失败");
         g_audio_task = nullptr;
-        vSemaphoreDelete(g_start_done);
-        g_start_done = nullptr;
         return ESP_ERR_NO_MEM;
     }
 
     if (xSemaphoreTake(g_start_done, AUDIO_START_WAIT_TIMEOUT) != pdTRUE) {
-        ESP_LOGE(TAG, "等待 AudioTask 初始化超时");
+        ESP_LOGE(TAG, "等待 AudioTask 初始化超时；任务仍在初始化，不释放启动握手对象");
         return ESP_ERR_TIMEOUT;
     }
 
-    vSemaphoreDelete(g_start_done);
-    g_start_done = nullptr;
     return g_start_result;
 }
 

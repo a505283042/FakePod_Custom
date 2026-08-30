@@ -257,6 +257,11 @@ esp_err_t ui_touch_input_start()
         TOUCH_INPUT_TASK_CORE);
     if (created != pdPASS) {
         g_task = nullptr;
+        g_ready = false;
+        if (g_edge_queue != nullptr) {
+            vQueueDelete(g_edge_queue);
+            g_edge_queue = nullptr;
+        }
         ESP_LOGE(TAG, "创建 TouchInputTask 失败");
         return ESP_ERR_NO_MEM;
     }

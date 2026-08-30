@@ -99,6 +99,25 @@ static ArtworkCacheEntry g_cache[ARTWORK_CACHE_SLOT_COUNT] = {};
 static uint32_t g_lru_counter = 1U;
 static uint32_t g_next_slot_revision = 1U;
 
+static void artwork_loader_cleanup_start_resources()
+{
+    // 后台任务尚未创建时，这些对象没有并发使用者；启动失败必须完整回滚。
+    g_ready = false;
+    g_artwork_task = nullptr;
+    if (g_request_queue != nullptr) {
+        vQueueDelete(g_request_queue);
+        g_request_queue = nullptr;
+    }
+    if (g_submit_mutex != nullptr) {
+        vSemaphoreDelete(g_submit_mutex);
+        g_submit_mutex = nullptr;
+    }
+    if (g_cache_mutex != nullptr) {
+        vSemaphoreDelete(g_cache_mutex);
+        g_cache_mutex = nullptr;
+    }
+}
+
 static void artwork_request_release(ArtworkLoadRequest *request)
 {
     if (request == nullptr) {
@@ -800,6 +819,7 @@ esp_err_t artwork_loader_start()
         g_cache_mutex = xSemaphoreCreateMutex();
     }
     if (g_request_queue == nullptr || g_submit_mutex == nullptr || g_cache_mutex == nullptr) {
+        artwork_loader_cleanup_start_resources();
         return ESP_ERR_NO_MEM;
     }
 
@@ -813,7 +833,7 @@ esp_err_t artwork_loader_start()
         ARTWORK_TASK_CORE
     );
     if (task_ret != pdPASS) {
-        g_artwork_task = nullptr;
+        artwork_loader_cleanup_start_resources();
         return ESP_ERR_NO_MEM;
     }
 

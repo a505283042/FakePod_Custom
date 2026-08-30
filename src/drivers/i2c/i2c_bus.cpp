@@ -226,6 +226,27 @@ esp_err_t i2c_bus_add_device_at_speed(
 
 
 // ============================================================
+// 注销 I2C 设备
+// ============================================================
+
+esp_err_t i2c_bus_remove_device(i2c_master_dev_handle_t *handle)
+{
+    if (handle == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (*handle == nullptr) {
+        return ESP_OK;
+    }
+
+    const esp_err_t ret = i2c_master_bus_rm_device(*handle);
+    if (ret == ESP_OK) {
+        *handle = nullptr;
+    }
+    return ret;
+}
+
+
+// ============================================================
 // 探测指定 I2C 地址
 // ============================================================
 

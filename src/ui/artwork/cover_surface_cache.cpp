@@ -105,6 +105,25 @@ static CoverCacheEntry g_cache[COVER_CACHE_SLOT_COUNT] = {};
 static uint32_t g_lru_counter = 1U;
 static uint32_t g_next_slot_revision = 1U;
 
+static void cover_surface_cache_cleanup_start_resources()
+{
+    // CoverSurfaceTask 尚未创建时没有并发使用者；可选服务启动失败后不要遗留 Queue/Mutex。
+    g_ready = false;
+    g_task = nullptr;
+    if (g_queue != nullptr) {
+        vQueueDelete(g_queue);
+        g_queue = nullptr;
+    }
+    if (g_submit_mutex != nullptr) {
+        vSemaphoreDelete(g_submit_mutex);
+        g_submit_mutex = nullptr;
+    }
+    if (g_cache_mutex != nullptr) {
+        vSemaphoreDelete(g_cache_mutex);
+        g_cache_mutex = nullptr;
+    }
+}
+
 // R.36：取消第三张 wire-order Surface。BoundedSPI Cover Present 统一消费 native RGB565，由传输层按需转换 wire-order。
 
 static uint32_t cover_next_request_id()
@@ -729,7 +748,10 @@ esp_err_t cover_surface_cache_start()
     if (g_queue == nullptr) g_queue = xQueueCreate(1, sizeof(CoverRequest));
     if (g_submit_mutex == nullptr) g_submit_mutex = xSemaphoreCreateMutex();
     if (g_cache_mutex == nullptr) g_cache_mutex = xSemaphoreCreateMutex();
-    if (g_queue == nullptr || g_submit_mutex == nullptr || g_cache_mutex == nullptr) return ESP_ERR_NO_MEM;
+    if (g_queue == nullptr || g_submit_mutex == nullptr || g_cache_mutex == nullptr) {
+        cover_surface_cache_cleanup_start_resources();
+        return ESP_ERR_NO_MEM;
+    }
 
     const BaseType_t ret = xTaskCreatePinnedToCore(
         cover_task_main,
@@ -740,7 +762,7 @@ esp_err_t cover_surface_cache_start()
         &g_task,
         COVER_TASK_CORE);
     if (ret != pdPASS) {
-        g_task = nullptr;
+        cover_surface_cache_cleanup_start_resources();
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
