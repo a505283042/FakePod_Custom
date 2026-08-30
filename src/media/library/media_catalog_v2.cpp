@@ -839,6 +839,13 @@ esp_err_t media_catalog_v2_publish(MusicCatalogV2 *catalog, uint32_t source_crc3
     if (catalog == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (s_ready) {
+        // 当前运行时大量 View 直接引用 Catalog 内存；在没有 lease/refcount 之前，
+        // 运行期替换会让旧指针立即失效。现阶段明确保持“每次启动只发布一次”。
+        ESP_LOGE(TAG, "拒绝运行期替换 Catalog：当前 generation=%lu",
+            static_cast<unsigned long>(s_catalog.generation));
+        return ESP_ERR_INVALID_STATE;
+    }
     const esp_err_t validate_ret = media_catalog_v2_validate(catalog);
     if (validate_ret != ESP_OK) {
         return validate_ret;

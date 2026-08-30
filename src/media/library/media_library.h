@@ -6,8 +6,9 @@
 #include "media_types.h"
 #include "media_catalog_v2.h"
 
-// 扫描 TF 卡音乐目录并建立运行时 MusicCatalogV2，同时维护 /sdcard/System/library 下的 V2 Index/Manifest。
+// 启动期扫描 TF 卡音乐目录并建立运行时 MusicCatalogV2，同时维护 /sdcard/System/library 下的 V2 Index/Manifest。
 // 未变化文件通过 FAST(size+mtime) Manifest 复用旧技术信息；V1 仅作为首次升级迁移源。
+// 当前运行时 Catalog 不支持热替换，因此每次启动周期只允许调用一次。
 esp_err_t media_library_scan();
 
 // 判断音乐库扫描是否完成。

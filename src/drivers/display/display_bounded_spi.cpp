@@ -29,11 +29,11 @@ static const char *TAG = "显示";
 // ============================================================
 //
 // 旧 Launcher PanelIO DirectScene 与 Cover ContinuousGRAM 都通过 esp_lcd_panel_io_tx_param()/
-// tx_color() 与 LVGL 共享 Panel IO。ESP-IDF 5.5 的 SPI Panel IO 在这些入口内部存在
+// tx_color() 与 LVGL 共享 Panel IO。ESP-IDF 5.5.3 的 SPI Panel IO 在这些入口内部存在
 // portMAX_DELAY 的 bus acquire/result recycle；Launcher 已迁移并通过压力测试；
 // 主页 Cover 也已迁入同一传输层，彻底移除对旧 ContinuousGRAM 的运行时依赖。
 //
-// 本模块不再调用上述 Panel IO 发送入口。项目固定 ESP-IDF 5.5，因此使用官方源中可验证的
+// 本模块不再调用上述 Panel IO 发送入口。项目固定 ESP-IDF 5.5.3，因此使用官方源中可验证的
 // esp_lcd_panel_io_spi_t 前缀布局取得其唯一 spi_device_handle_t 和 num_trans_inflight：
 // 1) 在同一个 LVGL Task 内先用有限 get_trans_result() 回收 Panel IO 已提交事务；
 // 2) 再直接向同一个 spi_device queue 本模块自己的 raw descriptor；
@@ -47,7 +47,7 @@ static const char *TAG = "显示";
 // address phase 保持单线，只有 RGB data phase 设置 SPI_TRANS_MODE_QIO；无需
 // SPI_TRANS_CS_KEEP_ACTIVE，因此完全不调用当前 IDF 只支持 portMAX_DELAY 的 acquire_bus()。
 
-struct DisplayPanelIoSpiV55Prefix
+struct DisplayPanelIoSpiV553Prefix
 {
     esp_lcd_panel_io_t base;
     spi_device_handle_t spi_dev;
@@ -64,7 +64,7 @@ struct DisplayPanelIoSpiV55Prefix
 // SPI driver 在 SPI_TRANS_VARIABLE_ADDR 下会把 spi_transaction_t 后的前三字节解释为
 // command_bits/address_bits/dummy_bits；esp_lcd SPI device 的 post-callback 又会把同一尾部
 // 解释为自己的 32-bit flags。这里显式保留4字节 tail：byte0=0 让 callback 的低2位恒为0，
-// byte1=32 给 SPI driver 提供32-bit address/header，byte2/3=0。项目固定 IDF 5.5 + ESP32-S3。
+// byte1=32 给 SPI driver 提供32-bit address/header，byte2/3=0。项目固定 IDF 5.5.3 + ESP32-S3。
 struct DisplayBoundedRawSpiTransaction
 {
     spi_transaction_t base = {};
@@ -109,19 +109,19 @@ static constexpr uint32_t display_bounded_qspi_header(uint32_t opcode, uint8_t c
     return (opcode << 24U) | (static_cast<uint32_t>(command) << 8U);
 }
 
-static DisplayPanelIoSpiV55Prefix *display_panel_io_spi_v55_prefix()
+static DisplayPanelIoSpiV553Prefix *display_panel_io_spi_v553_prefix()
 {
-#if ESP_IDF_VERSION_MAJOR == 5 && ESP_IDF_VERSION_MINOR == 5
-    return reinterpret_cast<DisplayPanelIoSpiV55Prefix *>(display_get_panel_io());
+#if ESP_IDF_VERSION_MAJOR == 5 && ESP_IDF_VERSION_MINOR == 5 && ESP_IDF_VERSION_PATCH == 3
+    return reinterpret_cast<DisplayPanelIoSpiV553Prefix *>(display_get_panel_io());
 #else
     return nullptr;
 #endif
 }
 
-static bool display_bounded_spi_abi_valid(DisplayPanelIoSpiV55Prefix *io)
+static bool display_bounded_spi_abi_valid(DisplayPanelIoSpiV553Prefix *io)
 {
     // 当前板卡是 CO5300 QSPI：无独立 D/C、32-bit QSPI header、8-bit 参数。
-    // 只有这组已验证配置才允许触碰 IDF 5.5 的 Panel IO 私有前缀。
+    // 只有这组已验证配置才允许触碰 IDF 5.5.3 的 Panel IO 私有前缀。
     return io != nullptr && io->spi_dev != nullptr && io->dc_gpio_num < 0 &&
         io->lcd_cmd_bits == 32 && io->lcd_param_bits == 8 && io->queue_size >= 2U &&
         io->spi_trans_max_bytes > 0U;
@@ -132,16 +132,24 @@ static bool display_bounded_spi_available_internal()
     if (!display_is_ready() || display_get_panel_io() == nullptr || g_bounded_spi.faulted) {
         return false;
     }
-    return display_bounded_spi_abi_valid(display_panel_io_spi_v55_prefix());
+    return display_bounded_spi_abi_valid(display_panel_io_spi_v553_prefix());
 }
 
 bool display_launcher_bounded_spi_available()
 {
+#if !(ESP_IDF_VERSION_MAJOR == 5 && ESP_IDF_VERSION_MINOR == 5 && ESP_IDF_VERSION_PATCH == 3)
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        ESP_LOGW(TAG, "BoundedSPI仅验证 ESP-IDF 5.5.3；当前版本 %d.%d.%d 固定回退 LVGL 传输链",
+            ESP_IDF_VERSION_MAJOR, ESP_IDF_VERSION_MINOR, ESP_IDF_VERSION_PATCH);
+    }
+#endif
     return display_bounded_spi_available_internal();
 }
 
 static esp_err_t display_bounded_spi_drain_panel(
-    DisplayPanelIoSpiV55Prefix *io,
+    DisplayPanelIoSpiV553Prefix *io,
     uint32_t *elapsed_us)
 {
     if (elapsed_us != nullptr) {
@@ -193,7 +201,7 @@ static esp_err_t display_bounded_spi_drain_panel(
 
 static void display_bounded_spi_prepare_transaction(
     DisplayBoundedRawSpiTransaction *tx,
-    DisplayPanelIoSpiV55Prefix *io,
+    DisplayPanelIoSpiV553Prefix *io,
     uint32_t qspi_header,
     bool qio_data)
 {
@@ -214,7 +222,7 @@ static void display_bounded_spi_prepare_transaction(
 }
 
 static esp_err_t display_bounded_spi_queue_wait_single(
-    DisplayPanelIoSpiV55Prefix *io,
+    DisplayPanelIoSpiV553Prefix *io,
     DisplayBoundedRawSpiTransaction *tx,
     uint32_t *queue_wait_us)
 {
@@ -274,7 +282,7 @@ static esp_err_t display_bounded_spi_queue_wait_single(
 }
 
 static esp_err_t display_bounded_spi_send_window_param(
-    DisplayPanelIoSpiV55Prefix *io,
+    DisplayPanelIoSpiV553Prefix *io,
     uint8_t control_index,
     uint8_t dcs_command,
     const uint8_t param[4],
@@ -309,7 +317,7 @@ static esp_err_t display_bounded_spi_session_begin(const char *owner)
         return ESP_ERR_INVALID_STATE;
     }
 
-    DisplayPanelIoSpiV55Prefix *io = display_panel_io_spi_v55_prefix();
+    DisplayPanelIoSpiV553Prefix *io = display_panel_io_spi_v553_prefix();
     if (!display_bounded_spi_abi_valid(io)) {
         return ESP_ERR_NOT_SUPPORTED;
     }
@@ -448,7 +456,7 @@ static esp_err_t display_bounded_spi_present_internal(
         return ESP_ERR_INVALID_ARG;
     }
 
-    DisplayPanelIoSpiV55Prefix *io = display_panel_io_spi_v55_prefix();
+    DisplayPanelIoSpiV553Prefix *io = display_panel_io_spi_v553_prefix();
     if (!display_bounded_spi_abi_valid(io)) {
         display_bounded_spi_poison("Panel IO ABI/配置不匹配");
         return ESP_ERR_NOT_SUPPORTED;

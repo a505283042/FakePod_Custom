@@ -244,7 +244,8 @@ void media_catalog_v2_release(MusicCatalogV2 *catalog);
 // 做运行时语义校验：字符串偏移、ID、技术 offset、路径排序等都必须合法。
 esp_err_t media_catalog_v2_validate(const MusicCatalogV2 *catalog);
 
-// 将构建/加载好的 Catalog 原子替换为运行时只读目录；发布时生成新的 generation。
+// 将构建/加载好的 Catalog 发布为本次启动周期的运行时只读目录，并生成 generation。
+// 当前 View 直接引用 Catalog 内存，因此每次启动只允许发布一次；运行期热替换尚不支持。
 esp_err_t media_catalog_v2_publish(MusicCatalogV2 *catalog, uint32_t source_crc32);
 bool media_catalog_v2_ready();
 const MusicCatalogV2 *media_catalog_v2_current();

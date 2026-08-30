@@ -8,6 +8,7 @@
 
 #include "boot_state.h"
 #include "system_runtime.h"
+#include "app_manager.h"
 #include "persistent_state.h"
 #include "power_service.h"
 #include "gpio0_service.h"
@@ -31,6 +32,11 @@ static const char *TAG =
 // 平时完全无开销；这样偶发停播时即使当时没开串口，随后连接监视器仍能看到现场。
 static constexpr TickType_t AUDIO_FAULT_REMINDER_INTERVAL = pdMS_TO_TICKS(15000);
 static TickType_t g_last_audio_fault_reminder_tick = 0;
+
+// 持久化运行态只用于维护 RAM 快照/dirty；真正写 NVS 前 flush 会再捕获一次最新状态。
+// 250ms 足够跟随音量/列表变化，也避免每 10ms 重复解析 Playlist 与比较多组字符串。
+static constexpr TickType_t PERSISTENT_OBSERVE_INTERVAL = pdMS_TO_TICKS(250);
+static TickType_t g_last_persistent_observe_tick = 0;
 
 #if APP_DIAG_SYSTEM_HEARTBEAT || APP_DIAG_FLAC_PERFORMANCE || APP_DIAG_MP3_PERFORMANCE
 static TickType_t g_last_diag_tick = 0;
@@ -197,6 +203,13 @@ static void system_artwork_current_update()
     if (!artwork_loader_is_ready() || !cover_surface_cache_is_ready() ||
         !player_state_is_ready() || !media_catalog_v2_ready()) return;
 
+    // Music 进入 Background 后 UI 已不可见，不再为后台切曲读 TF / 解码封面 / 生成 Surface。
+    // 已在执行的任务不强制取消；返回前台后会按当前 track 自动补齐资源。
+    if (app_manager_is_ready() &&
+        app_manager_state(AppId::Music) != AppRunState::Foreground) {
+        return;
+    }
+
     const uint32_t generation = media_catalog_v2_generation();
     const uint32_t current_track = static_cast<uint32_t>(player_state_get_index());
     if (generation != g_artwork_context_generation || current_track != g_artwork_current_track) {
@@ -304,11 +317,17 @@ void system_loop_update()
     // AudioTask 本身不依赖 Player/Catalog，也不会直接选择下一首。
     player_control_update();
 
-    // NVS V1 这里只同步 RAM 快照/dirty，不执行任何 Flash 写入。
-    persistent_state_observe_runtime();
+    // NVS V1 只低频同步 RAM 快照/dirty，不执行任何 Flash 写入。
+    // 关机 flush 内部会再次即时捕获，因此这里降频不会丢失最后一次用户操作。
+    const TickType_t persistent_now = xTaskGetTickCount();
+    if (g_last_persistent_observe_tick == 0 ||
+        persistent_now - g_last_persistent_observe_tick >= PERSISTENT_OBSERVE_INTERVAL) {
+        g_last_persistent_observe_tick = persistent_now;
+        persistent_state_observe_runtime();
+    }
 
-    // GPIO48 与 EC190707 共用电源键：放在 Player/持久化 RAM 快照更新之后，
-    // 长按触发时可以 flush 本轮最新状态；不用 ISR，也不提前接管硬件最终断电。
+    // GPIO48 与 EC190707 共用电源键：长按 flush 会在写 NVS 前再次即时捕获最新运行态；
+    // 不用 ISR，也不提前接管硬件最终断电。
     power_service_update();
 
     // GPIO0(K1) 辅助按键：音量- / 锁/解锁 / AOD / 熄屏（释放分级）。

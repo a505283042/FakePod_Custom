@@ -1076,10 +1076,29 @@ void screen_lock_wake_if_needed(void)
 }
 
 // ----------- Render -----------
+static bool screen_lock_simple_render_due(TickType_t now)
+{
+    if (g_power == ScreenPowerAOD) {
+        if (g_aod_root == nullptr) return false;
+
+        const uint32_t now_ms = static_cast<uint32_t>(pdTICKS_TO_MS(now));
+        const bool refresh_due = g_aod_last_refresh_tick == 0U ||
+            (now_ms - g_aod_last_refresh_tick) >= kAODRefreshTickMs;
+        const bool jitter_due = g_last_jitter_tick == 0 ||
+            (now - g_last_jitter_tick) >= pdMS_TO_TICKS(kJitterIntervalMs);
+        return refresh_due || jitter_due;
+    }
+
+    // Normal + Locked 仍保持原来的 10ms 置顶兜底；Normal + Unlocked / Off 无渲染工作。
+    return g_power == ScreenPowerNormal &&
+        g_lock == ScreenLockLocked && g_lock_icon != nullptr;
+}
+
 void screen_lock_simple_render(void)
 {
     if (!g_ready) return;
     const TickType_t now = xTaskGetTickCount();
+    if (!screen_lock_simple_render_due(now)) return;
     if (!lvgl_port_lock(10)) return;
 
     // 防烧屏抖动（AOD，30s ±1px）

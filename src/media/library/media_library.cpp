@@ -985,6 +985,12 @@ static esp_err_t media_library_scan_with_scratch(MediaLibraryScanScratch *scratc
 
 esp_err_t media_library_scan()
 {
+    if (g_ready || media_catalog_v2_ready()) {
+        // 当前 Catalog View 使用“generation 未变化期间有效”的裸指针语义；
+        // 未实现运行期 lease/refcount 前禁止二次扫描替换正在使用的 Catalog。
+        ESP_LOGE(TAG, "音乐库已发布，本次启动禁止再次扫描替换运行时 Catalog");
+        return ESP_ERR_INVALID_STATE;
+    }
     if (!sdcard_is_mounted()) {
         ESP_LOGE(TAG, "TF 卡尚未挂载，无法扫描音乐库");
         return ESP_ERR_INVALID_STATE;
