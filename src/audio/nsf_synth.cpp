@@ -1,5 +1,6 @@
 #include "nsf_synth.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -16,6 +17,7 @@ static constexpr uint32_t kInitInstructionLimit = 2000000U;
 static constexpr uint32_t kPlayInstructionLimit = 250000U;
 static constexpr size_t kWorkRamBytes = 8192U;
 static constexpr size_t kLoopHistoryCapacity = 24576U; // 典型60Hz下约409秒；双历史约192KB PSRAM，仅后台分析实例使用
+static constexpr size_t kVisualTickCapacity = 32U; // 播放路每块通常不到1个PLAY；短暂UI锁竞争时仍有足够余量
 static constexpr uint32_t kLoopDetectMinMs = 8000U;
 static constexpr uint32_t kLoopDetectProbeMs = 1000U;
 static constexpr uint32_t kLoopStructureProbeMs = 5000U;
@@ -202,6 +204,15 @@ struct NsfSynthImpl
     // 后台时长分析同时跟踪自然静音；实时48kHz实例不开启该统计。
     bool analysis_seen_audible = false;
     uint64_t analysis_silent_frames = 0ULL;
+
+    // 可视状态只由真实播放实例产生；后台分析实例不参与瀑布时间轴。
+    NsfSynthVisualTick *visual_ticks = nullptr;
+    size_t visual_tick_read = 0U;
+    size_t visual_tick_count = 0U;
+    // 音高换算只在定时器变化时执行；把实时播放路的 log2f 成本限制在音高真正变化时。
+    uint16_t visual_pitch_timer[3] = {};
+    uint8_t visual_pitch_cache[3] = {};
+    uint8_t visual_pitch_valid_mask = 0U;
 
     uint32_t sample_rate_hz = 0U;
     uint32_t play_speed_us = kDefaultNtscSpeedUs;
@@ -863,6 +874,104 @@ static bool apu_has_audible_activity(const NesApu &apu)
     return dmc.enabled && (!dmc.silence || dmc.bytes_remaining > 0U || dmc.bits_remaining > 0U);
 }
 
+static bool pulse_has_audible_activity(const PulseChannel &pulse, bool first_channel)
+{
+    if (!pulse.enabled || pulse.length == 0U || pulse.timer < 8U ||
+        envelope_volume(pulse.envelope) == 0U) {
+        return false;
+    }
+    const uint16_t sweep_target = pulse_sweep_target(pulse, first_channel);
+    return pulse.sweep_shift == 0U || sweep_target <= 0x07FFU;
+}
+
+static uint8_t frequency_to_midi_note(float frequency_hz)
+{
+    if (frequency_hz <= 0.0f) return 0U;
+    const float note_f = 69.0f + 12.0f * log2f(frequency_hz / 440.0f);
+    int32_t note = static_cast<int32_t>(note_f + (note_f >= 0.0f ? 0.5f : -0.5f));
+    if (note < 0) note = 0;
+    if (note > 127) note = 127;
+    return static_cast<uint8_t>(note);
+}
+
+static uint8_t visual_pitch_from_timer(
+    NsfSynthImpl *impl,
+    uint8_t voice,
+    uint16_t timer,
+    float divider)
+{
+    if (impl == nullptr || voice >= 3U) return 0U;
+    const uint8_t bit = static_cast<uint8_t>(1U << voice);
+    if ((impl->visual_pitch_valid_mask & bit) != 0U &&
+        impl->visual_pitch_timer[voice] == timer) {
+        return impl->visual_pitch_cache[voice];
+    }
+
+    const float hz = kNtscCpuHz /
+        (divider * static_cast<float>(static_cast<uint32_t>(timer) + 1U));
+    const uint8_t note = frequency_to_midi_note(hz);
+    impl->visual_pitch_timer[voice] = timer;
+    impl->visual_pitch_cache[voice] = note;
+    impl->visual_pitch_valid_mask |= bit;
+    return note;
+}
+
+static void capture_visual_tick(NsfSynth *synth)
+{
+    if (synth == nullptr || synth->impl == nullptr) return;
+    NsfSynthImpl *impl = static_cast<NsfSynthImpl *>(synth->impl);
+    if (impl->visual_ticks == nullptr) return;
+
+    NsfSynthVisualTick tick = {};
+    tick.frame = synth->position_frames > UINT32_MAX
+        ? UINT32_MAX
+        : static_cast<uint32_t>(synth->position_frames);
+
+    for (uint8_t index = 0U; index < 2U; ++index) {
+        const PulseChannel &pulse = impl->apu.pulse[index];
+        if (pulse_has_audible_activity(pulse, index == 0U)) {
+            tick.active_mask |= static_cast<uint8_t>(1U << index);
+            tick.pitch[index] = visual_pitch_from_timer(impl, index, pulse.timer, 16.0f);
+            tick.level[index] = static_cast<uint8_t>(envelope_volume(pulse.envelope) * 8U);
+        }
+    }
+
+    const TriangleChannel &triangle = impl->apu.triangle;
+    if (triangle.enabled && triangle.length > 0U && triangle.linear_counter > 0U &&
+        triangle.timer >= 2U) {
+        tick.active_mask |= 1U << 2U;
+        tick.pitch[2] = visual_pitch_from_timer(impl, 2U, triangle.timer, 32.0f);
+        tick.level[2] = 96U;
+    }
+
+    const NoiseChannel &noise = impl->apu.noise;
+    if (noise.enabled && noise.length > 0U && envelope_volume(noise.envelope) > 0U) {
+        tick.active_mask |= 1U << 3U;
+        tick.level[3] = static_cast<uint8_t>(envelope_volume(noise.envelope) * 8U);
+    }
+
+    const DmcChannel &dmc = impl->apu.dmc;
+    if (dmc.enabled && (!dmc.silence || dmc.bytes_remaining > 0U || dmc.bits_remaining > 0U)) {
+        tick.active_mask |= 1U << 4U;
+        tick.level[4] = dmc.output_level;
+    }
+
+    if ((impl->play_write_mask & (1UL << 0x03U)) != 0U) tick.trigger_mask |= 1U << 0U;
+    if ((impl->play_write_mask & (1UL << 0x07U)) != 0U) tick.trigger_mask |= 1U << 1U;
+    if ((impl->play_write_mask & (1UL << 0x0BU)) != 0U) tick.trigger_mask |= 1U << 2U;
+    if ((impl->play_write_mask & (1UL << 0x0FU)) != 0U) tick.trigger_mask |= 1U << 3U;
+    if ((impl->play_write_mask & (1UL << 0x15U)) != 0U) tick.trigger_mask |= 1U << 4U;
+
+    if (impl->visual_tick_count == kVisualTickCapacity) {
+        impl->visual_tick_read = (impl->visual_tick_read + 1U) % kVisualTickCapacity;
+        --impl->visual_tick_count;
+    }
+    const size_t write =
+        (impl->visual_tick_read + impl->visual_tick_count) % kVisualTickCapacity;
+    impl->visual_ticks[write] = tick;
+    ++impl->visual_tick_count;
+}
+
 static float noise_output(NoiseChannel *noise, uint32_t sample_rate_hz)
 {
     if (!noise->enabled || noise->length == 0U) return 0.0f;
@@ -1002,9 +1111,13 @@ static void memory_write(NsfSynthImpl *impl, uint16_t address, uint8_t value)
         return;
     }
     if (address >= 0x4000U && address <= 0x4017U) {
-        if (impl->config.enable_loop_detection && is_loop_audio_register(address)) {
+        const bool track_write =
+            impl->config.enable_loop_detection || impl->config.enable_visual_capture;
+        if (track_write && is_loop_audio_register(address)) {
             const uint8_t reg = static_cast<uint8_t>(address - 0x4000U);
-            impl->apu_registers[reg] = value;
+            if (impl->config.enable_loop_detection) {
+                impl->apu_registers[reg] = value;
+            }
             if (is_loop_trigger_register(address)) {
                 impl->play_write_mask |= 1UL << reg;
             }
@@ -1506,6 +1619,9 @@ static esp_err_t reset_track(NsfSynth *synth, uint8_t track)
     reset_loop_detector(impl);
     impl->analysis_seen_audible = false;
     impl->analysis_silent_frames = 0ULL;
+    impl->visual_tick_read = 0U;
+    impl->visual_tick_count = 0U;
+    impl->visual_pitch_valid_mask = 0U;
     // NSF1 初始化顺序与硬件播放器保持一致：先清通道，再启用四个基础波形；
     // DMC 由 INIT routine 自己决定是否开启。后台分析实例会同步循环检测所需的寄存器镜像。
     memory_write(impl, 0x4015U, 0x00U);
@@ -1550,7 +1666,7 @@ static esp_err_t run_due_play_calls(NsfSynth *synth)
     uint8_t calls = 0U;
     while (impl->play_phase_q32 >= impl->play_interval_q32) {
         impl->play_phase_q32 -= impl->play_interval_q32;
-        if (impl->config.enable_loop_detection) {
+        if (impl->config.enable_loop_detection || impl->config.enable_visual_capture) {
             impl->play_write_mask = 0U;
         }
         const esp_err_t ret = cpu_call(
@@ -1568,6 +1684,9 @@ static esp_err_t run_due_play_calls(NsfSynth *synth)
             return ret;
         }
         loop_detector_on_play(synth);
+        if (impl->config.enable_visual_capture) {
+            capture_visual_tick(synth);
+        }
         if (++calls >= 4U) {
             // 单个 PCM sample 正常最多跨过一个 PLAY tick；异常配置下丢弃多余欠账，避免 AudioTask 长时间追帧。
             impl->play_phase_q32 = 0ULL;
@@ -1632,6 +1751,15 @@ esp_err_t nsf_synth_open_owned(
             ESP_LOGW(TAG, "NSF循环分析PSRAM申请失败：本次仅使用静音结束");
         }
     }
+    if (config->enable_visual_capture) {
+        impl->visual_ticks = static_cast<NsfSynthVisualTick *>(heap_caps_calloc(
+            kVisualTickCapacity,
+            sizeof(NsfSynthVisualTick),
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (impl->visual_ticks == nullptr) {
+            ESP_LOGW(TAG, "NSF播放瀑布状态PSRAM申请失败：不影响音频播放");
+        }
+    }
 
     impl->prg = owned_prg;
     impl->prg_size = prg_size;
@@ -1685,6 +1813,7 @@ void nsf_synth_close(NsfSynth *synth)
         if (impl->work_ram != nullptr) heap_caps_free(impl->work_ram);
         if (impl->loop_history != nullptr) heap_caps_free(impl->loop_history);
         if (impl->loop_structure_history != nullptr) heap_caps_free(impl->loop_structure_history);
+        if (impl->visual_ticks != nullptr) heap_caps_free(impl->visual_ticks);
         free(impl);
     }
     *synth = {};
@@ -1809,4 +1938,23 @@ bool nsf_synth_get_activity_info(const NsfSynth *synth, NsfSynthActivityInfo *ou
     out_info->seen_audible = impl->analysis_seen_audible;
     out_info->silent_frames = impl->analysis_silent_frames;
     return true;
+}
+
+size_t nsf_synth_take_visual_ticks(
+    NsfSynth *synth,
+    NsfSynthVisualTick *out_ticks,
+    size_t capacity)
+{
+    if (synth == nullptr || !synth->open || synth->impl == nullptr ||
+        out_ticks == nullptr || capacity == 0U) {
+        return 0U;
+    }
+    NsfSynthImpl *impl = static_cast<NsfSynthImpl *>(synth->impl);
+    size_t count = impl->visual_tick_count < capacity ? impl->visual_tick_count : capacity;
+    for (size_t i = 0U; i < count; ++i) {
+        out_ticks[i] = impl->visual_ticks[impl->visual_tick_read];
+        impl->visual_tick_read = (impl->visual_tick_read + 1U) % kVisualTickCapacity;
+    }
+    impl->visual_tick_count -= count;
+    return count;
 }

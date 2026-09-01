@@ -20,6 +20,7 @@ struct NsfSynthConfig
     uint8_t pal_ntsc_bits = 0U;
     uint8_t expansion_chips = 0U;
     bool enable_loop_detection = false; // 仅后台分析实例开启，实时播放路径不承担循环搜索
+    bool enable_visual_capture = false; // 实时播放实例采当前音符；独立预读实例采未来约4秒音符
 };
 
 struct NsfSynth
@@ -47,6 +48,17 @@ struct NsfSynthActivityInfo
 {
     bool seen_audible = false;
     uint64_t silent_frames = 0ULL; // 仅后台分析实例累计的连续无可听通道活动帧数
+};
+
+// 开启可视采集的实例在每次 NSF PLAY 后记录一帧紧凑可视状态。
+// Pulse1/Pulse2/Triangle 使用 MIDI 音高编号；Noise/DMC 只使用 active/trigger/level。
+struct NsfSynthVisualTick
+{
+    uint32_t frame = 0U;
+    uint8_t pitch[3] = {};
+    uint8_t level[5] = {};
+    uint8_t active_mask = 0U;
+    uint8_t trigger_mask = 0U;
 };
 
 // owned_prg 所有权在成功后转移给 NsfSynth；失败时调用方仍负责释放。
@@ -79,3 +91,7 @@ uint64_t nsf_synth_position_frames(const NsfSynth *synth);
 uint8_t nsf_synth_track(const NsfSynth *synth);
 bool nsf_synth_get_loop_info(const NsfSynth *synth, NsfSynthLoopInfo *out_info);
 bool nsf_synth_get_activity_info(const NsfSynth *synth, NsfSynthActivityInfo *out_info);
+size_t nsf_synth_take_visual_ticks(
+    NsfSynth *synth,
+    NsfSynthVisualTick *out_ticks,
+    size_t capacity);

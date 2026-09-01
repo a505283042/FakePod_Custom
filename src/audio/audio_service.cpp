@@ -252,16 +252,41 @@ static bool g_nsf_natural_end_active = false;
 static uint64_t g_nsf_natural_end_frame = 0ULL;
 static bool g_nsf_restore_paused_music_hardware = false;
 
-// NSF 时长分析放到独立低优先级任务：优先识别 Loop，同时提前确认自然静音；实时 48kHz Synth 只负责出声。
+// NSF 时长分析和未来音符预读拆成两个独立低优先级任务，避免任一功能拖住另一条链路。
 static constexpr uint32_t NSF_ANALYSIS_SAMPLE_RATE_HZ = 500U;
 static constexpr uint32_t NSF_ANALYSIS_MAX_MS = 360000U;
 static constexpr uint32_t NSF_ANALYSIS_SILENCE_VERIFY_MS = 10000U;
 static constexpr size_t NSF_ANALYSIS_RENDER_FRAMES = 128U;
 static constexpr uint32_t NSF_ANALYSIS_TASK_STACK_BYTES = 8192U;
+// CPU0 的 AudioTask(priority=5) 持续出声，后台放在 CPU0 会长期拿不到足够时间片。
+// 分析任务放回 CPU1、priority=1；每个小块后固定休眠2 tick，让 LVGL 和 IDLE1 都有明确运行窗口。
 static constexpr UBaseType_t NSF_ANALYSIS_TASK_PRIORITY = 1U;
 static constexpr BaseType_t NSF_ANALYSIS_TASK_CORE = 1;
+static constexpr uint32_t NSF_ANALYSIS_YIELD_TICKS = 2U;
+// 启动阶段先让未来音符预读建立约4秒窗口，避免 Preview/Analysis 两个6502实例同时抢CPU1。
+// 预读失败时最多等待5秒，之后时长分析仍独立继续。
+static constexpr uint32_t NSF_ANALYSIS_PREVIEW_WAIT_MS = 5000U;
+static constexpr uint32_t NSF_ANALYSIS_PREVIEW_POLL_MS = 20U;
+
+static constexpr uint32_t NSF_PREVIEW_SAMPLE_RATE_HZ = 500U;
+static constexpr uint32_t NSF_PREVIEW_LEAD_MS = 5000U;
+static constexpr uint32_t NSF_PREVIEW_PUBLISH_STEP_MS = 750U;
+static constexpr size_t NSF_PREVIEW_RENDER_FRAMES = 128U;
+static constexpr uint32_t NSF_PREVIEW_TASK_STACK_BYTES = 6144U;
+static constexpr UBaseType_t NSF_PREVIEW_TASK_PRIORITY = 1U;
+static constexpr BaseType_t NSF_PREVIEW_TASK_CORE = 1;
+static constexpr uint32_t NSF_PREVIEW_RENDER_YIELD_TICKS = 2U;
+static constexpr uint32_t NSF_PREVIEW_IDLE_DELAY_MS = 20U;
 
 struct NsfAnalysisTaskArgs
+{
+    uint8_t *prg = nullptr;
+    size_t prg_size = 0U;
+    NsfSynthConfig config = {};
+    uint32_t generation = 0U;
+};
+
+struct NsfPreviewTaskArgs
 {
     uint8_t *prg = nullptr;
     size_t prg_size = 0U;
@@ -285,6 +310,55 @@ static portMUX_TYPE g_nsf_analysis_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t g_nsf_analysis_generation = 1U;
 static bool g_nsf_analysis_pending = false;
 static NsfAnalysisResult g_nsf_analysis_result = {};
+
+static portMUX_TYPE g_nsf_preview_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t g_nsf_preview_generation = 1U;
+
+static constexpr size_t NSF_VISUAL_EVENT_CAPACITY = 512U;
+static constexpr size_t NSF_LOOKAHEAD_MAX_EVENTS = 2048U;
+static constexpr uint32_t NSF_VISUAL_PERCUSSION_MS = 90U;
+
+struct NsfPlaybackVisualVoice
+{
+    bool active = false;
+    uint8_t note = 0U;
+    uint8_t level = 0U;
+    uint32_t start_ms = 0U;
+};
+
+struct NsfPlaybackVisualState
+{
+    AudioNsfVisualEvent *events = nullptr;
+    size_t head = 0U;
+    size_t count = 0U;
+    NsfPlaybackVisualVoice melodic[3] = {};
+    bool percussion_active[2] = {};
+    uint8_t track = 0U;
+    bool available = false;
+};
+
+struct NsfLookaheadBuilder
+{
+    AudioNsfVisualEvent *events = nullptr;
+    size_t count = 0U;
+    size_t capacity = 0U;
+    NsfPlaybackVisualVoice melodic[3] = {};
+    bool percussion_active[2] = {};
+    bool truncated = false;
+};
+
+struct NsfLookaheadInfo
+{
+    bool available = false;
+    uint8_t track = 0U;
+};
+
+static SemaphoreHandle_t g_nsf_visual_mutex = nullptr;
+static NsfPlaybackVisualState g_nsf_visual = {};
+static SemaphoreHandle_t g_nsf_lookahead_mutex = nullptr;
+static AudioNsfVisualEvent *g_nsf_lookahead_events = nullptr;
+static size_t g_nsf_lookahead_event_count = 0U;
+static NsfLookaheadInfo g_nsf_lookahead_info = {};
 
 // R.40.4.2：AudioTask 单写、Video Presenter/Decode 多读的 PCM 主时钟发布槽。
 // 不让 Video 直接读取 AudioTask 内部 decoder/clock，避免跨核撕裂 64-bit 计数。
@@ -2378,6 +2452,29 @@ static bool nsf_analysis_generation_current(uint32_t generation)
     return current;
 }
 
+static bool nsf_preview_generation_current(uint32_t generation)
+{
+    bool current = false;
+    portENTER_CRITICAL(&g_nsf_preview_mux);
+    current = generation == g_nsf_preview_generation;
+    portEXIT_CRITICAL(&g_nsf_preview_mux);
+    return current;
+}
+
+static bool nsf_lookahead_ready_for_track(uint8_t track)
+{
+    if (g_nsf_lookahead_mutex == nullptr ||
+        xSemaphoreTake(g_nsf_lookahead_mutex, 0) != pdTRUE) {
+        return false;
+    }
+    const bool ready = g_nsf_lookahead_info.available &&
+        g_nsf_lookahead_info.track == track &&
+        g_nsf_lookahead_events != nullptr &&
+        g_nsf_lookahead_event_count > 0U;
+    xSemaphoreGive(g_nsf_lookahead_mutex);
+    return ready;
+}
+
 static void nsf_analysis_publish(
     uint32_t generation,
     uint8_t track,
@@ -2426,6 +2523,335 @@ static void nsf_analysis_mark_unavailable(uint32_t generation)
     portEXIT_CRITICAL(&g_nsf_analysis_mux);
 }
 
+static void nsf_visual_append_locked(
+    uint32_t start_ms,
+    uint32_t end_ms,
+    uint8_t note,
+    uint8_t level,
+    AudioNsfVisualVoice voice)
+{
+    if (g_nsf_visual.events == nullptr || end_ms <= start_ms) return;
+    if (g_nsf_visual.count == NSF_VISUAL_EVENT_CAPACITY) {
+        g_nsf_visual.head = (g_nsf_visual.head + 1U) % NSF_VISUAL_EVENT_CAPACITY;
+        --g_nsf_visual.count;
+    }
+    const size_t index =
+        (g_nsf_visual.head + g_nsf_visual.count) % NSF_VISUAL_EVENT_CAPACITY;
+    AudioNsfVisualEvent &event = g_nsf_visual.events[index];
+    event.start_ms = start_ms;
+    event.end_ms = end_ms;
+    event.note = note;
+    event.level = level;
+    event.voice = voice;
+    event.reserved = 0U;
+    ++g_nsf_visual.count;
+}
+
+static void nsf_visual_close_melodic_locked(uint8_t voice, uint32_t end_ms)
+{
+    if (voice >= 3U) return;
+    NsfPlaybackVisualVoice &state = g_nsf_visual.melodic[voice];
+    if (!state.active) return;
+    nsf_visual_append_locked(
+        state.start_ms,
+        end_ms,
+        state.note,
+        state.level,
+        static_cast<AudioNsfVisualVoice>(voice));
+    state = {};
+}
+
+static void nsf_visual_push_tick_locked(
+    const NsfSynthVisualTick &tick,
+    uint32_t sample_rate_hz)
+{
+    if (sample_rate_hz == 0U) return;
+    const uint32_t tick_ms = static_cast<uint32_t>(
+        static_cast<uint64_t>(tick.frame) * 1000ULL / sample_rate_hz);
+
+    for (uint8_t voice = 0U; voice < 3U; ++voice) {
+        const bool active = (tick.active_mask & (1U << voice)) != 0U;
+        const bool trigger = (tick.trigger_mask & (1U << voice)) != 0U;
+        NsfPlaybackVisualVoice &state = g_nsf_visual.melodic[voice];
+        if (!active) {
+            nsf_visual_close_melodic_locked(voice, tick_ms);
+            continue;
+        }
+        if (!state.active || state.note != tick.pitch[voice] || trigger) {
+            nsf_visual_close_melodic_locked(voice, tick_ms);
+            state.active = true;
+            state.note = tick.pitch[voice];
+            state.level = tick.level[voice];
+            state.start_ms = tick_ms;
+        } else if (tick.level[voice] > state.level) {
+            state.level = tick.level[voice];
+        }
+    }
+
+    for (uint8_t index = 0U; index < 2U; ++index) {
+        const uint8_t voice = static_cast<uint8_t>(index + 3U);
+        const bool active = (tick.active_mask & (1U << voice)) != 0U;
+        const bool trigger = (tick.trigger_mask & (1U << voice)) != 0U;
+        if (active && (trigger || !g_nsf_visual.percussion_active[index])) {
+            nsf_visual_append_locked(
+                tick_ms,
+                tick_ms + NSF_VISUAL_PERCUSSION_MS,
+                0U,
+                tick.level[voice],
+                static_cast<AudioNsfVisualVoice>(voice));
+        }
+        g_nsf_visual.percussion_active[index] = active;
+    }
+}
+
+static void nsf_visual_reset_playback(uint8_t track)
+{
+    if (g_nsf_visual_mutex == nullptr) return;
+
+    AudioNsfVisualEvent *new_events = nullptr;
+    if (xSemaphoreTake(g_nsf_visual_mutex, portMAX_DELAY) != pdTRUE) return;
+    if (g_nsf_visual.events == nullptr) {
+        xSemaphoreGive(g_nsf_visual_mutex);
+        new_events = static_cast<AudioNsfVisualEvent *>(heap_caps_calloc(
+            NSF_VISUAL_EVENT_CAPACITY,
+            sizeof(AudioNsfVisualEvent),
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (new_events == nullptr) {
+            ESP_LOGW(TAG, "NSF播放瀑布事件PSRAM申请失败：不影响音频播放");
+            return;
+        }
+        if (xSemaphoreTake(g_nsf_visual_mutex, portMAX_DELAY) != pdTRUE) {
+            heap_caps_free(new_events);
+            return;
+        }
+        if (g_nsf_visual.events == nullptr) {
+            g_nsf_visual.events = new_events;
+            new_events = nullptr;
+        }
+    }
+
+    AudioNsfVisualEvent *events = g_nsf_visual.events;
+    g_nsf_visual = {};
+    g_nsf_visual.events = events;
+    g_nsf_visual.track = track;
+    g_nsf_visual.available = events != nullptr;
+    xSemaphoreGive(g_nsf_visual_mutex);
+    if (new_events != nullptr) heap_caps_free(new_events);
+
+    ESP_LOGI(TAG, "NSF播放瀑布已绑定真实播放路：track=%u", static_cast<unsigned>(track + 1U));
+}
+
+static void nsf_visual_release_playback()
+{
+    if (g_nsf_visual_mutex == nullptr) return;
+    if (xSemaphoreTake(g_nsf_visual_mutex, portMAX_DELAY) != pdTRUE) return;
+    AudioNsfVisualEvent *events = g_nsf_visual.events;
+    g_nsf_visual = {};
+    xSemaphoreGive(g_nsf_visual_mutex);
+    if (events != nullptr) heap_caps_free(events);
+}
+
+static void audio_task_update_nsf_visual_from_playback()
+{
+    if (!g_nsf_active || !nsf_synth_is_open(&g_nsf_synth) ||
+        g_nsf_visual_mutex == nullptr || g_nsf_synth.sample_rate_hz == 0U) {
+        return;
+    }
+    // AudioTask 不等待 UI；若 UI 正在复制事件，本轮先保留 Synth 内的小队列，下一块再取。
+    if (xSemaphoreTake(g_nsf_visual_mutex, 0) != pdTRUE) return;
+
+    NsfSynthVisualTick ticks[32] = {};
+    const size_t count = nsf_synth_take_visual_ticks(
+        &g_nsf_synth, ticks, sizeof(ticks) / sizeof(ticks[0]));
+    for (size_t i = 0U; i < count; ++i) {
+        nsf_visual_push_tick_locked(ticks[i], g_nsf_synth.sample_rate_hz);
+    }
+    xSemaphoreGive(g_nsf_visual_mutex);
+}
+
+static void nsf_lookahead_builder_append(
+    NsfLookaheadBuilder *builder,
+    uint32_t start_ms,
+    uint32_t end_ms,
+    uint8_t note,
+    uint8_t level,
+    AudioNsfVisualVoice voice)
+{
+    if (builder == nullptr || builder->events == nullptr || end_ms <= start_ms) return;
+    if (builder->count >= builder->capacity) {
+        builder->truncated = true;
+        return;
+    }
+    AudioNsfVisualEvent &event = builder->events[builder->count++];
+    event.start_ms = start_ms;
+    event.end_ms = end_ms;
+    event.note = note;
+    event.level = level;
+    event.voice = voice;
+    event.reserved = 0U;
+}
+
+static void nsf_lookahead_builder_close_melodic(
+    NsfLookaheadBuilder *builder,
+    uint8_t voice,
+    uint32_t end_ms)
+{
+    if (builder == nullptr || voice >= 3U) return;
+    NsfPlaybackVisualVoice &state = builder->melodic[voice];
+    if (!state.active) return;
+    nsf_lookahead_builder_append(
+        builder,
+        state.start_ms,
+        end_ms,
+        state.note,
+        state.level,
+        static_cast<AudioNsfVisualVoice>(voice));
+    state = {};
+}
+
+static void nsf_lookahead_builder_push_tick(
+    NsfLookaheadBuilder *builder,
+    const NsfSynthVisualTick &tick)
+{
+    if (builder == nullptr || builder->events == nullptr) return;
+    const uint32_t tick_ms = static_cast<uint32_t>(
+        static_cast<uint64_t>(tick.frame) * 1000ULL / NSF_PREVIEW_SAMPLE_RATE_HZ);
+
+    for (uint8_t voice = 0U; voice < 3U; ++voice) {
+        const bool active = (tick.active_mask & (1U << voice)) != 0U;
+        const bool trigger = (tick.trigger_mask & (1U << voice)) != 0U;
+        NsfPlaybackVisualVoice &state = builder->melodic[voice];
+        if (!active) {
+            nsf_lookahead_builder_close_melodic(builder, voice, tick_ms);
+            continue;
+        }
+        if (!state.active || state.note != tick.pitch[voice] || trigger) {
+            nsf_lookahead_builder_close_melodic(builder, voice, tick_ms);
+            state.active = true;
+            state.note = tick.pitch[voice];
+            state.level = tick.level[voice];
+            state.start_ms = tick_ms;
+        } else if (tick.level[voice] > state.level) {
+            state.level = tick.level[voice];
+        }
+    }
+
+    for (uint8_t index = 0U; index < 2U; ++index) {
+        const uint8_t voice = static_cast<uint8_t>(index + 3U);
+        const bool active = (tick.active_mask & (1U << voice)) != 0U;
+        const bool trigger = (tick.trigger_mask & (1U << voice)) != 0U;
+        if (active && (trigger || !builder->percussion_active[index])) {
+            nsf_lookahead_builder_append(
+                builder,
+                tick_ms,
+                tick_ms + NSF_VISUAL_PERCUSSION_MS,
+                0U,
+                tick.level[voice],
+                static_cast<AudioNsfVisualVoice>(voice));
+        }
+        builder->percussion_active[index] = active;
+    }
+}
+
+
+static void nsf_lookahead_builder_prune_before(
+    NsfLookaheadBuilder *builder,
+    uint32_t cutoff_ms)
+{
+    if (builder == nullptr || builder->events == nullptr || builder->count == 0U) return;
+    size_t write = 0U;
+    for (size_t read = 0U; read < builder->count; ++read) {
+        if (builder->events[read].end_ms <= cutoff_ms) continue;
+        if (write != read) builder->events[write] = builder->events[read];
+        ++write;
+    }
+    builder->count = write;
+    builder->truncated = false;
+    for (uint8_t voice = 0U; voice < 3U; ++voice) {
+        if (builder->melodic[voice].active && builder->melodic[voice].start_ms < cutoff_ms) {
+            builder->melodic[voice].start_ms = cutoff_ms;
+        }
+    }
+}
+
+static void nsf_lookahead_clear_published()
+{
+    AudioNsfVisualEvent *old_events = nullptr;
+    if (g_nsf_lookahead_mutex == nullptr ||
+        xSemaphoreTake(g_nsf_lookahead_mutex, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
+    old_events = g_nsf_lookahead_events;
+    g_nsf_lookahead_events = nullptr;
+    g_nsf_lookahead_event_count = 0U;
+    g_nsf_lookahead_info = {};
+    xSemaphoreGive(g_nsf_lookahead_mutex);
+    if (old_events != nullptr) heap_caps_free(old_events);
+}
+
+static size_t nsf_lookahead_publish_snapshot(
+    uint32_t generation,
+    uint8_t track,
+    const NsfLookaheadBuilder *builder,
+    uint32_t preview_end_ms)
+{
+    if (builder == nullptr || builder->events == nullptr) return 0U;
+
+    size_t active_count = 0U;
+    for (uint8_t voice = 0U; voice < 3U; ++voice) {
+        if (builder->melodic[voice].active &&
+            builder->melodic[voice].start_ms < preview_end_ms) {
+            ++active_count;
+        }
+    }
+    const size_t total_count = builder->count + active_count;
+    if (total_count == 0U) return 0U;
+
+    AudioNsfVisualEvent *snapshot = static_cast<AudioNsfVisualEvent *>(heap_caps_malloc(
+        total_count * sizeof(AudioNsfVisualEvent),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (snapshot == nullptr) return 0U;
+
+    size_t out_count = 0U;
+    for (size_t i = 0U; i < builder->count; ++i) snapshot[out_count++] = builder->events[i];
+    for (uint8_t voice = 0U; voice < 3U; ++voice) {
+        const NsfPlaybackVisualVoice &state = builder->melodic[voice];
+        if (!state.active || state.start_ms >= preview_end_ms) continue;
+        AudioNsfVisualEvent &event = snapshot[out_count++];
+        event.start_ms = state.start_ms;
+        event.end_ms = preview_end_ms;
+        event.note = state.note;
+        event.level = state.level;
+        event.voice = static_cast<AudioNsfVisualVoice>(voice);
+        event.reserved = 0U;
+    }
+
+    if (g_nsf_lookahead_mutex == nullptr ||
+        xSemaphoreTake(g_nsf_lookahead_mutex, portMAX_DELAY) != pdTRUE) {
+        heap_caps_free(snapshot);
+        return 0U;
+    }
+
+    bool current = false;
+    portENTER_CRITICAL(&g_nsf_preview_mux);
+    current = generation == g_nsf_preview_generation;
+    portEXIT_CRITICAL(&g_nsf_preview_mux);
+    if (!current) {
+        xSemaphoreGive(g_nsf_lookahead_mutex);
+        heap_caps_free(snapshot);
+        return 0U;
+    }
+
+    AudioNsfVisualEvent *old_events = g_nsf_lookahead_events;
+    g_nsf_lookahead_events = snapshot;
+    g_nsf_lookahead_event_count = out_count;
+    g_nsf_lookahead_info.available = true;
+    g_nsf_lookahead_info.track = track;
+    xSemaphoreGive(g_nsf_lookahead_mutex);
+    if (old_events != nullptr) heap_caps_free(old_events);
+    return out_count;
+}
+
 static void nsf_analysis_task(void *arg)
 {
     NsfAnalysisTaskArgs *args = static_cast<NsfAnalysisTaskArgs *>(arg);
@@ -2454,8 +2880,22 @@ static void nsf_analysis_task(void *arg)
         return;
     }
 
+    ESP_LOGI(TAG, "NSF后台时长分析运行：track=%u core=%d priority=%u",
+        static_cast<unsigned>(track + 1U),
+        static_cast<int>(NSF_ANALYSIS_TASK_CORE),
+        static_cast<unsigned>(NSF_ANALYSIS_TASK_PRIORITY));
+
+    // Preview先追到真实播放前方约5秒，再启动长时间Loop分析；
+    // 只协调启动负载，两个任务的数据和Synth仍完全独立。
+    uint32_t preview_waited_ms = 0U;
+    while (nsf_analysis_generation_current(generation) &&
+           preview_waited_ms < NSF_ANALYSIS_PREVIEW_WAIT_MS &&
+           !nsf_lookahead_ready_for_track(track)) {
+        vTaskDelay(pdMS_TO_TICKS(NSF_ANALYSIS_PREVIEW_POLL_MS));
+        preview_waited_ms += NSF_ANALYSIS_PREVIEW_POLL_MS;
+    }
+
     int32_t scratch[NSF_ANALYSIS_RENDER_FRAMES * 2U] = {};
-    uint8_t blocks_before_yield = 0U;
     uint64_t published_hint_ms = 0ULL;
     while (nsf_analysis_generation_current(generation)) {
         size_t frames = 0U;
@@ -2467,6 +2907,9 @@ static void nsf_analysis_task(void *arg)
                 static_cast<unsigned>(track + 1U), esp_err_to_name(ret));
             break;
         }
+
+        const uint64_t current_virtual_ms =
+            nsf_synth_position_frames(&synth) * 1000ULL / NSF_ANALYSIS_SAMPLE_RATE_HZ;
 
         NsfSynthLoopInfo loop = {};
         const bool has_loop_info = nsf_synth_get_loop_info(&synth, &loop);
@@ -2494,7 +2937,6 @@ static void nsf_analysis_task(void *arg)
                 loop.start_frame * 1000ULL / NSF_ANALYSIS_SAMPLE_RATE_HZ;
             const uint64_t loop_length_ms =
                 loop.length_frames * 1000ULL / NSF_ANALYSIS_SAMPLE_RATE_HZ;
-            // 结束点取3分钟目标附近最近的完整循环边界，避免只差几秒却被顺延一整个 Loop。
             const uint64_t duration_ms = nsf_loop_boundary_nearest(
                 loop_start_ms, loop_length_ms, NSF_LOOP_TARGET_MS);
             nsf_analysis_publish(
@@ -2510,8 +2952,7 @@ static void nsf_analysis_task(void *arg)
                 static_cast<unsigned long long>(loop_start_ms),
                 static_cast<unsigned long long>(loop_length_ms),
                 static_cast<unsigned long long>(duration_ms),
-                static_cast<unsigned long long>(
-                    nsf_synth_position_frames(&synth) * 1000ULL / NSF_ANALYSIS_SAMPLE_RATE_HZ));
+                static_cast<unsigned long long>(current_virtual_ms));
             break;
         }
 
@@ -2526,15 +2967,13 @@ static void nsf_analysis_task(void *arg)
                     position_frames >= activity.silent_frames
                         ? position_frames - activity.silent_frames
                         : 0ULL;
-                // 6秒静音和额外10秒只用于后台确认；真实曲目结束点就是静音开始处。
                 const uint64_t duration_ms =
                     silence_start_frame * 1000ULL / NSF_ANALYSIS_SAMPLE_RATE_HZ;
                 nsf_analysis_publish(generation, track, false, 0ULL, 0ULL, duration_ms);
                 ESP_LOGI(TAG,
                     "NSF后台静音分析完成：track=%u silence_start=%llums duration=%llums verified=%lums",
                     static_cast<unsigned>(track + 1U),
-                    static_cast<unsigned long long>(
-                        silence_start_frame * 1000ULL / NSF_ANALYSIS_SAMPLE_RATE_HZ),
+                    static_cast<unsigned long long>(duration_ms),
                     static_cast<unsigned long long>(duration_ms),
                     static_cast<unsigned long>(
                         NSF_SILENCE_END_MS + NSF_ANALYSIS_SILENCE_VERIFY_MS));
@@ -2542,9 +2981,7 @@ static void nsf_analysis_task(void *arg)
             }
         }
 
-        const uint64_t virtual_ms =
-            nsf_synth_position_frames(&synth) * 1000ULL / NSF_ANALYSIS_SAMPLE_RATE_HZ;
-        if (virtual_ms >= NSF_ANALYSIS_MAX_MS) {
+        if (current_virtual_ms >= NSF_ANALYSIS_MAX_MS) {
             nsf_analysis_publish(generation, track, false, 0ULL, 0ULL, 0ULL);
             ESP_LOGI(TAG, "NSF后台分析完成：track=%u %lus内未发现可靠Loop或自然静音，duration未知",
                 static_cast<unsigned>(track + 1U),
@@ -2552,14 +2989,197 @@ static void nsf_analysis_task(void *arg)
             break;
         }
 
-        if (++blocks_before_yield >= 4U) {
-            blocks_before_yield = 0U;
-            vTaskDelay(1);
-        }
+        // 每个小块后固定休眠，避免后台模拟持续占满 CPU1；让 LVGL 和 IDLE1 都能持续获得时间片。
+        vTaskDelay(NSF_ANALYSIS_YIELD_TICKS);
     }
 
     nsf_synth_close(&synth);
     vTaskDelete(nullptr);
+}
+
+static void nsf_preview_task(void *arg)
+{
+    NsfPreviewTaskArgs *args = static_cast<NsfPreviewTaskArgs *>(arg);
+    if (args == nullptr || args->prg == nullptr || args->prg_size == 0U) {
+        if (args != nullptr) heap_caps_free(args);
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    const uint32_t generation = args->generation;
+    const uint8_t track = args->config.track;
+    uint8_t *owned_prg = args->prg;
+    const size_t prg_size = args->prg_size;
+    NsfSynthConfig config = args->config;
+    heap_caps_free(args);
+
+    NsfSynth synth = {};
+    esp_err_t ret = nsf_synth_open_owned(
+        &synth, owned_prg, prg_size, &config, NSF_PREVIEW_SAMPLE_RATE_HZ);
+    if (ret != ESP_OK) {
+        heap_caps_free(owned_prg);
+        ESP_LOGW(TAG, "NSF未来4秒预读启动失败：track=%u ret=%s",
+            static_cast<unsigned>(track + 1U), esp_err_to_name(ret));
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    NsfLookaheadBuilder builder = {};
+    builder.events = static_cast<AudioNsfVisualEvent *>(heap_caps_calloc(
+        NSF_LOOKAHEAD_MAX_EVENTS,
+        sizeof(AudioNsfVisualEvent),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (builder.events == nullptr) {
+        ESP_LOGW(TAG, "NSF未来4秒预读事件PSRAM申请失败：track=%u",
+            static_cast<unsigned>(track + 1U));
+        nsf_synth_close(&synth);
+        vTaskDelete(nullptr);
+        return;
+    }
+    builder.capacity = NSF_LOOKAHEAD_MAX_EVENTS;
+    ESP_LOGI(TAG, "NSF未来4秒独立预读运行：track=%u core=%d priority=%u lead=%lums",
+        static_cast<unsigned>(track + 1U),
+        static_cast<int>(NSF_PREVIEW_TASK_CORE),
+        static_cast<unsigned>(NSF_PREVIEW_TASK_PRIORITY),
+        static_cast<unsigned long>(NSF_PREVIEW_LEAD_MS));
+
+    int32_t scratch[NSF_PREVIEW_RENDER_FRAMES * 2U] = {};
+    NsfSynthVisualTick visual_ticks[32] = {};
+    uint64_t last_publish_position_ms = UINT64_MAX;
+    bool ready_logged = false;
+
+    while (nsf_preview_generation_current(generation)) {
+        AudioNsfClockSnapshot clock = {};
+        if (!audio_service_nsf_get_clock(&clock) || !clock.active || clock.failed ||
+            clock.eof || clock.track != track) {
+            vTaskDelay(pdMS_TO_TICKS(NSF_PREVIEW_IDLE_DELAY_MS) + 1U);
+            continue;
+        }
+
+        const uint64_t target_ms = clock.position_ms + NSF_PREVIEW_LEAD_MS;
+        uint64_t virtual_ms =
+            nsf_synth_position_frames(&synth) * 1000ULL / NSF_PREVIEW_SAMPLE_RATE_HZ;
+
+        if (virtual_ms < target_ms) {
+            size_t frames = 0U;
+            ret = nsf_synth_render_pcm32(
+                &synth, scratch, NSF_PREVIEW_RENDER_FRAMES, &frames);
+            if (ret != ESP_OK || frames == 0U) {
+                ESP_LOGW(TAG, "NSF未来4秒预读失败：track=%u ret=%s",
+                    static_cast<unsigned>(track + 1U), esp_err_to_name(ret));
+                break;
+            }
+
+            const size_t visual_tick_count = nsf_synth_take_visual_ticks(
+                &synth, visual_ticks, sizeof(visual_ticks) / sizeof(visual_ticks[0]));
+            for (size_t i = 0U; i < visual_tick_count; ++i) {
+                nsf_lookahead_builder_push_tick(&builder, visual_ticks[i]);
+            }
+
+            // 只追到真实播放前方约5秒；每个小块后固定休眠，避免与 LVGL/IDLE1 争满 CPU1。
+            vTaskDelay(NSF_PREVIEW_RENDER_YIELD_TICKS);
+            continue;
+        }
+
+        const bool should_publish =
+            last_publish_position_ms == UINT64_MAX ||
+            clock.position_ms >= last_publish_position_ms + NSF_PREVIEW_PUBLISH_STEP_MS;
+        if (should_publish) {
+            const uint32_t now_ms = clock.position_ms > UINT32_MAX
+                ? UINT32_MAX
+                : static_cast<uint32_t>(clock.position_ms);
+            nsf_lookahead_builder_prune_before(&builder, now_ms);
+            virtual_ms =
+                nsf_synth_position_frames(&synth) * 1000ULL / NSF_PREVIEW_SAMPLE_RATE_HZ;
+            const uint32_t preview_end_ms = virtual_ms > UINT32_MAX
+                ? UINT32_MAX
+                : static_cast<uint32_t>(virtual_ms);
+            const size_t published_count = nsf_lookahead_publish_snapshot(
+                generation, track, &builder, preview_end_ms);
+            if (published_count > 0U && !ready_logged) {
+                ready_logged = true;
+                ESP_LOGI(TAG,
+                    "NSF独立未来4秒预读已就绪：track=%u now=%llums ahead=%llums events=%u",
+                    static_cast<unsigned>(track + 1U),
+                    static_cast<unsigned long long>(clock.position_ms),
+                    static_cast<unsigned long long>(
+                        virtual_ms > clock.position_ms ? virtual_ms - clock.position_ms : 0ULL),
+                    static_cast<unsigned>(published_count));
+            }
+            last_publish_position_ms = clock.position_ms;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(NSF_PREVIEW_IDLE_DELAY_MS) + 1U);
+    }
+
+    if (builder.truncated) {
+        ESP_LOGW(TAG, "NSF未来4秒预读事件达到上限：track=%u max=%u",
+            static_cast<unsigned>(track + 1U),
+            static_cast<unsigned>(NSF_LOOKAHEAD_MAX_EVENTS));
+    }
+    heap_caps_free(builder.events);
+    nsf_synth_close(&synth);
+    vTaskDelete(nullptr);
+}
+
+static void audio_task_cancel_nsf_preview()
+{
+    portENTER_CRITICAL(&g_nsf_preview_mux);
+    ++g_nsf_preview_generation;
+    if (g_nsf_preview_generation == 0U) ++g_nsf_preview_generation;
+    portEXIT_CRITICAL(&g_nsf_preview_mux);
+    nsf_lookahead_clear_published();
+}
+
+static bool audio_task_start_nsf_preview()
+{
+    audio_task_cancel_nsf_preview();
+    if (!nsf_synth_is_open(&g_nsf_synth)) return false;
+
+    uint8_t *prg = nullptr;
+    size_t prg_size = 0U;
+    NsfSynthConfig config = {};
+    const esp_err_t copy_ret = nsf_synth_copy_source(
+        &g_nsf_synth, &prg, &prg_size, &config);
+    if (copy_ret != ESP_OK) {
+        ESP_LOGW(TAG, "NSF未来4秒预读复制源失败：%s；不影响播放和时长分析",
+            esp_err_to_name(copy_ret));
+        return false;
+    }
+
+    NsfPreviewTaskArgs *args = static_cast<NsfPreviewTaskArgs *>(heap_caps_calloc(
+        1U, sizeof(NsfPreviewTaskArgs), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (args == nullptr) {
+        heap_caps_free(prg);
+        return false;
+    }
+
+    portENTER_CRITICAL(&g_nsf_preview_mux);
+    const uint32_t generation = g_nsf_preview_generation;
+    portEXIT_CRITICAL(&g_nsf_preview_mux);
+
+    config.enable_loop_detection = false;
+    config.enable_visual_capture = true;
+    args->prg = prg;
+    args->prg_size = prg_size;
+    args->config = config;
+    args->generation = generation;
+
+    const BaseType_t created = xTaskCreatePinnedToCore(
+        nsf_preview_task,
+        "NsfPreviewTask",
+        NSF_PREVIEW_TASK_STACK_BYTES,
+        args,
+        NSF_PREVIEW_TASK_PRIORITY,
+        nullptr,
+        NSF_PREVIEW_TASK_CORE);
+    if (created != pdPASS) {
+        heap_caps_free(prg);
+        heap_caps_free(args);
+        ESP_LOGW(TAG, "创建 NSF 未来4秒预读任务失败：不影响播放和时长分析");
+        return false;
+    }
+    return true;
 }
 
 static void audio_task_cancel_nsf_analysis()
@@ -2601,6 +3221,7 @@ static bool audio_task_start_nsf_analysis()
     portEXIT_CRITICAL(&g_nsf_analysis_mux);
 
     config.enable_loop_detection = true;
+    config.enable_visual_capture = false;
     args->prg = prg;
     args->prg_size = prg_size;
     args->config = config;
@@ -2819,7 +3440,9 @@ static esp_err_t audio_task_stop_nsf_internal(bool restore_music_hardware, const
 {
     const bool should_restore = restore_music_hardware && g_nsf_restore_paused_music_hardware;
     audio_task_cancel_nsf_analysis();
+    audio_task_cancel_nsf_preview();
     if (!g_nsf_active && !nsf_synth_is_open(&g_nsf_synth)) {
+        nsf_visual_release_playback();
         esp_err_t ret = ESP_OK;
         if (should_restore) ret = audio_task_restore_paused_music_hardware_for_nsf(reason);
         if (restore_music_hardware && ret == ESP_OK) {
@@ -2838,6 +3461,7 @@ static esp_err_t audio_task_stop_nsf_internal(bool restore_music_hardware, const
         audio_task_shutdown_output_hardware(rate, "NSF-2A03"), &first_error);
 
     nsf_synth_close(&g_nsf_synth);
+    nsf_visual_release_playback();
     g_nsf_active = false;
     g_nsf_paused = false;
     g_nsf_failed = false;
@@ -2898,11 +3522,14 @@ static void audio_task_handle_nsf_start(AudioRequest *request)
     }
 
     uint8_t *owned_prg = request->nsf_prg;
+    NsfSynthConfig playback_config = request->nsf_config;
+    playback_config.enable_loop_detection = false;
+    playback_config.enable_visual_capture = true;
     esp_err_t ret = nsf_synth_open_owned(
         &g_nsf_synth,
         owned_prg,
         request->nsf_prg_size,
-        &request->nsf_config,
+        &playback_config,
         48000U);
     if (ret != ESP_OK) {
         if (g_nsf_restore_paused_music_hardware) {
@@ -2914,6 +3541,7 @@ static void audio_task_handle_nsf_start(AudioRequest *request)
         return;
     }
     request->nsf_prg = nullptr; // 所有权已转移给 NsfSynth
+    nsf_visual_reset_playback(g_nsf_synth.track);
 
     audio_playback_clock_reset(&g_nsf_playback_clock, g_nsf_synth.sample_rate_hz);
     ret = audio_task_start_output_hardware(
@@ -2926,6 +3554,7 @@ static void audio_task_handle_nsf_start(AudioRequest *request)
         "nsf");
     if (ret != ESP_OK) {
         nsf_synth_close(&g_nsf_synth);
+        nsf_visual_release_playback();
         if (g_nsf_restore_paused_music_hardware) {
             const esp_err_t restore_ret =
                 audio_task_restore_paused_music_hardware_for_nsf("nsf_hw_failed");
@@ -2941,6 +3570,7 @@ static void audio_task_handle_nsf_start(AudioRequest *request)
     g_nsf_paused = false;
     g_nsf_failed = false;
     audio_task_reset_nsf_end_policy();
+    (void)audio_task_start_nsf_preview();
     (void)audio_task_start_nsf_analysis();
     audio_task_publish_nsf_clock_snapshot();
     ESP_LOGI(TAG, "NSF 2A03已启动：48000Hz/16bit/2ch track=%u/%u 基础5通道",
@@ -3000,10 +3630,12 @@ static void audio_task_handle_nsf_set_track(AudioRequest *request)
     esp_err_t ret = cs43131_set_pcm_mute(true);
     if (ret == ESP_OK) ret = nsf_synth_set_track(&g_nsf_synth, request->nsf_track);
     if (ret == ESP_OK) {
+        nsf_visual_reset_playback(request->nsf_track);
         audio_playback_clock_reset(&g_nsf_playback_clock, g_nsf_synth.sample_rate_hz);
         g_nsf_failed = false;
         audio_task_reset_nsf_end_policy();
         g_nsf_paused = was_paused;
+        (void)audio_task_start_nsf_preview();
         (void)audio_task_start_nsf_analysis();
         if (!was_paused) {
             ret = i2s_output_stream_write_silence(
@@ -3057,6 +3689,8 @@ static void audio_task_service_nsf()
         audio_task_publish_nsf_clock_snapshot();
         return;
     }
+
+    audio_task_update_nsf_visual_from_playback();
 
     const bool silence_eof = audio_task_update_nsf_silence_end(g_pcm_block, frames);
     const bool loop_eof = audio_task_apply_nsf_loop_end_fade(g_pcm_block, frames);
@@ -3923,6 +4557,22 @@ esp_err_t audio_service_start()
         }
     }
 
+    if (g_nsf_visual_mutex == nullptr) {
+        g_nsf_visual_mutex = xSemaphoreCreateMutex();
+        if (g_nsf_visual_mutex == nullptr) {
+            ESP_LOGE(TAG, "创建 NSF 播放瀑布事件锁失败");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (g_nsf_lookahead_mutex == nullptr) {
+        g_nsf_lookahead_mutex = xSemaphoreCreateMutex();
+        if (g_nsf_lookahead_mutex == nullptr) {
+            ESP_LOGE(TAG, "创建 NSF 未来预读事件锁失败");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     // 启动握手使用静态信号量并贯穿服务整个生命周期。若调用方等待超时，AudioTask 仍可能
     // 稍后完成初始化并 give；此时绝不能删除信号量，否则任务会访问已经释放的内核对象。
     if (g_start_done == nullptr) {
@@ -4326,6 +4976,84 @@ bool audio_service_nsf_get_clock(AudioNsfClockSnapshot *out_snapshot)
     *out_snapshot = g_nsf_clock_snapshot;
     portEXIT_CRITICAL(&g_nsf_clock_snapshot_mux);
     return true;
+}
+
+size_t audio_service_nsf_copy_visual_events(
+    uint8_t track,
+    uint32_t window_start_ms,
+    uint32_t window_end_ms,
+    AudioNsfVisualEvent *out_events,
+    size_t capacity)
+{
+    if (out_events == nullptr || capacity == 0U || window_end_ms < window_start_ms) return 0U;
+
+    if (g_nsf_visual_mutex == nullptr ||
+        xSemaphoreTake(g_nsf_visual_mutex, pdMS_TO_TICKS(5)) != pdTRUE) {
+        return 0U;
+    }
+
+    size_t out_count = 0U;
+    if (g_nsf_visual.available && g_nsf_visual.track == track &&
+        g_nsf_visual.events != nullptr) {
+        const size_t active_reserve = capacity < 3U ? 0U : 3U;
+        const size_t completed_limit = capacity - active_reserve;
+        // 环形缓存可能比UI窗口容量大；从最新事件向前取，保证当前听到的音符优先显示。
+        for (size_t offset = 0U; offset < g_nsf_visual.count && out_count < completed_limit; ++offset) {
+            const size_t reverse = g_nsf_visual.count - 1U - offset;
+            const size_t index =
+                (g_nsf_visual.head + reverse) % NSF_VISUAL_EVENT_CAPACITY;
+            const AudioNsfVisualEvent &event = g_nsf_visual.events[index];
+            if (event.end_ms < window_start_ms || event.start_ms > window_end_ms) continue;
+            out_events[out_count++] = event;
+        }
+
+        // 尚在发声的长音还没有 completed event；以 UI 的真实播放时钟补到当前窗口末端。
+        for (uint8_t voice = 0U; voice < 3U && out_count < capacity; ++voice) {
+            const NsfPlaybackVisualVoice &state = g_nsf_visual.melodic[voice];
+            if (!state.active || state.start_ms > window_end_ms) continue;
+            AudioNsfVisualEvent event = {};
+            event.start_ms = state.start_ms;
+            event.end_ms = window_end_ms;
+            event.note = state.note;
+            event.level = state.level;
+            event.voice = static_cast<AudioNsfVisualVoice>(voice);
+            if (event.end_ms >= window_start_ms) out_events[out_count++] = event;
+        }
+    }
+
+    xSemaphoreGive(g_nsf_visual_mutex);
+    return out_count;
+}
+
+size_t audio_service_nsf_copy_lookahead_events(
+    uint8_t track,
+    uint32_t window_start_ms,
+    uint32_t window_end_ms,
+    AudioNsfVisualEvent *out_events,
+    size_t capacity)
+{
+    if (out_events == nullptr || capacity == 0U || window_end_ms < window_start_ms) return 0U;
+    if (g_nsf_lookahead_mutex == nullptr ||
+        xSemaphoreTake(g_nsf_lookahead_mutex, pdMS_TO_TICKS(5)) != pdTRUE) {
+        return 0U;
+    }
+
+    size_t out_count = 0U;
+    if (!g_nsf_lookahead_info.available || g_nsf_lookahead_info.track != track ||
+        g_nsf_lookahead_events == nullptr || g_nsf_lookahead_event_count == 0U) {
+        xSemaphoreGive(g_nsf_lookahead_mutex);
+        return 0U;
+    }
+
+    // 预读实例始终跟随真实播放向前约5秒，因此这里只复制当前绝对时间窗口，不再复用时长分析的Loop结果。
+    for (size_t i = 0U; i < g_nsf_lookahead_event_count && out_count < capacity; ++i) {
+        const AudioNsfVisualEvent &event = g_nsf_lookahead_events[i];
+        if (event.end_ms < window_start_ms || event.start_ms > window_end_ms) continue;
+        out_events[out_count++] = event;
+    }
+
+    xSemaphoreGive(g_nsf_lookahead_mutex);
+    return out_count;
 }
 
 uint32_t audio_service_playback_revision()

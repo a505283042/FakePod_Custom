@@ -135,6 +135,43 @@ struct AudioNsfClockSnapshot
 };
 bool audio_service_nsf_get_clock(AudioNsfClockSnapshot *out_snapshot);
 
+enum class AudioNsfVisualVoice : uint8_t
+{
+    Pulse1 = 0U,
+    Pulse2,
+    Triangle,
+    Noise,
+    Dmc,
+};
+
+struct AudioNsfVisualEvent
+{
+    uint32_t start_ms = 0U;
+    uint32_t end_ms = 0U;
+    uint8_t note = 0U;   // Pulse/Triangle 使用MIDI音高；Noise/DMC忽略
+    uint8_t level = 0U;  // 0~127
+    AudioNsfVisualVoice voice = AudioNsfVisualVoice::Pulse1;
+    uint8_t reserved = 0U;
+};
+static_assert(sizeof(AudioNsfVisualEvent) == 12U, "AudioNsfVisualEvent must remain compact");
+
+// 复制当前 NSF 真实播放路在给定时间窗内的瀑布事件；用于“正在播/刚播过”的严格同步部分。
+size_t audio_service_nsf_copy_visual_events(
+    uint8_t track,
+    uint32_t window_start_ms,
+    uint32_t window_end_ms,
+    AudioNsfVisualEvent *out_events,
+    size_t capacity);
+
+// 复制独立 NsfPreviewTask 预读的未来音符。事件使用曲目绝对毫秒时间戳；UI 必须仍以真实 I2S position_ms 对齐，
+// 预读任务只维持约4~5秒领先，不参与 Loop/时长分析，也不得作为当前播放时间。
+size_t audio_service_nsf_copy_lookahead_events(
+    uint8_t track,
+    uint32_t window_start_ms,
+    uint32_t window_end_ms,
+    AudioNsfVisualEvent *out_events,
+    size_t capacity);
+
 // Stage 11.x：对当前选中 Track 发起 Seek。Play/Seek 共用 latest-intent 单槽；
 // 路径/技术索引仍复制进请求，AudioTask 会核对 track + playback_revision，并丢弃被更新意图覆盖的旧请求。
 bool audio_service_seek_track(

@@ -57,15 +57,20 @@ static constexpr uint32_t kFlacSafePercent = 90U;
 static constexpr size_t kScanBatchNoFlac = 8U;
 static constexpr size_t kScanBatchWithFlac = 1U;
 static constexpr uint32_t kWaitLogIntervalMs = 1000U;
-// MIDI 播放时后台 Music 已暂停，瀑布只按25fps有界刷新；
+// MIDI 预解析事件较轻，保持25fps；NSF 需要同时运行预读/时长后台任务，
+// 其瀑布降到12.5fps，避免310px绘图区持续刷屏占满CPU1和SPI刷新链路。
 // Browser/解析阶段仍通过 FLAC 水位策略给后台 Music 的 SD 读取让路。
-static constexpr uint32_t kWaterfallFramePeriodMs = 40U;
+static constexpr uint32_t kMidiWaterfallFramePeriodMs = 40U;
+static constexpr uint32_t kNsfWaterfallFramePeriodMs = 80U;
 static constexpr uint32_t kWaterfallTimeLabelPeriodMs = 250U;
 static constexpr uint32_t kWaterfallFutureMs = 4000U;
-static constexpr uint32_t kWaterfallPastMs = 600U;
+static constexpr uint8_t kWaterfallPitchMin = 36U; // C2以下统一折叠到左侧低频区
+static constexpr uint8_t kWaterfallPitchMax = 96U; // C7以上夹到最右列
+static constexpr int32_t kWaterfallLowAreaWidth = 44;
+static constexpr size_t kNsfVisualWindowCapacity = 192U;
 static constexpr int32_t kPlayerTitleHeight = 68;
 static constexpr int32_t kPlayerControlHeight = 82;
-static constexpr int32_t kPlayerWaterfallHeight = 310;
+static constexpr int32_t kPlayerWaterfallHeight = 460 - kPlayerTitleHeight - kPlayerControlHeight;
 
 struct RowUi
 {
@@ -116,8 +121,7 @@ static char *g_selected_path = nullptr;
 static VisualMusicMidi::Timeline g_midi_timeline = {};
 static VisualMusicNsf::Image g_nsf_image = {};
 static uint8_t g_nsf_track = 0U;
-static uint8_t g_midi_pitch_lane[128] = {};
-static uint16_t g_midi_pitch_lane_count = 0U;
+static AudioNsfVisualEvent g_nsf_visual_window[kNsfVisualWindowCapacity] = {};
 static uint32_t g_last_waterfall_draw_tick = 0U;
 static uint32_t g_last_time_label_tick = 0U;
 static bool g_midi_paused = true;
@@ -411,12 +415,11 @@ static void format_time_pair(char *out, size_t out_size, uint32_t position_ms, u
     snprintf(
         out,
         out_size,
-        "%lu:%02lu / %lu:%02lu%s",
+        "%lu:%02lu / %lu:%02lu",
         static_cast<unsigned long>(position_seconds / 60U),
         static_cast<unsigned long>(position_seconds % 60U),
         static_cast<unsigned long>(duration_seconds / 60U),
-        static_cast<unsigned long>(duration_seconds % 60U),
-        g_midi_paused && position_ms < duration_ms ? "  已暂停" : "");
+        static_cast<unsigned long>(duration_seconds % 60U));
 }
 
 static void update_midi_time_label()
@@ -439,92 +442,148 @@ static size_t midi_first_candidate(uint32_t earliest_start_ms)
     return left;
 }
 
-static void rebuild_midi_pitch_lanes()
+static uint32_t waterfall_level_color(uint32_t color, uint8_t level)
 {
-    // 只为当前MIDI真正出现过的音高分配列，避免从未使用的半音留下空列。
-    memset(g_midi_pitch_lane, 0xFF, sizeof(g_midi_pitch_lane));
-    g_midi_pitch_lane_count = 0U;
-    if (g_midi_timeline.notes == nullptr || g_midi_timeline.note_count == 0U) return;
-
-    bool used[128] = {};
-    for (size_t i = 0U; i < g_midi_timeline.note_count; ++i) {
-        const uint8_t note = g_midi_timeline.notes[i].note;
-        if (note < 128U) used[note] = true;
-    }
-    for (uint16_t note = 0U; note < 128U; ++note) {
-        if (!used[note]) continue;
-        g_midi_pitch_lane[note] = static_cast<uint8_t>(g_midi_pitch_lane_count);
-        ++g_midi_pitch_lane_count;
-    }
-}
-
-static uint8_t program_color_adjust(uint8_t component, int32_t delta)
-{
-    const int32_t value = static_cast<int32_t>(component) + delta;
-    if (value < 0) return 0U;
-    if (value > 255) return 255U;
-    return static_cast<uint8_t>(value);
-}
-
-static uint32_t midi_program_color(uint8_t program, uint8_t channel)
-{
-    // GM 128个Program按16个乐器家族选基色，再用家族内Program调整明度；
-    // 同一Program颜色固定，同一Channel中途换Program后后续音柱会立即换色。
-    static constexpr uint32_t kFamilyColors[16] = {
-        0x72B7FF, // Piano
-        0x8ED1C5, // Chromatic Percussion
-        0xF0C66E, // Organ
-        0xE59A6F, // Guitar
-        0x78C98D, // Bass
-        0xA98BFF, // Strings
-        0xF08DB7, // Ensemble
-        0xD98AE4, // Brass
-        0x63D9D0, // Reed
-        0x6E9FFF, // Pipe
-        0xC39AE8, // Synth Lead
-        0x7FC7FF, // Synth Pad
-        0xE5B36F, // Synth Effects
-        0x94D66D, // Ethnic
-        0xE38B8B, // Percussive
-        0xA9B3C1, // Sound Effects
-    };
-    static constexpr int8_t kVariantDelta[8] = {-18, -10, -4, 4, 10, 16, 22, 28};
-
-    if (channel == 9U) {
-        // GM Channel 10为鼓组；Program通常表示鼓组选择，使用独立暖色系但仍随Program变化。
-        const int32_t delta = kVariantDelta[program & 0x07U];
-        const uint32_t base = 0xF19B68;
-        return
-            (static_cast<uint32_t>(program_color_adjust((base >> 16U) & 0xFFU, delta)) << 16U) |
-            (static_cast<uint32_t>(program_color_adjust((base >> 8U) & 0xFFU, delta)) << 8U) |
-            static_cast<uint32_t>(program_color_adjust(base & 0xFFU, delta));
-    }
-
-    const uint32_t base = kFamilyColors[(program >> 3U) & 0x0FU];
-    const int32_t delta = kVariantDelta[program & 0x07U];
-    return
-        (static_cast<uint32_t>(program_color_adjust((base >> 16U) & 0xFFU, delta)) << 16U) |
-        (static_cast<uint32_t>(program_color_adjust((base >> 8U) & 0xFFU, delta)) << 8U) |
-        static_cast<uint32_t>(program_color_adjust(base & 0xFFU, delta));
-}
-
-static uint32_t midi_velocity_color(uint32_t color, uint8_t velocity)
-{
-    // 原方案用半透明矩形表达力度，LVGL每个音柱都要做RGB565 alpha blend。
-    // 改为直接按Velocity调暗/调亮Program颜色并全不透明绘制，视觉语义不变但热路径更轻。
-    const uint32_t scale = 58U + (static_cast<uint32_t>(velocity) * 42U) / 127U;
+    const uint32_t scale = 62U + (static_cast<uint32_t>(level) * 38U) / 127U;
     const uint32_t r = (((color >> 16U) & 0xFFU) * scale) / 100U;
     const uint32_t g = (((color >> 8U) & 0xFFU) * scale) / 100U;
-    const uint32_t bl = ((color & 0xFFU) * scale) / 100U;
-    return (r << 16U) | (g << 8U) | bl;
+    const uint32_t b = ((color & 0xFFU) * scale) / 100U;
+    return (r << 16U) | (g << 8U) | b;
+}
+
+static uint32_t midi_waterfall_color(const VisualMusicMidi::NoteEvent &note)
+{
+    if (note.channel == 9U || note.note < kWaterfallPitchMin) return 0xF4A62A;
+    // MIDI和NSF共用青/粉/蓝视觉语言；Channel只决定主旋律区基色，不再按Program铺满多色。
+    static constexpr uint32_t kColors[4] = {
+        0x20C7F4,
+        0xFF5B9D,
+        0x55A8FF,
+        0x9A7CFF,
+    };
+    return kColors[note.channel & 0x03U];
+}
+
+static uint32_t nsf_waterfall_color(AudioNsfVisualVoice voice)
+{
+    switch (voice) {
+        case AudioNsfVisualVoice::Pulse1: return 0x20C7F4;
+        case AudioNsfVisualVoice::Pulse2: return 0xFF5B9D;
+        case AudioNsfVisualVoice::Triangle: return 0x55A8FF;
+        case AudioNsfVisualVoice::Noise:
+        case AudioNsfVisualVoice::Dmc: return 0xF4A62A;
+        default: return 0xD7E4F5;
+    }
+}
+
+static void waterfall_draw_grid(
+    lv_layer_t *layer,
+    const lv_area_t &coords,
+    int32_t current_line_y)
+{
+    const int32_t main_x1 = coords.x1 + kWaterfallLowAreaWidth;
+    const int32_t main_width = coords.x2 - main_x1 + 1;
+    if (main_width <= 0) return;
+
+    lv_draw_rect_dsc_t grid_dsc = {};
+    lv_draw_rect_dsc_init(&grid_dsc);
+    grid_dsc.radius = 0;
+    grid_dsc.border_width = 0;
+    grid_dsc.bg_opa = LV_OPA_COVER;
+
+    const int32_t pitch_span = kWaterfallPitchMax - kWaterfallPitchMin;
+    for (uint8_t note = kWaterfallPitchMin; note <= kWaterfallPitchMax; ++note) {
+        const int32_t x = main_x1 +
+            (static_cast<int32_t>(note - kWaterfallPitchMin) * (main_width - 1)) / pitch_span;
+        grid_dsc.bg_color = lv_color_hex((note % 12U) == 0U ? 0x263A55 : 0x16263A);
+        lv_area_t line = {x, coords.y1, x, current_line_y - 1};
+        lv_draw_rect(layer, &grid_dsc, &line);
+    }
+
+    grid_dsc.bg_color = lv_color_hex(0x31475F);
+    lv_area_t divider = {main_x1 - 1, coords.y1, main_x1, current_line_y};
+    lv_draw_rect(layer, &grid_dsc, &divider);
+
+    // 左侧两条窄轨统一承载鼓组/Noise/DMC和折叠低音。
+    grid_dsc.bg_color = lv_color_hex(0x122033);
+    lv_area_t low_split = {coords.x1 + kWaterfallLowAreaWidth / 2, coords.y1,
+        coords.x1 + kWaterfallLowAreaWidth / 2, current_line_y - 1};
+    lv_draw_rect(layer, &grid_dsc, &low_split);
+}
+
+static void waterfall_draw_event(
+    lv_layer_t *layer,
+    const lv_area_t &coords,
+    int32_t current_line_y,
+    int32_t future_pixels,
+    uint32_t now_ms,
+    uint32_t start_ms,
+    uint32_t end_ms,
+    uint8_t note,
+    uint8_t level,
+    uint32_t color,
+    int8_t low_lane)
+{
+    if (end_ms < start_ms || end_ms < now_ms) return;
+    // 播放线就是“现在”：当前音符贴住播放线，未来4秒全部位于其上方并随真实时钟向下移动。
+    auto time_to_y = [current_line_y, future_pixels, now_ms](uint32_t time_ms) -> int32_t {
+        if (time_ms <= now_ms) return current_line_y;
+        const uint64_t delta_ms = static_cast<uint64_t>(time_ms) - now_ms;
+        if (delta_ms >= kWaterfallFutureMs) return current_line_y - future_pixels;
+        return current_line_y - static_cast<int32_t>(
+            delta_ms * static_cast<uint64_t>(future_pixels) / kWaterfallFutureMs);
+    };
+    const int32_t y_start = time_to_y(start_ms);
+    const int32_t y_end = time_to_y(end_ms);
+    int32_t y1 = y_end < y_start ? y_end : y_start;
+    int32_t y2 = y_end > y_start ? y_end : y_start;
+    if (y2 - y1 < 3) y2 = y1 + 3;
+    if (y2 < coords.y1 || y1 > coords.y2) return;
+    if (y1 < coords.y1) y1 = coords.y1;
+    if (y2 > coords.y2) y2 = coords.y2;
+
+    int32_t center_x = 0;
+    int32_t note_width = 6;
+    if (low_lane >= 0) {
+        const int32_t lane_width = kWaterfallLowAreaWidth / 2;
+        center_x = coords.x1 + lane_width * low_lane + lane_width / 2;
+        note_width = 9;
+    } else {
+        const int32_t main_x1 = coords.x1 + kWaterfallLowAreaWidth;
+        const int32_t main_width = coords.x2 - main_x1 + 1;
+        uint8_t clamped_note = note;
+        if (clamped_note < kWaterfallPitchMin) clamped_note = kWaterfallPitchMin;
+        if (clamped_note > kWaterfallPitchMax) clamped_note = kWaterfallPitchMax;
+        center_x = main_x1 +
+            (static_cast<int32_t>(clamped_note - kWaterfallPitchMin) * (main_width - 1)) /
+            (kWaterfallPitchMax - kWaterfallPitchMin);
+    }
+
+    lv_draw_rect_dsc_t note_dsc = {};
+    lv_draw_rect_dsc_init(&note_dsc);
+    note_dsc.radius = 0;
+    note_dsc.border_width = 0;
+    note_dsc.bg_opa = LV_OPA_COVER;
+    note_dsc.bg_color = lv_color_hex(waterfall_level_color(color, level));
+
+    lv_area_t area = {};
+    area.x1 = center_x - note_width / 2;
+    area.x2 = area.x1 + note_width - 1;
+    area.y1 = y1;
+    area.y2 = y2;
+    if (area.x1 < coords.x1) area.x1 = coords.x1;
+    if (area.x2 > coords.x2) area.x2 = coords.x2;
+    lv_draw_rect(layer, &note_dsc, &area);
 }
 
 static void waterfall_draw_cb(lv_event_t *event)
 {
     if (event == nullptr || lv_event_get_code(event) != LV_EVENT_DRAW_MAIN ||
-        g_page != VisualMusicPage::MidiWaterfall || g_midi_timeline.notes == nullptr) {
+        (g_page != VisualMusicPage::MidiWaterfall && g_page != VisualMusicPage::NsfReady)) {
         return;
     }
+    if (g_page == VisualMusicPage::MidiWaterfall && g_midi_timeline.notes == nullptr) return;
+
     lv_layer_t *layer = lv_event_get_layer(event);
     lv_obj_t *obj = lv_event_get_current_target_obj(event);
     if (layer == nullptr || obj == nullptr) return;
@@ -533,79 +592,101 @@ static void waterfall_draw_cb(lv_event_t *event)
     lv_obj_get_coords(obj, &coords);
     const int32_t width = coords.x2 - coords.x1 + 1;
     const int32_t height = coords.y2 - coords.y1 + 1;
-    if (width <= 8 || height <= 20) return;
+    if (width <= kWaterfallLowAreaWidth + 20 || height <= 20) return;
 
     const int32_t top = coords.y1 + 4;
-    const int32_t current_line_y = coords.y2 - 28;
+    const int32_t current_line_y = coords.y2 - 3;
     const int32_t future_pixels = current_line_y - top;
     if (future_pixels <= 0) return;
 
-    const uint32_t now_ms = midi_position_ms();
-    const uint32_t window_start = now_ms > kWaterfallPastMs ? now_ms - kWaterfallPastMs : 0U;
-    const uint32_t window_end =
-        UINT32_MAX - now_ms < kWaterfallFutureMs ? UINT32_MAX : now_ms + kWaterfallFutureMs;
-    const uint32_t earliest_start = window_start > g_midi_timeline.max_note_duration_ms
-        ? window_start - g_midi_timeline.max_note_duration_ms
-        : 0U;
+    uint32_t now_ms = 0U;
+    if (g_page == VisualMusicPage::MidiWaterfall) {
+        now_ms = midi_position_ms();
+    } else {
+        AudioNsfClockSnapshot clock = {};
+        if (audio_service_nsf_get_clock(&clock) && clock.active) {
+            now_ms = clock.position_ms > UINT32_MAX
+                ? UINT32_MAX
+                : static_cast<uint32_t>(clock.position_ms);
+        }
+    }
 
-    const int32_t pitch_count = static_cast<int32_t>(g_midi_pitch_lane_count);
-    if (pitch_count <= 0) return;
-    const int32_t lane_width = width / pitch_count;
-    int32_t note_width = lane_width > 2 ? lane_width - 2 : 3;
-    if (note_width < 3) note_width = 3;
-    if (note_width > 20) note_width = 20;
+    waterfall_draw_grid(layer, coords, current_line_y);
 
-    lv_draw_rect_dsc_t note_dsc = {};
-    lv_draw_rect_dsc_init(&note_dsc);
-    // 纯瀑布音柱使用直角全不透明矩形，避免圆角/透明混合放大持续刷新成本。
-    note_dsc.radius = 0;
-    note_dsc.border_width = 0;
-    note_dsc.bg_opa = LV_OPA_COVER;
+    if (g_page == VisualMusicPage::MidiWaterfall) {
+        const uint32_t window_end = UINT32_MAX - now_ms < kWaterfallFutureMs
+            ? UINT32_MAX
+            : now_ms + kWaterfallFutureMs;
+        const uint32_t earliest_start = now_ms > g_midi_timeline.max_note_duration_ms
+            ? now_ms - g_midi_timeline.max_note_duration_ms
+            : 0U;
+        const size_t first = midi_first_candidate(earliest_start);
+        for (size_t i = first; i < g_midi_timeline.note_count; ++i) {
+            const VisualMusicMidi::NoteEvent &note = g_midi_timeline.notes[i];
+            if (note.start_ms > window_end) break;
+            if (note.end_ms < now_ms) continue;
+            const int8_t low_lane = note.channel == 9U ? 0 :
+                (note.note < kWaterfallPitchMin ? 1 : -1);
+            waterfall_draw_event(
+                layer, coords, current_line_y, future_pixels, now_ms,
+                note.start_ms, note.end_ms, note.note, note.velocity,
+                midi_waterfall_color(note), low_lane);
+        }
+    } else {
+        // 当前音符只由48kHz播放路确认；不画历史，避免产生“从播放线向上滚”的反向视觉。
+        size_t count = audio_service_nsf_copy_visual_events(
+            g_nsf_track,
+            now_ms,
+            now_ms,
+            g_nsf_visual_window,
+            kNsfVisualWindowCapacity);
+        for (size_t i = 0U; i < count; ++i) {
+            const AudioNsfVisualEvent &note = g_nsf_visual_window[i];
+            if (note.start_ms > now_ms || note.end_ms < now_ms) continue;
+            int8_t low_lane = -1;
+            if (note.voice == AudioNsfVisualVoice::Noise) low_lane = 0;
+            else if (note.voice == AudioNsfVisualVoice::Dmc ||
+                    note.note < kWaterfallPitchMin) low_lane = 1;
+            // 当前音符只在播放线处给一个短标记；未来长度由预读事件负责。
+            const uint32_t marker_end = UINT32_MAX - now_ms < 40U ? UINT32_MAX : now_ms + 40U;
+            waterfall_draw_event(
+                layer, coords, current_line_y, future_pixels, now_ms,
+                now_ms, marker_end, note.note, note.level,
+                low_lane >= 0 ? 0xF4A62A : nsf_waterfall_color(note.voice), low_lane);
+        }
 
-    const size_t first = midi_first_candidate(earliest_start);
-    for (size_t i = first; i < g_midi_timeline.note_count; ++i) {
-        const VisualMusicMidi::NoteEvent &note = g_midi_timeline.notes[i];
-        if (note.start_ms > window_end) break;
-        if (note.end_ms < window_start || note.note >= 128U) continue;
-        const uint8_t pitch_lane = g_midi_pitch_lane[note.note];
-        if (pitch_lane == 0xFFU) continue;
-
-        const int64_t start_delta = static_cast<int64_t>(note.start_ms) - now_ms;
-        const int64_t end_delta = static_cast<int64_t>(note.end_ms) - now_ms;
-        int32_t y_start = current_line_y - static_cast<int32_t>(
-            (start_delta * future_pixels) / static_cast<int64_t>(kWaterfallFutureMs));
-        int32_t y_end = current_line_y - static_cast<int32_t>(
-            (end_delta * future_pixels) / static_cast<int64_t>(kWaterfallFutureMs));
-        int32_t y1 = y_end < y_start ? y_end : y_start;
-        int32_t y2 = y_end > y_start ? y_end : y_start;
-        if (y2 - y1 < 2) y2 = y1 + 2;
-        if (y2 < coords.y1 || y1 > coords.y2) continue;
-        if (y1 < coords.y1) y1 = coords.y1;
-        if (y2 > coords.y2) y2 = coords.y2;
-
-        const int32_t pitch_index = static_cast<int32_t>(pitch_lane);
-        const int32_t center_x = coords.x1 +
-            (pitch_index * width + width / 2) / pitch_count;
-        lv_area_t area = {};
-        area.x1 = center_x - note_width / 2;
-        area.x2 = area.x1 + note_width - 1;
-        area.y1 = y1;
-        area.y2 = y2;
-        if (area.x1 < coords.x1) area.x1 = coords.x1;
-        if (area.x2 > coords.x2) area.x2 = coords.x2;
-
-        note_dsc.bg_color = lv_color_hex(midi_velocity_color(
-            midi_program_color(note.program, note.channel), note.velocity));
-        lv_draw_rect(layer, &note_dsc, &area);
+        // 未来4秒来自后台预读，但全部按真实I2S position_ms定位，只能从上向下落到播放线。
+        const uint32_t future_end = UINT32_MAX - now_ms < kWaterfallFutureMs
+            ? UINT32_MAX
+            : now_ms + kWaterfallFutureMs;
+        count = audio_service_nsf_copy_lookahead_events(
+            g_nsf_track,
+            now_ms,
+            future_end,
+            g_nsf_visual_window,
+            kNsfVisualWindowCapacity);
+        for (size_t i = 0U; i < count; ++i) {
+            const AudioNsfVisualEvent &note = g_nsf_visual_window[i];
+            if (note.end_ms <= now_ms) continue;
+            const uint32_t visible_start = note.start_ms < now_ms ? now_ms : note.start_ms;
+            int8_t low_lane = -1;
+            if (note.voice == AudioNsfVisualVoice::Noise) low_lane = 0;
+            else if (note.voice == AudioNsfVisualVoice::Dmc ||
+                    note.note < kWaterfallPitchMin) low_lane = 1;
+            waterfall_draw_event(
+                layer, coords, current_line_y, future_pixels, now_ms,
+                visible_start, note.end_ms, note.note, note.level,
+                low_lane >= 0 ? 0xF4A62A : nsf_waterfall_color(note.voice), low_lane);
+        }
     }
 
     lv_draw_rect_dsc_t line_dsc = {};
     lv_draw_rect_dsc_init(&line_dsc);
-    line_dsc.bg_color = lv_color_hex(0xD7E4F5);
-    line_dsc.bg_opa = LV_OPA_70;
+    line_dsc.bg_color = lv_color_hex(0x30D7FF);
+    line_dsc.bg_opa = LV_OPA_COVER;
     line_dsc.radius = 0;
     line_dsc.border_width = 0;
-    lv_area_t line = {coords.x1 + 2, current_line_y, coords.x2 - 2, current_line_y};
+    lv_area_t line = {coords.x1 + 2, current_line_y, coords.x2 - 2, current_line_y + 1};
     lv_draw_rect(layer, &line_dsc, &line);
 }
 
@@ -613,8 +694,6 @@ static void cancel_midi_player()
 {
     VisualMusicMidi::cancel();
     VisualMusicMidi::release_timeline(&g_midi_timeline);
-    memset(g_midi_pitch_lane, 0xFF, sizeof(g_midi_pitch_lane));
-    g_midi_pitch_lane_count = 0U;
     g_last_waterfall_draw_tick = 0U;
     g_last_time_label_tick = 0U;
     g_midi_paused = true;
@@ -629,6 +708,7 @@ static void cancel_nsf_player()
     g_nsf_eof = false;
     g_nsf_eof_action_handled = false;
     g_last_nsf_time_label_tick = 0U;
+    g_last_waterfall_draw_tick = 0U;
 }
 
 static void set_player_loading_ui(const char *message, const char *hint)
@@ -701,10 +781,14 @@ static void update_nsf_time_label()
 static void update_nsf_ready_ui()
 {
     if (g_page != VisualMusicPage::NsfReady || g_nsf_image.track_count == 0U) return;
-    set_visible(g_waterfall_widget, false);
+    const bool waterfall_ready = g_nsf_image.version == 1U &&
+        g_nsf_image.expansion_chips == 0U &&
+        (g_nsf_image.pal_ntsc_bits & 0x03U) != 0x01U &&
+        !g_nsf_failed;
+    set_visible(g_waterfall_widget, waterfall_ready);
     set_visible(g_player_time, true);
-    set_visible(g_player_message, true);
-    set_visible(g_player_hint, true);
+    set_visible(g_player_message, !waterfall_ready);
+    set_visible(g_player_hint, !waterfall_ready);
 
     if (g_player_title != nullptr) {
         lv_label_set_text(
@@ -811,7 +895,9 @@ static bool start_nsf_audio_from_image()
     g_nsf_eof_action_handled = false;
     g_nsf_failed = false;
     g_last_nsf_time_label_tick = 0U;
+    g_last_waterfall_draw_tick = 0U;
     update_nsf_ready_ui();
+    if (g_waterfall_widget != nullptr) lv_obj_invalidate(g_waterfall_widget);
     ESP_LOGI(TAG, "NSF 2A03音频启动：track=%u/%u 48000Hz 基础5通道",
         static_cast<unsigned>(g_nsf_track + 1U),
         static_cast<unsigned>(g_nsf_image.track_count));
@@ -914,7 +1000,9 @@ static bool select_nsf_subsong(int direction, bool allow_wrap)
     g_nsf_eof_action_handled = false;
     g_nsf_failed = false;
     g_last_nsf_time_label_tick = 0U;
+    g_last_waterfall_draw_tick = 0U;
     update_nsf_ready_ui();
+    if (g_waterfall_widget != nullptr) lv_obj_invalidate(g_waterfall_widget);
     ESP_LOGI(
         TAG,
         "NSF Subsong选择：track=%u/%u",
@@ -939,7 +1027,6 @@ static void midi_result_tick()
     VisualMusicMidi::release_timeline(&g_midi_timeline);
     g_midi_timeline = result.timeline;
     result.timeline = {};
-    rebuild_midi_pitch_lanes();
 
     if (!pause_music_for_midi_exclusive()) {
         set_player_loading_ui("无法暂停后台Music", "返回列表后可继续浏览文件");
@@ -965,12 +1052,11 @@ static void midi_result_tick()
     g_midi_eof_action_handled = false;
     g_page = VisualMusicPage::MidiWaterfall;
 
-    char format[96] = {};
+    char format[48] = {};
     snprintf(
         format,
         sizeof(format),
-        "MIDI瀑布 · %u音符 · %u轨",
-        static_cast<unsigned>(g_midi_timeline.note_count),
+        "MIDI · %u轨",
         static_cast<unsigned>(g_midi_timeline.track_count));
     if (g_player_format != nullptr) lv_label_set_text(g_player_format, format);
     set_visible(g_player_message, false);
@@ -982,9 +1068,8 @@ static void midi_result_tick()
     if (g_waterfall_widget != nullptr) lv_obj_invalidate(g_waterfall_widget);
     ESP_LOGI(
         TAG,
-        "MIDI瀑布+音频启动：notes=%u lanes=%u range=%u-%u duration=%lums",
+        "MIDI瀑布+音频启动：notes=%u range=%u-%u duration=%lums",
         static_cast<unsigned>(g_midi_timeline.note_count),
-        static_cast<unsigned>(g_midi_pitch_lane_count),
         static_cast<unsigned>(g_midi_timeline.min_note),
         static_cast<unsigned>(g_midi_timeline.max_note),
         static_cast<unsigned long>(g_midi_timeline.duration_ms));
@@ -1497,7 +1582,7 @@ static void timer_cb(lv_timer_t *timer)
                 }
                 if (!clock.paused &&
                     (g_last_waterfall_draw_tick == 0U ||
-                     now_tick - g_last_waterfall_draw_tick >= kWaterfallFramePeriodMs)) {
+                     now_tick - g_last_waterfall_draw_tick >= kMidiWaterfallFramePeriodMs)) {
                     g_last_waterfall_draw_tick = now_tick;
                     if (g_waterfall_widget != nullptr) lv_obj_invalidate(g_waterfall_widget);
                 }
@@ -1545,6 +1630,15 @@ static void timer_cb(lv_timer_t *timer)
                     g_last_nsf_time_label_tick = now_tick;
                     update_nsf_time_label();
                     if (paused_changed) update_player_controls();
+                    if (clock.paused && g_waterfall_widget != nullptr) {
+                        lv_obj_invalidate(g_waterfall_widget);
+                    }
+                }
+                if (!clock.paused &&
+                    (g_last_waterfall_draw_tick == 0U ||
+                     now_tick - g_last_waterfall_draw_tick >= kNsfWaterfallFramePeriodMs)) {
+                    g_last_waterfall_draw_tick = now_tick;
+                    if (g_waterfall_widget != nullptr) lv_obj_invalidate(g_waterfall_widget);
                 }
             }
         }
@@ -1806,7 +1900,7 @@ static esp_err_t visual_music_create()
     lv_obj_set_size(g_waterfall_widget, 460, kPlayerWaterfallHeight);
     lv_obj_set_style_radius(g_waterfall_widget, 0, 0);
     lv_obj_set_style_border_width(g_waterfall_widget, 0, 0);
-    lv_obj_set_style_bg_color(g_waterfall_widget, lv_color_hex(0x080C12), 0);
+    lv_obj_set_style_bg_color(g_waterfall_widget, lv_color_hex(0x071425), 0);
     lv_obj_set_style_bg_opa(g_waterfall_widget, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(g_waterfall_widget, 0, 0);
     lv_obj_remove_flag(g_waterfall_widget, LV_OBJ_FLAG_SCROLLABLE);
@@ -1828,7 +1922,7 @@ static esp_err_t visual_music_create()
     g_player_controls = lv_obj_create(g_player_host);
     if (g_player_controls == nullptr) return cleanup_create_failure(ESP_ERR_NO_MEM);
     ui_common_lock_object(g_player_controls);
-    lv_obj_set_pos(g_player_controls, 0, kPlayerTitleHeight + kPlayerWaterfallHeight);
+    lv_obj_set_pos(g_player_controls, 0, 460 - kPlayerControlHeight);
     lv_obj_set_size(g_player_controls, 460, kPlayerControlHeight);
     lv_obj_set_style_radius(g_player_controls, 0, 0);
     lv_obj_set_style_border_width(g_player_controls, 0, 0);
