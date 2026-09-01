@@ -15,7 +15,6 @@
 #include "audio_decode_workspace.h"
 #include "audio_playback_clock.h"
 #include "audio_spectrum_snapshot.h"
-#include "midi_synth.h"
 #include "nsf_synth.h"
 #include "sources/avi_mp3_audio_source.h"
 #include "app_diag_config.h"
@@ -100,11 +99,6 @@ enum class AudioCommandType : uint8_t
     VideoMp3Start,
     VideoMp3ReleaseStart,
     VideoMp3Stop,
-    MidiStart,
-    MidiPause,
-    MidiResume,
-    MidiRestart,
-    MidiStop,
     NsfStart,
     NsfPause,
     NsfResume,
@@ -127,10 +121,6 @@ struct AudioRequest
     uint8_t video_channels = 0U;
     uint8_t video_bits_per_sample = 0U;
     bool video_start_barrier_armed = false;
-    MidiSynthNoteEvent *midi_notes = nullptr;
-    size_t midi_note_count = 0U;
-    uint32_t midi_duration_ms = 0U;
-    bool midi_restore_music_hardware = true;
     uint8_t *nsf_prg = nullptr;
     size_t nsf_prg_size = 0U;
     NsfSynthConfig nsf_config = {};
@@ -222,16 +212,7 @@ static uint32_t g_video_mp3_sample_rate_hz = 0U;
 static uint16_t g_video_mp3_channels = 0U;
 static uint16_t g_video_mp3_bits_per_sample = 0U;
 
-// VM07：MIDI Synth 与 Music decoder 互斥占用同一 AudioTask/I2S。Music 保持 Paused 原位，
-// Synth 结束后可只恢复 Paused Music 硬件，是否真正 resume 由电子音流 APP 生命周期决定。
-static MidiSynth g_midi_synth = {};
-static AudioPlaybackClock g_midi_playback_clock = {};
-static bool g_midi_active = false;
-static bool g_midi_paused = false;
-static bool g_midi_eof = false;
-static bool g_midi_restore_paused_music_hardware = false;
-
-// VM10：NSF 6502/2A03 与 MIDI 一样由 AudioTask 独占输出硬件；
+// VM10：NSF 6502/2A03 由 AudioTask 独占输出硬件；
 // 传统 NSF v1 没有 Subsong 时长：后台确认可靠循环后，在3分钟附近的完整循环边界结束；
 // 无循环时后台预读确认自然静音起点并直接作为结束点；实时6秒静音仅保留为分析失败兜底。
 static constexpr uint32_t NSF_SILENCE_END_MS = 6000U;
@@ -256,13 +237,13 @@ static bool g_nsf_restore_paused_music_hardware = false;
 static constexpr uint32_t NSF_ANALYSIS_SAMPLE_RATE_HZ = 500U;
 static constexpr uint32_t NSF_ANALYSIS_MAX_MS = 360000U;
 static constexpr uint32_t NSF_ANALYSIS_SILENCE_VERIFY_MS = 10000U;
-static constexpr size_t NSF_ANALYSIS_RENDER_FRAMES = 128U;
+static constexpr size_t NSF_ANALYSIS_RENDER_FRAMES = 64U;
 static constexpr uint32_t NSF_ANALYSIS_TASK_STACK_BYTES = 8192U;
 // CPU0 的 AudioTask(priority=5) 持续出声，后台放在 CPU0 会长期拿不到足够时间片。
 // 分析任务放回 CPU1、priority=1；每个小块后固定休眠2 tick，让 LVGL 和 IDLE1 都有明确运行窗口。
 static constexpr UBaseType_t NSF_ANALYSIS_TASK_PRIORITY = 1U;
 static constexpr BaseType_t NSF_ANALYSIS_TASK_CORE = 1;
-static constexpr uint32_t NSF_ANALYSIS_YIELD_TICKS = 2U;
+static constexpr uint32_t NSF_ANALYSIS_YIELD_TICKS = 4U;
 // 启动阶段先让未来音符预读建立约4秒窗口，避免 Preview/Analysis 两个6502实例同时抢CPU1。
 // 预读失败时最多等待5秒，之后时长分析仍独立继续。
 static constexpr uint32_t NSF_ANALYSIS_PREVIEW_WAIT_MS = 5000U;
@@ -270,12 +251,14 @@ static constexpr uint32_t NSF_ANALYSIS_PREVIEW_POLL_MS = 20U;
 
 static constexpr uint32_t NSF_PREVIEW_SAMPLE_RATE_HZ = 500U;
 static constexpr uint32_t NSF_PREVIEW_LEAD_MS = 5000U;
-static constexpr uint32_t NSF_PREVIEW_PUBLISH_STEP_MS = 750U;
+static constexpr uint32_t NSF_PREVIEW_PUBLISH_STEP_MS = 80U;
+// 瀑布播放线下方保留的已演奏历史窗：已结束音符在快照中多停留该时长，供 UI 画历史轨迹。
+static constexpr uint32_t NSF_VISUAL_HISTORY_MS = 2000U;
 static constexpr size_t NSF_PREVIEW_RENDER_FRAMES = 128U;
 static constexpr uint32_t NSF_PREVIEW_TASK_STACK_BYTES = 6144U;
-static constexpr UBaseType_t NSF_PREVIEW_TASK_PRIORITY = 1U;
+static constexpr UBaseType_t NSF_PREVIEW_TASK_PRIORITY = 3U;
 static constexpr BaseType_t NSF_PREVIEW_TASK_CORE = 1;
-static constexpr uint32_t NSF_PREVIEW_RENDER_YIELD_TICKS = 2U;
+static constexpr uint32_t NSF_PREVIEW_RENDER_YIELD_TICKS = 1U;
 static constexpr uint32_t NSF_PREVIEW_IDLE_DELAY_MS = 20U;
 
 struct NsfAnalysisTaskArgs
@@ -366,34 +349,12 @@ static portMUX_TYPE g_video_clock_snapshot_mux = portMUX_INITIALIZER_UNLOCKED;
 static AudioVideoClockSnapshot g_video_clock_snapshot = {};
 static uint32_t g_video_clock_revision = 0U;
 
-// VM07：瀑布 UI 只读取 I2S 已提交 PCM 对应的 MIDI 主时钟，不再依赖 LVGL tick 猜播放进度。
-static portMUX_TYPE g_midi_clock_snapshot_mux = portMUX_INITIALIZER_UNLOCKED;
-static AudioMidiClockSnapshot g_midi_clock_snapshot = {};
-static uint32_t g_midi_clock_revision = 0U;
-
 static portMUX_TYPE g_nsf_clock_snapshot_mux = portMUX_INITIALIZER_UNLOCKED;
 static AudioNsfClockSnapshot g_nsf_clock_snapshot = {};
 static uint32_t g_nsf_clock_revision = 0U;
 
 static void audio_task_sync_nsf_analysis_end_plan();
 static uint64_t audio_task_get_nsf_analysis_duration_hint(uint8_t track);
-
-static void audio_task_publish_midi_clock_snapshot()
-{
-    AudioMidiClockSnapshot snapshot = {};
-    snapshot.active = g_midi_active;
-    snapshot.paused = g_midi_paused;
-    snapshot.eof = g_midi_eof;
-    snapshot.revision = g_midi_clock_revision;
-    snapshot.sample_rate_hz = g_midi_playback_clock.sample_rate_hz;
-    snapshot.submitted_frames = g_midi_playback_clock.submitted_frames;
-    snapshot.position_ms = audio_playback_clock_position_ms(&g_midi_playback_clock);
-    snapshot.duration_ms = g_midi_synth.duration_ms;
-
-    portENTER_CRITICAL(&g_midi_clock_snapshot_mux);
-    g_midi_clock_snapshot = snapshot;
-    portEXIT_CRITICAL(&g_midi_clock_snapshot_mux);
-}
 
 static void audio_task_publish_nsf_clock_snapshot()
 {
@@ -494,10 +455,6 @@ static void audio_request_release(AudioRequest *request)
     if (request->extended_path != nullptr) {
         heap_caps_free(request->extended_path);
         request->extended_path = nullptr;
-    }
-    if (request->midi_notes != nullptr) {
-        heap_caps_free(request->midi_notes);
-        request->midi_notes = nullptr;
     }
     if (request->nsf_prg != nullptr) {
         heap_caps_free(request->nsf_prg);
@@ -772,11 +729,6 @@ static const char *audio_command_name(AudioCommandType type)
         case AudioCommandType::VideoMp3Start: return "VIDEO_MP3_START";
         case AudioCommandType::VideoMp3ReleaseStart: return "VIDEO_MP3_RELEASE_START";
         case AudioCommandType::VideoMp3Stop: return "VIDEO_MP3_STOP";
-        case AudioCommandType::MidiStart: return "MIDI_START";
-        case AudioCommandType::MidiPause: return "MIDI_PAUSE";
-        case AudioCommandType::MidiResume: return "MIDI_RESUME";
-        case AudioCommandType::MidiRestart: return "MIDI_RESTART";
-        case AudioCommandType::MidiStop: return "MIDI_STOP";
         case AudioCommandType::NsfStart: return "NSF_START";
         case AudioCommandType::NsfPause: return "NSF_PAUSE";
         case AudioCommandType::NsfResume: return "NSF_RESUME";
@@ -1893,8 +1845,7 @@ static void audio_task_handle_video_mp3_start(AudioRequest *request)
         audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
         return;
     }
-    if (g_midi_active || midi_synth_is_open(&g_midi_synth) ||
-        g_nsf_active || nsf_synth_is_open(&g_nsf_synth)) {
+    if (g_nsf_active || nsf_synth_is_open(&g_nsf_synth)) {
         ESP_LOGE(TAG, "AVI MP3启动被拒绝：电子音流仍占用AudioTask输出");
         audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
         return;
@@ -2094,296 +2045,6 @@ static void audio_task_service_video_mp3()
     }
     audio_playback_clock_commit_pcm(&g_video_playback_clock, frames);
     audio_task_publish_video_clock_snapshot();
-}
-
-static esp_err_t audio_task_restore_paused_music_hardware_for_midi(const char *reason)
-{
-    if (!g_midi_restore_paused_music_hardware) return ESP_OK;
-    if (g_task_state != AudioPlaybackState::Paused || !pcm_decoder_is_open(&g_decoder) ||
-        g_task_sample_rate_hz == 0U) {
-        ESP_LOGE(TAG, "MIDI恢复Music硬件失败：Music pipeline不再处于Paused reason=%s",
-            reason != nullptr ? reason : "unknown");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    const esp_err_t ret = audio_task_start_output_hardware(
-        g_task_sample_rate_hz,
-        g_task_bits_per_sample,
-        g_task_channels,
-        "Music-Restore",
-        nullptr,
-        false,
-        nullptr);
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "MIDI已恢复Paused Music硬件：%luHz/%ubit/%uch reason=%s；等待电子音流决定是否resume",
-            static_cast<unsigned long>(g_task_sample_rate_hz),
-            static_cast<unsigned>(g_task_bits_per_sample),
-            static_cast<unsigned>(g_task_channels),
-            reason != nullptr ? reason : "unknown");
-    }
-    return ret;
-}
-
-static esp_err_t audio_task_stop_midi_internal(bool restore_music_hardware, const char *reason)
-{
-    const bool should_restore = restore_music_hardware && g_midi_restore_paused_music_hardware;
-    if (!g_midi_active && !midi_synth_is_open(&g_midi_synth)) {
-        esp_err_t ret = ESP_OK;
-        if (should_restore) {
-            ret = audio_task_restore_paused_music_hardware_for_midi(reason);
-        }
-        // restore=false 用于同 APP 切 MIDI：保留“Paused Music硬件待恢复”所有权，
-        // 这样下一首解析失败/用户返回列表时仍能先重建 Music 硬件再 Resume。
-        if (restore_music_hardware && ret == ESP_OK) {
-            g_midi_restore_paused_music_hardware = false;
-        }
-        g_midi_paused = false;
-        g_midi_eof = false;
-        audio_task_publish_midi_clock_snapshot();
-        return ret;
-    }
-
-    esp_err_t first_error = ESP_OK;
-    const uint32_t rate = g_midi_synth.sample_rate_hz > 0U
-        ? g_midi_synth.sample_rate_hz : 48000U;
-    audio_task_remember_first_error(
-        audio_task_shutdown_output_hardware(rate, "MIDI-Synth"), &first_error);
-
-    midi_synth_close(&g_midi_synth);
-    g_midi_active = false;
-    g_midi_paused = false;
-    g_midi_eof = false;
-    audio_playback_clock_reset(&g_midi_playback_clock, 0U);
-    audio_task_publish_midi_clock_snapshot();
-
-    if (should_restore) {
-        audio_task_remember_first_error(
-            audio_task_restore_paused_music_hardware_for_midi(reason), &first_error);
-    }
-    if (restore_music_hardware && first_error == ESP_OK) {
-        g_midi_restore_paused_music_hardware = false;
-    }
-
-    ESP_LOGI(TAG, "MIDI Synth已停止：恢复Music硬件=%u 结果=%s",
-        static_cast<unsigned>(should_restore), esp_err_to_name(first_error));
-    return first_error;
-}
-
-static void audio_task_handle_midi_start(AudioRequest *request)
-{
-    if (request == nullptr) return;
-    g_task_last_request_id = request->request_id;
-
-    if (g_midi_active || midi_synth_is_open(&g_midi_synth) || request->midi_notes == nullptr ||
-        request->midi_note_count == 0U || request->midi_duration_ms == 0U) {
-        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
-        return;
-    }
-    if (g_video_mp3_active || mp3_decoder_is_open(&g_video_mp3_decoder)) {
-        ESP_LOGE(TAG, "MIDI启动被拒绝：Video Audio仍在活动");
-        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
-        return;
-    }
-    if (g_nsf_active || nsf_synth_is_open(&g_nsf_synth)) {
-        ESP_LOGE(TAG, "MIDI启动被拒绝：NSF仍在活动");
-        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
-        return;
-    }
-    if (g_task_state == AudioPlaybackState::Playing ||
-        g_task_state == AudioPlaybackState::Preparing ||
-        g_task_state == AudioPlaybackState::Seeking) {
-        ESP_LOGE(TAG, "MIDI启动要求Music先暂停：当前state=%s",
-            audio_playback_state_name_cn(g_task_state));
-        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
-        return;
-    }
-
-    g_midi_restore_paused_music_hardware =
-        g_task_state == AudioPlaybackState::Paused && pcm_decoder_is_open(&g_decoder);
-
-    if (g_pipeline_headphone_enabled || g_pipeline_clock_prepared ||
-        g_pipeline_i2s_started || i2s_output_is_started()) {
-        const uint32_t active_rate = g_task_sample_rate_hz > 0U ? g_task_sample_rate_hz : 48000U;
-        const esp_err_t shutdown_ret = audio_task_shutdown_output_hardware(active_rate, "Music-Paused");
-        if (shutdown_ret != ESP_OK) {
-            g_midi_restore_paused_music_hardware = false;
-            audio_request_complete(request, false, shutdown_ret);
-            return;
-        }
-    }
-
-    MidiSynthNoteEvent *owned_notes = request->midi_notes;
-    esp_err_t ret = midi_synth_open_owned(
-        &g_midi_synth,
-        owned_notes,
-        request->midi_note_count,
-        request->midi_duration_ms,
-        48000U);
-    if (ret != ESP_OK) {
-        if (g_midi_restore_paused_music_hardware) {
-            const esp_err_t restore_ret =
-                audio_task_restore_paused_music_hardware_for_midi("midi_open_failed");
-            if (restore_ret == ESP_OK) g_midi_restore_paused_music_hardware = false;
-        }
-        audio_request_complete(request, false, ret);
-        return;
-    }
-    request->midi_notes = nullptr; // 所有权已转移给 MidiSynth
-
-    audio_playback_clock_reset(&g_midi_playback_clock, g_midi_synth.sample_rate_hz);
-    ret = audio_task_start_output_hardware(
-        g_midi_synth.sample_rate_hz,
-        16U,
-        2U,
-        "MIDI-Synth",
-        nullptr,
-        true,
-        "midi");
-    if (ret != ESP_OK) {
-        midi_synth_close(&g_midi_synth);
-        if (g_midi_restore_paused_music_hardware) {
-            const esp_err_t restore_ret =
-                audio_task_restore_paused_music_hardware_for_midi("midi_hw_failed");
-            if (restore_ret == ESP_OK) g_midi_restore_paused_music_hardware = false;
-        }
-        audio_request_complete(request, false, ret);
-        return;
-    }
-
-    ++g_midi_clock_revision;
-    if (g_midi_clock_revision == 0U) ++g_midi_clock_revision;
-    g_midi_active = true;
-    g_midi_paused = false;
-    g_midi_eof = false;
-    audio_task_publish_midi_clock_snapshot();
-    ESP_LOGI(TAG, "MIDI Synth已启动：48000Hz/16bit/2ch notes=%u duration=%lums voices=32",
-        static_cast<unsigned>(g_midi_synth.note_count),
-        static_cast<unsigned long>(g_midi_synth.duration_ms));
-    audio_request_complete(request, true, ESP_OK);
-}
-
-static void audio_task_handle_midi_pause(AudioRequest *request)
-{
-    if (request == nullptr) return;
-    g_task_last_request_id = request->request_id;
-    if (!g_midi_active || g_midi_paused || g_midi_eof) {
-        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
-        return;
-    }
-    const esp_err_t ret = cs43131_set_pcm_mute(true);
-    if (ret != ESP_OK) {
-        audio_request_complete(request, false, ret);
-        return;
-    }
-    g_pcm_unmute_pending = false;
-    audio_task_reset_pcm_fade_in();
-    g_midi_paused = true;
-    audio_task_publish_midi_clock_snapshot();
-    audio_request_complete(request, true, ESP_OK);
-}
-
-static void audio_task_handle_midi_resume(AudioRequest *request)
-{
-    if (request == nullptr) return;
-    g_task_last_request_id = request->request_id;
-    if (!g_midi_active || !g_midi_paused || g_midi_eof) {
-        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
-        return;
-    }
-    esp_err_t ret = i2s_output_stream_write_silence(
-        AUDIO_STREAM_FRAMES * 2U, AUDIO_I2S_WRITE_TIMEOUT_MS);
-    if (ret == ESP_OK) {
-        audio_task_begin_pcm_fade_in("midi_resume", g_midi_synth.sample_rate_hz);
-        g_pcm_unmute_pending = true;
-        g_midi_paused = false;
-        audio_task_publish_midi_clock_snapshot();
-    }
-    audio_request_complete(request, ret == ESP_OK, ret);
-}
-
-static void audio_task_handle_midi_restart(AudioRequest *request)
-{
-    if (request == nullptr) return;
-    g_task_last_request_id = request->request_id;
-    if (!g_midi_active || !midi_synth_is_open(&g_midi_synth)) {
-        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
-        return;
-    }
-    midi_synth_restart(&g_midi_synth);
-    audio_playback_clock_reset(&g_midi_playback_clock, g_midi_synth.sample_rate_hz);
-    g_midi_eof = false;
-    g_midi_paused = false;
-    audio_task_begin_pcm_fade_in("midi_restart", g_midi_synth.sample_rate_hz);
-    g_pcm_unmute_pending = true;
-    audio_task_publish_midi_clock_snapshot();
-    audio_request_complete(request, true, ESP_OK);
-}
-
-static void audio_task_handle_midi_stop(AudioRequest *request)
-{
-    if (request == nullptr) return;
-    g_task_last_request_id = request->request_id;
-    const esp_err_t ret = audio_task_stop_midi_internal(
-        request->midi_restore_music_hardware,
-        "midi_stop_command");
-    audio_request_complete(request, ret == ESP_OK, ret);
-}
-
-static void audio_task_service_midi()
-{
-    if (!g_midi_active || !midi_synth_is_open(&g_midi_synth)) return;
-
-    if (g_midi_paused || g_midi_eof) {
-        const esp_err_t silence_ret =
-            i2s_output_stream_write_silence(AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
-        if (silence_ret != ESP_OK) {
-            ESP_LOGE(TAG, "MIDI静音时钟维持失败：%s", esp_err_to_name(silence_ret));
-        }
-        return;
-    }
-
-    size_t frames = 0U;
-    esp_err_t ret = midi_synth_render_pcm32(
-        &g_midi_synth,
-        g_pcm_block,
-        AUDIO_STREAM_FRAMES,
-        &frames);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "MIDI Synth渲染失败：%s；后续保持静音", esp_err_to_name(ret));
-        (void)cs43131_set_pcm_mute(true);
-        g_midi_eof = true;
-        audio_task_publish_midi_clock_snapshot();
-        return;
-    }
-
-    audio_playback_clock_note_decoder(
-        &g_midi_playback_clock, midi_synth_position_frames(&g_midi_synth));
-    if (frames == 0U) {
-        if (midi_synth_is_eof(&g_midi_synth)) {
-            g_midi_eof = true;
-            audio_task_publish_midi_clock_snapshot();
-            ESP_LOGI(TAG, "MIDI Synth EOS：PCM=%lluf/%llums",
-                static_cast<unsigned long long>(g_midi_playback_clock.submitted_frames),
-                static_cast<unsigned long long>(audio_playback_clock_position_ms(&g_midi_playback_clock)));
-        }
-        return;
-    }
-
-    audio_task_apply_pcm_fade_in(g_pcm_block, frames);
-    ret = audio_task_unmute_when_pcm_ready();
-    if (ret == ESP_OK) {
-        ret = i2s_output_stream_write_pcm32(g_pcm_block, frames, AUDIO_I2S_WRITE_TIMEOUT_MS);
-    }
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "MIDI I2S发送失败：%s；后续保持静音", esp_err_to_name(ret));
-        (void)cs43131_set_pcm_mute(true);
-        g_midi_eof = true;
-        audio_task_publish_midi_clock_snapshot();
-        return;
-    }
-
-    audio_playback_clock_commit_pcm(&g_midi_playback_clock, frames);
-    audio_task_publish_midi_clock_snapshot();
 }
 
 static esp_err_t audio_task_restore_paused_music_hardware_for_nsf(const char *reason)
@@ -2812,6 +2473,10 @@ static size_t nsf_lookahead_publish_snapshot(
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (snapshot == nullptr) return 0U;
 
+    // 事件时间戳为预览时钟（超前真实播放约 LEAD）。UI 按真实 position 显示，
+    // 音符会在未来窗口中自上而下移动；预览已渲染完的音符其真实结束时刻必然 ≤ 当前
+    // 真实时间，因此这里不做时钟换算（换算会把快照清空）。播放线附近的历史由
+    // 实时播放路（audio_service_nsf_copy_visual_events）在 UI 侧兜底补充。
     size_t out_count = 0U;
     for (size_t i = 0U; i < builder->count; ++i) snapshot[out_count++] = builder->events[i];
     for (uint8_t voice = 0U; voice < 3U; ++voice) {
@@ -3047,6 +2712,7 @@ static void nsf_preview_task(void *arg)
     NsfSynthVisualTick visual_ticks[32] = {};
     uint64_t last_publish_position_ms = UINT64_MAX;
     bool ready_logged = false;
+    uint32_t status_publish_count = 0U;
 
     while (nsf_preview_generation_current(generation)) {
         AudioNsfClockSnapshot clock = {};
@@ -3054,6 +2720,51 @@ static void nsf_preview_task(void *arg)
             clock.eof || clock.track != track) {
             vTaskDelay(pdMS_TO_TICKS(NSF_PREVIEW_IDLE_DELAY_MS) + 1U);
             continue;
+        }
+
+        // 发布按真实位置步长独立进行，不依赖是否追平领先：即使预读暂时落后，
+        // 也持续小步发布，避免积压整段后一次性灌入造成瀑布"整块刷新"。
+        const bool should_publish =
+            last_publish_position_ms == UINT64_MAX ||
+            clock.position_ms >= last_publish_position_ms + NSF_PREVIEW_PUBLISH_STEP_MS;
+        if (should_publish) {
+            const uint32_t now_ms = clock.position_ms > UINT32_MAX
+                ? UINT32_MAX
+                : static_cast<uint32_t>(clock.position_ms);
+            // 事件时间戳是歌曲时间轴（=真实播放时间轴）。prune 阈值延后一个历史窗，
+            // 让刚结束的音符多停留 2s，供 UI 在播放线下方绘制历史轨迹。
+            const uint32_t history_cutoff_ms = now_ms > NSF_VISUAL_HISTORY_MS
+                ? now_ms - NSF_VISUAL_HISTORY_MS
+                : 0U;
+            nsf_lookahead_builder_prune_before(&builder, history_cutoff_ms);
+            uint64_t virtual_now =
+                nsf_synth_position_frames(&synth) * 1000ULL / NSF_PREVIEW_SAMPLE_RATE_HZ;
+            const uint32_t preview_end_ms = virtual_now > UINT32_MAX
+                ? UINT32_MAX
+                : static_cast<uint32_t>(virtual_now);
+            const size_t published_count = nsf_lookahead_publish_snapshot(
+                generation, track, &builder, preview_end_ms);
+            if (published_count > 0U && !ready_logged) {
+                ready_logged = true;
+                ESP_LOGI(TAG,
+                    "NSF独立未来4秒预读已就绪：track=%u now=%llums ahead=%llums events=%u",
+                    static_cast<unsigned>(track + 1U),
+                    static_cast<unsigned long long>(clock.position_ms),
+                    static_cast<unsigned long long>(
+                        virtual_now > clock.position_ms ? virtual_now - clock.position_ms : 0ULL),
+                    static_cast<unsigned>(published_count));
+            }
+            // 周期性打印持续领先量，用于核对预读是否跟得上播放。
+            ++status_publish_count;
+            if ((status_publish_count % 60U) == 0U) {
+                ESP_LOGI(TAG,
+                    "NSF预读状态：track=%u ahead=%llums events=%u",
+                    static_cast<unsigned>(track + 1U),
+                    static_cast<unsigned long long>(
+                        virtual_now > clock.position_ms ? virtual_now - clock.position_ms : 0ULL),
+                    static_cast<unsigned>(published_count));
+            }
+            last_publish_position_ms = clock.position_ms;
         }
 
         const uint64_t target_ms = clock.position_ms + NSF_PREVIEW_LEAD_MS;
@@ -3078,38 +2789,9 @@ static void nsf_preview_task(void *arg)
 
             // 只追到真实播放前方约5秒；每个小块后固定休眠，避免与 LVGL/IDLE1 争满 CPU1。
             vTaskDelay(NSF_PREVIEW_RENDER_YIELD_TICKS);
-            continue;
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(NSF_PREVIEW_IDLE_DELAY_MS) + 1U);
         }
-
-        const bool should_publish =
-            last_publish_position_ms == UINT64_MAX ||
-            clock.position_ms >= last_publish_position_ms + NSF_PREVIEW_PUBLISH_STEP_MS;
-        if (should_publish) {
-            const uint32_t now_ms = clock.position_ms > UINT32_MAX
-                ? UINT32_MAX
-                : static_cast<uint32_t>(clock.position_ms);
-            nsf_lookahead_builder_prune_before(&builder, now_ms);
-            virtual_ms =
-                nsf_synth_position_frames(&synth) * 1000ULL / NSF_PREVIEW_SAMPLE_RATE_HZ;
-            const uint32_t preview_end_ms = virtual_ms > UINT32_MAX
-                ? UINT32_MAX
-                : static_cast<uint32_t>(virtual_ms);
-            const size_t published_count = nsf_lookahead_publish_snapshot(
-                generation, track, &builder, preview_end_ms);
-            if (published_count > 0U && !ready_logged) {
-                ready_logged = true;
-                ESP_LOGI(TAG,
-                    "NSF独立未来4秒预读已就绪：track=%u now=%llums ahead=%llums events=%u",
-                    static_cast<unsigned>(track + 1U),
-                    static_cast<unsigned long long>(clock.position_ms),
-                    static_cast<unsigned long long>(
-                        virtual_ms > clock.position_ms ? virtual_ms - clock.position_ms : 0ULL),
-                    static_cast<unsigned>(published_count));
-            }
-            last_publish_position_ms = clock.position_ms;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(NSF_PREVIEW_IDLE_DELAY_MS) + 1U);
     }
 
     if (builder.truncated) {
@@ -3492,8 +3174,7 @@ static void audio_task_handle_nsf_start(AudioRequest *request)
         audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
         return;
     }
-    if (g_video_mp3_active || mp3_decoder_is_open(&g_video_mp3_decoder) ||
-        g_midi_active || midi_synth_is_open(&g_midi_synth)) {
+    if (g_video_mp3_active || mp3_decoder_is_open(&g_video_mp3_decoder)) {
         ESP_LOGE(TAG, "NSF启动被拒绝：其它临时音频仍在活动");
         audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
         return;
@@ -3734,7 +3415,6 @@ static bool audio_task_pipeline_has_resources()
         g_pipeline_headphone_enabled ||
         i2s_output_is_started() ||
         pcm_decoder_is_open(&g_decoder) ||
-        midi_synth_is_open(&g_midi_synth) ||
         nsf_synth_is_open(&g_nsf_synth);
 }
 
@@ -3753,14 +3433,10 @@ static void audio_task_handle_play(AudioRequest *request)
     if (g_video_mp3_active || mp3_decoder_is_open(&g_video_mp3_decoder)) {
         (void)audio_task_stop_video_mp3_internal(false, "music_play_override");
     }
-    if (g_midi_active || midi_synth_is_open(&g_midi_synth)) {
-        (void)audio_task_stop_midi_internal(false, "music_play_override");
-    }
     if (g_nsf_active || nsf_synth_is_open(&g_nsf_synth)) {
         (void)audio_task_stop_nsf_internal(false, "music_play_override");
     }
     // 新 Music Play 会完整重建自己的 pipeline，不再需要临时音源恢复旧 Paused 硬件。
-    g_midi_restore_paused_music_hardware = false;
     g_nsf_restore_paused_music_hardware = false;
     const char *path = audio_request_path(request);
 
@@ -4002,13 +3678,9 @@ static void audio_task_handle_stop(AudioRequest *request)
     if (g_video_mp3_active || mp3_decoder_is_open(&g_video_mp3_decoder)) {
         (void)audio_task_stop_video_mp3_internal(false, "global_stop");
     }
-    if (g_midi_active || midi_synth_is_open(&g_midi_synth)) {
-        (void)audio_task_stop_midi_internal(false, "global_stop");
-    }
     if (g_nsf_active || nsf_synth_is_open(&g_nsf_synth)) {
         (void)audio_task_stop_nsf_internal(false, "global_stop");
     }
-    g_midi_restore_paused_music_hardware = false;
     g_nsf_restore_paused_music_hardware = false;
     esp_err_t ret = audio_task_shutdown_pipeline();
     audio_task_advance_playback_revision();
@@ -4036,7 +3708,7 @@ static void audio_task_handle_stop(AudioRequest *request)
 static void audio_task_handle_pause(AudioRequest *request)
 {
     g_task_last_request_id = request->request_id;
-    if (g_video_mp3_active || g_midi_active || g_nsf_active) {
+    if (g_video_mp3_active || g_nsf_active) {
         ESP_LOGW(TAG, "临时音频活动期间拒绝Music Pause重复请求");
         audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
         return;
@@ -4071,7 +3743,7 @@ static void audio_task_handle_pause(AudioRequest *request)
 static void audio_task_handle_resume(AudioRequest *request)
 {
     g_task_last_request_id = request->request_id;
-    if (g_video_mp3_active || g_midi_active || g_nsf_active) {
+    if (g_video_mp3_active || g_nsf_active) {
         ESP_LOGW(TAG, "临时音频活动期间拒绝Music Resume；必须先停止当前临时音频");
         audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
         return;
@@ -4196,21 +3868,6 @@ static void audio_task_process_request(AudioRequest *request)
             break;
         case AudioCommandType::VideoMp3Stop:
             audio_task_handle_video_mp3_stop(request);
-            break;
-        case AudioCommandType::MidiStart:
-            audio_task_handle_midi_start(request);
-            break;
-        case AudioCommandType::MidiPause:
-            audio_task_handle_midi_pause(request);
-            break;
-        case AudioCommandType::MidiResume:
-            audio_task_handle_midi_resume(request);
-            break;
-        case AudioCommandType::MidiRestart:
-            audio_task_handle_midi_restart(request);
-            break;
-        case AudioCommandType::MidiStop:
-            audio_task_handle_midi_stop(request);
             break;
         case AudioCommandType::NsfStart:
             audio_task_handle_nsf_start(request);
@@ -4359,7 +4016,6 @@ static void audio_task_main(void *arg)
         AudioRequest *request = nullptr;
         const bool stream_needs_service =
             g_video_mp3_active ||
-            g_midi_active ||
             g_nsf_active ||
             g_task_state == AudioPlaybackState::Playing ||
             g_task_state == AudioPlaybackState::Paused;
@@ -4372,8 +4028,6 @@ static void audio_task_main(void *arg)
 
         if (g_video_mp3_active) {
             audio_task_service_video_mp3();
-        } else if (g_midi_active) {
-            audio_task_service_midi();
         } else if (g_nsf_active) {
             audio_task_service_nsf();
         } else if (g_task_state == AudioPlaybackState::Playing) {
@@ -4853,68 +4507,6 @@ bool audio_service_video_mp3_get_clock(AudioVideoClockSnapshot *out_snapshot)
     return true;
 }
 
-bool audio_service_midi_start(
-    const MidiSynthNoteEvent *notes,
-    size_t note_count,
-    uint32_t duration_ms,
-    bool wait)
-{
-    if (notes == nullptr || note_count == 0U || duration_ms == 0U ||
-        note_count > SIZE_MAX / sizeof(MidiSynthNoteEvent)) {
-        return false;
-    }
-
-    AudioRequest *request = audio_request_create(AudioCommandType::MidiStart, wait);
-    if (request == nullptr) return false;
-    const size_t bytes = note_count * sizeof(MidiSynthNoteEvent);
-    request->midi_notes = static_cast<MidiSynthNoteEvent *>(heap_caps_malloc(
-        bytes,
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (request->midi_notes == nullptr) {
-        audio_request_release(request);
-        return false;
-    }
-    memcpy(request->midi_notes, notes, bytes);
-    request->midi_note_count = note_count;
-    request->midi_duration_ms = duration_ms;
-    return audio_service_submit(request, wait);
-}
-
-bool audio_service_midi_pause(bool wait)
-{
-    AudioRequest *request = audio_request_create(AudioCommandType::MidiPause, wait);
-    return audio_service_submit(request, wait);
-}
-
-bool audio_service_midi_resume(bool wait)
-{
-    AudioRequest *request = audio_request_create(AudioCommandType::MidiResume, wait);
-    return audio_service_submit(request, wait);
-}
-
-bool audio_service_midi_restart(bool wait)
-{
-    AudioRequest *request = audio_request_create(AudioCommandType::MidiRestart, wait);
-    return audio_service_submit(request, wait);
-}
-
-bool audio_service_midi_stop(bool restore_music_hardware, bool wait)
-{
-    AudioRequest *request = audio_request_create(AudioCommandType::MidiStop, wait);
-    if (request == nullptr) return false;
-    request->midi_restore_music_hardware = restore_music_hardware;
-    return audio_service_submit(request, wait);
-}
-
-bool audio_service_midi_get_clock(AudioMidiClockSnapshot *out_snapshot)
-{
-    if (out_snapshot == nullptr) return false;
-    portENTER_CRITICAL(&g_midi_clock_snapshot_mux);
-    *out_snapshot = g_midi_clock_snapshot;
-    portEXIT_CRITICAL(&g_midi_clock_snapshot_mux);
-    return true;
-}
-
 bool audio_service_nsf_start(
     const uint8_t *prg,
     size_t prg_size,
@@ -5046,8 +4638,10 @@ size_t audio_service_nsf_copy_lookahead_events(
     }
 
     // 预读实例始终跟随真实播放向前约5秒，因此这里只复制当前绝对时间窗口，不再复用时长分析的Loop结果。
-    for (size_t i = 0U; i < g_nsf_lookahead_event_count && out_count < capacity; ++i) {
-        const AudioNsfVisualEvent &event = g_nsf_lookahead_events[i];
+    // 从最新事件往回拷贝：容量不足时优先保住未来窗口顶部（最新音符），
+    // 最早的历史先被截掉，避免密集段落时顶部空白。
+    for (size_t i = g_nsf_lookahead_event_count; i > 0U && out_count < capacity; --i) {
+        const AudioNsfVisualEvent &event = g_nsf_lookahead_events[i - 1U];
         if (event.end_ms < window_start_ms || event.start_ms > window_end_ms) continue;
         out_events[out_count++] = event;
     }

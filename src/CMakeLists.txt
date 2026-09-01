@@ -13,7 +13,6 @@ idf_component_register(
         "app/ebook_reader_model.cpp"
         "app/visual_music_app.cpp"
         "app/visual_music_browser_model.cpp"
-        "app/visual_music_midi.cpp"
         "app/visual_music_nsf.cpp"
         "app/video_app.cpp"
         "app/video_browser_model.cpp"
@@ -45,7 +44,6 @@ idf_component_register(
 
         "audio/audio_service.cpp"
         "audio/audio_decode_workspace.cpp"
-        "audio/midi_synth.cpp"
         "audio/nsf_synth.cpp"
         "audio/audio_spectrum_snapshot.cpp"
         "audio/sources/audio_source.cpp"

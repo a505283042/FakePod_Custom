@@ -27,13 +27,15 @@ static inline bool audio_rate_profile_get(uint32_t sample_rate_hz, AudioRateProf
         case 44100U:
             profile.sample_rate_hz = 44100U;
             profile.cs43131_asp_sprate = 0x01U;
-            profile.i2s_dma_desc_num = 8U;
+            // 48kHz 档加大 DMA 余量（16×256≈85ms）：电子音流 NSF 渲染与
+            // 瀑布 SPI 刷屏争抢总线时，避免瞬时下溢导致音频卡顿。
+            profile.i2s_dma_desc_num = 16U;
             profile.flac_stage_enabled = true;
             break;
         case 48000U:
             profile.sample_rate_hz = 48000U;
             profile.cs43131_asp_sprate = 0x02U;
-            profile.i2s_dma_desc_num = 8U;
+            profile.i2s_dma_desc_num = 16U;
             profile.flac_stage_enabled = true;
             break;
         case 88200U:

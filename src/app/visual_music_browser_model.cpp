@@ -63,9 +63,6 @@ static bool ascii_extension_is(const char *name, const char *extension)
 
 static uint32_t supported_file_flag(const char *name)
 {
-    if (ascii_extension_is(name, ".mid") || ascii_extension_is(name, ".midi")) {
-        return kEntryMidi;
-    }
     if (ascii_extension_is(name, ".nsf") || ascii_extension_is(name, ".nsfe")) {
         return kEntryNsf;
     }
@@ -453,11 +450,6 @@ bool entry_is_directory(const EntryIndex *entry)
     return entry != nullptr && (entry->flags & kEntryDirectory) != 0U;
 }
 
-bool entry_is_midi(const EntryIndex *entry)
-{
-    return entry != nullptr && (entry->flags & kEntryMidi) != 0U;
-}
-
 bool entry_is_nsf(const EntryIndex *entry)
 {
     return entry != nullptr && (entry->flags & kEntryNsf) != 0U;
@@ -466,7 +458,6 @@ bool entry_is_nsf(const EntryIndex *entry)
 const char *entry_kind_name(const EntryIndex *entry)
 {
     if (entry_is_directory(entry)) return ">";
-    if (entry_is_midi(entry)) return "MIDI";
     if (entry_is_nsf(entry)) return "NSF";
     return "?";
 }

@@ -16,8 +16,7 @@ enum EntryFlags : uint32_t
 {
     kEntryNone = 0U,
     kEntryDirectory = 1U << 0U,
-    kEntryMidi = 1U << 1U,
-    kEntryNsf = 1U << 2U,
+    kEntryNsf = 1U << 1U,
 };
 
 // 电子音流目录与 Video/Ebook 保持相同的紧凑 Row + PSRAM StringPool 结构。
@@ -65,7 +64,6 @@ void release_directory(DirectorySnapshot *snapshot);
 const EntryIndex *entry_at(const DirectorySnapshot *snapshot, size_t index);
 const char *entry_name(const DirectorySnapshot *snapshot, size_t index);
 bool entry_is_directory(const EntryIndex *entry);
-bool entry_is_midi(const EntryIndex *entry);
 bool entry_is_nsf(const EntryIndex *entry);
 const char *entry_kind_name(const EntryIndex *entry);
 

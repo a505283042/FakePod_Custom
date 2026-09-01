@@ -15,7 +15,6 @@
 #include "lvgl.h"
 #include "ui_common.h"
 #include "visual_music_browser_model.h"
-#include "visual_music_midi.h"
 #include "visual_music_nsf.h"
 
 static const char *TAG = "电子音流";
@@ -26,8 +25,6 @@ namespace
 enum class VisualMusicPage : uint8_t
 {
     Browser = 0,
-    MidiLoading,
-    MidiWaterfall,
     NsfLoading,
     NsfReady,
 };
@@ -57,17 +54,19 @@ static constexpr uint32_t kFlacSafePercent = 90U;
 static constexpr size_t kScanBatchNoFlac = 8U;
 static constexpr size_t kScanBatchWithFlac = 1U;
 static constexpr uint32_t kWaitLogIntervalMs = 1000U;
-// MIDI 预解析事件较轻，保持25fps；NSF 需要同时运行预读/时长后台任务，
-// 其瀑布降到12.5fps，避免310px绘图区持续刷屏占满CPU1和SPI刷新链路。
+// NSF 与后台预读/分析共抢 Core1，其瀑布降到8fps，
+// 避免310px绘图区持续刷屏占满CPU1和SPI刷新链路。
 // Browser/解析阶段仍通过 FLAC 水位策略给后台 Music 的 SD 读取让路。
-static constexpr uint32_t kMidiWaterfallFramePeriodMs = 40U;
-static constexpr uint32_t kNsfWaterfallFramePeriodMs = 80U;
+static constexpr uint32_t kNsfWaterfallFramePeriodMs = 125U;
 static constexpr uint32_t kWaterfallTimeLabelPeriodMs = 250U;
-static constexpr uint32_t kWaterfallFutureMs = 4000U;
+// NSF 预读受 Core1 CPU 限制，无法持续领先 4s；缩小到预读能喂饱的尺寸，保证满窗且平滑。
+static constexpr uint32_t kWaterfallNsfFutureMs = 2000U;
+static constexpr uint32_t kWaterfallNsfPastMs = 1800U;  // 历史区：下落适中，避免音符叠成糊
+static constexpr int32_t kWaterfallPastPixels = 70;   // 播放线距控件底部的历史区高度
 static constexpr uint8_t kWaterfallPitchMin = 36U; // C2以下统一折叠到左侧低频区
 static constexpr uint8_t kWaterfallPitchMax = 96U; // C7以上夹到最右列
 static constexpr int32_t kWaterfallLowAreaWidth = 44;
-static constexpr size_t kNsfVisualWindowCapacity = 192U;
+static constexpr size_t kNsfVisualWindowCapacity = 512U; // 覆盖整个4s未来窗（约260+事件）并留余量，避免顶部截断
 static constexpr int32_t kPlayerTitleHeight = 68;
 static constexpr int32_t kPlayerControlHeight = 82;
 static constexpr int32_t kPlayerWaterfallHeight = 460 - kPlayerTitleHeight - kPlayerControlHeight;
@@ -118,16 +117,10 @@ static size_t g_selected_index = SIZE_MAX;
 static char *g_current_dir = nullptr;
 static char *g_scratch_path = nullptr;
 static char *g_selected_path = nullptr;
-static VisualMusicMidi::Timeline g_midi_timeline = {};
 static VisualMusicNsf::Image g_nsf_image = {};
 static uint8_t g_nsf_track = 0U;
 static AudioNsfVisualEvent g_nsf_visual_window[kNsfVisualWindowCapacity] = {};
 static uint32_t g_last_waterfall_draw_tick = 0U;
-static uint32_t g_last_time_label_tick = 0U;
-static bool g_midi_paused = true;
-static bool g_midi_audio_active = false;
-static bool g_music_paused_for_midi = false;
-static bool g_midi_eof_action_handled = false;
 static bool g_nsf_paused = true;
 static bool g_nsf_audio_active = false;
 static bool g_nsf_eof = false;
@@ -232,20 +225,18 @@ static const char *loop_mode_symbol()
 static void update_player_controls()
 {
     if (g_loop_label != nullptr) lv_label_set_text(g_loop_label, loop_mode_symbol());
-    const bool midi_playing =
-        g_page == VisualMusicPage::MidiWaterfall && g_midi_audio_active && !g_midi_paused;
     const bool nsf_playing =
         g_page == VisualMusicPage::NsfReady && g_nsf_audio_active &&
         !g_nsf_paused && !g_nsf_eof && !g_nsf_failed;
     if (g_play_label != nullptr) {
-        lv_label_set_text(g_play_label, midi_playing || nsf_playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+        lv_label_set_text(g_play_label, nsf_playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
     }
     if (g_play_button != nullptr) {
         const bool nsf_supported =
             g_page == VisualMusicPage::NsfReady && g_nsf_image.version == 1U &&
             g_nsf_image.track_count > 0U && g_nsf_image.expansion_chips == 0U &&
             (g_nsf_image.pal_ntsc_bits & 0x03U) != 0x01U;
-        if (g_page == VisualMusicPage::MidiWaterfall || nsf_supported) {
+        if (nsf_supported) {
             lv_obj_remove_state(g_play_button, LV_STATE_DISABLED);
         } else {
             lv_obj_add_state(g_play_button, LV_STATE_DISABLED);
@@ -288,58 +279,6 @@ static void update_header()
     } else {
         lv_label_set_text(g_header_title, "电子音流");
     }
-}
-
-static bool pause_music_for_midi_exclusive()
-{
-    if (g_music_paused_for_midi) return true;
-
-    AudioStateSnapshot snapshot = {};
-    if (!audio_service_get_snapshot(&snapshot) || !snapshot.ready) {
-        ESP_LOGI(TAG, "MIDI Exclusive：AudioTask未就绪，无活动Music需要暂停");
-        return true;
-    }
-    if (snapshot.state != AudioPlaybackState::Playing) {
-        ESP_LOGI(TAG, "MIDI Exclusive：Music当前非Playing(state=%u)，保持原状态",
-            static_cast<unsigned>(snapshot.state));
-        return true;
-    }
-    if (!audio_service_pause(true)) {
-        ESP_LOGE(TAG, "MIDI Exclusive：暂停Music失败");
-        return false;
-    }
-    g_music_paused_for_midi = true;
-    ESP_LOGI(TAG, "MIDI Exclusive：Music已暂停；AudioTask切换到MIDI Synth");
-    return true;
-}
-
-static bool stop_midi_audio(bool restore_music, const char *reason)
-{
-    // 同 APP 切曲时 Synth 可能已停但 Paused Music 硬件仍保持“待恢复”状态。
-    // restore=true 时始终通知 AudioTask 收口 MIDI 临时硬件；即使 Music 进入 APP 前本来就已暂停，
-    // 也必须恢复它的 Paused 硬件，之后是否 Resume 再由 g_music_paused_for_midi 决定。
-    if (g_midi_audio_active || restore_music) {
-        if (!audio_service_midi_stop(restore_music, true)) {
-            ESP_LOGE(TAG, "MIDI Synth停止/恢复Music硬件失败：reason=%s",
-                reason != nullptr ? reason : "unknown");
-            return false;
-        }
-        g_midi_audio_active = false;
-        g_midi_paused = true;
-        g_midi_eof_action_handled = false;
-    }
-
-    if (restore_music && g_music_paused_for_midi) {
-        if (!audio_service_resume(false)) {
-            ESP_LOGW(TAG, "MIDI Exclusive恢复Music请求失败：reason=%s；保留暂停标记等待生命周期重试",
-                reason != nullptr ? reason : "unknown");
-            return false;
-        }
-        g_music_paused_for_midi = false;
-        ESP_LOGI(TAG, "MIDI Exclusive：已请求恢复Music reason=%s",
-            reason != nullptr ? reason : "unknown");
-    }
-    return true;
 }
 
 static bool pause_music_for_nsf_exclusive()
@@ -393,55 +332,6 @@ static bool stop_nsf_audio(bool restore_music, const char *reason)
     return true;
 }
 
-static uint32_t midi_position_ms()
-{
-    if (g_midi_timeline.duration_ms == 0U) return 0U;
-    AudioMidiClockSnapshot clock = {};
-    if (g_midi_audio_active && audio_service_midi_get_clock(&clock) && clock.active) {
-        g_midi_paused = clock.paused || clock.eof;
-        const uint64_t position = clock.position_ms;
-        return position >= g_midi_timeline.duration_ms
-            ? g_midi_timeline.duration_ms
-            : static_cast<uint32_t>(position);
-    }
-    return 0U;
-}
-
-static void format_time_pair(char *out, size_t out_size, uint32_t position_ms, uint32_t duration_ms)
-{
-    if (out == nullptr || out_size == 0U) return;
-    const uint32_t position_seconds = position_ms / 1000U;
-    const uint32_t duration_seconds = duration_ms / 1000U;
-    snprintf(
-        out,
-        out_size,
-        "%lu:%02lu / %lu:%02lu",
-        static_cast<unsigned long>(position_seconds / 60U),
-        static_cast<unsigned long>(position_seconds % 60U),
-        static_cast<unsigned long>(duration_seconds / 60U),
-        static_cast<unsigned long>(duration_seconds % 60U));
-}
-
-static void update_midi_time_label()
-{
-    if (g_player_time == nullptr || g_page != VisualMusicPage::MidiWaterfall) return;
-    char text[64] = {};
-    format_time_pair(text, sizeof(text), midi_position_ms(), g_midi_timeline.duration_ms);
-    lv_label_set_text(g_player_time, text);
-}
-
-static size_t midi_first_candidate(uint32_t earliest_start_ms)
-{
-    size_t left = 0U;
-    size_t right = g_midi_timeline.note_count;
-    while (left < right) {
-        const size_t mid = left + (right - left) / 2U;
-        if (g_midi_timeline.notes[mid].start_ms < earliest_start_ms) left = mid + 1U;
-        else right = mid;
-    }
-    return left;
-}
-
 static uint32_t waterfall_level_color(uint32_t color, uint8_t level)
 {
     const uint32_t scale = 62U + (static_cast<uint32_t>(level) * 38U) / 127U;
@@ -451,17 +341,17 @@ static uint32_t waterfall_level_color(uint32_t color, uint8_t level)
     return (r << 16U) | (g << 8U) | b;
 }
 
-static uint32_t midi_waterfall_color(const VisualMusicMidi::NoteEvent &note)
+// 历史区固定深色值：与各声部/通道基色同色系的深色，避免用缩放/半透明等效果。
+static uint32_t waterfall_dim_color(uint32_t color)
 {
-    if (note.channel == 9U || note.note < kWaterfallPitchMin) return 0xF4A62A;
-    // MIDI和NSF共用青/粉/蓝视觉语言；Channel只决定主旋律区基色，不再按Program铺满多色。
-    static constexpr uint32_t kColors[4] = {
-        0x20C7F4,
-        0xFF5B9D,
-        0x55A8FF,
-        0x9A7CFF,
-    };
-    return kColors[note.channel & 0x03U];
+    switch (color) {
+        case 0x20C7F4: return 0x0D5A6E;   // 青
+        case 0xFF5B9D: return 0x7A2B4A;   // 粉
+        case 0x55A8FF: return 0x27527D;   // 蓝
+        case 0x9A7CFF: return 0x46376F;   // 紫
+        case 0xF4A62A: return 0x6E4A14;   // 橙
+        default:       return 0x3A4250;   // 灰
+    }
 }
 
 static uint32_t nsf_waterfall_color(AudioNsfVisualVoice voice)
@@ -478,8 +368,7 @@ static uint32_t nsf_waterfall_color(AudioNsfVisualVoice voice)
 
 static void waterfall_draw_grid(
     lv_layer_t *layer,
-    const lv_area_t &coords,
-    int32_t current_line_y)
+    const lv_area_t &coords)
 {
     const int32_t main_x1 = coords.x1 + kWaterfallLowAreaWidth;
     const int32_t main_width = coords.x2 - main_x1 + 1;
@@ -496,18 +385,19 @@ static void waterfall_draw_grid(
         const int32_t x = main_x1 +
             (static_cast<int32_t>(note - kWaterfallPitchMin) * (main_width - 1)) / pitch_span;
         grid_dsc.bg_color = lv_color_hex((note % 12U) == 0U ? 0x263A55 : 0x16263A);
-        lv_area_t line = {x, coords.y1, x, current_line_y - 1};
+        // 音高线贯通整个控件（含播放线下方历史区），保证音符穿过播放线时背景连续。
+        lv_area_t line = {x, coords.y1, x, coords.y2};
         lv_draw_rect(layer, &grid_dsc, &line);
     }
 
     grid_dsc.bg_color = lv_color_hex(0x31475F);
-    lv_area_t divider = {main_x1 - 1, coords.y1, main_x1, current_line_y};
+    lv_area_t divider = {main_x1 - 1, coords.y1, main_x1, coords.y2};
     lv_draw_rect(layer, &grid_dsc, &divider);
 
     // 左侧两条窄轨统一承载鼓组/Noise/DMC和折叠低音。
     grid_dsc.bg_color = lv_color_hex(0x122033);
     lv_area_t low_split = {coords.x1 + kWaterfallLowAreaWidth / 2, coords.y1,
-        coords.x1 + kWaterfallLowAreaWidth / 2, current_line_y - 1};
+        coords.x1 + kWaterfallLowAreaWidth / 2, coords.y2};
     lv_draw_rect(layer, &grid_dsc, &low_split);
 }
 
@@ -516,6 +406,9 @@ static void waterfall_draw_event(
     const lv_area_t &coords,
     int32_t current_line_y,
     int32_t future_pixels,
+    int32_t past_pixels,
+    uint32_t future_ms,
+    uint32_t past_ms,
     uint32_t now_ms,
     uint32_t start_ms,
     uint32_t end_ms,
@@ -524,14 +417,22 @@ static void waterfall_draw_event(
     uint32_t color,
     int8_t low_lane)
 {
-    if (end_ms < start_ms || end_ms < now_ms) return;
-    // 播放线就是“现在”：当前音符贴住播放线，未来4秒全部位于其上方并随真实时钟向下移动。
-    auto time_to_y = [current_line_y, future_pixels, now_ms](uint32_t time_ms) -> int32_t {
-        if (time_ms <= now_ms) return current_line_y;
+    if (end_ms < start_ms) return;
+    // 播放线就是“现在”：未来窗在其上方随真实时钟向下移动；
+    // 已结束/正在演奏的音符落到播放线下方（历史区），让音符完整穿过播放线。
+    auto time_to_y = [current_line_y, future_pixels, past_pixels, future_ms, past_ms, now_ms](
+        uint32_t time_ms) -> int32_t {
+        if (time_ms == now_ms) return current_line_y;
+        if (time_ms < now_ms) {
+            const uint64_t delta_ms = static_cast<uint64_t>(now_ms) - time_ms;
+            if (delta_ms >= past_ms) return current_line_y + past_pixels;
+            return current_line_y + static_cast<int32_t>(
+                delta_ms * static_cast<uint64_t>(past_pixels) / past_ms);
+        }
         const uint64_t delta_ms = static_cast<uint64_t>(time_ms) - now_ms;
-        if (delta_ms >= kWaterfallFutureMs) return current_line_y - future_pixels;
+        if (delta_ms >= future_ms) return current_line_y - future_pixels;
         return current_line_y - static_cast<int32_t>(
-            delta_ms * static_cast<uint64_t>(future_pixels) / kWaterfallFutureMs);
+            delta_ms * static_cast<uint64_t>(future_pixels) / future_ms);
     };
     const int32_t y_start = time_to_y(start_ms);
     const int32_t y_end = time_to_y(end_ms);
@@ -564,25 +465,40 @@ static void waterfall_draw_event(
     note_dsc.radius = 0;
     note_dsc.border_width = 0;
     note_dsc.bg_opa = LV_OPA_COVER;
-    note_dsc.bg_color = lv_color_hex(waterfall_level_color(color, level));
 
     lv_area_t area = {};
     area.x1 = center_x - note_width / 2;
     area.x2 = area.x1 + note_width - 1;
-    area.y1 = y1;
-    area.y2 = y2;
     if (area.x1 < coords.x1) area.x1 = coords.x1;
     if (area.x2 > coords.x2) area.x2 = coords.x2;
-    lv_draw_rect(layer, &note_dsc, &area);
+
+    // 播放线（current_line_y）下方 = 已演奏历史，用同色系固定深色值压暗；
+    // 线上 = 未来/当前，保持原亮度。分段绘制，让跨线音符亮度平滑过渡。
+    const uint32_t bright_color = waterfall_level_color(color, level);
+    const uint32_t dim_color = waterfall_dim_color(color);
+
+    const int32_t bright_y2 = y2 < current_line_y ? y2 : current_line_y;
+    if (bright_y2 >= y1) {
+        note_dsc.bg_color = lv_color_hex(bright_color);
+        area.y1 = y1;
+        area.y2 = bright_y2;
+        lv_draw_rect(layer, &note_dsc, &area);
+    }
+    const int32_t dim_y1 = y1 > current_line_y ? y1 : current_line_y;
+    if (y2 >= dim_y1) {
+        note_dsc.bg_color = lv_color_hex(dim_color);
+        area.y1 = dim_y1;
+        area.y2 = y2;
+        lv_draw_rect(layer, &note_dsc, &area);
+    }
 }
 
 static void waterfall_draw_cb(lv_event_t *event)
 {
     if (event == nullptr || lv_event_get_code(event) != LV_EVENT_DRAW_MAIN ||
-        (g_page != VisualMusicPage::MidiWaterfall && g_page != VisualMusicPage::NsfReady)) {
+        g_page != VisualMusicPage::NsfReady) {
         return;
     }
-    if (g_page == VisualMusicPage::MidiWaterfall && g_midi_timeline.notes == nullptr) return;
 
     lv_layer_t *layer = lv_event_get_layer(event);
     lv_obj_t *obj = lv_event_get_current_target_obj(event);
@@ -595,89 +511,60 @@ static void waterfall_draw_cb(lv_event_t *event)
     if (width <= kWaterfallLowAreaWidth + 20 || height <= 20) return;
 
     const int32_t top = coords.y1 + 4;
-    const int32_t current_line_y = coords.y2 - 3;
+    // 播放线上方为未来区，下方留出历史区（当前音符已演奏部分）。
+    const int32_t current_line_y = coords.y2 - kWaterfallPastPixels - 2;
     const int32_t future_pixels = current_line_y - top;
-    if (future_pixels <= 0) return;
+    const int32_t past_pixels = coords.y2 - current_line_y;
+    if (future_pixels <= 0 || past_pixels <= 0) return;
 
+    // NSF：预读受 Core1 CPU 限制，用更小的窗口保证满窗且平滑。
     uint32_t now_ms = 0U;
-    if (g_page == VisualMusicPage::MidiWaterfall) {
-        now_ms = midi_position_ms();
-    } else {
-        AudioNsfClockSnapshot clock = {};
-        if (audio_service_nsf_get_clock(&clock) && clock.active) {
-            now_ms = clock.position_ms > UINT32_MAX
-                ? UINT32_MAX
-                : static_cast<uint32_t>(clock.position_ms);
-        }
+    const uint32_t future_ms = kWaterfallNsfFutureMs;
+    const uint32_t past_ms = kWaterfallNsfPastMs;
+    AudioNsfClockSnapshot clock = {};
+    if (audio_service_nsf_get_clock(&clock) && clock.active) {
+        now_ms = clock.position_ms > UINT32_MAX
+            ? UINT32_MAX
+            : static_cast<uint32_t>(clock.position_ms);
     }
 
-    waterfall_draw_grid(layer, coords, current_line_y);
+    waterfall_draw_grid(layer, coords);
 
-    if (g_page == VisualMusicPage::MidiWaterfall) {
-        const uint32_t window_end = UINT32_MAX - now_ms < kWaterfallFutureMs
-            ? UINT32_MAX
-            : now_ms + kWaterfallFutureMs;
-        const uint32_t earliest_start = now_ms > g_midi_timeline.max_note_duration_ms
-            ? now_ms - g_midi_timeline.max_note_duration_ms
-            : 0U;
-        const size_t first = midi_first_candidate(earliest_start);
-        for (size_t i = first; i < g_midi_timeline.note_count; ++i) {
-            const VisualMusicMidi::NoteEvent &note = g_midi_timeline.notes[i];
-            if (note.start_ms > window_end) break;
-            if (note.end_ms < now_ms) continue;
-            const int8_t low_lane = note.channel == 9U ? 0 :
-                (note.note < kWaterfallPitchMin ? 1 : -1);
-            waterfall_draw_event(
-                layer, coords, current_line_y, future_pixels, now_ms,
-                note.start_ms, note.end_ms, note.note, note.velocity,
-                midi_waterfall_color(note), low_lane);
-        }
-    } else {
-        // 当前音符只由48kHz播放路确认；不画历史，避免产生“从播放线向上滚”的反向视觉。
-        size_t count = audio_service_nsf_copy_visual_events(
+    // 预读事件时间戳 = 歌曲时间轴（与真实播放同步）。直接画全部事件：
+    // 未来在上方下落，正在/刚结束的音符完整穿过播放线，已演奏部分留在下方历史区。
+    const uint32_t history_start = now_ms > past_ms
+        ? now_ms - past_ms
+        : 0U;
+    const uint32_t future_end = UINT32_MAX - now_ms < future_ms
+        ? UINT32_MAX
+        : now_ms + future_ms;
+    size_t count = audio_service_nsf_copy_lookahead_events(
+        g_nsf_track,
+        history_start,
+        future_end,
+        g_nsf_visual_window,
+        kNsfVisualWindowCapacity);
+    if (count == 0U) {
+        // 预读尚未就绪时退回实时播放路，保证播放线上至少有当前音符。
+        count = audio_service_nsf_copy_visual_events(
             g_nsf_track,
             now_ms,
             now_ms,
             g_nsf_visual_window,
             kNsfVisualWindowCapacity);
-        for (size_t i = 0U; i < count; ++i) {
-            const AudioNsfVisualEvent &note = g_nsf_visual_window[i];
-            if (note.start_ms > now_ms || note.end_ms < now_ms) continue;
-            int8_t low_lane = -1;
-            if (note.voice == AudioNsfVisualVoice::Noise) low_lane = 0;
-            else if (note.voice == AudioNsfVisualVoice::Dmc ||
-                    note.note < kWaterfallPitchMin) low_lane = 1;
-            // 当前音符只在播放线处给一个短标记；未来长度由预读事件负责。
-            const uint32_t marker_end = UINT32_MAX - now_ms < 40U ? UINT32_MAX : now_ms + 40U;
-            waterfall_draw_event(
-                layer, coords, current_line_y, future_pixels, now_ms,
-                now_ms, marker_end, note.note, note.level,
-                low_lane >= 0 ? 0xF4A62A : nsf_waterfall_color(note.voice), low_lane);
-        }
-
-        // 未来4秒来自后台预读，但全部按真实I2S position_ms定位，只能从上向下落到播放线。
-        const uint32_t future_end = UINT32_MAX - now_ms < kWaterfallFutureMs
-            ? UINT32_MAX
-            : now_ms + kWaterfallFutureMs;
-        count = audio_service_nsf_copy_lookahead_events(
-            g_nsf_track,
-            now_ms,
-            future_end,
-            g_nsf_visual_window,
-            kNsfVisualWindowCapacity);
-        for (size_t i = 0U; i < count; ++i) {
-            const AudioNsfVisualEvent &note = g_nsf_visual_window[i];
-            if (note.end_ms <= now_ms) continue;
-            const uint32_t visible_start = note.start_ms < now_ms ? now_ms : note.start_ms;
-            int8_t low_lane = -1;
-            if (note.voice == AudioNsfVisualVoice::Noise) low_lane = 0;
-            else if (note.voice == AudioNsfVisualVoice::Dmc ||
-                    note.note < kWaterfallPitchMin) low_lane = 1;
-            waterfall_draw_event(
-                layer, coords, current_line_y, future_pixels, now_ms,
-                visible_start, note.end_ms, note.note, note.level,
-                low_lane >= 0 ? 0xF4A62A : nsf_waterfall_color(note.voice), low_lane);
-        }
+    }
+    for (size_t i = 0U; i < count; ++i) {
+        const AudioNsfVisualEvent &note = g_nsf_visual_window[i];
+        if (note.end_ms < note.start_ms || note.end_ms < history_start) continue;
+        int8_t low_lane = -1;
+        if (note.voice == AudioNsfVisualVoice::Noise) low_lane = 0;
+        else if (note.voice == AudioNsfVisualVoice::Dmc ||
+                note.note < kWaterfallPitchMin) low_lane = 1;
+        waterfall_draw_event(
+            layer, coords, current_line_y, future_pixels, past_pixels,
+            future_ms, past_ms, now_ms,
+            note.start_ms, note.end_ms, note.note, note.level,
+            low_lane >= 0 ? 0xF4A62A : nsf_waterfall_color(note.voice), low_lane);
     }
 
     lv_draw_rect_dsc_t line_dsc = {};
@@ -688,16 +575,6 @@ static void waterfall_draw_cb(lv_event_t *event)
     line_dsc.border_width = 0;
     lv_area_t line = {coords.x1 + 2, current_line_y, coords.x2 - 2, current_line_y + 1};
     lv_draw_rect(layer, &line_dsc, &line);
-}
-
-static void cancel_midi_player()
-{
-    VisualMusicMidi::cancel();
-    VisualMusicMidi::release_timeline(&g_midi_timeline);
-    g_last_waterfall_draw_tick = 0U;
-    g_last_time_label_tick = 0U;
-    g_midi_paused = true;
-    g_midi_eof_action_handled = false;
 }
 
 static void cancel_nsf_player()
@@ -722,32 +599,6 @@ static void set_player_loading_ui(const char *message, const char *hint)
     update_player_controls();
 }
 
-static void begin_midi_load()
-{
-    if (g_selected_path == nullptr || g_selected_path[0] == '\0') return;
-    // 同一 MIDI 文件切换仍避免恢复 Music；若当前是 NSF，则先完整交还音频硬件。
-    (void)stop_midi_audio(false, "switch_midi");
-    (void)stop_nsf_audio(true, "switch_nsf_to_midi");
-    cancel_midi_player();
-    cancel_nsf_player();
-    g_page = VisualMusicPage::MidiLoading;
-    set_visible(g_browser_host, false);
-    set_browser_header_visible(false);
-    set_visible(g_player_host, true);
-    if (g_player_format != nullptr) lv_label_set_text(g_player_format, "MIDI");
-    if (g_player_title != nullptr) lv_label_set_text(g_player_title, basename_of(g_selected_path));
-    set_player_loading_ui("正在解析 MIDI…", "右滑或点击“列表”返回文件列表");
-    const esp_err_t ret = VisualMusicMidi::start(g_selected_path);
-    if (ret != ESP_OK) {
-        (void)stop_midi_audio(true, "midi_parser_start_failed");
-        set_player_loading_ui("MIDI解析任务启动失败", esp_err_to_name(ret));
-        ESP_LOGW(TAG, "MIDI解析任务启动失败：path=%s ret=%s", g_selected_path, esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "MIDI解析已排队：%s", g_selected_path);
-    }
-    gesture_router_reset();
-}
-
 static void update_nsf_time_label()
 {
     if (g_player_time == nullptr || g_nsf_image.track_count == 0U) return;
@@ -759,21 +610,26 @@ static void update_nsf_time_label()
         g_nsf_eof = clock.eof;
         g_nsf_failed = clock.failed;
     }
-    const uint64_t seconds = position_ms / 1000ULL;
     char duration_text[24] = "--:--";
+    uint64_t display_position_ms = position_ms;
     if (clock.duration_ms > 0ULL) {
         const uint64_t duration_seconds = clock.duration_ms / 1000ULL;
         snprintf(duration_text, sizeof(duration_text), "%llu:%02llu",
             static_cast<unsigned long long>(duration_seconds / 60ULL),
             static_cast<unsigned long long>(duration_seconds % 60ULL));
+        // NSF 循环曲目：真实 position 单调累加，会超过显示时长。
+        // 按 duration 取模显示，让进度在 0 ~ 时长 之间循环，避免 "5:30 / 3:00"。
+        if (position_ms >= clock.duration_ms) {
+            display_position_ms = position_ms % clock.duration_ms;
+        }
     }
     char text[48] = {};
     snprintf(
         text,
         sizeof(text),
         "%llu:%02llu / %s",
-        static_cast<unsigned long long>(seconds / 60ULL),
-        static_cast<unsigned long long>(seconds % 60ULL),
+        static_cast<unsigned long long>((display_position_ms / 1000ULL) / 60ULL),
+        static_cast<unsigned long long>((display_position_ms / 1000ULL) % 60ULL),
         duration_text);
     lv_label_set_text(g_player_time, text);
 }
@@ -908,9 +764,7 @@ static void begin_nsf_load()
 {
     if (g_selected_path == nullptr || g_selected_path[0] == '\0') return;
     // 切换到新的 NSF 文件时先完整交还上一种临时音源；解析阶段允许原 Music 继续播放。
-    (void)stop_midi_audio(true, "switch_to_nsf");
     (void)stop_nsf_audio(true, "switch_nsf_file");
-    cancel_midi_player();
     cancel_nsf_player();
     g_nsf_paused = true;
     g_nsf_eof = false;
@@ -1011,96 +865,7 @@ static bool select_nsf_subsong(int direction, bool allow_wrap)
     return true;
 }
 
-static void midi_result_tick()
-{
-    if (g_page != VisualMusicPage::MidiLoading) return;
-    VisualMusicMidi::LoadResult result = {};
-    if (!VisualMusicMidi::take_result(&result)) return;
-    if (result.state != VisualMusicMidi::LoadState::Ready || result.result != ESP_OK) {
-        VisualMusicMidi::release_timeline(&result.timeline);
-        (void)stop_midi_audio(true, "midi_parse_failed");
-        set_player_loading_ui("MIDI解析失败", esp_err_to_name(result.result));
-        ESP_LOGW(TAG, "MIDI时间轴不可用：ret=%s", esp_err_to_name(result.result));
-        return;
-    }
-
-    VisualMusicMidi::release_timeline(&g_midi_timeline);
-    g_midi_timeline = result.timeline;
-    result.timeline = {};
-
-    if (!pause_music_for_midi_exclusive()) {
-        set_player_loading_ui("无法暂停后台Music", "返回列表后可继续浏览文件");
-        return;
-    }
-    if (!audio_service_midi_start(
-            g_midi_timeline.notes,
-            g_midi_timeline.note_count,
-            g_midi_timeline.duration_ms,
-            true)) {
-        (void)stop_midi_audio(true, "midi_start_failed");
-        set_player_loading_ui("MIDI音频启动失败", "AudioTask未能接管MIDI Synth");
-        ESP_LOGE(TAG, "MIDI Synth启动失败：notes=%u duration=%lums",
-            static_cast<unsigned>(g_midi_timeline.note_count),
-            static_cast<unsigned long>(g_midi_timeline.duration_ms));
-        return;
-    }
-
-    g_midi_audio_active = true;
-    g_last_waterfall_draw_tick = 0U;
-    g_last_time_label_tick = 0U;
-    g_midi_paused = false;
-    g_midi_eof_action_handled = false;
-    g_page = VisualMusicPage::MidiWaterfall;
-
-    char format[48] = {};
-    snprintf(
-        format,
-        sizeof(format),
-        "MIDI · %u轨",
-        static_cast<unsigned>(g_midi_timeline.track_count));
-    if (g_player_format != nullptr) lv_label_set_text(g_player_format, format);
-    set_visible(g_player_message, false);
-    set_visible(g_player_hint, false);
-    set_visible(g_waterfall_widget, true);
-    set_visible(g_player_time, true);
-    update_midi_time_label();
-    update_player_controls();
-    if (g_waterfall_widget != nullptr) lv_obj_invalidate(g_waterfall_widget);
-    ESP_LOGI(
-        TAG,
-        "MIDI瀑布+音频启动：notes=%u range=%u-%u duration=%lums",
-        static_cast<unsigned>(g_midi_timeline.note_count),
-        static_cast<unsigned>(g_midi_timeline.min_note),
-        static_cast<unsigned>(g_midi_timeline.max_note),
-        static_cast<unsigned long>(g_midi_timeline.duration_ms));
-}
-
 static void show_browser();
-
-static void toggle_midi_playback()
-{
-    if (g_page != VisualMusicPage::MidiWaterfall || !g_midi_audio_active) return;
-    AudioMidiClockSnapshot clock = {};
-    if (!audio_service_midi_get_clock(&clock) || !clock.active) return;
-
-    bool success = false;
-    if (clock.eof) {
-        success = audio_service_midi_restart(true);
-        if (success) g_midi_paused = false;
-    } else if (clock.paused) {
-        success = audio_service_midi_resume(true);
-        if (success) g_midi_paused = false;
-    } else {
-        success = audio_service_midi_pause(true);
-        if (success) g_midi_paused = true;
-    }
-    if (!success) return;
-    g_midi_eof_action_handled = false;
-
-    update_midi_time_label();
-    update_player_controls();
-    if (g_waterfall_widget != nullptr) lv_obj_invalidate(g_waterfall_widget);
-}
 
 static void toggle_nsf_playback()
 {
@@ -1137,7 +902,7 @@ static bool select_playable_index(size_t index)
     const VisualMusicBrowser::EntryIndex *entry = VisualMusicBrowser::entry_at(&g_directory, index);
     const char *name = VisualMusicBrowser::entry_name(&g_directory, index);
     if (entry == nullptr || name == nullptr || VisualMusicBrowser::entry_is_directory(entry) ||
-        (!VisualMusicBrowser::entry_is_midi(entry) && !VisualMusicBrowser::entry_is_nsf(entry)) ||
+        !VisualMusicBrowser::entry_is_nsf(entry) ||
         VisualMusicBrowser::join_child_path(
             g_current_dir,
             name,
@@ -1147,8 +912,7 @@ static bool select_playable_index(size_t index)
     }
 
     g_selected_index = index;
-    if (VisualMusicBrowser::entry_is_midi(entry)) begin_midi_load();
-    else begin_nsf_load();
+    begin_nsf_load();
     return true;
 }
 
@@ -1206,8 +970,7 @@ static void play_clicked_cb(lv_event_t *event)
 {
     if (event == nullptr || lv_event_get_code(event) != LV_EVENT_CLICKED ||
         gesture_router_should_suppress_click()) return;
-    if (g_page == VisualMusicPage::MidiWaterfall) toggle_midi_playback();
-    else if (g_page == VisualMusicPage::NsfReady) toggle_nsf_playback();
+    if (g_page == VisualMusicPage::NsfReady) toggle_nsf_playback();
 }
 
 static void next_clicked_cb(lv_event_t *event)
@@ -1251,7 +1014,7 @@ static void show_status(const char *text, uint32_t color)
 static void update_rows()
 {
     if (g_directory.entries == nullptr || g_directory.count == 0U) {
-        show_status("/synth 中没有 MIDI / NSF", 0x7F8A99);
+        show_status("/synth 中没有 NSF", 0x7F8A99);
         return;
     }
     if (g_browser_status != nullptr) set_visible(g_browser_status, false);
@@ -1280,7 +1043,6 @@ static void update_rows()
         }
 
         const bool is_dir = VisualMusicBrowser::entry_is_directory(entry);
-        const bool is_midi = VisualMusicBrowser::entry_is_midi(entry);
         lv_label_set_text(ui.name, name);
         lv_label_set_text(ui.kind, VisualMusicBrowser::entry_kind_name(entry));
         lv_obj_set_style_text_color(
@@ -1289,7 +1051,7 @@ static void update_rows()
             0);
         lv_obj_set_style_text_color(
             ui.kind,
-            lv_color_hex(is_dir ? 0x6EA5F2 : (is_midi ? 0x77B5FF : 0xC79BFF)),
+            lv_color_hex(is_dir ? 0x6EA5F2 : 0xC79BFF),
             0);
         lv_obj_set_style_bg_color(
             ui.row,
@@ -1443,9 +1205,7 @@ static void browser_load_tick()
 
 static void show_browser()
 {
-    (void)stop_midi_audio(true, "back_to_list");
     (void)stop_nsf_audio(true, "back_to_list");
-    cancel_midi_player();
     cancel_nsf_player();
     g_page = VisualMusicPage::Browser;
     set_visible(g_browser_host, true);
@@ -1528,8 +1288,7 @@ static void row_clicked_cb(lv_event_t *event)
 
     g_selected_index = index;
     snprintf(g_selected_path, VisualMusicBrowser::kPathBytes, "%s", g_scratch_path);
-    if (VisualMusicBrowser::entry_is_midi(entry)) begin_midi_load();
-    else begin_nsf_load();
+    begin_nsf_load();
 }
 
 static void back_clicked_cb(lv_event_t *event)
@@ -1547,49 +1306,7 @@ static void timer_cb(lv_timer_t *timer)
     if (g_root == nullptr || app_manager_foreground() != AppId::Nsf) return;
 
     browser_load_tick();
-    midi_result_tick();
     nsf_result_tick();
-    if (g_page == VisualMusicPage::MidiWaterfall && g_midi_audio_active) {
-        const uint32_t now_tick = static_cast<uint32_t>(lv_tick_get());
-        AudioMidiClockSnapshot clock = {};
-        if (audio_service_midi_get_clock(&clock) && clock.active) {
-            g_midi_paused = clock.paused || clock.eof;
-            if (clock.eof) {
-                // EOF 只消费一次，避免10ms UI timer在最后一曲或异步Restart尚未处理时重复入队。
-                if (!g_midi_eof_action_handled) {
-                    g_midi_eof_action_handled = true;
-                    if (g_loop_mode == PlayerLoopMode::RepeatOne) {
-                        if (audio_service_midi_restart(false)) {
-                            g_midi_paused = false;
-                            g_last_waterfall_draw_tick = 0U;
-                        } else {
-                            g_midi_eof_action_handled = false;
-                        }
-                    } else if (select_adjacent_track(
-                                   +1,
-                                   g_loop_mode == PlayerLoopMode::RepeatAll)) {
-                        return;
-                    }
-                    update_midi_time_label();
-                    update_player_controls();
-                    if (g_waterfall_widget != nullptr) lv_obj_invalidate(g_waterfall_widget);
-                }
-            } else {
-                g_midi_eof_action_handled = false;
-                if (now_tick - g_last_time_label_tick >= kWaterfallTimeLabelPeriodMs) {
-                    g_last_time_label_tick = now_tick;
-                    update_midi_time_label();
-                }
-                if (!clock.paused &&
-                    (g_last_waterfall_draw_tick == 0U ||
-                     now_tick - g_last_waterfall_draw_tick >= kMidiWaterfallFramePeriodMs)) {
-                    g_last_waterfall_draw_tick = now_tick;
-                    if (g_waterfall_widget != nullptr) lv_obj_invalidate(g_waterfall_widget);
-                }
-            }
-        }
-    }
-
     if (g_page == VisualMusicPage::NsfReady && g_nsf_audio_active) {
         const uint32_t now_tick = static_cast<uint32_t>(lv_tick_get());
         AudioNsfClockSnapshot clock = {};
@@ -1717,8 +1434,6 @@ static esp_err_t create_rows()
 static esp_err_t cleanup_create_failure(esp_err_t err)
 {
     cancel_browser_load();
-    (void)stop_midi_audio(true, "create_failure");
-    cancel_midi_player();
     cancel_nsf_player();
     VisualMusicBrowser::release_directory(&g_directory);
     if (g_timer != nullptr) {
@@ -1963,7 +1678,7 @@ static esp_err_t visual_music_create()
     lv_timer_pause(g_timer);
     set_visible(g_root, false);
 
-    ESP_LOGI(TAG, "电子音流 create完成：5-Row Browser + 三段式MIDI Waterfall Player");
+    ESP_LOGI(TAG, "电子音流 create完成：5-Row Browser + 三段式NSF Waterfall Player");
     return ESP_OK;
 }
 
@@ -1971,14 +1686,10 @@ static esp_err_t visual_music_enter()
 {
     if (g_root == nullptr || g_current_dir == nullptr) return ESP_ERR_INVALID_STATE;
 
-    g_midi_audio_active = false;
-    g_music_paused_for_midi = false;
-    g_midi_eof_action_handled = false;
     g_nsf_audio_active = false;
     g_nsf_paused = true;
     g_nsf_failed = false;
     g_music_paused_for_nsf = false;
-    cancel_midi_player();
     cancel_nsf_player();
     g_page = VisualMusicPage::Browser;
     g_selected_path[0] = '\0';
@@ -2001,7 +1712,7 @@ static esp_err_t visual_music_enter()
     begin_browser_load();
     ESP_LOGI(
         TAG,
-        "电子音流进入Foreground：/synth 浏览器已显示；MIDI使用GM-Lite Synth，NSF使用6502/2A03基础5通道");
+        "电子音流进入Foreground：/synth 浏览器已显示；NSF使用6502/2A03基础5通道");
     return ESP_OK;
 }
 
@@ -2009,25 +1720,21 @@ static esp_err_t visual_music_leave(AppRunState next_state)
 {
     (void)next_state;
     cancel_browser_load();
-    if (!stop_midi_audio(true, "app_leave")) return ESP_ERR_INVALID_STATE;
     if (!stop_nsf_audio(true, "app_leave")) return ESP_ERR_INVALID_STATE;
-    cancel_midi_player();
     cancel_nsf_player();
     if (g_timer != nullptr) lv_timer_pause(g_timer);
     gesture_router_reset();
     app_launcher_overlay_hide();
     set_visible(g_root, false);
     g_page = VisualMusicPage::Browser;
-    ESP_LOGI(TAG, "电子音流离开Foreground：MIDI/NSF音频与目录协作任务已停止，进入前Music状态已恢复");
+    ESP_LOGI(TAG, "电子音流离开Foreground：NSF音频与目录协作任务已停止，进入前Music状态已恢复");
     return ESP_OK;
 }
 
 static void visual_music_destroy()
 {
     cancel_browser_load();
-    (void)stop_midi_audio(true, "app_destroy");
     (void)stop_nsf_audio(true, "app_destroy");
-    cancel_midi_player();
     cancel_nsf_player();
     VisualMusicBrowser::release_directory(&g_directory);
     if (g_timer != nullptr) {
@@ -2072,9 +1779,6 @@ static void visual_music_destroy()
     g_first_index = 0U;
     g_selected_index = SIZE_MAX;
     g_loop_mode = PlayerLoopMode::Sequential;
-    g_midi_audio_active = false;
-    g_music_paused_for_midi = false;
-    g_midi_eof_action_handled = false;
     g_nsf_audio_active = false;
     g_nsf_paused = true;
     g_nsf_failed = false;
@@ -2087,8 +1791,6 @@ static void visual_music_destroy()
 
 esp_err_t visual_music_app_register()
 {
-    const esp_err_t midi_ret = VisualMusicMidi::init();
-    if (midi_ret != ESP_OK) return midi_ret;
     const esp_err_t nsf_ret = VisualMusicNsf::init();
     if (nsf_ret != ESP_OK) return nsf_ret;
 
@@ -2103,7 +1805,7 @@ esp_err_t visual_music_app_register()
 
     const esp_err_t ret = app_manager_register(descriptor);
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "电子音流 APP已注册：MIDI Synth/Waterfall + NSF 6502/2A03 + 统一AppManager生命周期");
+        ESP_LOGI(TAG, "电子音流 APP已注册：NSF 6502/2A03 + 统一AppManager生命周期");
     }
     return ret;
 }
