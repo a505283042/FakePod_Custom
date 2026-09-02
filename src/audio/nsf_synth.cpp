@@ -17,7 +17,8 @@ static constexpr uint32_t kInitInstructionLimit = 2000000U;
 static constexpr uint32_t kPlayInstructionLimit = 250000U;
 static constexpr size_t kWorkRamBytes = 8192U;
 static constexpr size_t kLoopHistoryCapacity = 24576U; // 典型60Hz下约409秒；双历史约192KB PSRAM，仅后台分析实例使用
-static constexpr size_t kVisualTickCapacity = 32U; // 播放路每块通常不到1个PLAY；短暂UI锁竞争时仍有足够余量
+static constexpr size_t kVisualTickCapacity = 32U; // Sequencer 每批及时 drain；保留短暂调度抖动余量
+static constexpr size_t kApuEventCapacity = 4096U; // 每批最多32个PLAY；PSRAM Ring 防止密集寄存器写丢失
 static constexpr uint32_t kLoopDetectMinMs = 8000U;
 static constexpr uint32_t kLoopDetectProbeMs = 1000U;
 static constexpr uint32_t kLoopStructureProbeMs = 1000U;
@@ -177,7 +178,7 @@ struct NsfSynthImpl
     uint8_t *prg = nullptr;       // PSRAM，Synth 独占
     size_t prg_size = 0U;
     uint8_t ram[2048] = {};       // 6502 Zero-page/Stack 热路径留在内部 RAM
-    uint8_t *work_ram = nullptr;  // $6000-$7FFF NSF 工作 RAM，8KB PSRAM
+    uint8_t *work_ram = nullptr;  // $6000-$7FFF NSF 工作 RAM；Sequencer优先internal，回退PSRAM
 
     NsfSynthConfig config = {};
     Cpu6502 cpu = {};
@@ -203,9 +204,13 @@ struct NsfSynthImpl
     bool loop_detected = false;
     uint64_t loop_start_frame = 0ULL;
     uint64_t loop_length_frames = 0ULL;
+    uint32_t loop_start_play_tick = 0U;
+    uint32_t loop_length_play_ticks = 0U;
     bool loop_hint_available = false;
     uint64_t loop_hint_start_frame = 0ULL;
     uint64_t loop_hint_length_frames = 0ULL;
+    uint32_t loop_hint_start_play_tick = 0U;
+    uint32_t loop_hint_length_play_ticks = 0U;
     bool structure_candidate_active = false;
     uint32_t structure_candidate_start = 0U;
     uint32_t structure_candidate_repeat = 0U;
@@ -218,6 +223,13 @@ struct NsfSynthImpl
     NsfSynthVisualTick *visual_ticks = nullptr;
     size_t visual_tick_read = 0U;
     size_t visual_tick_count = 0U;
+
+    // R6：唯一 Sequencer 记录 APU/Bank 写事件；真实播放端不再执行 6502。
+    NsfSynthApuEvent *apu_events = nullptr;
+    size_t apu_event_read = 0U;
+    size_t apu_event_count = 0U;
+    uint16_t event_play_tick = 0U;
+    bool apu_event_overflow = false;
     // 音高换算只在定时器变化时执行；把实时播放路的 log2f 成本限制在音高真正变化时。
     uint16_t visual_pitch_timer[3] = {};
     uint8_t visual_pitch_cache[3] = {};
@@ -228,7 +240,6 @@ struct NsfSynthImpl
     float hp_alpha = 0.0f;
     float lp_alpha = 0.0f;
     uint64_t play_interval_q32 = 0ULL;
-    uint64_t play_phase_q32 = 0ULL;
     uint64_t analysis_position_q32 = 0ULL;
     bool failed = false;
 };
@@ -374,6 +385,8 @@ static bool try_find_structure_fingerprint_hint(NsfSynthImpl *impl, uint32_t cur
                     --repeated;
                 }
                 const uint32_t loop_ticks = repeated - start;
+                impl->loop_hint_start_play_tick = start;
+                impl->loop_hint_length_play_ticks = loop_ticks;
                 impl->loop_hint_start_frame = play_tick_to_frame(impl, start);
                 impl->loop_hint_length_frames = play_tick_to_frame(impl, loop_ticks);
                 impl->loop_hint_available = impl->loop_hint_length_frames > 0ULL;
@@ -504,6 +517,8 @@ static bool try_detect_structure_loop(NsfSynthImpl *impl, uint32_t current)
                    impl->loop_structure_history[loop_start - 1U + period]) {
             --loop_start;
         }
+        impl->loop_start_play_tick = loop_start;
+        impl->loop_length_play_ticks = period;
         impl->loop_start_frame = play_tick_to_frame(impl, loop_start);
         impl->loop_length_frames = play_tick_to_frame(impl, period);
         impl->loop_detected = impl->loop_length_frames > 0ULL;
@@ -534,9 +549,13 @@ static void reset_loop_detector(NsfSynthImpl *impl)
     impl->loop_detected = false;
     impl->loop_start_frame = 0ULL;
     impl->loop_length_frames = 0ULL;
+    impl->loop_start_play_tick = 0U;
+    impl->loop_length_play_ticks = 0U;
     impl->loop_hint_available = false;
     impl->loop_hint_start_frame = 0ULL;
     impl->loop_hint_length_frames = 0ULL;
+    impl->loop_hint_start_play_tick = 0U;
+    impl->loop_hint_length_play_ticks = 0U;
     impl->structure_candidate_active = false;
     impl->structure_candidate_start = 0U;
     impl->structure_candidate_repeat = 0U;
@@ -590,6 +609,8 @@ static void loop_detector_on_play(NsfSynth *synth)
                         --repeated;
                     }
                     const uint32_t loop_ticks = repeated - start;
+                    impl->loop_start_play_tick = start;
+                    impl->loop_length_play_ticks = loop_ticks;
                     impl->loop_start_frame = play_tick_to_frame(impl, start);
                     impl->loop_length_frames = play_tick_to_frame(impl, loop_ticks);
                     impl->loop_detected = impl->loop_length_frames > 0ULL;
@@ -1238,8 +1259,31 @@ static uint8_t memory_read(NsfSynthImpl *impl, uint16_t address)
     return 0U;
 }
 
+static void capture_apu_event(NsfSynthImpl *impl, uint16_t address, uint8_t value)
+{
+    if (impl == nullptr || !impl->config.enable_event_capture || impl->apu_events == nullptr) return;
+    uint8_t target = 0xFFU;
+    if (address >= 0x4000U && address <= 0x4017U) {
+        target = static_cast<uint8_t>(address - 0x4000U);
+    } else if (address >= 0x5FF8U && address <= 0x5FFFU) {
+        target = static_cast<uint8_t>(0x18U + address - 0x5FF8U);
+    } else {
+        return;
+    }
+    if (impl->apu_event_count >= kApuEventCapacity) {
+        impl->apu_event_overflow = true;
+        return;
+    }
+    const size_t write = (impl->apu_event_read + impl->apu_event_count) % kApuEventCapacity;
+    impl->apu_events[write].play_tick = impl->event_play_tick;
+    impl->apu_events[write].target = target;
+    impl->apu_events[write].value = value;
+    ++impl->apu_event_count;
+}
+
 static void memory_write(NsfSynthImpl *impl, uint16_t address, uint8_t value)
 {
+    capture_apu_event(impl, address, value);
     if (address < 0x2000U) {
         impl->ram[address & 0x07FFU] = value;
         return;
@@ -1756,6 +1800,10 @@ static esp_err_t reset_track(NsfSynth *synth, uint8_t track)
     impl->visual_tick_read = 0U;
     impl->visual_tick_count = 0U;
     impl->visual_pitch_valid_mask = 0U;
+    impl->apu_event_read = 0U;
+    impl->apu_event_count = 0U;
+    impl->event_play_tick = 0U;
+    impl->apu_event_overflow = false;
     // NSF1 初始化顺序与硬件播放器保持一致：先清通道，再启用四个基础波形；
     // DMC 由 INIT routine 自己决定是否开启。后台分析实例会同步循环检测所需的寄存器镜像。
     memory_write(impl, 0x4015U, 0x00U);
@@ -1785,7 +1833,6 @@ static esp_err_t reset_track(NsfSynth *synth, uint8_t track)
         (static_cast<long double>(speed_us) * impl->sample_rate_hz * 4294967296.0L) /
         1000000.0L);
     if (impl->play_interval_q32 == 0ULL) impl->play_interval_q32 = 1ULL << 32U;
-    impl->play_phase_q32 = 0ULL;
     impl->analysis_position_q32 = 0ULL;
     impl->failed = false;
     synth->failed = false;
@@ -1798,6 +1845,14 @@ static esp_err_t execute_one_play_call(NsfSynth *synth)
 {
     if (synth == nullptr || synth->impl == nullptr) return ESP_ERR_INVALID_STATE;
     NsfSynthImpl *impl = static_cast<NsfSynthImpl *>(synth->impl);
+    if (impl->config.enable_event_capture) {
+        if (impl->event_play_tick == UINT16_MAX) {
+            impl->failed = true;
+            synth->failed = true;
+            return ESP_ERR_INVALID_SIZE;
+        }
+        ++impl->event_play_tick;
+    }
     if (impl->config.enable_loop_detection || impl->config.enable_visual_capture) {
         impl->play_write_mask = 0U;
     }
@@ -1815,28 +1870,20 @@ static esp_err_t execute_one_play_call(NsfSynth *synth)
         synth->failed = true;
         return ret;
     }
+    if (impl->apu_event_overflow) {
+        impl->failed = true;
+        synth->failed = true;
+        ESP_LOGE(TAG, "NSF APU事件Ring溢出：play_tick=%u capacity=%u",
+            static_cast<unsigned>(impl->event_play_tick),
+            static_cast<unsigned>(kApuEventCapacity));
+        return ESP_ERR_NO_MEM;
+    }
     loop_detector_on_play(synth);
     if (impl->config.enable_visual_capture) capture_visual_tick(synth);
     return ESP_OK;
 }
 
-static esp_err_t run_due_play_calls(NsfSynth *synth)
-{
-    NsfSynthImpl *impl = static_cast<NsfSynthImpl *>(synth->impl);
-    impl->play_phase_q32 += 1ULL << 32U;
-    uint8_t calls = 0U;
-    while (impl->play_phase_q32 >= impl->play_interval_q32) {
-        impl->play_phase_q32 -= impl->play_interval_q32;
-        const esp_err_t ret = execute_one_play_call(synth);
-        if (ret != ESP_OK) return ret;
-        if (++calls >= 4U) {
-            // 单个 PCM sample 正常最多跨过一个 PLAY tick；异常配置下丢弃多余欠账，避免 AudioTask 长时间追帧。
-            impl->play_phase_q32 = 0ULL;
-            break;
-        }
-    }
-    return ESP_OK;
-}
+
 
 
 } // namespace
@@ -1870,10 +1917,19 @@ esp_err_t nsf_synth_open_owned(
     }
     if (impl == nullptr) return ESP_ERR_NO_MEM;
 
-    impl->work_ram = static_cast<uint8_t *>(heap_caps_calloc(
-        1,
-        kWorkRamBytes,
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    // R6 唯一 Sequencer 是 6502 的唯一执行者；其 $6000-$7FFF 工作 RAM 若落在
+    // PSRAM，会让每次 CPU 绝对寻址都付出外部 RAM 延迟。优先用 8KB internal，
+    // 内存不足再回退 PSRAM；Renderer 不走此 open 路径。
+    bool work_ram_internal = false;
+    if (config->enable_event_capture) {
+        impl->work_ram = static_cast<uint8_t *>(heap_caps_calloc(
+            1, kWorkRamBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        work_ram_internal = impl->work_ram != nullptr;
+    }
+    if (impl->work_ram == nullptr) {
+        impl->work_ram = static_cast<uint8_t *>(heap_caps_calloc(
+            1, kWorkRamBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    }
     if (impl->work_ram == nullptr) {
         free(impl);
         return ESP_ERR_NO_MEM;
@@ -1901,6 +1957,20 @@ esp_err_t nsf_synth_open_owned(
             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         if (impl->visual_ticks == nullptr) {
             ESP_LOGW(TAG, "NSF播放瀑布状态PSRAM申请失败：不影响音频播放");
+        }
+    }
+
+    if (config->enable_event_capture) {
+        impl->apu_events = static_cast<NsfSynthApuEvent *>(heap_caps_calloc(
+            kApuEventCapacity, sizeof(NsfSynthApuEvent),
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (impl->apu_events == nullptr) {
+            if (impl->visual_ticks != nullptr) heap_caps_free(impl->visual_ticks);
+            if (impl->loop_history != nullptr) heap_caps_free(impl->loop_history);
+            if (impl->loop_structure_history != nullptr) heap_caps_free(impl->loop_structure_history);
+            if (impl->work_ram != nullptr) heap_caps_free(impl->work_ram);
+            free(impl);
+            return ESP_ERR_NO_MEM;
         }
     }
 
@@ -1937,13 +2007,14 @@ esp_err_t nsf_synth_open_owned(
     }
 
     ESP_LOGI(TAG,
-        "NSF 2A03已打开：track=%u/%u prg=%uB bank=%u speed=%uus rate=%luHz",
+        "NSF 2A03已打开：track=%u/%u prg=%uB bank=%u speed=%uus rate=%luHz workram=%s",
         static_cast<unsigned>(synth->track + 1U),
         static_cast<unsigned>(synth->track_count),
         static_cast<unsigned>(prg_size),
         static_cast<unsigned>(impl->uses_banking),
         static_cast<unsigned>(config->ntsc_speed_us != 0U ? config->ntsc_speed_us : kDefaultNtscSpeedUs),
-        static_cast<unsigned long>(sample_rate_hz));
+        static_cast<unsigned long>(sample_rate_hz),
+        work_ram_internal ? "internal" : "psram");
     return ESP_OK;
 }
 
@@ -1957,84 +2028,10 @@ void nsf_synth_close(NsfSynth *synth)
         if (impl->loop_history != nullptr) heap_caps_free(impl->loop_history);
         if (impl->loop_structure_history != nullptr) heap_caps_free(impl->loop_structure_history);
         if (impl->visual_ticks != nullptr) heap_caps_free(impl->visual_ticks);
+        if (impl->apu_events != nullptr) heap_caps_free(impl->apu_events);
         free(impl);
     }
     *synth = {};
-}
-
-esp_err_t nsf_synth_set_track(NsfSynth *synth, uint8_t track)
-{
-    if (synth == nullptr || !synth->open || synth->impl == nullptr) return ESP_ERR_INVALID_STATE;
-    const esp_err_t ret = reset_track(synth, track);
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "NSF Subsong已重置：track=%u/%u",
-            static_cast<unsigned>(track + 1U),
-            static_cast<unsigned>(synth->track_count));
-    }
-    return ret;
-}
-
-esp_err_t nsf_synth_copy_source(
-    const NsfSynth *synth,
-    uint8_t **out_prg,
-    size_t *out_prg_size,
-    NsfSynthConfig *out_config)
-{
-    if (out_prg == nullptr || out_prg_size == nullptr || out_config == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    *out_prg = nullptr;
-    *out_prg_size = 0U;
-    *out_config = {};
-    if (synth == nullptr || !synth->open || synth->impl == nullptr) return ESP_ERR_INVALID_STATE;
-
-    const NsfSynthImpl *impl = static_cast<const NsfSynthImpl *>(synth->impl);
-    if (impl->prg == nullptr || impl->prg_size == 0U) return ESP_ERR_INVALID_STATE;
-    uint8_t *copy = static_cast<uint8_t *>(heap_caps_malloc(
-        impl->prg_size,
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (copy == nullptr) return ESP_ERR_NO_MEM;
-    memcpy(copy, impl->prg, impl->prg_size);
-
-    *out_prg = copy;
-    *out_prg_size = impl->prg_size;
-    *out_config = impl->config;
-    out_config->track = synth->track;
-    return ESP_OK;
-}
-
-esp_err_t nsf_synth_render_pcm32(
-    NsfSynth *synth,
-    int32_t *out_interleaved_stereo,
-    size_t max_frames,
-    size_t *out_frames)
-{
-    if (out_frames != nullptr) *out_frames = 0U;
-    if (synth == nullptr || out_interleaved_stereo == nullptr || out_frames == nullptr ||
-        max_frames == 0U || !synth->open || synth->impl == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (synth->failed) return ESP_ERR_INVALID_STATE;
-
-    NsfSynthImpl *impl = static_cast<NsfSynthImpl *>(synth->impl);
-    for (size_t frame = 0U; frame < max_frames; ++frame) {
-        const esp_err_t play_ret = run_due_play_calls(synth);
-        if (play_ret != ESP_OK) return play_ret;
-        const int32_t sample = float_to_pcm32(apu_sample(impl));
-        if (impl->config.enable_loop_detection) {
-            if (apu_has_audible_activity(impl->apu)) {
-                impl->analysis_seen_audible = true;
-                impl->analysis_silent_frames = 0ULL;
-            } else if (impl->analysis_seen_audible) {
-                ++impl->analysis_silent_frames;
-            }
-        }
-        out_interleaved_stereo[frame * 2U] = sample;
-        out_interleaved_stereo[frame * 2U + 1U] = sample;
-        ++synth->position_frames;
-    }
-    *out_frames = max_frames;
-    return ESP_OK;
 }
 
 esp_err_t nsf_synth_analyze_play_calls(
@@ -2049,8 +2046,8 @@ esp_err_t nsf_synth_analyze_play_calls(
     }
 
     NsfSynthImpl *impl = static_cast<NsfSynthImpl *>(synth->impl);
-    // R5：同一条 PLAY-driven 快速推进同时服务 duration analysis 和未来音符 preview。
-    // Preview 只开 visual_capture，不需要 loop detector；两者都不应退回 PCM render。
+    // R6：唯一 PLAY-driven Sequencer 同时产出 APU Event、可视事件与 Loop/静音分析。
+    // 这里只推进控制状态并执行6502 PLAY，不生成任何 PCM。
     if (!impl->config.enable_loop_detection && !impl->config.enable_visual_capture) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -2080,8 +2077,8 @@ esp_err_t nsf_synth_analyze_play_calls(
         const bool active_after_play =
             track_activity ? apu_has_audible_activity(impl->apu) : false;
 
-        // 不生成 Pulse/Noise 波形、不跑滤波器、不转换 PCM。自然静音统计只属于
-        // duration analysis；Preview 只取 execute_one_play_call() 生成的 visual tick。
+        // 不生成 Pulse/Noise 波形、不跑滤波器、不转换 PCM；自然静音与瀑布也都
+        // 直接消费这一次 PLAY-driven 推进产生的控制状态。
         if (impl->config.enable_loop_detection) {
             if (active_interval_start || active_before_play || active_after_play) {
                 impl->analysis_seen_audible = true;
@@ -2118,6 +2115,13 @@ uint8_t nsf_synth_track(const NsfSynth *synth)
     return synth != nullptr && synth->open ? synth->track : 0U;
 }
 
+uint16_t nsf_synth_play_tick(const NsfSynth *synth)
+{
+    if (synth == nullptr || !synth->open || synth->impl == nullptr) return 0U;
+    const NsfSynthImpl *impl = static_cast<const NsfSynthImpl *>(synth->impl);
+    return impl->event_play_tick;
+}
+
 bool nsf_synth_get_loop_info(const NsfSynth *synth, NsfSynthLoopInfo *out_info)
 {
     if (out_info == nullptr) return false;
@@ -2130,6 +2134,10 @@ bool nsf_synth_get_loop_info(const NsfSynth *synth, NsfSynthLoopInfo *out_info)
     out_info->hint_available = impl->loop_hint_available;
     out_info->hint_start_frame = impl->loop_hint_start_frame;
     out_info->hint_length_frames = impl->loop_hint_length_frames;
+    out_info->start_play_tick = impl->loop_start_play_tick;
+    out_info->length_play_ticks = impl->loop_length_play_ticks;
+    out_info->hint_start_play_tick = impl->loop_hint_start_play_tick;
+    out_info->hint_length_play_ticks = impl->loop_hint_length_play_ticks;
     return true;
 }
 
@@ -2161,4 +2169,179 @@ size_t nsf_synth_take_visual_ticks(
     }
     impl->visual_tick_count -= count;
     return count;
+}
+
+size_t nsf_synth_take_apu_events(
+    NsfSynth *synth,
+    NsfSynthApuEvent *out_events,
+    size_t capacity)
+{
+    if (synth == nullptr || !synth->open || synth->impl == nullptr ||
+        out_events == nullptr || capacity == 0U) return 0U;
+    NsfSynthImpl *impl = static_cast<NsfSynthImpl *>(synth->impl);
+    if (impl->apu_events == nullptr) return 0U;
+    const size_t count = impl->apu_event_count < capacity ? impl->apu_event_count : capacity;
+    for (size_t i = 0U; i < count; ++i) {
+        out_events[i] = impl->apu_events[impl->apu_event_read];
+        impl->apu_event_read = (impl->apu_event_read + 1U) % kApuEventCapacity;
+    }
+    impl->apu_event_count -= count;
+    return count;
+}
+
+static void renderer_apply_event(NsfSynthImpl *impl, const NsfSynthApuEvent &event)
+{
+    if (impl == nullptr) return;
+    if (event.target <= 0x17U) {
+        apu_write(&impl->apu, static_cast<uint16_t>(0x4000U + event.target), event.value);
+    } else if (event.target <= 0x1FU) {
+        impl->bank[event.target - 0x18U] = event.value;
+    }
+}
+
+esp_err_t nsf_apu_renderer_open_owned(
+    NsfApuRenderer *renderer,
+    uint8_t *owned_prg,
+    size_t prg_size,
+    const NsfSynthConfig *config,
+    uint32_t sample_rate_hz)
+{
+    if (renderer == nullptr || owned_prg == nullptr || prg_size == 0U || config == nullptr ||
+        sample_rate_hz == 0U || config->track_count == 0U || config->track >= config->track_count) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nsf_apu_renderer_close(renderer);
+    NsfSynthImpl *impl = static_cast<NsfSynthImpl *>(heap_caps_calloc(
+        1U, sizeof(NsfSynthImpl), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (impl == nullptr) impl = static_cast<NsfSynthImpl *>(calloc(1U, sizeof(NsfSynthImpl)));
+    if (impl == nullptr) return ESP_ERR_NO_MEM;
+
+    impl->prg = owned_prg;
+    impl->prg_size = prg_size;
+    impl->config = *config;
+    impl->sample_rate_hz = sample_rate_hz;
+    impl->play_speed_us = config->ntsc_speed_us != 0U ? config->ntsc_speed_us : kDefaultNtscSpeedUs;
+    impl->play_interval_q32 = static_cast<uint64_t>(
+        (static_cast<long double>(impl->play_speed_us) * sample_rate_hz * 4294967296.0L) /
+        1000000.0L);
+    if (impl->play_interval_q32 == 0ULL) impl->play_interval_q32 = 1ULL << 32U;
+    impl->load_padding = static_cast<uint16_t>(config->load_address & 0x0FFFU);
+    memcpy(impl->bank, config->banks, sizeof(impl->bank));
+    for (uint8_t bank : config->banks) {
+        if (bank != 0U) { impl->uses_banking = true; break; }
+    }
+    apu_reset(&impl->apu);
+    const float dt = 1.0f / static_cast<float>(sample_rate_hz);
+    const float hp_rc = 1.0f / (kTwoPi * 90.0f);
+    const float lp_rc = 1.0f / (kTwoPi * 14000.0f);
+    impl->hp_alpha = hp_rc / (hp_rc + dt);
+    impl->lp_alpha = dt / (lp_rc + dt);
+
+    renderer->impl = impl;
+    renderer->sample_rate_hz = sample_rate_hz;
+    renderer->position_frames = 0ULL;
+    renderer->track = config->track;
+    renderer->track_count = config->track_count;
+    renderer->open = true;
+    renderer->failed = false;
+    ESP_LOGI(TAG, "NSF APU Event Renderer已打开：track=%u/%u rate=%luHz prg=%uB",
+        static_cast<unsigned>(renderer->track + 1U),
+        static_cast<unsigned>(renderer->track_count),
+        static_cast<unsigned long>(sample_rate_hz),
+        static_cast<unsigned>(prg_size));
+    return ESP_OK;
+}
+
+void nsf_apu_renderer_close(NsfApuRenderer *renderer)
+{
+    if (renderer == nullptr) return;
+    NsfSynthImpl *impl = static_cast<NsfSynthImpl *>(renderer->impl);
+    if (impl != nullptr) {
+        if (impl->prg != nullptr) heap_caps_free(impl->prg);
+        free(impl);
+    }
+    *renderer = {};
+}
+
+esp_err_t nsf_apu_renderer_set_track(NsfApuRenderer *renderer, uint8_t track)
+{
+    if (renderer == nullptr || !renderer->open || renderer->impl == nullptr ||
+        track >= renderer->track_count) return ESP_ERR_INVALID_STATE;
+    NsfSynthImpl *impl = static_cast<NsfSynthImpl *>(renderer->impl);
+    impl->config.track = track;
+    memcpy(impl->bank, impl->config.banks, sizeof(impl->bank));
+    apu_reset(&impl->apu);
+    renderer->position_frames = 0ULL;
+    renderer->track = track;
+    renderer->failed = false;
+    return ESP_OK;
+}
+
+esp_err_t nsf_apu_renderer_copy_source(
+    const NsfApuRenderer *renderer,
+    uint8_t **out_prg,
+    size_t *out_prg_size,
+    NsfSynthConfig *out_config)
+{
+    if (out_prg == nullptr || out_prg_size == nullptr || out_config == nullptr) return ESP_ERR_INVALID_ARG;
+    *out_prg = nullptr;
+    *out_prg_size = 0U;
+    *out_config = {};
+    if (renderer == nullptr || !renderer->open || renderer->impl == nullptr) return ESP_ERR_INVALID_STATE;
+    const NsfSynthImpl *impl = static_cast<const NsfSynthImpl *>(renderer->impl);
+    uint8_t *copy = static_cast<uint8_t *>(heap_caps_malloc(
+        impl->prg_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (copy == nullptr) return ESP_ERR_NO_MEM;
+    memcpy(copy, impl->prg, impl->prg_size);
+    *out_prg = copy;
+    *out_prg_size = impl->prg_size;
+    *out_config = impl->config;
+    out_config->track = renderer->track;
+    return ESP_OK;
+}
+
+esp_err_t nsf_apu_renderer_render_pcm32(
+    NsfApuRenderer *renderer,
+    const NsfSynthApuEvent *events,
+    size_t event_count,
+    int32_t *out_interleaved_stereo,
+    size_t max_frames,
+    size_t *out_frames,
+    size_t *out_events_consumed)
+{
+    if (out_frames != nullptr) *out_frames = 0U;
+    if (out_events_consumed != nullptr) *out_events_consumed = 0U;
+    if (renderer == nullptr || !renderer->open || renderer->impl == nullptr ||
+        out_interleaved_stereo == nullptr || out_frames == nullptr ||
+        out_events_consumed == nullptr || max_frames == 0U ||
+        (event_count > 0U && events == nullptr)) return ESP_ERR_INVALID_ARG;
+
+    NsfSynthImpl *impl = static_cast<NsfSynthImpl *>(renderer->impl);
+    size_t event_index = 0U;
+    for (size_t frame = 0U; frame < max_frames; ++frame) {
+        while (event_index < event_count) {
+            const uint64_t event_frame =
+                play_tick_to_frame(impl, events[event_index].play_tick);
+            if (event_frame > renderer->position_frames) break;
+            renderer_apply_event(impl, events[event_index]);
+            ++event_index;
+        }
+        const int32_t sample = float_to_pcm32(apu_sample(impl));
+        out_interleaved_stereo[frame * 2U] = sample;
+        out_interleaved_stereo[frame * 2U + 1U] = sample;
+        ++renderer->position_frames;
+    }
+    *out_frames = max_frames;
+    *out_events_consumed = event_index;
+    return ESP_OK;
+}
+
+bool nsf_apu_renderer_is_open(const NsfApuRenderer *renderer)
+{
+    return renderer != nullptr && renderer->open && renderer->impl != nullptr;
+}
+
+uint64_t nsf_apu_renderer_position_frames(const NsfApuRenderer *renderer)
+{
+    return renderer != nullptr ? renderer->position_frames : 0ULL;
 }

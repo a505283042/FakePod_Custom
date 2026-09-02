@@ -79,8 +79,9 @@ struct AudioVideoClockSnapshot
 };
 bool audio_service_video_mp3_get_clock(AudioVideoClockSnapshot *out_snapshot);
 
-// VM10：传统 NESM NSF 由 AudioTask 内置 6502/2A03 Core 产出 48kHz stereo PCM。
-// prg 会在提交时复制到 AudioTask 自有 PSRAM；第一阶段只支持 NTSC + 基础五通道。
+// R6：传统 NESM NSF 只由唯一后台 6502 Sequencer 执行 INIT/PLAY；AudioTask
+// 消费同源 APU/Bank Event Timeline，经轻量 2A03 Renderer 产出 48kHz stereo PCM。
+// prg 会复制到音频服务自有内存；当前仍只支持 NTSC + 基础五通道。
 bool audio_service_nsf_start(
     const uint8_t *prg,
     size_t prg_size,
@@ -137,7 +138,8 @@ struct AudioNsfVisualEvent
 };
 static_assert(sizeof(AudioNsfVisualEvent) == 12U, "AudioNsfVisualEvent must remain compact");
 
-// 复制当前 NSF 真实播放路在给定时间窗内的瀑布事件；用于“正在播/刚播过”的严格同步部分。
+// R6：复制唯一 NSF Sequencer 生成的可视事件时间线。PCM Renderer 与瀑布消费同一扫描结果，
+// 因此“当前/刚播过”不再由另一套 6502/视觉捕获链重复计算。
 size_t audio_service_nsf_copy_visual_events(
     uint8_t track,
     uint32_t window_start_ms,
@@ -145,8 +147,8 @@ size_t audio_service_nsf_copy_visual_events(
     AudioNsfVisualEvent *out_events,
     size_t capacity);
 
-// 复制独立 NsfPreviewTask 预读的未来音符。事件使用曲目绝对毫秒时间戳；UI 必须仍以真实 I2S position_ms 对齐，
-// 预读任务只维持约4~5秒领先，不参与 Loop/时长分析，也不得作为当前播放时间。
+// 兼容接口：复制同一个 NSF Sequencer 的可视事件。Strict Loop 后只保存 Intro + canonical Loop，
+// 查询更远未来时按绝对毫秒临时映射；UI 始终以真实 I2S position_ms 对齐。
 size_t audio_service_nsf_copy_lookahead_events(
     uint8_t track,
     uint32_t window_start_ms,

@@ -540,23 +540,14 @@ static void waterfall_draw_cb(lv_event_t *event)
     const uint32_t future_end = UINT32_MAX - now_ms < future_ms
         ? UINT32_MAX
         : now_ms + future_ms;
-    // R5：播放线以下/当前音符永远以真实 AudioTask 为准；未来区才消费 Preview。
-    // 旧逻辑只要 Preview 有任意数据就完全替代实时路，而且 Preview 未就绪时只查 now~now，
-    // 8fps 下短音符很容易刚好错过，表现成“时长出来前整个瀑布是空的”。
-    size_t count = audio_service_nsf_copy_visual_events(
+    // R6：PCM、当前音符和未来音符全部消费同一个 Sequencer Timeline。
+    // 一次复制覆盖历史+未来窗口，避免 UI 对同一份大时间线做两次扫描。
+    const size_t count = audio_service_nsf_copy_visual_events(
         g_nsf_track,
         history_start,
-        now_ms,
+        future_end,
         g_nsf_visual_window,
         kNsfVisualWindowCapacity);
-    if (count < kNsfVisualWindowCapacity && now_ms < UINT32_MAX) {
-        count += audio_service_nsf_copy_lookahead_events(
-            g_nsf_track,
-            now_ms + 1U,
-            future_end,
-            g_nsf_visual_window + count,
-            kNsfVisualWindowCapacity - count);
-    }
     for (size_t i = 0U; i < count; ++i) {
         const AudioNsfVisualEvent &note = g_nsf_visual_window[i];
         if (note.end_ms < note.start_ms || note.end_ms < history_start) continue;
