@@ -20,9 +20,15 @@ static constexpr size_t kLoopHistoryCapacity = 24576U; // 典型60Hz下约409秒
 static constexpr size_t kVisualTickCapacity = 32U; // 播放路每块通常不到1个PLAY；短暂UI锁竞争时仍有足够余量
 static constexpr uint32_t kLoopDetectMinMs = 8000U;
 static constexpr uint32_t kLoopDetectProbeMs = 1000U;
-static constexpr uint32_t kLoopStructureProbeMs = 2000U;
+static constexpr uint32_t kLoopStructureProbeMs = 1000U;
+// R4：结构 Loop 不再要求完整重复第二/第三整轮。
+// 固定窗口至少覆盖 96 个 PLAY 状态且不少于 4 秒；首次命中后再向后 4 秒验证第二锚点。
+static constexpr uint32_t kLoopFingerprintMinTicks = 96U;
+static constexpr uint32_t kLoopFingerprintMinSpanMs = 4000U;
+static constexpr uint32_t kLoopFingerprintVerifyOffsetMs = 4000U;
 static constexpr uint32_t kLoopStructureVerifyMs = 90000U;
-static constexpr uint32_t kLoopDetectMaxSearchMs = 150000U; // 覆盖较长BGM循环；后台需再完整验证一轮
+static constexpr uint32_t kLoopStructureFinalProbeMs = 5000U;
+static constexpr uint32_t kLoopDetectMaxSearchMs = 150000U; // 覆盖较长BGM循环候选搜索
 static constexpr uint16_t kLoopDetectMinTransitions = 4U;
 static constexpr uint16_t kReturnSentinel = 0xFFFFU;
 static constexpr float kTwoPi = 6.28318530718f;
@@ -200,6 +206,9 @@ struct NsfSynthImpl
     bool loop_hint_available = false;
     uint64_t loop_hint_start_frame = 0ULL;
     uint64_t loop_hint_length_frames = 0ULL;
+    bool structure_candidate_active = false;
+    uint32_t structure_candidate_start = 0U;
+    uint32_t structure_candidate_repeat = 0U;
 
     // 后台时长分析同时跟踪自然静音；实时48kHz实例不开启该统计。
     bool analysis_seen_audible = false;
@@ -220,6 +229,7 @@ struct NsfSynthImpl
     float lp_alpha = 0.0f;
     uint64_t play_interval_q32 = 0ULL;
     uint64_t play_phase_q32 = 0ULL;
+    uint64_t analysis_position_q32 = 0ULL;
     bool failed = false;
 };
 
@@ -299,62 +309,131 @@ static uint32_t build_structure_signature(const NsfSynthImpl *impl)
     return hash;
 }
 
-static bool try_find_structure_loop_hint(NsfSynthImpl *impl, uint32_t current)
+static uint32_t structure_fingerprint_window_ticks(const NsfSynthImpl *impl)
+{
+    uint32_t ticks = play_ticks_for_ms(impl, kLoopFingerprintMinSpanMs);
+    if (ticks < kLoopFingerprintMinTicks) ticks = kLoopFingerprintMinTicks;
+    return ticks;
+}
+
+static bool structure_window_equal(
+    const NsfSynthImpl *impl,
+    uint32_t first,
+    uint32_t second,
+    uint32_t ticks,
+    uint16_t *out_transitions)
+{
+    if (out_transitions != nullptr) *out_transitions = 0U;
+    if (impl == nullptr || impl->loop_structure_history == nullptr || ticks == 0U) return false;
+
+    uint16_t transitions = 0U;
+    for (uint32_t i = 0U; i < ticks; ++i) {
+        const uint32_t expected = impl->loop_structure_history[first + i];
+        if (expected != impl->loop_structure_history[second + i]) return false;
+        if (i > 0U && expected != impl->loop_structure_history[first + i - 1U] &&
+            transitions != UINT16_MAX) {
+            ++transitions;
+        }
+    }
+    if (out_transitions != nullptr) *out_transitions = transitions;
+    return true;
+}
+
+static bool try_find_structure_fingerprint_hint(NsfSynthImpl *impl, uint32_t current)
 {
     if (impl == nullptr || impl->loop_structure_history == nullptr ||
         impl->loop_hint_available || current < 2U) {
         return false;
     }
 
-    const uint32_t probe_ticks = play_ticks_for_ms(impl, kLoopStructureProbeMs);
-    if (probe_ticks == 0U || (current % probe_ticks) != 0U) return false;
+    const uint32_t window_ticks = structure_fingerprint_window_ticks(impl);
+    const uint32_t verify_offset_ticks =
+        play_ticks_for_ms(impl, kLoopFingerprintVerifyOffsetMs);
+    const uint32_t count = current + 1U;
 
+    // 已找到第一锚点 A/A' 后，只需等待固定偏移处的 B' 窗口完整出现。
+    if (impl->structure_candidate_active) {
+        const uint64_t verify_end64 =
+            static_cast<uint64_t>(impl->structure_candidate_repeat) +
+            verify_offset_ticks + window_ticks;
+        if (verify_end64 <= count) {
+            uint16_t transitions = 0U;
+            const bool same = structure_window_equal(
+                impl,
+                impl->structure_candidate_start + verify_offset_ticks,
+                impl->structure_candidate_repeat + verify_offset_ticks,
+                window_ticks,
+                &transitions);
+            if (same && transitions >= kLoopDetectMinTransitions) {
+                uint32_t start = impl->structure_candidate_start;
+                uint32_t repeated = impl->structure_candidate_repeat;
+                while (start > 0U && repeated > 0U &&
+                       impl->loop_structure_history[start - 1U] ==
+                           impl->loop_structure_history[repeated - 1U]) {
+                    --start;
+                    --repeated;
+                }
+                const uint32_t loop_ticks = repeated - start;
+                impl->loop_hint_start_frame = play_tick_to_frame(impl, start);
+                impl->loop_hint_length_frames = play_tick_to_frame(impl, loop_ticks);
+                impl->loop_hint_available = impl->loop_hint_length_frames > 0ULL;
+                if (impl->loop_hint_available) {
+                    ESP_LOGI(TAG,
+                        "NSF循环候选已识别：start=%llums loop=%llums verified=fixed_windows window=%lums offset=%lums signatures=%lu",
+                        static_cast<unsigned long long>(
+                            impl->loop_hint_start_frame * 1000ULL / impl->sample_rate_hz),
+                        static_cast<unsigned long long>(
+                            impl->loop_hint_length_frames * 1000ULL / impl->sample_rate_hz),
+                        static_cast<unsigned long>(
+                            window_ticks * impl->play_speed_us / 1000U),
+                        static_cast<unsigned long>(
+                            verify_offset_ticks * impl->play_speed_us / 1000U),
+                        static_cast<unsigned long>(impl->loop_history_count));
+                }
+                impl->structure_candidate_active = false;
+                return impl->loop_hint_available;
+            }
+            // 第一锚点只是局部重复，不保留错误候选；继续寻找下一组 A/A'。
+            impl->structure_candidate_active = false;
+        }
+        return false;
+    }
+
+    const uint32_t probe_ticks = play_ticks_for_ms(impl, kLoopStructureProbeMs);
+    if (probe_ticks == 0U || (current % probe_ticks) != 0U || count < window_ticks) return false;
+
+    const uint32_t repeat_start = count - window_ticks;
     const uint32_t min_loop_ticks = play_ticks_for_ms(impl, kLoopDetectMinMs);
     const uint32_t max_loop_ticks = play_ticks_for_ms(impl, kLoopDetectMaxSearchMs);
-    const uint32_t count = current + 1U;
-    uint32_t max_period = count / 2U;
-    if (max_period > max_loop_ticks) max_period = max_loop_ticks;
-    if (max_period < min_loop_ticks) return false;
+    if (repeat_start < min_loop_ticks) return false;
 
-    // UI 时长提示只要求两个完整结构周期一致；真正 EOF 仍由三轮/90秒验证后的 detected 结果决定。
-    for (uint32_t period = min_loop_ticks; period <= max_period; ++period) {
-        const uint32_t start = count - period * 2U;
-        const uint32_t middle = period / 2U;
-        const uint32_t last = period - 1U;
-        if (impl->loop_structure_history[start] !=
-                impl->loop_structure_history[start + period] ||
-            impl->loop_structure_history[start + middle] !=
-                impl->loop_structure_history[start + period + middle] ||
-            impl->loop_structure_history[start + last] !=
-                impl->loop_structure_history[start + period + last]) {
-            continue;
-        }
+    const uint32_t newest_candidate = repeat_start - min_loop_ticks;
+    const uint32_t oldest_candidate = repeat_start > max_loop_ticks
+        ? repeat_start - max_loop_ticks
+        : 0U;
+    const uint32_t middle = window_ticks / 2U;
+    const uint32_t last = window_ticks - 1U;
 
-        uint16_t transitions = 0U;
-        bool same = true;
-        for (uint32_t i = 0U; i < period; ++i) {
-            const uint32_t expected = impl->loop_structure_history[start + i];
-            if (expected != impl->loop_structure_history[start + period + i]) {
-                same = false;
+    // 从最近的合法周期向前搜索。先比较三个种子点，命中后只核验固定窗口，
+    // 不再把 candidate_period 个状态完整比较一整轮。
+    for (uint32_t candidate = newest_candidate;; --candidate) {
+        if (impl->loop_structure_history[candidate] ==
+                impl->loop_structure_history[repeat_start] &&
+            impl->loop_structure_history[candidate + middle] ==
+                impl->loop_structure_history[repeat_start + middle] &&
+            impl->loop_structure_history[candidate + last] ==
+                impl->loop_structure_history[repeat_start + last]) {
+            uint16_t transitions = 0U;
+            if (structure_window_equal(
+                    impl, candidate, repeat_start, window_ticks, &transitions) &&
+                transitions >= kLoopDetectMinTransitions) {
+                impl->structure_candidate_active = true;
+                impl->structure_candidate_start = candidate;
+                impl->structure_candidate_repeat = repeat_start;
                 break;
             }
-            if (i > 0U && expected != impl->loop_structure_history[start + i - 1U] &&
-                transitions != UINT16_MAX) {
-                ++transitions;
-            }
         }
-        if (!same || transitions < kLoopDetectMinTransitions) continue;
-
-        uint32_t loop_start = start;
-        while (loop_start > 0U &&
-               impl->loop_structure_history[loop_start - 1U] ==
-                   impl->loop_structure_history[loop_start - 1U + period]) {
-            --loop_start;
-        }
-        impl->loop_hint_start_frame = play_tick_to_frame(impl, loop_start);
-        impl->loop_hint_length_frames = play_tick_to_frame(impl, period);
-        impl->loop_hint_available = impl->loop_hint_length_frames > 0ULL;
-        return impl->loop_hint_available;
+        if (candidate == oldest_candidate) break;
     }
     return false;
 }
@@ -363,7 +442,7 @@ static bool try_detect_structure_loop(NsfSynthImpl *impl, uint32_t current)
 {
     if (impl == nullptr || impl->loop_structure_history == nullptr || current < 2U) return false;
 
-    const uint32_t probe_ticks = play_ticks_for_ms(impl, kLoopStructureProbeMs);
+    const uint32_t probe_ticks = play_ticks_for_ms(impl, kLoopStructureFinalProbeMs);
     if (probe_ticks == 0U || (current % probe_ticks) != 0U) return false;
 
     const uint32_t min_loop_ticks = play_ticks_for_ms(impl, kLoopDetectMinMs);
@@ -376,7 +455,8 @@ static bool try_detect_structure_loop(NsfSynthImpl *impl, uint32_t current)
     if (max_period > max_loop_ticks) max_period = max_loop_ticks;
     if (max_period < min_loop_ticks) return false;
 
-    // 第二级检测要求至少覆盖90秒且不少于三整轮。短乐句必须连续重复更多轮，避免误认成整曲 Loop。
+    // 最终 EOF 仍保留 R1 的严格语义：至少90秒且不少于三整轮。
+    // R4 固定窗口只负责提前给 UI duration hint，不直接截断 Track。
     for (uint32_t period = min_loop_ticks; period <= max_period; ++period) {
         uint32_t repeats = (verify_ticks + period - 1U) / period;
         if (repeats < 3U) repeats = 3U;
@@ -457,6 +537,9 @@ static void reset_loop_detector(NsfSynthImpl *impl)
     impl->loop_hint_available = false;
     impl->loop_hint_start_frame = 0ULL;
     impl->loop_hint_length_frames = 0ULL;
+    impl->structure_candidate_active = false;
+    impl->structure_candidate_start = 0U;
+    impl->structure_candidate_repeat = 0U;
 }
 
 static void loop_detector_on_play(NsfSynth *synth)
@@ -476,9 +559,8 @@ static void loop_detector_on_play(NsfSynth *synth)
     }
     ++impl->loop_history_count;
 
-    // 两个完整结构周期一致时先提供 UI 时长提示；自动结束仍等待更严格的最终确认。
-    (void)try_find_structure_loop_hint(impl, current);
-    // 第二级结构检测有独立5秒探测节奏，不能受严格检测的1秒取整周期约束。
+    // R4：固定窗口 + 第二锚点先给 duration hint；最终 EOF 仍由严格检测确认。
+    (void)try_find_structure_fingerprint_hint(impl, current);
     if (try_detect_structure_loop(impl, current)) return;
 
     const uint32_t min_loop_ticks = play_ticks_for_ms(impl, kLoopDetectMinMs);
@@ -651,6 +733,42 @@ static void apu_half_frame(NesApu *apu)
     clock_length(&apu->noise.length, apu->noise.envelope.loop);
     pulse_sweep_clock(&apu->pulse[0], true);
     pulse_sweep_clock(&apu->pulse[1], false);
+}
+
+static void apu_advance_frame_sequencer(NesApu *apu, float quarter_ticks)
+{
+    if (apu == nullptr || quarter_ticks <= 0.0f) return;
+    apu->quarter_phase += quarter_ticks;
+    while (apu->quarter_phase >= 1.0f) {
+        apu->quarter_phase -= 1.0f;
+        if ((apu->frame_counter & 0x80U) != 0U) {
+            // 5-step：Q, Q+H, Q, -, Q+H。
+            switch (apu->quarter_step) {
+                case 0U:
+                    apu_quarter_frame(apu);
+                    break;
+                case 1U:
+                    apu_quarter_frame(apu);
+                    apu_half_frame(apu);
+                    break;
+                case 2U:
+                    apu_quarter_frame(apu);
+                    break;
+                case 3U:
+                    break;
+                default:
+                    apu_quarter_frame(apu);
+                    apu_half_frame(apu);
+                    break;
+            }
+            apu->quarter_step = (apu->quarter_step + 1U) % 5U;
+        } else {
+            // 4-step：Q, Q+H, Q, Q+H；IRQ 在 NSF1 基础播放器中不参与。
+            apu_quarter_frame(apu);
+            if ((apu->quarter_step & 1U) != 0U) apu_half_frame(apu);
+            apu->quarter_step = (apu->quarter_step + 1U) & 0x03U;
+        }
+    }
 }
 
 static void apu_reset(NesApu *apu)
@@ -874,6 +992,53 @@ static bool apu_has_audible_activity(const NesApu &apu)
     return dmc.enabled && (!dmc.silence || dmc.bytes_remaining > 0U || dmc.bits_remaining > 0U);
 }
 
+static void dmc_fast_advance_analysis(NsfSynthImpl *impl, uint32_t interval_us)
+{
+    if (impl == nullptr || interval_us == 0U) return;
+    DmcChannel &dmc = impl->apu.dmc;
+    if (!dmc.enabled) return;
+
+    const float dmc_hz = kNtscCpuHz /
+        static_cast<float>(kDmcPeriodNtsc[dmc.rate_index]);
+    dmc.phase += dmc_hz * static_cast<float>(interval_us) / 1000000.0f;
+    const uint32_t clocks = static_cast<uint32_t>(dmc.phase);
+    dmc.phase -= static_cast<float>(clocks);
+    if (clocks == 0U) return;
+
+    uint64_t remaining_bits =
+        static_cast<uint64_t>(dmc.bytes_remaining) * 8ULL + dmc.bits_remaining;
+    const uint64_t sample_bits =
+        (static_cast<uint64_t>(dmc.sample_length_reg) * 16ULL + 1ULL) * 8ULL;
+    if (remaining_bits == 0ULL && dmc.loop) remaining_bits = sample_bits;
+
+    if (dmc.loop && sample_bits > 0ULL) {
+        uint64_t consume = clocks;
+        if (consume >= remaining_bits) {
+            consume -= remaining_bits;
+            consume %= sample_bits;
+            remaining_bits = sample_bits - consume;
+            if (remaining_bits == 0ULL) remaining_bits = sample_bits;
+        } else {
+            remaining_bits -= consume;
+        }
+    } else {
+        remaining_bits = clocks >= remaining_bits ? 0ULL : remaining_bits - clocks;
+    }
+
+    dmc.bytes_remaining = static_cast<uint16_t>(remaining_bits / 8ULL);
+    dmc.bits_remaining = static_cast<uint8_t>(remaining_bits % 8ULL);
+    dmc.silence = remaining_bits == 0ULL;
+}
+
+static void apu_fast_advance_analysis_interval(NsfSynthImpl *impl)
+{
+    if (impl == nullptr || impl->play_speed_us == 0U) return;
+    apu_advance_frame_sequencer(
+        &impl->apu,
+        240.0f * static_cast<float>(impl->play_speed_us) / 1000000.0f);
+    dmc_fast_advance_analysis(impl, impl->play_speed_us);
+}
+
 static bool pulse_has_audible_activity(const PulseChannel &pulse, bool first_channel)
 {
     if (!pulse.enabled || pulse.length == 0U || pulse.timer < 8U ||
@@ -996,39 +1161,8 @@ static float apu_sample(NsfSynthImpl *impl)
     NesApu &apu = impl->apu;
     const uint32_t rate = impl->sample_rate_hz;
 
-    // Frame Counter 的基础事件间隔约为 240Hz。4-step 每个槽都有 quarter event，
-    // 5-step 则包含一个空槽；不能简单仍按 240/120Hz，否则 Envelope/Length/Sweep 会偏快。
-    apu.quarter_phase += 240.0f / static_cast<float>(rate);
-    while (apu.quarter_phase >= 1.0f) {
-        apu.quarter_phase -= 1.0f;
-        if ((apu.frame_counter & 0x80U) != 0U) {
-            // 5-step：Q, Q+H, Q, -, Q+H。时序按 PCM sample 边界近似，保持平均更新率正确。
-            switch (apu.quarter_step) {
-                case 0U:
-                    apu_quarter_frame(&apu);
-                    break;
-                case 1U:
-                    apu_quarter_frame(&apu);
-                    apu_half_frame(&apu);
-                    break;
-                case 2U:
-                    apu_quarter_frame(&apu);
-                    break;
-                case 3U:
-                    break;
-                default:
-                    apu_quarter_frame(&apu);
-                    apu_half_frame(&apu);
-                    break;
-            }
-            apu.quarter_step = (apu.quarter_step + 1U) % 5U;
-        } else {
-            // 4-step：Q, Q+H, Q, Q+H；IRQ 在 NSF1 基础播放器中不参与。
-            apu_quarter_frame(&apu);
-            if ((apu.quarter_step & 1U) != 0U) apu_half_frame(&apu);
-            apu.quarter_step = (apu.quarter_step + 1U) & 0x03U;
-        }
-    }
+    // Frame Counter 的基础事件间隔约为 240Hz；共享推进器也供 PLAY-driven 分析路径使用。
+    apu_advance_frame_sequencer(&apu, 240.0f / static_cast<float>(rate));
 
     DmcChannel &dmc = apu.dmc;
     if (dmc.enabled) {
@@ -1652,10 +1786,37 @@ static esp_err_t reset_track(NsfSynth *synth, uint8_t track)
         1000000.0L);
     if (impl->play_interval_q32 == 0ULL) impl->play_interval_q32 = 1ULL << 32U;
     impl->play_phase_q32 = 0ULL;
+    impl->analysis_position_q32 = 0ULL;
     impl->failed = false;
     synth->failed = false;
     synth->track = track;
     synth->position_frames = 0ULL;
+    return ESP_OK;
+}
+
+static esp_err_t execute_one_play_call(NsfSynth *synth)
+{
+    if (synth == nullptr || synth->impl == nullptr) return ESP_ERR_INVALID_STATE;
+    NsfSynthImpl *impl = static_cast<NsfSynthImpl *>(synth->impl);
+    if (impl->config.enable_loop_detection || impl->config.enable_visual_capture) {
+        impl->play_write_mask = 0U;
+    }
+    const esp_err_t ret = cpu_call(
+        impl,
+        impl->config.play_address,
+        0U,
+        0U,
+        0U,
+        false,
+        kPlayInstructionLimit,
+        "PLAY");
+    if (ret != ESP_OK) {
+        impl->failed = true;
+        synth->failed = true;
+        return ret;
+    }
+    loop_detector_on_play(synth);
+    if (impl->config.enable_visual_capture) capture_visual_tick(synth);
     return ESP_OK;
 }
 
@@ -1666,27 +1827,8 @@ static esp_err_t run_due_play_calls(NsfSynth *synth)
     uint8_t calls = 0U;
     while (impl->play_phase_q32 >= impl->play_interval_q32) {
         impl->play_phase_q32 -= impl->play_interval_q32;
-        if (impl->config.enable_loop_detection || impl->config.enable_visual_capture) {
-            impl->play_write_mask = 0U;
-        }
-        const esp_err_t ret = cpu_call(
-            impl,
-            impl->config.play_address,
-            0U,
-            0U,
-            0U,
-            false,
-            kPlayInstructionLimit,
-            "PLAY");
-        if (ret != ESP_OK) {
-            impl->failed = true;
-            synth->failed = true;
-            return ret;
-        }
-        loop_detector_on_play(synth);
-        if (impl->config.enable_visual_capture) {
-            capture_visual_tick(synth);
-        }
+        const esp_err_t ret = execute_one_play_call(synth);
+        if (ret != ESP_OK) return ret;
         if (++calls >= 4U) {
             // 单个 PCM sample 正常最多跨过一个 PLAY tick；异常配置下丢弃多余欠账，避免 AudioTask 长时间追帧。
             impl->play_phase_q32 = 0ULL;
@@ -1695,6 +1837,7 @@ static esp_err_t run_due_play_calls(NsfSynth *synth)
     }
     return ESP_OK;
 }
+
 
 } // namespace
 
@@ -1891,6 +2034,56 @@ esp_err_t nsf_synth_render_pcm32(
         ++synth->position_frames;
     }
     *out_frames = max_frames;
+    return ESP_OK;
+}
+
+esp_err_t nsf_synth_analyze_play_calls(
+    NsfSynth *synth,
+    size_t max_calls,
+    size_t *out_calls)
+{
+    if (out_calls != nullptr) *out_calls = 0U;
+    if (synth == nullptr || out_calls == nullptr || max_calls == 0U ||
+        !synth->open || synth->impl == nullptr || synth->failed) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    NsfSynthImpl *impl = static_cast<NsfSynthImpl *>(synth->impl);
+    if (!impl->config.enable_loop_detection) return ESP_ERR_INVALID_STATE;
+
+    size_t calls = 0U;
+    while (calls < max_calls) {
+        // 真实渲染路径是在约16.6ms PLAY 周期到点后才调用 PLAY。快速分析也先推进
+        // Envelope/Length/DMC 控制状态，再执行下一次 PLAY，避免 INIT 后首帧状态偏移。
+        const bool active_interval_start = apu_has_audible_activity(impl->apu);
+        apu_fast_advance_analysis_interval(impl);
+        const bool active_before_play = apu_has_audible_activity(impl->apu);
+
+        const uint64_t previous_frames = impl->analysis_position_q32 >> 32U;
+        impl->analysis_position_q32 += impl->play_interval_q32;
+        const uint64_t current_frames = impl->analysis_position_q32 >> 32U;
+        synth->position_frames = current_frames;
+        const uint64_t advanced_frames = current_frames >= previous_frames
+            ? current_frames - previous_frames
+            : 0ULL;
+
+        const esp_err_t ret = execute_one_play_call(synth);
+        if (ret != ESP_OK) return ret;
+        const bool active_after_play = apu_has_audible_activity(impl->apu);
+
+        // 不生成 Pulse/Noise 波形、不跑滤波器、不转换 PCM；自然静音只按 PLAY 周期
+        // 累计，误差上限约一个 NSF PLAY 周期。
+        if (active_interval_start || active_before_play || active_after_play) {
+            impl->analysis_seen_audible = true;
+            impl->analysis_silent_frames = 0ULL;
+        } else if (impl->analysis_seen_audible) {
+            impl->analysis_silent_frames += advanced_frames;
+        }
+
+        ++calls;
+        if (impl->loop_detected) break;
+    }
+    *out_calls = calls;
     return ESP_OK;
 }
 

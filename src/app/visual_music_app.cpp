@@ -124,7 +124,9 @@ static uint32_t g_last_waterfall_draw_tick = 0U;
 static bool g_nsf_paused = true;
 static bool g_nsf_audio_active = false;
 static bool g_nsf_eof = false;
-static bool g_nsf_eof_action_handled = false;
+// NSF EOF 按 AudioTask Track 实例 revision 去重，和主 Music playback_revision 采用同一模型。
+// 同一 Subsong RepeatOne reset 后 track 不变，但 revision 会变化，因此不会吞掉新实例的 EOF。
+static uint32_t g_last_nsf_eof_revision = 0U;
 static bool g_nsf_failed = false;
 static bool g_music_paused_for_nsf = false;
 static uint32_t g_last_nsf_time_label_tick = 0U;
@@ -315,7 +317,7 @@ static bool stop_nsf_audio(bool restore_music, const char *reason)
         g_nsf_audio_active = false;
         g_nsf_paused = true;
         g_nsf_eof = false;
-        g_nsf_eof_action_handled = false;
+        g_last_nsf_eof_revision = 0U;
         g_nsf_failed = false;
     }
 
@@ -583,7 +585,7 @@ static void cancel_nsf_player()
     VisualMusicNsf::release_image(&g_nsf_image);
     g_nsf_track = 0U;
     g_nsf_eof = false;
-    g_nsf_eof_action_handled = false;
+    g_last_nsf_eof_revision = 0U;
     g_last_nsf_time_label_tick = 0U;
     g_last_waterfall_draw_tick = 0U;
 }
@@ -750,7 +752,7 @@ static bool start_nsf_audio_from_image()
     g_nsf_audio_active = true;
     g_nsf_paused = false;
     g_nsf_eof = false;
-    g_nsf_eof_action_handled = false;
+    g_last_nsf_eof_revision = 0U;
     g_nsf_failed = false;
     g_last_nsf_time_label_tick = 0U;
     g_last_waterfall_draw_tick = 0U;
@@ -770,7 +772,7 @@ static void begin_nsf_load()
     cancel_nsf_player();
     g_nsf_paused = true;
     g_nsf_eof = false;
-    g_nsf_eof_action_handled = false;
+    g_last_nsf_eof_revision = 0U;
     g_nsf_failed = false;
     g_page = VisualMusicPage::NsfLoading;
     set_visible(g_browser_host, false);
@@ -810,7 +812,7 @@ static void nsf_result_tick()
     g_nsf_track = g_nsf_image.initial_track;
     g_nsf_paused = true;
     g_nsf_eof = false;
-    g_nsf_eof_action_handled = false;
+    g_last_nsf_eof_revision = 0U;
     g_nsf_failed = false;
     g_page = VisualMusicPage::NsfReady;
     update_nsf_ready_ui();
@@ -847,7 +849,7 @@ static bool select_nsf_subsong(int direction, bool allow_wrap)
     if (g_nsf_audio_active && !audio_service_nsf_set_track(next_track, true)) {
         // EOF 自动切歌必须区分“没有下一首”和“AudioTask 切换失败”。
         // 后者允许下一次 timer 重新消费 EOF，避免一次瞬态失败后永久卡在曲尾。
-        if (restarting_from_eof) g_nsf_eof_action_handled = false;
+        if (restarting_from_eof) g_last_nsf_eof_revision = 0U;
         ESP_LOGE(TAG, "NSF Subsong切换失败：track=%u/%u%s",
             static_cast<unsigned>(next_track + 1U),
             static_cast<unsigned>(g_nsf_image.track_count),
@@ -857,7 +859,6 @@ static bool select_nsf_subsong(int direction, bool allow_wrap)
     g_nsf_track = next_track;
     if (restarting_from_eof) g_nsf_paused = false;
     g_nsf_eof = false;
-    g_nsf_eof_action_handled = false;
     g_nsf_failed = false;
     g_last_nsf_time_label_tick = 0U;
     g_last_waterfall_draw_tick = 0U;
@@ -889,7 +890,6 @@ static void toggle_nsf_playback()
         if (success) {
             g_nsf_paused = false;
             g_nsf_eof = false;
-            g_nsf_eof_action_handled = false;
         }
     } else if (clock.paused) {
         success = audio_service_nsf_resume(true);
@@ -1328,16 +1328,20 @@ static void timer_cb(lv_timer_t *timer)
                 update_nsf_ready_ui();
             } else if (clock.eof) {
                 // NSF v1 没有原生 Track 时长：AudioTask 只在 Final 结束计划真正到点后发布 EOF。
-                // UI 只消费一次 EOF，并按当前循环模式切换 Subsong。
-                if (!g_nsf_eof_action_handled) {
-                    g_nsf_eof_action_handled = true;
+                // UI 按 Track 实例 revision 只消费一次 EOF，并按当前循环模式切换 Subsong。
+                if (clock.revision != 0U && clock.revision != g_last_nsf_eof_revision) {
+                    g_last_nsf_eof_revision = clock.revision;
+                    ESP_LOGI(TAG, "NSF EOF消费：track=%u/%u revision=%lu mode=%s",
+                        static_cast<unsigned>(g_nsf_track + 1U),
+                        static_cast<unsigned>(g_nsf_image.track_count),
+                        static_cast<unsigned long>(clock.revision),
+                        loop_mode_text());
                     if (g_loop_mode == PlayerLoopMode::RepeatOne) {
                         // EOF 后重启必须等待 AudioTask 真正完成 reset。异步提交只代表“已入队”，
                         // 底层 mute/INIT/reset 失败时会让 UI 误以为 EOF 已消费并永久卡住。
                         if (audio_service_nsf_set_track(g_nsf_track, true)) {
                             g_nsf_paused = false;
                             g_nsf_eof = false;
-                            g_nsf_eof_action_handled = false;
                             g_last_nsf_time_label_tick = 0U;
                             g_last_waterfall_draw_tick = 0U;
                             if (g_waterfall_widget != nullptr) lv_obj_invalidate(g_waterfall_widget);
@@ -1345,7 +1349,7 @@ static void timer_cb(lv_timer_t *timer)
                                 static_cast<unsigned>(g_nsf_track + 1U),
                                 static_cast<unsigned>(g_nsf_image.track_count));
                         } else {
-                            g_nsf_eof_action_handled = false;
+                            g_last_nsf_eof_revision = 0U;
                             ESP_LOGW(TAG, "NSF RepeatOne重启失败：track=%u/%u；保留EOF供重试",
                                 static_cast<unsigned>(g_nsf_track + 1U),
                                 static_cast<unsigned>(g_nsf_image.track_count));
@@ -1359,7 +1363,6 @@ static void timer_cb(lv_timer_t *timer)
                     update_player_controls();
                 }
             } else {
-                g_nsf_eof_action_handled = false;
                 if (g_last_nsf_time_label_tick == 0U ||
                     now_tick - g_last_nsf_time_label_tick >= kWaterfallTimeLabelPeriodMs) {
                     g_last_nsf_time_label_tick = now_tick;

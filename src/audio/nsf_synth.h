@@ -85,6 +85,13 @@ esp_err_t nsf_synth_render_pcm32(
     size_t max_frames,
     size_t *out_frames);
 
+// R4 后台快速分析：每步直接执行 NSF PLAY，并只推进 Envelope/Length/DMC 等控制状态。
+// 不生成 PCM；虚拟 position_frames 仍按 sample_rate_hz 时间基准累计。
+esp_err_t nsf_synth_analyze_play_calls(
+    NsfSynth *synth,
+    size_t max_calls,
+    size_t *out_calls);
+
 bool nsf_synth_is_open(const NsfSynth *synth);
 bool nsf_synth_has_failed(const NsfSynth *synth);
 uint64_t nsf_synth_position_frames(const NsfSynth *synth);

@@ -244,20 +244,21 @@ static uint64_t g_nsf_end_frame = 0ULL;
 static bool g_nsf_restore_paused_music_hardware = false;
 
 // NSF 时长分析和未来音符预读拆成两个独立低优先级任务，避免任一功能拖住另一条链路。
-static constexpr uint32_t NSF_ANALYSIS_SAMPLE_RATE_HZ = 500U;
+static constexpr uint32_t NSF_ANALYSIS_SAMPLE_RATE_HZ = 500U; // 仅作为虚拟时间基准，不再生成500Hz PCM
 static constexpr uint32_t NSF_ANALYSIS_MAX_MS = NSF_UNKNOWN_HARD_END_MS;
 static constexpr uint32_t NSF_ANALYSIS_SILENCE_VERIFY_MS = 10000U;
-static constexpr size_t NSF_ANALYSIS_RENDER_FRAMES = 64U;
+static constexpr size_t NSF_ANALYSIS_PLAY_BATCH = 32U;
 static constexpr uint32_t NSF_ANALYSIS_TASK_STACK_BYTES = 8192U;
-// CPU0 的 AudioTask(priority=5) 持续出声，后台放在 CPU0 会长期拿不到足够时间片。
-// 分析任务放回 CPU1、priority=1；每个小块后固定休眠2 tick，让 LVGL 和 IDLE1 都有明确运行窗口。
-static constexpr UBaseType_t NSF_ANALYSIS_TASK_PRIORITY = 1U;
+// R4：分析任务在 CPU1 上以 PLAY-driven burst 全速推进。只有连续占用 CPU 超过约100ms 时
+// 才休眠 1 tick 喂给 IDLE1/LVGL；不再每模拟128ms音乐就固定睡40ms。
+static constexpr UBaseType_t NSF_ANALYSIS_TASK_PRIORITY = 2U;
 static constexpr BaseType_t NSF_ANALYSIS_TASK_CORE = 1;
-static constexpr uint32_t NSF_ANALYSIS_YIELD_TICKS = 4U;
-// 启动阶段先让未来音符预读建立约4秒窗口，避免 Preview/Analysis 两个6502实例同时抢CPU1。
-// 预读失败时最多等待5秒，之后时长分析仍独立继续。
-static constexpr uint32_t NSF_ANALYSIS_PREVIEW_WAIT_MS = 5000U;
-static constexpr uint32_t NSF_ANALYSIS_PREVIEW_POLL_MS = 20U;
+static constexpr int64_t NSF_ANALYSIS_CPU_BURST_US = 100000LL;
+static constexpr TickType_t NSF_ANALYSIS_REST_TICKS = 1U;
+// 小型/常见 NSF 尝试把分析副本迁到内部 RAM，减少 6502 解释器逐指令从 PSRAM 取码。
+// 必须额外保留 64KB 最大连续内部块，失败则继续使用 PSRAM，不影响播放。
+static constexpr size_t NSF_ANALYSIS_INTERNAL_PRG_MAX_BYTES = 64U * 1024U;
+static constexpr size_t NSF_ANALYSIS_INTERNAL_PRG_RESERVE_BYTES = 64U * 1024U;
 
 static constexpr uint32_t NSF_PREVIEW_SAMPLE_RATE_HZ = 500U;
 static constexpr uint32_t NSF_PREVIEW_LEAD_MS = 5000U;
@@ -266,7 +267,7 @@ static constexpr uint32_t NSF_PREVIEW_PUBLISH_STEP_MS = 80U;
 static constexpr uint32_t NSF_VISUAL_HISTORY_MS = 2000U;
 static constexpr size_t NSF_PREVIEW_RENDER_FRAMES = 128U;
 static constexpr uint32_t NSF_PREVIEW_TASK_STACK_BYTES = 6144U;
-static constexpr UBaseType_t NSF_PREVIEW_TASK_PRIORITY = 3U;
+static constexpr UBaseType_t NSF_PREVIEW_TASK_PRIORITY = 1U;
 static constexpr BaseType_t NSF_PREVIEW_TASK_CORE = 1;
 static constexpr uint32_t NSF_PREVIEW_RENDER_YIELD_TICKS = 1U;
 static constexpr uint32_t NSF_PREVIEW_IDLE_DELAY_MS = 20U;
@@ -2142,20 +2143,6 @@ static bool nsf_preview_generation_current(uint32_t generation)
     return current;
 }
 
-static bool nsf_lookahead_ready_for_track(uint8_t track)
-{
-    if (g_nsf_lookahead_mutex == nullptr ||
-        xSemaphoreTake(g_nsf_lookahead_mutex, 0) != pdTRUE) {
-        return false;
-    }
-    const bool ready = g_nsf_lookahead_info.available &&
-        g_nsf_lookahead_info.track == track &&
-        g_nsf_lookahead_events != nullptr &&
-        g_nsf_lookahead_event_count > 0U;
-    xSemaphoreGive(g_nsf_lookahead_mutex);
-    return ready;
-}
-
 static void nsf_analysis_publish(
     uint32_t generation,
     uint8_t track,
@@ -2553,6 +2540,22 @@ static void nsf_analysis_task(void *arg)
     NsfSynthConfig config = args->config;
     heap_caps_free(args);
 
+    bool prg_internal = false;
+    if (prg_size <= NSF_ANALYSIS_INTERNAL_PRG_MAX_BYTES) {
+        const size_t largest_internal =
+            heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (largest_internal > prg_size + NSF_ANALYSIS_INTERNAL_PRG_RESERVE_BYTES) {
+            uint8_t *internal_prg = static_cast<uint8_t *>(heap_caps_malloc(
+                prg_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+            if (internal_prg != nullptr) {
+                memcpy(internal_prg, owned_prg, prg_size);
+                heap_caps_free(owned_prg);
+                owned_prg = internal_prg;
+                prg_internal = true;
+            }
+        }
+    }
+
     NsfSynth synth = {};
     esp_err_t ret = nsf_synth_open_owned(
         &synth, owned_prg, prg_size, &config, NSF_ANALYSIS_SAMPLE_RATE_HZ);
@@ -2565,28 +2568,23 @@ static void nsf_analysis_task(void *arg)
         return;
     }
 
-    ESP_LOGI(TAG, "NSF后台时长分析运行：track=%u core=%d priority=%u",
+    ESP_LOGI(TAG,
+        "NSF快速时长分析运行：track=%u core=%d priority=%u mode=PLAY-driven prg=%s",
         static_cast<unsigned>(track + 1U),
         static_cast<int>(NSF_ANALYSIS_TASK_CORE),
-        static_cast<unsigned>(NSF_ANALYSIS_TASK_PRIORITY));
+        static_cast<unsigned>(NSF_ANALYSIS_TASK_PRIORITY),
+        prg_internal ? "internal" : "psram");
 
-    // Preview先追到真实播放前方约5秒，再启动长时间Loop分析；
-    // 只协调启动负载，两个任务的数据和Synth仍完全独立。
-    uint32_t preview_waited_ms = 0U;
-    while (nsf_analysis_generation_current(generation) &&
-           preview_waited_ms < NSF_ANALYSIS_PREVIEW_WAIT_MS &&
-           !nsf_lookahead_ready_for_track(track)) {
-        vTaskDelay(pdMS_TO_TICKS(NSF_ANALYSIS_PREVIEW_POLL_MS));
-        preview_waited_ms += NSF_ANALYSIS_PREVIEW_POLL_MS;
-    }
-
-    int32_t scratch[NSF_ANALYSIS_RENDER_FRAMES * 2U] = {};
+    // R4：时长分析不再等待 Preview，也不再生成任何 PCM。
+    // 每批直接执行一组 NSF PLAY，并只推进 Envelope/Length/DMC 控制状态。
     uint64_t published_hint_ms = 0ULL;
+    const int64_t analysis_start_us = esp_timer_get_time();
+    int64_t last_rest_us = analysis_start_us;
     while (nsf_analysis_generation_current(generation)) {
-        size_t frames = 0U;
-        ret = nsf_synth_render_pcm32(
-            &synth, scratch, NSF_ANALYSIS_RENDER_FRAMES, &frames);
-        if (ret != ESP_OK || frames == 0U) {
+        size_t play_calls = 0U;
+        ret = nsf_synth_analyze_play_calls(
+            &synth, NSF_ANALYSIS_PLAY_BATCH, &play_calls);
+        if (ret != ESP_OK || play_calls == 0U) {
             nsf_analysis_mark_unavailable(generation);
             ESP_LOGW(TAG, "NSF后台分析失败：track=%u ret=%s",
                 static_cast<unsigned>(track + 1U), esp_err_to_name(ret));
@@ -2610,11 +2608,14 @@ static void nsf_analysis_task(void *arg)
                 published_hint_ms = hint_duration_ms;
                 nsf_analysis_publish_hint(generation, track, hint_duration_ms);
                 ESP_LOGI(TAG,
-                    "NSF后台Loop时长提示：track=%u start=%llums loop=%llums duration=%llums verified=2_cycles",
+                    "NSF快速Loop时长提示：track=%u start=%llums loop=%llums duration=%llums verified=fixed_windows virtual=%llums real=%llums",
                     static_cast<unsigned>(track + 1U),
                     static_cast<unsigned long long>(hint_start_ms),
                     static_cast<unsigned long long>(hint_length_ms),
-                    static_cast<unsigned long long>(hint_duration_ms));
+                    static_cast<unsigned long long>(hint_duration_ms),
+                    static_cast<unsigned long long>(current_virtual_ms),
+                    static_cast<unsigned long long>(
+                        (esp_timer_get_time() - analysis_start_us) / 1000LL));
             }
         }
         if (has_loop_info && loop.detected && loop.length_frames > 0ULL) {
@@ -2632,12 +2633,14 @@ static void nsf_analysis_task(void *arg)
                 loop_length_ms,
                 duration_ms);
             ESP_LOGI(TAG,
-                "NSF后台Loop分析完成：track=%u start=%llums loop=%llums duration=%llums virtual=%llums",
+                "NSF快速Loop分析完成：track=%u start=%llums loop=%llums duration=%llums virtual=%llums real=%llums",
                 static_cast<unsigned>(track + 1U),
                 static_cast<unsigned long long>(loop_start_ms),
                 static_cast<unsigned long long>(loop_length_ms),
                 static_cast<unsigned long long>(duration_ms),
-                static_cast<unsigned long long>(current_virtual_ms));
+                static_cast<unsigned long long>(current_virtual_ms),
+                static_cast<unsigned long long>(
+                    (esp_timer_get_time() - analysis_start_us) / 1000LL));
             break;
         }
 
@@ -2662,12 +2665,14 @@ static void nsf_analysis_task(void *arg)
                     0ULL,
                     duration_ms);
                 ESP_LOGI(TAG,
-                    "NSF后台静音分析完成：track=%u silence_start=%llums duration=%llums verified=%lums",
+                    "NSF快速静音分析完成：track=%u silence_start=%llums duration=%llums verified=%lums real=%llums",
                     static_cast<unsigned>(track + 1U),
                     static_cast<unsigned long long>(duration_ms),
                     static_cast<unsigned long long>(duration_ms),
                     static_cast<unsigned long>(
-                        NSF_SILENCE_END_MS + NSF_ANALYSIS_SILENCE_VERIFY_MS));
+                        NSF_SILENCE_END_MS + NSF_ANALYSIS_SILENCE_VERIFY_MS),
+                    static_cast<unsigned long long>(
+                        (esp_timer_get_time() - analysis_start_us) / 1000LL));
                 break;
             }
         }
@@ -2680,15 +2685,22 @@ static void nsf_analysis_task(void *arg)
                 0ULL,
                 0ULL,
                 NSF_UNKNOWN_HARD_END_MS);
-            ESP_LOGI(TAG, "NSF后台分析完成：track=%u %lus内未发现可靠Loop或自然静音，采用%lus硬上限",
+            ESP_LOGI(TAG, "NSF快速分析完成：track=%u %lus内未发现可靠Loop或自然静音，采用%lus硬上限 real=%llums",
                 static_cast<unsigned>(track + 1U),
                 static_cast<unsigned long>(NSF_ANALYSIS_MAX_MS / 1000U),
-                static_cast<unsigned long>(NSF_UNKNOWN_HARD_END_MS / 1000U));
+                static_cast<unsigned long>(NSF_UNKNOWN_HARD_END_MS / 1000U),
+                static_cast<unsigned long long>(
+                    (esp_timer_get_time() - analysis_start_us) / 1000LL));
             break;
         }
 
-        // 每个小块后固定休眠，避免后台模拟持续占满 CPU1；让 LVGL 和 IDLE1 都能持续获得时间片。
-        vTaskDelay(NSF_ANALYSIS_YIELD_TICKS);
+        // 只按真实 CPU 占用时间让路，而不是按虚拟音乐时间固定限速。
+        // vTaskDelay(1) 让 priority=0 的 IDLE1 有机会运行，避免仅 taskYIELD() 仍饿死 WDT。
+        const int64_t now_us = esp_timer_get_time();
+        if (now_us - last_rest_us >= NSF_ANALYSIS_CPU_BURST_US) {
+            vTaskDelay(NSF_ANALYSIS_REST_TICKS);
+            last_rest_us = esp_timer_get_time();
+        }
     }
 
     nsf_synth_close(&synth);
