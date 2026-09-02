@@ -85,8 +85,8 @@ esp_err_t nsf_synth_render_pcm32(
     size_t max_frames,
     size_t *out_frames);
 
-// R4 后台快速分析：每步直接执行 NSF PLAY，并只推进 Envelope/Length/DMC 等控制状态。
-// 不生成 PCM；虚拟 position_frames 仍按 sample_rate_hz 时间基准累计。
+// R4/R5 PLAY-driven 快速推进：每步直接执行 NSF PLAY，并只推进 Envelope/Length/DMC 等控制状态。
+// 不生成 PCM；既供时长分析，也供未来音符 Preview。虚拟 position_frames 仍按 sample_rate_hz 时间基准累计。
 esp_err_t nsf_synth_analyze_play_calls(
     NsfSynth *synth,
     size_t max_calls,

@@ -251,7 +251,7 @@ static constexpr size_t NSF_ANALYSIS_PLAY_BATCH = 32U;
 static constexpr uint32_t NSF_ANALYSIS_TASK_STACK_BYTES = 8192U;
 // R4：分析任务在 CPU1 上以 PLAY-driven burst 全速推进。只有连续占用 CPU 超过约100ms 时
 // 才休眠 1 tick 喂给 IDLE1/LVGL；不再每模拟128ms音乐就固定睡40ms。
-static constexpr UBaseType_t NSF_ANALYSIS_TASK_PRIORITY = 2U;
+static constexpr UBaseType_t NSF_ANALYSIS_TASK_PRIORITY = 1U;
 static constexpr BaseType_t NSF_ANALYSIS_TASK_CORE = 1;
 static constexpr int64_t NSF_ANALYSIS_CPU_BURST_US = 100000LL;
 static constexpr TickType_t NSF_ANALYSIS_REST_TICKS = 1U;
@@ -265,11 +265,12 @@ static constexpr uint32_t NSF_PREVIEW_LEAD_MS = 5000U;
 static constexpr uint32_t NSF_PREVIEW_PUBLISH_STEP_MS = 80U;
 // 瀑布播放线下方保留的已演奏历史窗：已结束音符在快照中多停留该时长，供 UI 画历史轨迹。
 static constexpr uint32_t NSF_VISUAL_HISTORY_MS = 2000U;
-static constexpr size_t NSF_PREVIEW_RENDER_FRAMES = 128U;
+static constexpr size_t NSF_PREVIEW_PLAY_BATCH = 16U;
 static constexpr uint32_t NSF_PREVIEW_TASK_STACK_BYTES = 6144U;
-static constexpr UBaseType_t NSF_PREVIEW_TASK_PRIORITY = 1U;
+static constexpr UBaseType_t NSF_PREVIEW_TASK_PRIORITY = 2U;
 static constexpr BaseType_t NSF_PREVIEW_TASK_CORE = 1;
-static constexpr uint32_t NSF_PREVIEW_RENDER_YIELD_TICKS = 1U;
+static constexpr int64_t NSF_PREVIEW_CPU_BURST_US = 50000LL;
+static constexpr TickType_t NSF_PREVIEW_REST_TICKS = 1U;
 static constexpr uint32_t NSF_PREVIEW_IDLE_DELAY_MS = 20U;
 
 struct NsfAnalysisTaskArgs
@@ -2747,17 +2748,17 @@ static void nsf_preview_task(void *arg)
         return;
     }
     builder.capacity = NSF_LOOKAHEAD_MAX_EVENTS;
-    ESP_LOGI(TAG, "NSF未来4秒独立预读运行：track=%u core=%d priority=%u lead=%lums",
+    ESP_LOGI(TAG, "NSF未来4秒快速预读运行：track=%u core=%d priority=%u mode=PLAY-driven lead=%lums",
         static_cast<unsigned>(track + 1U),
         static_cast<int>(NSF_PREVIEW_TASK_CORE),
         static_cast<unsigned>(NSF_PREVIEW_TASK_PRIORITY),
         static_cast<unsigned long>(NSF_PREVIEW_LEAD_MS));
 
-    int32_t scratch[NSF_PREVIEW_RENDER_FRAMES * 2U] = {};
     NsfSynthVisualTick visual_ticks[32] = {};
     uint64_t last_publish_position_ms = UINT64_MAX;
     bool ready_logged = false;
     uint32_t status_publish_count = 0U;
+    int64_t last_rest_us = esp_timer_get_time();
 
     while (nsf_preview_generation_current(generation)) {
         AudioNsfClockSnapshot clock = {};
@@ -2817,11 +2818,14 @@ static void nsf_preview_task(void *arg)
             nsf_synth_position_frames(&synth) * 1000ULL / NSF_PREVIEW_SAMPLE_RATE_HZ;
 
         if (virtual_ms < target_ms) {
-            size_t frames = 0U;
-            ret = nsf_synth_render_pcm32(
-                &synth, scratch, NSF_PREVIEW_RENDER_FRAMES, &frames);
-            if (ret != ESP_OK || frames == 0U) {
-                ESP_LOGW(TAG, "NSF未来4秒预读失败：track=%u ret=%s",
+            // R5：未来音符与时长分析一样直接按 NSF PLAY 推进，不再生成 500Hz PCM。
+            // Preview priority 高于 Analysis，只在尚未追平约5秒未来窗时短 burst；追平后立即休眠，
+            // 因而启动时先把瀑布喂满，随后 CPU1 主要交还给时长分析。
+            size_t play_calls = 0U;
+            ret = nsf_synth_analyze_play_calls(
+                &synth, NSF_PREVIEW_PLAY_BATCH, &play_calls);
+            if (ret != ESP_OK || play_calls == 0U) {
+                ESP_LOGW(TAG, "NSF未来4秒快速预读失败：track=%u ret=%s",
                     static_cast<unsigned>(track + 1U), esp_err_to_name(ret));
                 break;
             }
@@ -2832,8 +2836,13 @@ static void nsf_preview_task(void *arg)
                 nsf_lookahead_builder_push_tick(&builder, visual_ticks[i]);
             }
 
-            // 只追到真实播放前方约5秒；每个小块后固定休眠，避免与 LVGL/IDLE1 争满 CPU1。
-            vTaskDelay(NSF_PREVIEW_RENDER_YIELD_TICKS);
+            // 初次追5秒未来窗时也必须给 IDLE1 留 WDT 时间；50ms burst 足够保持首屏快速出现，
+            // 休眠的 1 tick 同时让低一级 Analysis 顺手推进，而不是两条后台链互相饿死。
+            const int64_t now_us = esp_timer_get_time();
+            if (now_us - last_rest_us >= NSF_PREVIEW_CPU_BURST_US) {
+                vTaskDelay(NSF_PREVIEW_REST_TICKS);
+                last_rest_us = esp_timer_get_time();
+            }
         } else {
             vTaskDelay(pdMS_TO_TICKS(NSF_PREVIEW_IDLE_DELAY_MS) + 1U);
         }
@@ -3316,9 +3325,11 @@ static void audio_task_handle_nsf_start(AudioRequest *request)
     g_nsf_paused = false;
     g_nsf_failed = false;
     audio_task_reset_nsf_end_policy();
+    // R5：先发布 active/track 时钟，再启动 Core1 Preview/Analysis。否则 Preview 首轮会读到
+    // 旧的 inactive snapshot 并主动睡眠，恰好又被高负载分析阶段放大成首屏空窗。
+    audio_task_publish_nsf_clock_snapshot();
     (void)audio_task_start_nsf_preview();
     (void)audio_task_start_nsf_analysis();
-    audio_task_publish_nsf_clock_snapshot();
     ESP_LOGI(TAG, "NSF 2A03已启动：48000Hz/16bit/2ch track=%u/%u 基础5通道",
         static_cast<unsigned>(g_nsf_synth.track + 1U),
         static_cast<unsigned>(g_nsf_synth.track_count));
@@ -3403,6 +3414,8 @@ static void audio_task_handle_nsf_set_track(AudioRequest *request)
     audio_task_reset_nsf_end_policy();
     g_nsf_paused = was_paused;
     audio_task_advance_nsf_clock_revision();
+    // 新 Track 先让 Preview 看见正确的 revision/track/active，再启动后台任务。
+    audio_task_publish_nsf_clock_snapshot();
     (void)audio_task_start_nsf_preview();
     (void)audio_task_start_nsf_analysis();
     if (!was_paused) {

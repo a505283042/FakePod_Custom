@@ -2049,15 +2049,23 @@ esp_err_t nsf_synth_analyze_play_calls(
     }
 
     NsfSynthImpl *impl = static_cast<NsfSynthImpl *>(synth->impl);
-    if (!impl->config.enable_loop_detection) return ESP_ERR_INVALID_STATE;
+    // R5：同一条 PLAY-driven 快速推进同时服务 duration analysis 和未来音符 preview。
+    // Preview 只开 visual_capture，不需要 loop detector；两者都不应退回 PCM render。
+    if (!impl->config.enable_loop_detection && !impl->config.enable_visual_capture) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
     size_t calls = 0U;
     while (calls < max_calls) {
-        // 真实渲染路径是在约16.6ms PLAY 周期到点后才调用 PLAY。快速分析也先推进
+        // 真实渲染路径是在约16.6ms PLAY 周期到点后才调用 PLAY。快速推进也先推进
         // Envelope/Length/DMC 控制状态，再执行下一次 PLAY，避免 INIT 后首帧状态偏移。
-        const bool active_interval_start = apu_has_audible_activity(impl->apu);
+        // Preview 不做自然静音判断，因此省掉三次 audible probe，只保留控制状态推进。
+        const bool track_activity = impl->config.enable_loop_detection;
+        const bool active_interval_start =
+            track_activity ? apu_has_audible_activity(impl->apu) : false;
         apu_fast_advance_analysis_interval(impl);
-        const bool active_before_play = apu_has_audible_activity(impl->apu);
+        const bool active_before_play =
+            track_activity ? apu_has_audible_activity(impl->apu) : false;
 
         const uint64_t previous_frames = impl->analysis_position_q32 >> 32U;
         impl->analysis_position_q32 += impl->play_interval_q32;
@@ -2069,15 +2077,18 @@ esp_err_t nsf_synth_analyze_play_calls(
 
         const esp_err_t ret = execute_one_play_call(synth);
         if (ret != ESP_OK) return ret;
-        const bool active_after_play = apu_has_audible_activity(impl->apu);
+        const bool active_after_play =
+            track_activity ? apu_has_audible_activity(impl->apu) : false;
 
-        // 不生成 Pulse/Noise 波形、不跑滤波器、不转换 PCM；自然静音只按 PLAY 周期
-        // 累计，误差上限约一个 NSF PLAY 周期。
-        if (active_interval_start || active_before_play || active_after_play) {
-            impl->analysis_seen_audible = true;
-            impl->analysis_silent_frames = 0ULL;
-        } else if (impl->analysis_seen_audible) {
-            impl->analysis_silent_frames += advanced_frames;
+        // 不生成 Pulse/Noise 波形、不跑滤波器、不转换 PCM。自然静音统计只属于
+        // duration analysis；Preview 只取 execute_one_play_call() 生成的 visual tick。
+        if (impl->config.enable_loop_detection) {
+            if (active_interval_start || active_before_play || active_after_play) {
+                impl->analysis_seen_audible = true;
+                impl->analysis_silent_frames = 0ULL;
+            } else if (impl->analysis_seen_audible) {
+                impl->analysis_silent_frames += advanced_frames;
+            }
         }
 
         ++calls;
