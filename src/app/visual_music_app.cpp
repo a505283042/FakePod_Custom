@@ -845,9 +845,13 @@ static bool select_nsf_subsong(int direction, bool allow_wrap)
     const uint8_t next_track = static_cast<uint8_t>(next);
     const bool restarting_from_eof = g_nsf_eof;
     if (g_nsf_audio_active && !audio_service_nsf_set_track(next_track, true)) {
-        ESP_LOGE(TAG, "NSF Subsong切换失败：track=%u/%u",
+        // EOF 自动切歌必须区分“没有下一首”和“AudioTask 切换失败”。
+        // 后者允许下一次 timer 重新消费 EOF，避免一次瞬态失败后永久卡在曲尾。
+        if (restarting_from_eof) g_nsf_eof_action_handled = false;
+        ESP_LOGE(TAG, "NSF Subsong切换失败：track=%u/%u%s",
             static_cast<unsigned>(next_track + 1U),
-            static_cast<unsigned>(g_nsf_image.track_count));
+            static_cast<unsigned>(g_nsf_image.track_count),
+            restarting_from_eof ? "；保留EOF供重试" : "");
         return false;
     }
     g_nsf_track = next_track;
@@ -1323,16 +1327,28 @@ static void timer_cb(lv_timer_t *timer)
                 g_nsf_failed = true;
                 update_nsf_ready_ui();
             } else if (clock.eof) {
-                // NSF v1 没有 Track 时长：AudioTask 依据持续静音或3分钟附近完整循环边界发布 EOF。
+                // NSF v1 没有原生 Track 时长：AudioTask 只在 Final 结束计划真正到点后发布 EOF。
                 // UI 只消费一次 EOF，并按当前循环模式切换 Subsong。
                 if (!g_nsf_eof_action_handled) {
                     g_nsf_eof_action_handled = true;
                     if (g_loop_mode == PlayerLoopMode::RepeatOne) {
-                        if (audio_service_nsf_set_track(g_nsf_track, false)) {
+                        // EOF 后重启必须等待 AudioTask 真正完成 reset。异步提交只代表“已入队”，
+                        // 底层 mute/INIT/reset 失败时会让 UI 误以为 EOF 已消费并永久卡住。
+                        if (audio_service_nsf_set_track(g_nsf_track, true)) {
                             g_nsf_paused = false;
                             g_nsf_eof = false;
+                            g_nsf_eof_action_handled = false;
+                            g_last_nsf_time_label_tick = 0U;
+                            g_last_waterfall_draw_tick = 0U;
+                            if (g_waterfall_widget != nullptr) lv_obj_invalidate(g_waterfall_widget);
+                            ESP_LOGI(TAG, "NSF RepeatOne已重启：track=%u/%u",
+                                static_cast<unsigned>(g_nsf_track + 1U),
+                                static_cast<unsigned>(g_nsf_image.track_count));
                         } else {
                             g_nsf_eof_action_handled = false;
+                            ESP_LOGW(TAG, "NSF RepeatOne重启失败：track=%u/%u；保留EOF供重试",
+                                static_cast<unsigned>(g_nsf_track + 1U),
+                                static_cast<unsigned>(g_nsf_image.track_count));
                         }
                     } else if (select_nsf_subsong(
                                    +1,

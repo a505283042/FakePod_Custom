@@ -363,6 +363,14 @@ static portMUX_TYPE g_nsf_clock_snapshot_mux = portMUX_INITIALIZER_UNLOCKED;
 static AudioNsfClockSnapshot g_nsf_clock_snapshot = {};
 static uint32_t g_nsf_clock_revision = 0U;
 
+// revision 标识“当前 NSF Track 实例”，不仅是文件启动次数。
+// RepeatOne 会重启同一个 0-based track，只有 revision 能让读者区分旧 EOF 与新实例。
+static void audio_task_advance_nsf_clock_revision()
+{
+    ++g_nsf_clock_revision;
+    if (g_nsf_clock_revision == 0U) ++g_nsf_clock_revision;
+}
+
 static void audio_task_sync_nsf_analysis_end_plan();
 static uint64_t audio_task_get_nsf_analysis_duration_hint(uint8_t track);
 
@@ -3291,8 +3299,7 @@ static void audio_task_handle_nsf_start(AudioRequest *request)
         return;
     }
 
-    ++g_nsf_clock_revision;
-    if (g_nsf_clock_revision == 0U) ++g_nsf_clock_revision;
+    audio_task_advance_nsf_clock_revision();
     g_nsf_active = true;
     g_nsf_paused = false;
     g_nsf_failed = false;
@@ -3355,29 +3362,59 @@ static void audio_task_handle_nsf_set_track(AudioRequest *request)
 
     const bool was_paused = g_nsf_paused;
     esp_err_t ret = cs43131_set_pcm_mute(true);
-    if (ret == ESP_OK) ret = nsf_synth_set_track(&g_nsf_synth, request->nsf_track);
-    if (ret == ESP_OK) {
-        nsf_visual_reset_playback(request->nsf_track);
-        audio_playback_clock_reset(&g_nsf_playback_clock, g_nsf_synth.sample_rate_hz);
-        g_nsf_failed = false;
-        audio_task_reset_nsf_end_policy();
-        g_nsf_paused = was_paused;
-        (void)audio_task_start_nsf_preview();
-        (void)audio_task_start_nsf_analysis();
-        if (!was_paused) {
-            ret = i2s_output_stream_write_silence(
-                AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
-            if (ret == ESP_OK) {
-                audio_task_begin_pcm_fade_in("nsf_track", g_nsf_synth.sample_rate_hz);
-                g_pcm_unmute_pending = true;
-            }
-        } else {
-            g_pcm_unmute_pending = false;
-            audio_task_reset_pcm_fade_in();
-        }
-        audio_task_publish_nsf_clock_snapshot();
+    if (ret != ESP_OK) {
+        audio_request_complete(request, false, ret);
+        return;
     }
-    audio_request_complete(request, ret == ESP_OK, ret);
+
+    ret = nsf_synth_set_track(&g_nsf_synth, request->nsf_track);
+    if (ret != ESP_OK) {
+        // INIT/reset 已经进入目标 Subsong 后失败时，旧实例不能再视为可继续播放。
+        // 明确发布 failed，让 UI 走统一 stop/恢复 Music 路径，避免保持 DAC mute 的半失败状态。
+        audio_task_cancel_nsf_analysis();
+        audio_task_cancel_nsf_preview();
+        g_pcm_unmute_pending = false;
+        audio_task_reset_pcm_fade_in();
+        g_nsf_failed = true;
+        audio_task_publish_nsf_clock_snapshot();
+        ESP_LOGE(TAG, "NSF Track实例切换失败：target=%u/%u ret=%s；进入failed状态",
+            static_cast<unsigned>(request->nsf_track + 1U),
+            static_cast<unsigned>(g_nsf_synth.track_count),
+            esp_err_to_name(ret));
+        audio_request_complete(request, false, ret);
+        return;
+    }
+
+    nsf_visual_reset_playback(request->nsf_track);
+    audio_playback_clock_reset(&g_nsf_playback_clock, g_nsf_synth.sample_rate_hz);
+    g_nsf_failed = false;
+    audio_task_reset_nsf_end_policy();
+    g_nsf_paused = was_paused;
+    audio_task_advance_nsf_clock_revision();
+    (void)audio_task_start_nsf_preview();
+    (void)audio_task_start_nsf_analysis();
+    if (!was_paused) {
+        audio_task_begin_pcm_fade_in("nsf_track", g_nsf_synth.sample_rate_hz);
+        g_pcm_unmute_pending = true;
+        const esp_err_t prime_ret = i2s_output_stream_write_silence(
+            AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
+        if (prime_ret != ESP_OK) {
+            // Track reset 已经成功，不能把一次预卷失败伪装成“切歌失败”。
+            // 保持 unmute_pending；下一次 service_nsf 会重新 prime，若仍失败再进入 failed。
+            ESP_LOGW(TAG, "NSF Track切换静音预卷失败：%s；下一PCM块重试prime",
+                esp_err_to_name(prime_ret));
+        }
+    } else {
+        g_pcm_unmute_pending = false;
+        audio_task_reset_pcm_fade_in();
+    }
+    audio_task_publish_nsf_clock_snapshot();
+    ESP_LOGI(TAG, "NSF Track实例切换完成：track=%u/%u revision=%lu paused=%u",
+        static_cast<unsigned>(g_nsf_synth.track + 1U),
+        static_cast<unsigned>(g_nsf_synth.track_count),
+        static_cast<unsigned long>(g_nsf_clock_revision),
+        static_cast<unsigned>(g_nsf_paused));
+    audio_request_complete(request, true, ESP_OK);
 }
 
 static void audio_task_handle_nsf_stop(AudioRequest *request)
