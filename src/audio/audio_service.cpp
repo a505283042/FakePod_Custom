@@ -255,8 +255,6 @@ static constexpr BaseType_t NSF_ANALYSIS_TASK_CORE = 1;
 static constexpr int64_t NSF_ANALYSIS_CPU_BURST_US = 100000LL;
 static constexpr TickType_t NSF_ANALYSIS_REST_TICKS = 1U;
 static constexpr TickType_t NSF_SEQUENCER_START_TIMEOUT = pdMS_TO_TICKS(2000);
-static constexpr size_t NSF_ANALYSIS_INTERNAL_PRG_MAX_BYTES = 64U * 1024U;
-static constexpr size_t NSF_ANALYSIS_INTERNAL_PRG_RESERVE_BYTES = 64U * 1024U;
 
 static constexpr uint32_t NSF_PREVIEW_LEAD_MS = 5000U;
 static constexpr uint32_t NSF_PREVIEW_PUBLISH_STEP_MS = 80U;
@@ -2587,21 +2585,6 @@ static void nsf_analysis_task(void *arg)
     NsfSynthConfig config = args->config;
     heap_caps_free(args);
 
-    bool prg_internal = false;
-    if (prg_size <= NSF_ANALYSIS_INTERNAL_PRG_MAX_BYTES) {
-        const size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (largest_internal > prg_size + NSF_ANALYSIS_INTERNAL_PRG_RESERVE_BYTES) {
-            uint8_t *internal = static_cast<uint8_t *>(heap_caps_malloc(
-                prg_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-            if (internal != nullptr) {
-                memcpy(internal, owned_prg, prg_size);
-                heap_caps_free(owned_prg);
-                owned_prg = internal;
-                prg_internal = true;
-            }
-        }
-    }
-
     NsfSynth synth = {};
     esp_err_t ret = nsf_synth_open_owned(
         &synth, owned_prg, prg_size, &config, NSF_ANALYSIS_SAMPLE_RATE_HZ);
@@ -2636,7 +2619,7 @@ static void nsf_analysis_task(void *arg)
     ESP_LOGI(TAG,
         "NSF统一Sequencer运行：track=%u core=%d priority=%u mode=PLAY-driven single6502 prg=%s",
         static_cast<unsigned>(track + 1U), static_cast<int>(NSF_ANALYSIS_TASK_CORE),
-        static_cast<unsigned>(NSF_ANALYSIS_TASK_PRIORITY), prg_internal ? "internal" : "psram");
+        static_cast<unsigned>(NSF_ANALYSIS_TASK_PRIORITY), "psram");
 
     const int64_t analysis_start_us = esp_timer_get_time();
     int64_t last_rest_us = analysis_start_us;

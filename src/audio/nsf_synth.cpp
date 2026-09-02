@@ -16,25 +16,20 @@ static constexpr uint16_t kDefaultNtscSpeedUs = 16639U;
 static constexpr uint32_t kInitInstructionLimit = 2000000U;
 static constexpr uint32_t kPlayInstructionLimit = 250000U;
 static constexpr size_t kWorkRamBytes = 8192U;
-static constexpr size_t kLoopHistoryCapacity = 24576U; // 典型60Hz下约409秒；双历史约192KB PSRAM，仅后台分析实例使用
+static constexpr size_t kLoopHistoryCapacity = 24576U; // 典型60Hz下约409秒；R6.4统一为单历史，约96KB PSRAM
 static constexpr size_t kVisualTickCapacity = 32U; // Sequencer 每批及时 drain；保留短暂调度抖动余量
 static constexpr size_t kApuEventCapacity = 4096U; // 每批最多32个PLAY；PSRAM Ring 防止密集寄存器写丢失
 static constexpr uint32_t kLoopDetectMinMs = 8000U;
 static constexpr uint32_t kLoopDetectProbeMs = 1000U;
-static constexpr uint32_t kLoopStructureProbeMs = 1000U;
-// R4：结构 Loop 不再要求完整重复第二/第三整轮。
-// 固定窗口至少覆盖 96 个 PLAY 状态且不少于 4 秒；首次命中后再向后 4 秒验证第二锚点。
-static constexpr uint32_t kLoopFingerprintMinTicks = 96U;
-static constexpr uint32_t kLoopFingerprintMinSpanMs = 4000U;
-static constexpr uint32_t kLoopFingerprintVerifyOffsetMs = 4000U;
-static constexpr uint32_t kLoopStructureVerifyMs = 90000U;
-static constexpr uint32_t kLoopStructureFinalProbeMs = 5000U;
+static constexpr uint32_t kLoopHintCoverageMs = 8000U; // 2次重复，先给UI估算
+static constexpr uint32_t kLoopFinalCoverageMs = 12000U; // Final连续验证12秒严格可听状态
+static constexpr uint32_t kLoopShortPeriodMs = 20000U;
+static constexpr uint8_t kLoopShortRepeatCount = 4U; // 短乐句至少4次，避免把局部反复当整曲Loop
+static constexpr uint8_t kLoopLongRepeatCount = 2U;
 static constexpr uint32_t kLoopDetectMaxSearchMs = 150000U; // 覆盖较长BGM循环候选搜索
 static constexpr uint16_t kLoopDetectMinTransitions = 4U;
 static constexpr uint16_t kReturnSentinel = 0xFFFFU;
 static constexpr float kTwoPi = 6.28318530718f;
-static constexpr uint32_t kFnvOffset = 2166136261U;
-static constexpr uint32_t kFnvPrime = 16777619U;
 
 static constexpr uint8_t kLengthTable[32] = {
     10, 254, 20, 2, 40, 4, 80, 6,
@@ -186,21 +181,12 @@ struct NsfSynthImpl
     uint8_t bank[8] = {};
     bool uses_banking = false;
     uint16_t load_padding = 0U;
-
-    uint8_t apu_registers[0x18] = {};
-    // Loop 签名只记录会产生重触发/时序副作用的寄存器写入。
-    // 普通参数寄存器的最终值已包含在 apu_registers 中，重复写入本身不应导致循环失配。
+    // play_write_mask 只服务瀑布 note-trigger；R6.6 Loop detector 不再依赖逐寄存器写时序。
     uint32_t play_write_mask = 0U;
 
-    // 仅后台分析实例在约60Hz PLAY 边界记录驱动状态；实时48kHz播放实例不开启循环搜索。
-    uint32_t *loop_history = nullptr; // PSRAM，每项一个严格可听状态签名
-    uint32_t *loop_structure_history = nullptr; // PSRAM，每项一个音高/节奏结构签名
+    // R6.6：Hint/Final共用一份通道化音乐状态历史；Loop 按多旋律通道共识判断。
+    uint32_t *loop_history = nullptr; // PSRAM，典型60Hz约409秒，约96KB
     uint32_t loop_history_count = 0U;
-    uint32_t loop_candidate_start = 0U;
-    uint32_t loop_candidate_current = 0U;
-    uint32_t loop_candidate_match = 0U;
-    uint16_t loop_candidate_transitions = 0U;
-    bool loop_candidate_active = false;
     bool loop_detected = false;
     uint64_t loop_start_frame = 0ULL;
     uint64_t loop_length_frames = 0ULL;
@@ -211,10 +197,6 @@ struct NsfSynthImpl
     uint64_t loop_hint_length_frames = 0ULL;
     uint32_t loop_hint_start_play_tick = 0U;
     uint32_t loop_hint_length_play_ticks = 0U;
-    bool structure_candidate_active = false;
-    uint32_t structure_candidate_start = 0U;
-    uint32_t structure_candidate_repeat = 0U;
-
     // 后台时长分析同时跟踪自然静音；实时48kHz实例不开启该统计。
     bool analysis_seen_audible = false;
     uint64_t analysis_silent_frames = 0ULL;
@@ -244,24 +226,9 @@ struct NsfSynthImpl
     bool failed = false;
 };
 
-static uint32_t fnv_mix(uint32_t hash, uint8_t value)
-{
-    hash ^= value;
-    return hash * kFnvPrime;
-}
-
-static bool is_loop_audio_register(uint16_t address)
-{
-    // 只保留当前 APU 实现真正产生音频状态变化的寄存器；忽略 $4009/$400D/$4014/$4016 等无关写入。
-    return (address >= 0x4000U && address <= 0x4008U) ||
-        (address >= 0x400AU && address <= 0x400CU) ||
-        (address >= 0x400EU && address <= 0x4013U) ||
-        address == 0x4015U || address == 0x4017U;
-}
-
 static bool is_loop_trigger_register(uint16_t address)
 {
-    // 这些寄存器即使重复写入相同值，也会重载包络/长度/相位或帧时序，因此保留“本帧写过”信息。
+    // 这些写入用于瀑布 note-trigger；R6.6 Loop detector 不再要求写入时序逐帧一致。
     return address == 0x4001U || address == 0x4003U ||
         address == 0x4005U || address == 0x4007U ||
         address == 0x400BU || address == 0x400FU ||
@@ -283,51 +250,149 @@ static uint64_t play_tick_to_frame(const NsfSynthImpl *impl, uint32_t tick)
     return (static_cast<uint64_t>(tick) * impl->play_interval_q32) >> 32U;
 }
 
-static uint32_t build_play_signature(const NsfSynthImpl *impl)
+// R6.6：Loop 判定使用“听感通道共识”而不是逐寄存器完全一致。
+// 这些 helper 在文件后部有正式实现；这里前置声明以便 detector 热路径直接复用。
+static uint8_t envelope_volume(const Envelope &envelope);
+static bool pulse_has_audible_activity(const PulseChannel &pulse, bool first_channel);
+static uint8_t visual_pitch_from_timer(
+    NsfSynthImpl *impl,
+    uint8_t voice,
+    uint16_t timer,
+    float divider);
+
+// R6.6：Loop history 不再保存整帧 hash，而是把三个旋律通道的“开/关 + MIDI音高”
+// 直接压进 32 bit。Noise/DMC 只保留粗粒度节奏状态，不能再单独否决一个听感上重复的 Loop。
+// bit 0..2   : Pulse1/Pulse2/Triangle active
+// bit 3..9   : Pulse1 MIDI note
+// bit 10..16 : Pulse2 MIDI note
+// bit 17..23 : Triangle MIDI note
+// bit 24     : Noise active
+// bit 25     : DMC active
+// bit 26..29 : Noise period
+// bit 30     : Noise mode
+static constexpr uint8_t kLoopPitchShift[3] = {3U, 10U, 17U};
+
+static uint32_t build_play_signature(NsfSynthImpl *impl)
 {
-    uint32_t hash = kFnvOffset;
-    for (uint8_t value : impl->apu_registers) hash = fnv_mix(hash, value);
-    // Bank 是程序/数据映射状态，不是可听状态；音乐数据跨 Bank 轮换时不应阻止等价 BGM 循环识别。
-    // 保留会产生重触发副作用的寄存器写入节奏，但忽略普通参数寄存器的无害重复写与写入顺序。
-    for (uint8_t shift = 0U; shift < 32U; shift += 8U) {
-        hash = fnv_mix(hash, static_cast<uint8_t>(impl->play_write_mask >> shift));
+    uint32_t state = 0U;
+
+    for (uint8_t index = 0U; index < 2U; ++index) {
+        const PulseChannel &pulse = impl->apu.pulse[index];
+        const bool active = pulse_has_audible_activity(pulse, index == 0U);
+        if (active) {
+            state |= 1UL << index;
+            state |= static_cast<uint32_t>(
+                visual_pitch_from_timer(impl, index, pulse.timer, 16.0f) & 0x7FU)
+                << kLoopPitchShift[index];
+        }
     }
-    return hash;
-}
 
-static uint32_t build_structure_signature(const NsfSynthImpl *impl)
-{
-    // 第二级检测只比较决定旋律/节奏结构的参数，忽略音量包络、长度计数与 Sweep 细节。
-    // 同一 B 段即使每轮动态细节略有变化，只要音高与重触发节奏一致，仍可识别结构循环。
-    uint32_t hash = kFnvOffset;
-    hash = fnv_mix(hash, static_cast<uint8_t>(impl->apu_registers[0x00U] & 0xC0U));
-    hash = fnv_mix(hash, impl->apu_registers[0x02U]);
-    hash = fnv_mix(hash, static_cast<uint8_t>(impl->apu_registers[0x03U] & 0x07U));
-    hash = fnv_mix(hash, static_cast<uint8_t>(impl->apu_registers[0x04U] & 0xC0U));
-    hash = fnv_mix(hash, impl->apu_registers[0x06U]);
-    hash = fnv_mix(hash, static_cast<uint8_t>(impl->apu_registers[0x07U] & 0x07U));
-    hash = fnv_mix(hash, impl->apu_registers[0x0AU]);
-    hash = fnv_mix(hash, static_cast<uint8_t>(impl->apu_registers[0x0BU] & 0x07U));
-    hash = fnv_mix(hash, static_cast<uint8_t>(impl->apu_registers[0x0EU] & 0x8FU));
-    hash = fnv_mix(hash, static_cast<uint8_t>(impl->apu_registers[0x10U] & 0x0FU));
-    hash = fnv_mix(hash, static_cast<uint8_t>(impl->apu_registers[0x15U] & 0x1FU));
-    const uint32_t rhythm_mask = impl->play_write_mask &
-        ((1UL << 0x03U) | (1UL << 0x07U) | (1UL << 0x0BU) |
-         (1UL << 0x0FU) | (1UL << 0x15U));
-    for (uint8_t shift = 0U; shift < 24U; shift += 8U) {
-        hash = fnv_mix(hash, static_cast<uint8_t>(rhythm_mask >> shift));
+    const TriangleChannel &triangle = impl->apu.triangle;
+    const bool triangle_active = triangle.enabled && triangle.length > 0U &&
+        triangle.linear_counter > 0U && triangle.timer >= 2U;
+    if (triangle_active) {
+        state |= 1UL << 2U;
+        state |= static_cast<uint32_t>(
+            visual_pitch_from_timer(impl, 2U, triangle.timer, 32.0f) & 0x7FU)
+            << kLoopPitchShift[2];
     }
-    return hash;
+
+    const NoiseChannel &noise = impl->apu.noise;
+    const bool noise_active = noise.enabled && noise.length > 0U &&
+        envelope_volume(noise.envelope) > 0U;
+    if (noise_active) {
+        state |= 1UL << 24U;
+        state |= static_cast<uint32_t>(noise.period_index & 0x0FU) << 26U;
+        if (noise.mode) state |= 1UL << 30U;
+    }
+
+    const DmcChannel &dmc = impl->apu.dmc;
+    const bool dmc_active = dmc.enabled &&
+        (!dmc.silence || dmc.bytes_remaining > 0U || dmc.bits_remaining > 0U);
+    if (dmc_active) state |= 1UL << 25U;
+
+    return state;
 }
 
-static uint32_t structure_fingerprint_window_ticks(const NsfSynthImpl *impl)
+static bool loop_voice_active(uint32_t state, uint8_t voice)
 {
-    uint32_t ticks = play_ticks_for_ms(impl, kLoopFingerprintMinSpanMs);
-    if (ticks < kLoopFingerprintMinTicks) ticks = kLoopFingerprintMinTicks;
-    return ticks;
+    return voice < 3U && (state & (1UL << voice)) != 0U;
 }
 
-static bool structure_window_equal(
+static uint8_t loop_voice_pitch(uint32_t state, uint8_t voice)
+{
+    if (voice >= 3U) return 0U;
+    return static_cast<uint8_t>((state >> kLoopPitchShift[voice]) & 0x7FU);
+}
+
+static bool loop_voice_state_equal(uint32_t first, uint32_t second, uint8_t voice)
+{
+    const bool first_active = loop_voice_active(first, voice);
+    const bool second_active = loop_voice_active(second, voice);
+    if (first_active != second_active) return false;
+    if (!first_active) return true;
+    return loop_voice_pitch(first, voice) == loop_voice_pitch(second, voice);
+}
+
+static uint32_t loop_melodic_key(uint32_t state)
+{
+    // 只保留三个旋律通道；用于统计窗口内是否真的存在足够音乐变化。
+    return state & 0x00FFFFFFUL;
+}
+
+static uint8_t loop_rhythm_key(uint32_t state)
+{
+    // Noise/DMC 只做单旋律/纯节奏曲目的辅助验证，不参与多旋律通道的一票否决。
+    return static_cast<uint8_t>((state >> 24U) & 0x7FU);
+}
+
+static bool loop_tick_consensus_equal(uint32_t first, uint32_t second)
+{
+    uint8_t present = 0U;
+    uint8_t matched = 0U;
+    for (uint8_t voice = 0U; voice < 3U; ++voice) {
+        if (!loop_voice_active(first, voice) && !loop_voice_active(second, voice)) continue;
+        ++present;
+        if (loop_voice_state_equal(first, second, voice)) ++matched;
+    }
+
+    if (present >= 3U) return matched >= 2U;
+    if (present == 2U) return matched == 2U;
+    if (present == 1U) {
+        // 只有一个旋律通道时，必须同时满足粗粒度节奏状态，避免单音 ostinato 大量误命中。
+        return matched == 1U && loop_rhythm_key(first) == loop_rhythm_key(second);
+    }
+    return loop_rhythm_key(first) == loop_rhythm_key(second);
+}
+
+struct LoopSearchResult
+{
+    bool found = false;
+    uint32_t start = 0U;
+    uint32_t period = 0U;
+    uint16_t transitions = 0U;
+    uint8_t repeats = 0U;
+};
+
+static uint8_t loop_window_seed_score(
+    const NsfSynthImpl *impl,
+    uint32_t first,
+    uint32_t second,
+    uint32_t ticks)
+{
+    if (impl == nullptr || impl->loop_history == nullptr || ticks == 0U) return 0U;
+    const uint32_t q1 = ticks / 3U;
+    const uint32_t q2 = (ticks * 2U) / 3U;
+    const uint32_t last = ticks - 1U;
+    uint8_t score = 0U;
+    if (loop_tick_consensus_equal(impl->loop_history[first], impl->loop_history[second])) ++score;
+    if (loop_tick_consensus_equal(impl->loop_history[first + q1], impl->loop_history[second + q1])) ++score;
+    if (loop_tick_consensus_equal(impl->loop_history[first + q2], impl->loop_history[second + q2])) ++score;
+    if (loop_tick_consensus_equal(impl->loop_history[first + last], impl->loop_history[second + last])) ++score;
+    return score;
+}
+
+static bool loop_window_equal(
     const NsfSynthImpl *impl,
     uint32_t first,
     uint32_t second,
@@ -335,217 +400,242 @@ static bool structure_window_equal(
     uint16_t *out_transitions)
 {
     if (out_transitions != nullptr) *out_transitions = 0U;
-    if (impl == nullptr || impl->loop_structure_history == nullptr || ticks == 0U) return false;
+    if (impl == nullptr || impl->loop_history == nullptr || ticks == 0U) return false;
 
+    uint32_t content_ticks[3] = {};
+    uint32_t mismatch_ticks[3] = {};
+    uint32_t rhythm_mismatches = 0U;
     uint16_t transitions = 0U;
+    uint32_t previous_key = loop_melodic_key(impl->loop_history[first]);
+
     for (uint32_t i = 0U; i < ticks; ++i) {
-        const uint32_t expected = impl->loop_structure_history[first + i];
-        if (expected != impl->loop_structure_history[second + i]) return false;
-        if (i > 0U && expected != impl->loop_structure_history[first + i - 1U] &&
-            transitions != UINT16_MAX) {
-            ++transitions;
+        const uint32_t a = impl->loop_history[first + i];
+        const uint32_t b = impl->loop_history[second + i];
+        for (uint8_t voice = 0U; voice < 3U; ++voice) {
+            if (!loop_voice_active(a, voice) && !loop_voice_active(b, voice)) continue;
+            ++content_ticks[voice];
+            if (!loop_voice_state_equal(a, b, voice)) ++mismatch_ticks[voice];
         }
+        if (loop_rhythm_key(a) != loop_rhythm_key(b)) ++rhythm_mismatches;
+
+        const uint32_t key = loop_melodic_key(a);
+        if (i > 0U && key != previous_key && transitions != UINT16_MAX) ++transitions;
+        previous_key = key;
     }
+
+    // 允许少量 note-on/off 边界错开。12秒窗口约720 PLAY tick，2%约14帧。
+    const uint32_t allowed_mismatch = ticks / 50U > 2U ? ticks / 50U : 2U;
+    const uint32_t min_content = ticks / 20U > 1U ? ticks / 20U : 1U; // 至少覆盖窗口5%
+    uint8_t present_voices = 0U;
+    uint8_t matched_voices = 0U;
+    for (uint8_t voice = 0U; voice < 3U; ++voice) {
+        if (content_ticks[voice] < min_content) continue;
+        ++present_voices;
+        if (mismatch_ticks[voice] <= allowed_mismatch) ++matched_voices;
+    }
+
+    bool accepted = false;
+    if (present_voices >= 3U) {
+        // 三个旋律通道中允许一个伴奏拥有更长 super-loop；另外两个必须稳定重复。
+        accepted = matched_voices >= 2U;
+    } else if (present_voices == 2U) {
+        accepted = matched_voices == 2U;
+    } else if (present_voices == 1U) {
+        accepted = matched_voices == 1U && rhythm_mismatches <= allowed_mismatch * 2U;
+    } else {
+        accepted = rhythm_mismatches <= allowed_mismatch;
+    }
+
+    if (!accepted) return false;
     if (out_transitions != nullptr) *out_transitions = transitions;
     return true;
 }
 
-static bool try_find_structure_fingerprint_hint(NsfSynthImpl *impl, uint32_t current)
+static bool find_unified_loop_candidate(
+    NsfSynthImpl *impl,
+    uint32_t current,
+    uint32_t coverage_ms,
+    bool final_search,
+    LoopSearchResult *out_result)
 {
-    if (impl == nullptr || impl->loop_structure_history == nullptr ||
-        impl->loop_hint_available || current < 2U) {
-        return false;
-    }
+    if (out_result != nullptr) *out_result = {};
+    if (impl == nullptr || impl->loop_history == nullptr || out_result == nullptr) return false;
 
-    const uint32_t window_ticks = structure_fingerprint_window_ticks(impl);
-    const uint32_t verify_offset_ticks =
-        play_ticks_for_ms(impl, kLoopFingerprintVerifyOffsetMs);
-    const uint32_t count = current + 1U;
-
-    // 已找到第一锚点 A/A' 后，只需等待固定偏移处的 B' 窗口完整出现。
-    if (impl->structure_candidate_active) {
-        const uint64_t verify_end64 =
-            static_cast<uint64_t>(impl->structure_candidate_repeat) +
-            verify_offset_ticks + window_ticks;
-        if (verify_end64 <= count) {
-            uint16_t transitions = 0U;
-            const bool same = structure_window_equal(
-                impl,
-                impl->structure_candidate_start + verify_offset_ticks,
-                impl->structure_candidate_repeat + verify_offset_ticks,
-                window_ticks,
-                &transitions);
-            if (same && transitions >= kLoopDetectMinTransitions) {
-                uint32_t start = impl->structure_candidate_start;
-                uint32_t repeated = impl->structure_candidate_repeat;
-                while (start > 0U && repeated > 0U &&
-                       impl->loop_structure_history[start - 1U] ==
-                           impl->loop_structure_history[repeated - 1U]) {
-                    --start;
-                    --repeated;
-                }
-                const uint32_t loop_ticks = repeated - start;
-                impl->loop_hint_start_play_tick = start;
-                impl->loop_hint_length_play_ticks = loop_ticks;
-                impl->loop_hint_start_frame = play_tick_to_frame(impl, start);
-                impl->loop_hint_length_frames = play_tick_to_frame(impl, loop_ticks);
-                impl->loop_hint_available = impl->loop_hint_length_frames > 0ULL;
-                if (impl->loop_hint_available) {
-                    ESP_LOGI(TAG,
-                        "NSF循环候选已识别：start=%llums loop=%llums verified=fixed_windows window=%lums offset=%lums signatures=%lu",
-                        static_cast<unsigned long long>(
-                            impl->loop_hint_start_frame * 1000ULL / impl->sample_rate_hz),
-                        static_cast<unsigned long long>(
-                            impl->loop_hint_length_frames * 1000ULL / impl->sample_rate_hz),
-                        static_cast<unsigned long>(
-                            window_ticks * impl->play_speed_us / 1000U),
-                        static_cast<unsigned long>(
-                            verify_offset_ticks * impl->play_speed_us / 1000U),
-                        static_cast<unsigned long>(impl->loop_history_count));
-                }
-                impl->structure_candidate_active = false;
-                return impl->loop_hint_available;
-            }
-            // 第一锚点只是局部重复，不保留错误候选；继续寻找下一组 A/A'。
-            impl->structure_candidate_active = false;
-        }
-        return false;
-    }
-
-    const uint32_t probe_ticks = play_ticks_for_ms(impl, kLoopStructureProbeMs);
-    if (probe_ticks == 0U || (current % probe_ticks) != 0U || count < window_ticks) return false;
-
-    const uint32_t repeat_start = count - window_ticks;
-    const uint32_t min_loop_ticks = play_ticks_for_ms(impl, kLoopDetectMinMs);
-    const uint32_t max_loop_ticks = play_ticks_for_ms(impl, kLoopDetectMaxSearchMs);
-    if (repeat_start < min_loop_ticks) return false;
-
-    const uint32_t newest_candidate = repeat_start - min_loop_ticks;
-    const uint32_t oldest_candidate = repeat_start > max_loop_ticks
-        ? repeat_start - max_loop_ticks
-        : 0U;
-    const uint32_t middle = window_ticks / 2U;
-    const uint32_t last = window_ticks - 1U;
-
-    // 从最近的合法周期向前搜索。先比较三个种子点，命中后只核验固定窗口，
-    // 不再把 candidate_period 个状态完整比较一整轮。
-    for (uint32_t candidate = newest_candidate;; --candidate) {
-        if (impl->loop_structure_history[candidate] ==
-                impl->loop_structure_history[repeat_start] &&
-            impl->loop_structure_history[candidate + middle] ==
-                impl->loop_structure_history[repeat_start + middle] &&
-            impl->loop_structure_history[candidate + last] ==
-                impl->loop_structure_history[repeat_start + last]) {
-            uint16_t transitions = 0U;
-            if (structure_window_equal(
-                    impl, candidate, repeat_start, window_ticks, &transitions) &&
-                transitions >= kLoopDetectMinTransitions) {
-                impl->structure_candidate_active = true;
-                impl->structure_candidate_start = candidate;
-                impl->structure_candidate_repeat = repeat_start;
-                break;
-            }
-        }
-        if (candidate == oldest_candidate) break;
-    }
-    return false;
-}
-
-static bool try_detect_structure_loop(NsfSynthImpl *impl, uint32_t current)
-{
-    if (impl == nullptr || impl->loop_structure_history == nullptr || current < 2U) return false;
-
-    const uint32_t probe_ticks = play_ticks_for_ms(impl, kLoopStructureFinalProbeMs);
+    const uint32_t probe_ticks = play_ticks_for_ms(impl, kLoopDetectProbeMs);
     if (probe_ticks == 0U || (current % probe_ticks) != 0U) return false;
 
-    const uint32_t min_loop_ticks = play_ticks_for_ms(impl, kLoopDetectMinMs);
-    const uint32_t max_loop_ticks = play_ticks_for_ms(impl, kLoopDetectMaxSearchMs);
-    const uint32_t verify_ticks = play_ticks_for_ms(impl, kLoopStructureVerifyMs);
+    const uint32_t coverage_ticks = play_ticks_for_ms(impl, coverage_ms);
+    const uint32_t min_period_ticks = play_ticks_for_ms(impl, kLoopDetectMinMs);
+    const uint32_t max_search_ticks = play_ticks_for_ms(impl, kLoopDetectMaxSearchMs);
+    const uint32_t short_period_ticks = play_ticks_for_ms(impl, kLoopShortPeriodMs);
     const uint32_t count = current + 1U;
-    if (count < verify_ticks) return false;
+    if (coverage_ticks == 0U || count <= coverage_ticks + min_period_ticks) return false;
 
-    uint32_t max_period = count / 3U;
-    if (max_period > max_loop_ticks) max_period = max_loop_ticks;
-    if (max_period < min_loop_ticks) return false;
+    // latest_start 是最后一段固定验证窗口的起点。逐个周期搜索时仅比较固定长度窗口，
+    // 不再像旧 detector 那样完整扫描 candidate_period 或等待90秒/三整轮。
+    const uint32_t latest_start = count - coverage_ticks;
+    uint32_t max_period_ticks = latest_start;
+    if (max_period_ticks > max_search_ticks) max_period_ticks = max_search_ticks;
+    if (max_period_ticks < min_period_ticks) return false;
 
-    // 最终 EOF 仍保留 R1 的严格语义：至少90秒且不少于三整轮。
-    // R4 固定窗口只负责提前给 UI duration hint，不直接截断 Track。
-    for (uint32_t period = min_loop_ticks; period <= max_period; ++period) {
-        uint32_t repeats = (verify_ticks + period - 1U) / period;
-        if (repeats < 3U) repeats = 3U;
-        const uint64_t span64 = static_cast<uint64_t>(period) * repeats;
-        if (span64 > count) continue;
-        const uint32_t span = static_cast<uint32_t>(span64);
-        const uint32_t start = count - span;
-        const uint32_t middle = period / 2U;
-        const uint32_t last = period - 1U;
+    LoopSearchResult best = {};
+    uint8_t best_seed_score = 0U;
+    uint32_t best_seed_period = 0U;
+    for (uint32_t period = min_period_ticks; period <= max_period_ticks; ++period) {
+        const uint8_t repeats = final_search && period < short_period_ticks
+            ? kLoopShortRepeatCount
+            : kLoopLongRepeatCount;
+        const uint64_t back_span64 =
+            static_cast<uint64_t>(period) * static_cast<uint64_t>(repeats - 1U);
+        if (back_span64 > latest_start) continue;
+        const uint32_t first = latest_start - static_cast<uint32_t>(back_span64);
 
         bool seed_match = true;
-        for (uint32_t r = 1U; r < repeats; ++r) {
-            const uint32_t base = start + r * period;
-            if (impl->loop_structure_history[start] != impl->loop_structure_history[base] ||
-                impl->loop_structure_history[start + middle] !=
-                    impl->loop_structure_history[base + middle] ||
-                impl->loop_structure_history[start + last] !=
-                    impl->loop_structure_history[base + last]) {
+        uint8_t candidate_seed_score = 4U;
+        for (uint8_t r = 1U; r < repeats; ++r) {
+            const uint8_t score = loop_window_seed_score(
+                impl, first, first + static_cast<uint32_t>(r) * period, coverage_ticks);
+            if (score < candidate_seed_score) candidate_seed_score = score;
+            if (score < 4U) {
                 seed_match = false;
                 break;
             }
+        }
+        if (candidate_seed_score > best_seed_score) {
+            best_seed_score = candidate_seed_score;
+            best_seed_period = period;
         }
         if (!seed_match) continue;
 
         uint16_t transitions = 0U;
         bool same = true;
-        for (uint32_t i = 0U; i < period && same; ++i) {
-            const uint32_t expected = impl->loop_structure_history[start + i];
-            for (uint32_t r = 1U; r < repeats; ++r) {
-                if (expected != impl->loop_structure_history[start + r * period + i]) {
-                    same = false;
-                    break;
-                }
+        for (uint8_t r = 1U; r < repeats; ++r) {
+            uint16_t local_transitions = 0U;
+            if (!loop_window_equal(
+                    impl,
+                    first,
+                    first + static_cast<uint32_t>(r) * period,
+                    coverage_ticks,
+                    &local_transitions)) {
+                same = false;
+                break;
             }
-            if (i > 0U && expected != impl->loop_structure_history[start + i - 1U] &&
-                transitions != UINT16_MAX) {
-                ++transitions;
-            }
+            if (r == 1U) transitions = local_transitions;
         }
         if (!same || transitions < kLoopDetectMinTransitions) continue;
 
-        uint32_t loop_start = start;
-        while (loop_start > 0U &&
-               impl->loop_structure_history[loop_start - 1U] ==
-                   impl->loop_structure_history[loop_start - 1U + period]) {
+        uint32_t loop_start = first;
+        uint32_t repeated = first + period;
+        while (loop_start > 0U && repeated > 0U &&
+               impl->loop_history[loop_start - 1U] ==
+                   impl->loop_history[repeated - 1U]) {
             --loop_start;
+            --repeated;
         }
-        impl->loop_start_play_tick = loop_start;
-        impl->loop_length_play_ticks = period;
-        impl->loop_start_frame = play_tick_to_frame(impl, loop_start);
-        impl->loop_length_frames = play_tick_to_frame(impl, period);
-        impl->loop_detected = impl->loop_length_frames > 0ULL;
-        if (impl->loop_detected) {
-            ESP_LOGI(TAG,
-                "NSF循环已识别：start=%llums loop=%llums verified=%lu_cycles signature=music_structure signatures=%lu",
-                static_cast<unsigned long long>(
-                    impl->loop_start_frame * 1000ULL / impl->sample_rate_hz),
-                static_cast<unsigned long long>(
-                    impl->loop_length_frames * 1000ULL / impl->sample_rate_hz),
-                static_cast<unsigned long>(repeats),
-                static_cast<unsigned long>(impl->loop_history_count));
-            return true;
+        const uint32_t normalized_period = repeated - loop_start;
+        if (normalized_period == 0U) continue;
+
+        LoopSearchResult candidate = {};
+        candidate.found = true;
+        candidate.start = loop_start;
+        candidate.period = normalized_period;
+        candidate.transitions = transitions;
+        candidate.repeats = repeats;
+
+        if (!best.found) {
+            best = candidate;
+            if (!final_search) break; // Hint优先最短合法周期，尽快显示
+            continue;
+        }
+
+        // Final：优先验证次数更多的短周期；同级时取更短的 canonical period，
+        // 避免把真实 Loop 的2倍/3倍当成周期。
+        if (candidate.repeats > best.repeats ||
+            (candidate.repeats == best.repeats && candidate.period < best.period)) {
+            best = candidate;
         }
     }
-    return false;
+
+    if (!best.found) {
+        if (!final_search) {
+            const uint32_t diag_ticks = play_ticks_for_ms(impl, 60000U);
+            if (diag_ticks > 0U && current > 0U && (current % diag_ticks) == 0U) {
+                ESP_LOGI(TAG,
+                    "NSF Loop诊断：best_seed=%u/4 period=%llums signatures=%lu mode=melodic_consensus",
+                    static_cast<unsigned>(best_seed_score),
+                    static_cast<unsigned long long>(
+                        play_tick_to_frame(impl, best_seed_period) * 1000ULL / impl->sample_rate_hz),
+                    static_cast<unsigned long>(impl->loop_history_count));
+            }
+        }
+        return false;
+    }
+    *out_result = best;
+    return true;
+}
+
+static bool try_publish_unified_loop_hint(NsfSynthImpl *impl, uint32_t current)
+{
+    if (impl == nullptr || impl->loop_hint_available) return false;
+
+    LoopSearchResult result = {};
+    if (!find_unified_loop_candidate(
+            impl, current, kLoopHintCoverageMs, false, &result)) {
+        return false;
+    }
+
+    impl->loop_hint_start_play_tick = result.start;
+    impl->loop_hint_length_play_ticks = result.period;
+    impl->loop_hint_start_frame = play_tick_to_frame(impl, result.start);
+    impl->loop_hint_length_frames = play_tick_to_frame(impl, result.period);
+    impl->loop_hint_available = impl->loop_hint_length_frames > 0ULL;
+    if (impl->loop_hint_available) {
+        ESP_LOGI(TAG,
+            "NSF循环候选已识别：start=%llums loop=%llums verified=unified_hint coverage=%lums repeats=%u signatures=%lu",
+            static_cast<unsigned long long>(
+                impl->loop_hint_start_frame * 1000ULL / impl->sample_rate_hz),
+            static_cast<unsigned long long>(
+                impl->loop_hint_length_frames * 1000ULL / impl->sample_rate_hz),
+            static_cast<unsigned long>(kLoopHintCoverageMs),
+            static_cast<unsigned>(result.repeats),
+            static_cast<unsigned long>(impl->loop_history_count));
+    }
+    return impl->loop_hint_available;
+}
+
+static bool try_detect_unified_loop_final(NsfSynthImpl *impl, uint32_t current)
+{
+    if (impl == nullptr || impl->loop_detected) return impl != nullptr && impl->loop_detected;
+
+    LoopSearchResult result = {};
+    if (!find_unified_loop_candidate(
+            impl, current, kLoopFinalCoverageMs, true, &result)) {
+        return false;
+    }
+
+    impl->loop_start_play_tick = result.start;
+    impl->loop_length_play_ticks = result.period;
+    impl->loop_start_frame = play_tick_to_frame(impl, result.start);
+    impl->loop_length_frames = play_tick_to_frame(impl, result.period);
+    impl->loop_detected = impl->loop_length_frames > 0ULL;
+    if (impl->loop_detected) {
+        ESP_LOGI(TAG,
+            "NSF循环已识别：start=%llums loop=%llums verified=unified_multi_window coverage=%lums repeats=%u signature=melodic_consensus signatures=%lu",
+            static_cast<unsigned long long>(
+                impl->loop_start_frame * 1000ULL / impl->sample_rate_hz),
+            static_cast<unsigned long long>(
+                impl->loop_length_frames * 1000ULL / impl->sample_rate_hz),
+            static_cast<unsigned long>(kLoopFinalCoverageMs),
+            static_cast<unsigned>(result.repeats),
+            static_cast<unsigned long>(impl->loop_history_count));
+    }
+    return impl->loop_detected;
 }
 
 static void reset_loop_detector(NsfSynthImpl *impl)
 {
     if (impl == nullptr) return;
     impl->loop_history_count = 0U;
-    impl->loop_candidate_start = 0U;
-    impl->loop_candidate_current = 0U;
-    impl->loop_candidate_match = 0U;
-    impl->loop_candidate_transitions = 0U;
-    impl->loop_candidate_active = false;
     impl->loop_detected = false;
     impl->loop_start_frame = 0ULL;
     impl->loop_length_frames = 0ULL;
@@ -556,108 +646,25 @@ static void reset_loop_detector(NsfSynthImpl *impl)
     impl->loop_hint_length_frames = 0ULL;
     impl->loop_hint_start_play_tick = 0U;
     impl->loop_hint_length_play_ticks = 0U;
-    impl->structure_candidate_active = false;
-    impl->structure_candidate_start = 0U;
-    impl->structure_candidate_repeat = 0U;
 }
 
 static void loop_detector_on_play(NsfSynth *synth)
 {
     if (synth == nullptr || synth->impl == nullptr) return;
     NsfSynthImpl *impl = static_cast<NsfSynthImpl *>(synth->impl);
-    if (!impl->config.enable_loop_detection || impl->loop_history == nullptr || impl->loop_detected ||
-        impl->loop_history_count >= kLoopHistoryCapacity) {
+    if (!impl->config.enable_loop_detection || impl->loop_history == nullptr ||
+        impl->loop_detected || impl->loop_history_count >= kLoopHistoryCapacity) {
         return;
     }
 
-    const uint32_t signature = build_play_signature(impl);
     const uint32_t current = impl->loop_history_count;
-    impl->loop_history[current] = signature;
-    if (impl->loop_structure_history != nullptr) {
-        impl->loop_structure_history[current] = build_structure_signature(impl);
-    }
+    impl->loop_history[current] = build_play_signature(impl);
     ++impl->loop_history_count;
 
-    // R4：固定窗口 + 第二锚点先给 duration hint；最终 EOF 仍由严格检测确认。
-    (void)try_find_structure_fingerprint_hint(impl, current);
-    if (try_detect_structure_loop(impl, current)) return;
-
-    const uint32_t min_loop_ticks = play_ticks_for_ms(impl, kLoopDetectMinMs);
-    const uint32_t probe_ticks = play_ticks_for_ms(impl, kLoopDetectProbeMs);
-    const uint32_t max_search_ticks = play_ticks_for_ms(impl, kLoopDetectMaxSearchMs);
-
-    if (impl->loop_candidate_active) {
-        const uint32_t expected = impl->loop_candidate_start + impl->loop_candidate_match;
-        const uint32_t expected_current = impl->loop_candidate_current + impl->loop_candidate_match;
-        if (current == expected_current && expected < impl->loop_candidate_current &&
-            impl->loop_history[expected] == signature) {
-            if (current > 0U && impl->loop_history[current - 1U] != signature &&
-                impl->loop_candidate_transitions != UINT16_MAX) {
-                ++impl->loop_candidate_transitions;
-            }
-            ++impl->loop_candidate_match;
-            const uint32_t candidate_period =
-                impl->loop_candidate_current - impl->loop_candidate_start;
-            // 不能只靠几秒相似片段确认循环；候选周期必须完整重复一整轮。
-            if (candidate_period > 0U && impl->loop_candidate_match >= candidate_period) {
-                if (impl->loop_candidate_transitions >= kLoopDetectMinTransitions) {
-                    uint32_t start = impl->loop_candidate_start;
-                    uint32_t repeated = impl->loop_candidate_current;
-                    while (start > 0U && repeated > 0U &&
-                           impl->loop_history[start - 1U] == impl->loop_history[repeated - 1U]) {
-                        --start;
-                        --repeated;
-                    }
-                    const uint32_t loop_ticks = repeated - start;
-                    impl->loop_start_play_tick = start;
-                    impl->loop_length_play_ticks = loop_ticks;
-                    impl->loop_start_frame = play_tick_to_frame(impl, start);
-                    impl->loop_length_frames = play_tick_to_frame(impl, loop_ticks);
-                    impl->loop_detected = impl->loop_length_frames > 0ULL;
-                    if (impl->loop_detected) {
-                        ESP_LOGI(TAG,
-                            "NSF循环已识别：start=%llums loop=%llums verified=full_cycle signature=audible_state signatures=%lu",
-                            static_cast<unsigned long long>(
-                                impl->loop_start_frame * 1000ULL / impl->sample_rate_hz),
-                            static_cast<unsigned long long>(
-                                impl->loop_length_frames * 1000ULL / impl->sample_rate_hz),
-                            static_cast<unsigned long>(impl->loop_history_count));
-                    }
-                }
-                impl->loop_candidate_active = false;
-            }
-            return;
-        }
-        impl->loop_candidate_active = false;
-    }
-
-    if (current < min_loop_ticks + 2U || probe_ticks == 0U ||
-        (current % probe_ticks) != 0U) {
-        return;
-    }
-
-    const uint32_t newest_candidate = current - min_loop_ticks;
-    const uint32_t oldest_candidate = current > max_search_ticks
-        ? current - max_search_ticks
-        : 2U;
-    if (newest_candidate < oldest_candidate || current < 2U) return;
-
-    for (uint32_t candidate = newest_candidate;; --candidate) {
-        if (candidate >= 2U &&
-            impl->loop_history[candidate] == signature &&
-            impl->loop_history[candidate - 1U] == impl->loop_history[current - 1U] &&
-            impl->loop_history[candidate - 2U] == impl->loop_history[current - 2U]) {
-            impl->loop_candidate_start = candidate - 2U;
-            impl->loop_candidate_current = current - 2U;
-            impl->loop_candidate_match = 3U;
-            impl->loop_candidate_transitions =
-                (impl->loop_history[current - 2U] != impl->loop_history[current - 1U] ? 1U : 0U) +
-                (impl->loop_history[current - 1U] != signature ? 1U : 0U);
-            impl->loop_candidate_active = true;
-            break;
-        }
-        if (candidate == oldest_candidate) break;
-    }
+    // R6.4：Hint/Final都只消费这一份严格 history。Hint命中后仍继续扫描，
+    // Final 不再依赖旧 full_cycle 或第二套 structure history。
+    (void)try_publish_unified_loop_hint(impl, current);
+    (void)try_detect_unified_loop_final(impl, current);
 }
 
 static void set_flag(Cpu6502 *cpu, uint8_t flag, bool value)
@@ -1289,16 +1296,10 @@ static void memory_write(NsfSynthImpl *impl, uint16_t address, uint8_t value)
         return;
     }
     if (address >= 0x4000U && address <= 0x4017U) {
-        const bool track_write =
-            impl->config.enable_loop_detection || impl->config.enable_visual_capture;
-        if (track_write && is_loop_audio_register(address)) {
+        if ((impl->config.enable_loop_detection || impl->config.enable_visual_capture) &&
+            is_loop_trigger_register(address)) {
             const uint8_t reg = static_cast<uint8_t>(address - 0x4000U);
-            if (impl->config.enable_loop_detection) {
-                impl->apu_registers[reg] = value;
-            }
-            if (is_loop_trigger_register(address)) {
-                impl->play_write_mask |= 1UL << reg;
-            }
+            impl->play_write_mask |= 1UL << reg;
         }
         apu_write(&impl->apu, address, value);
         return;
@@ -1792,7 +1793,6 @@ static esp_err_t reset_track(NsfSynth *synth, uint8_t track)
     impl->config.track = track;
     prepare_memory(impl);
     apu_reset(&impl->apu);
-    memset(impl->apu_registers, 0, sizeof(impl->apu_registers));
     impl->play_write_mask = 0U;
     reset_loop_detector(impl);
     impl->analysis_seen_audible = false;
@@ -1938,16 +1938,9 @@ esp_err_t nsf_synth_open_owned(
         impl->loop_history = static_cast<uint32_t *>(heap_caps_malloc(
             kLoopHistoryCapacity * sizeof(uint32_t),
             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        if (impl->loop_history != nullptr) {
-            impl->loop_structure_history = static_cast<uint32_t *>(heap_caps_malloc(
-                kLoopHistoryCapacity * sizeof(uint32_t),
-                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-            if (impl->loop_structure_history == nullptr) {
-                ESP_LOGW(TAG, "NSF结构Loop历史PSRAM申请失败：仅使用严格可听状态检测");
-            }
-        } else {
-            // 后台循环分析是增强能力；申请失败时实时播放仍可继续，以静音作为结束兜底。
-            ESP_LOGW(TAG, "NSF循环分析PSRAM申请失败：本次仅使用静音结束");
+        if (impl->loop_history == nullptr) {
+            // 后台循环分析是增强能力；申请失败时真实播放仍可继续，以静音/硬上限作为结束兜底。
+            ESP_LOGW(TAG, "NSF统一Loop历史PSRAM申请失败：本次仅使用静音/硬上限结束");
         }
     }
     if (config->enable_visual_capture) {
@@ -1967,7 +1960,6 @@ esp_err_t nsf_synth_open_owned(
         if (impl->apu_events == nullptr) {
             if (impl->visual_ticks != nullptr) heap_caps_free(impl->visual_ticks);
             if (impl->loop_history != nullptr) heap_caps_free(impl->loop_history);
-            if (impl->loop_structure_history != nullptr) heap_caps_free(impl->loop_structure_history);
             if (impl->work_ram != nullptr) heap_caps_free(impl->work_ram);
             free(impl);
             return ESP_ERR_NO_MEM;
@@ -2007,14 +1999,16 @@ esp_err_t nsf_synth_open_owned(
     }
 
     ESP_LOGI(TAG,
-        "NSF 2A03已打开：track=%u/%u prg=%uB bank=%u speed=%uus rate=%luHz workram=%s",
+        "NSF 2A03已打开：track=%u/%u prg=%uB bank=%u speed=%uus rate=%luHz workram=%s loop_history=%uKB loop_signature=melodic_consensus",
         static_cast<unsigned>(synth->track + 1U),
         static_cast<unsigned>(synth->track_count),
         static_cast<unsigned>(prg_size),
         static_cast<unsigned>(impl->uses_banking),
         static_cast<unsigned>(config->ntsc_speed_us != 0U ? config->ntsc_speed_us : kDefaultNtscSpeedUs),
         static_cast<unsigned long>(sample_rate_hz),
-        work_ram_internal ? "internal" : "psram");
+        work_ram_internal ? "internal" : "psram",
+        static_cast<unsigned>(impl->loop_history != nullptr
+            ? kLoopHistoryCapacity * sizeof(uint32_t) / 1024U : 0U));
     return ESP_OK;
 }
 
@@ -2026,7 +2020,6 @@ void nsf_synth_close(NsfSynth *synth)
         if (impl->prg != nullptr) heap_caps_free(impl->prg);
         if (impl->work_ram != nullptr) heap_caps_free(impl->work_ram);
         if (impl->loop_history != nullptr) heap_caps_free(impl->loop_history);
-        if (impl->loop_structure_history != nullptr) heap_caps_free(impl->loop_structure_history);
         if (impl->visual_ticks != nullptr) heap_caps_free(impl->visual_ticks);
         if (impl->apu_events != nullptr) heap_caps_free(impl->apu_events);
         free(impl);
