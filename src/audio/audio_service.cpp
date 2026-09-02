@@ -218,7 +218,19 @@ static uint16_t g_video_mp3_bits_per_sample = 0U;
 static constexpr uint32_t NSF_SILENCE_END_MS = 6000U;
 static constexpr uint32_t NSF_LOOP_TARGET_MS = 180000U;
 static constexpr uint32_t NSF_TRACK_FADE_MS = 5000U;
+// 普通 NSF 没有 Track 时长。后台在该虚拟时间内仍无法确认 Loop/自然静音时，
+// 必须采用硬上限结束，不能让持续发声或完全静音的异常 Track 永久播放。
+static constexpr uint32_t NSF_UNKNOWN_HARD_END_MS = 360000U;
 static constexpr int32_t NSF_SILENCE_PEAK_PCM16 = 32;
+
+enum class NsfEndPlanKind : uint8_t
+{
+    None = 0U,
+    VerifiedLoop,
+    NaturalSilence,
+    HardLimit,
+};
+
 static NsfSynth g_nsf_synth = {};
 static AudioPlaybackClock g_nsf_playback_clock = {};
 static bool g_nsf_active = false;
@@ -227,15 +239,13 @@ static bool g_nsf_eof = false;
 static bool g_nsf_failed = false;
 static bool g_nsf_seen_audible = false;
 static uint64_t g_nsf_silence_frames = 0ULL;
-static bool g_nsf_loop_end_active = false;
-static uint64_t g_nsf_loop_end_frame = 0ULL;
-static bool g_nsf_natural_end_active = false;
-static uint64_t g_nsf_natural_end_frame = 0ULL;
+static NsfEndPlanKind g_nsf_end_plan_kind = NsfEndPlanKind::None;
+static uint64_t g_nsf_end_frame = 0ULL;
 static bool g_nsf_restore_paused_music_hardware = false;
 
 // NSF 时长分析和未来音符预读拆成两个独立低优先级任务，避免任一功能拖住另一条链路。
 static constexpr uint32_t NSF_ANALYSIS_SAMPLE_RATE_HZ = 500U;
-static constexpr uint32_t NSF_ANALYSIS_MAX_MS = 360000U;
+static constexpr uint32_t NSF_ANALYSIS_MAX_MS = NSF_UNKNOWN_HARD_END_MS;
 static constexpr uint32_t NSF_ANALYSIS_SILENCE_VERIFY_MS = 10000U;
 static constexpr size_t NSF_ANALYSIS_RENDER_FRAMES = 64U;
 static constexpr uint32_t NSF_ANALYSIS_TASK_STACK_BYTES = 8192U;
@@ -280,7 +290,7 @@ struct NsfPreviewTaskArgs
 struct NsfAnalysisResult
 {
     bool complete = false;
-    bool loop_detected = false;
+    NsfEndPlanKind end_kind = NsfEndPlanKind::None;
     uint32_t generation = 0U;
     uint8_t track = 0U;
     uint64_t loop_start_ms = 0ULL;
@@ -368,15 +378,17 @@ static void audio_task_publish_nsf_clock_snapshot()
     snapshot.sample_rate_hz = g_nsf_playback_clock.sample_rate_hz;
     snapshot.submitted_frames = g_nsf_playback_clock.submitted_frames;
     snapshot.position_ms = audio_playback_clock_position_ms(&g_nsf_playback_clock);
-    if (g_nsf_loop_end_active && g_nsf_synth.sample_rate_hz != 0U) {
+    if (g_nsf_end_plan_kind != NsfEndPlanKind::None &&
+        g_nsf_synth.sample_rate_hz != 0U) {
         snapshot.duration_ms =
-            g_nsf_loop_end_frame * 1000ULL / g_nsf_synth.sample_rate_hz;
-    } else if (g_nsf_natural_end_active && g_nsf_synth.sample_rate_hz != 0U) {
-        snapshot.duration_ms =
-            g_nsf_natural_end_frame * 1000ULL / g_nsf_synth.sample_rate_hz;
+            g_nsf_end_frame * 1000ULL / g_nsf_synth.sample_rate_hz;
+        snapshot.duration_state = AudioNsfDurationState::Final;
     } else {
         snapshot.duration_ms = audio_task_get_nsf_analysis_duration_hint(
             nsf_synth_track(&g_nsf_synth));
+        snapshot.duration_state = snapshot.duration_ms > 0ULL
+            ? AudioNsfDurationState::Estimated
+            : AudioNsfDurationState::Unknown;
     }
     snapshot.track = nsf_synth_track(&g_nsf_synth);
     snapshot.track_count = g_nsf_synth.track_count;
@@ -2139,7 +2151,7 @@ static bool nsf_lookahead_ready_for_track(uint8_t track)
 static void nsf_analysis_publish(
     uint32_t generation,
     uint8_t track,
-    bool loop_detected,
+    NsfEndPlanKind end_kind,
     uint64_t loop_start_ms,
     uint64_t loop_length_ms,
     uint64_t duration_ms)
@@ -2148,7 +2160,7 @@ static void nsf_analysis_publish(
     if (generation == g_nsf_analysis_generation) {
         g_nsf_analysis_pending = false;
         g_nsf_analysis_result.complete = true;
-        g_nsf_analysis_result.loop_detected = loop_detected;
+        g_nsf_analysis_result.end_kind = end_kind;
         g_nsf_analysis_result.generation = generation;
         g_nsf_analysis_result.track = track;
         g_nsf_analysis_result.loop_start_ms = loop_start_ms;
@@ -2607,7 +2619,7 @@ static void nsf_analysis_task(void *arg)
             nsf_analysis_publish(
                 generation,
                 track,
-                duration_ms > 0ULL,
+                NsfEndPlanKind::VerifiedLoop,
                 loop_start_ms,
                 loop_length_ms,
                 duration_ms);
@@ -2634,7 +2646,13 @@ static void nsf_analysis_task(void *arg)
                         : 0ULL;
                 const uint64_t duration_ms =
                     silence_start_frame * 1000ULL / NSF_ANALYSIS_SAMPLE_RATE_HZ;
-                nsf_analysis_publish(generation, track, false, 0ULL, 0ULL, duration_ms);
+                nsf_analysis_publish(
+                    generation,
+                    track,
+                    NsfEndPlanKind::NaturalSilence,
+                    0ULL,
+                    0ULL,
+                    duration_ms);
                 ESP_LOGI(TAG,
                     "NSF后台静音分析完成：track=%u silence_start=%llums duration=%llums verified=%lums",
                     static_cast<unsigned>(track + 1U),
@@ -2647,10 +2665,17 @@ static void nsf_analysis_task(void *arg)
         }
 
         if (current_virtual_ms >= NSF_ANALYSIS_MAX_MS) {
-            nsf_analysis_publish(generation, track, false, 0ULL, 0ULL, 0ULL);
-            ESP_LOGI(TAG, "NSF后台分析完成：track=%u %lus内未发现可靠Loop或自然静音，duration未知",
+            nsf_analysis_publish(
+                generation,
+                track,
+                NsfEndPlanKind::HardLimit,
+                0ULL,
+                0ULL,
+                NSF_UNKNOWN_HARD_END_MS);
+            ESP_LOGI(TAG, "NSF后台分析完成：track=%u %lus内未发现可靠Loop或自然静音，采用%lus硬上限",
                 static_cast<unsigned>(track + 1U),
-                static_cast<unsigned long>(NSF_ANALYSIS_MAX_MS / 1000U));
+                static_cast<unsigned long>(NSF_ANALYSIS_MAX_MS / 1000U),
+                static_cast<unsigned long>(NSF_UNKNOWN_HARD_END_MS / 1000U));
             break;
         }
 
@@ -2964,7 +2989,7 @@ static bool audio_task_get_nsf_analysis_result(NsfAnalysisResult *out_result)
 
 static void audio_task_sync_nsf_analysis_end_plan()
 {
-    if (g_nsf_loop_end_active || g_nsf_natural_end_active || !g_nsf_active ||
+    if (g_nsf_end_plan_kind != NsfEndPlanKind::None || !g_nsf_active ||
         g_nsf_synth.sample_rate_hz == 0U) {
         return;
     }
@@ -2976,7 +3001,7 @@ static void audio_task_sync_nsf_analysis_end_plan()
     }
 
     const uint64_t rate = g_nsf_synth.sample_rate_hz;
-    if (!result.loop_detected) {
+    if (result.end_kind == NsfEndPlanKind::NaturalSilence) {
         const uint64_t end_frame = result.duration_ms * rate / 1000ULL;
         if (end_frame == 0ULL) return;
 
@@ -2990,13 +3015,33 @@ static void audio_task_sync_nsf_analysis_end_plan()
             return;
         }
 
-        g_nsf_natural_end_frame = end_frame;
-        g_nsf_natural_end_active = true;
+        g_nsf_end_frame = end_frame;
+        g_nsf_end_plan_kind = NsfEndPlanKind::NaturalSilence;
         ESP_LOGI(TAG, "NSF自然结束计划已采用后台分析：end=%llums",
             static_cast<unsigned long long>(result.duration_ms));
         return;
     }
 
+    if (result.end_kind == NsfEndPlanKind::HardLimit) {
+        const uint64_t fade_frames = rate * NSF_TRACK_FADE_MS / 1000ULL;
+        uint64_t end_frame = result.duration_ms * rate / 1000ULL;
+        if (end_frame == 0ULL) return;
+
+        // 若后台在低负载异常下过晚返回，至少从当前点保留完整淡出，避免突然截断。
+        const uint64_t earliest_end =
+            nsf_synth_position_frames(&g_nsf_synth) + fade_frames;
+        if (end_frame < earliest_end) end_frame = earliest_end;
+
+        g_nsf_end_frame = end_frame;
+        g_nsf_end_plan_kind = NsfEndPlanKind::HardLimit;
+        ESP_LOGI(TAG, "NSF结束计划采用硬上限：target=%lums end=%llums fade=%lums",
+            static_cast<unsigned long>(NSF_UNKNOWN_HARD_END_MS),
+            static_cast<unsigned long long>(g_nsf_end_frame * 1000ULL / rate),
+            static_cast<unsigned long>(NSF_TRACK_FADE_MS));
+        return;
+    }
+
+    if (result.end_kind != NsfEndPlanKind::VerifiedLoop) return;
     if (result.loop_length_ms == 0ULL) return;
     const uint64_t fade_frames = rate * NSF_TRACK_FADE_MS / 1000ULL;
     const uint64_t loop_start_frame = result.loop_start_ms * rate / 1000ULL;
@@ -3012,14 +3057,14 @@ static void audio_task_sync_nsf_analysis_end_plan()
             loop_start_frame, loop_length_frame, earliest_end);
     }
 
-    g_nsf_loop_end_frame = end_frame;
-    g_nsf_loop_end_active = true;
+    g_nsf_end_frame = end_frame;
+    g_nsf_end_plan_kind = NsfEndPlanKind::VerifiedLoop;
     ESP_LOGI(TAG,
         "NSF结束计划已采用后台分析：start=%llums loop=%llums target=%lums end=%llums",
         static_cast<unsigned long long>(result.loop_start_ms),
         static_cast<unsigned long long>(result.loop_length_ms),
         static_cast<unsigned long>(NSF_LOOP_TARGET_MS),
-        static_cast<unsigned long long>(g_nsf_loop_end_frame * 1000ULL / rate));
+        static_cast<unsigned long long>(g_nsf_end_frame * 1000ULL / rate));
 }
 
 static void audio_task_reset_nsf_end_policy()
@@ -3027,10 +3072,8 @@ static void audio_task_reset_nsf_end_policy()
     g_nsf_eof = false;
     g_nsf_seen_audible = false;
     g_nsf_silence_frames = 0ULL;
-    g_nsf_loop_end_active = false;
-    g_nsf_loop_end_frame = 0ULL;
-    g_nsf_natural_end_active = false;
-    g_nsf_natural_end_frame = 0ULL;
+    g_nsf_end_plan_kind = NsfEndPlanKind::None;
+    g_nsf_end_frame = 0ULL;
 }
 
 static int32_t audio_task_nsf_block_peak_pcm16(const int32_t *pcm, size_t frames)
@@ -3065,15 +3108,18 @@ static bool audio_task_reached_nsf_natural_end()
 {
     if (g_nsf_synth.sample_rate_hz == 0U) return false;
     audio_task_sync_nsf_analysis_end_plan();
-    return g_nsf_natural_end_active &&
-        nsf_synth_position_frames(&g_nsf_synth) >= g_nsf_natural_end_frame;
+    return g_nsf_end_plan_kind == NsfEndPlanKind::NaturalSilence &&
+        nsf_synth_position_frames(&g_nsf_synth) >= g_nsf_end_frame;
 }
 
-static bool audio_task_apply_nsf_loop_end_fade(int32_t *pcm, size_t frames)
+static bool audio_task_apply_nsf_fade_end(int32_t *pcm, size_t frames)
 {
     if (g_nsf_synth.sample_rate_hz == 0U || frames == 0U) return false;
     audio_task_sync_nsf_analysis_end_plan();
-    if (!g_nsf_loop_end_active) return false;
+    if (g_nsf_end_plan_kind != NsfEndPlanKind::VerifiedLoop &&
+        g_nsf_end_plan_kind != NsfEndPlanKind::HardLimit) {
+        return false;
+    }
 
     const uint64_t rate = g_nsf_synth.sample_rate_hz;
     const uint64_t current_frame = nsf_synth_position_frames(&g_nsf_synth);
@@ -3081,15 +3127,15 @@ static bool audio_task_apply_nsf_loop_end_fade(int32_t *pcm, size_t frames)
     const uint64_t fade_frames = rate * NSF_TRACK_FADE_MS / 1000ULL;
 
     const uint64_t fade_start =
-        g_nsf_loop_end_frame > fade_frames ? g_nsf_loop_end_frame - fade_frames : 0ULL;
+        g_nsf_end_frame > fade_frames ? g_nsf_end_frame - fade_frames : 0ULL;
     if (current_frame <= fade_start) return false;
 
     for (size_t frame = 0U; frame < frames; ++frame) {
         const uint64_t absolute_frame = block_start + frame;
         int32_t gain_q15 = 32767;
         if (absolute_frame >= fade_start) {
-            const uint64_t remaining = absolute_frame < g_nsf_loop_end_frame
-                ? g_nsf_loop_end_frame - absolute_frame
+            const uint64_t remaining = absolute_frame < g_nsf_end_frame
+                ? g_nsf_end_frame - absolute_frame
                 : 0ULL;
             gain_q15 = fade_frames != 0ULL
                 ? static_cast<int32_t>((remaining * 32767ULL) / fade_frames)
@@ -3100,7 +3146,7 @@ static bool audio_task_apply_nsf_loop_end_fade(int32_t *pcm, size_t frames)
         pcm[frame * 2U + 1U] = static_cast<int32_t>(
             (static_cast<int64_t>(pcm[frame * 2U + 1U]) * gain_q15) >> 15);
     }
-    return current_frame >= g_nsf_loop_end_frame;
+    return current_frame >= g_nsf_end_frame;
 }
 
 static void audio_task_finish_nsf_track(const char *reason)
@@ -3374,7 +3420,7 @@ static void audio_task_service_nsf()
     audio_task_update_nsf_visual_from_playback();
 
     const bool silence_eof = audio_task_update_nsf_silence_end(g_pcm_block, frames);
-    const bool loop_eof = audio_task_apply_nsf_loop_end_fade(g_pcm_block, frames);
+    const bool fade_eof = audio_task_apply_nsf_fade_end(g_pcm_block, frames);
     const bool natural_eof = audio_task_reached_nsf_natural_end();
 
     audio_playback_clock_note_decoder(
@@ -3393,11 +3439,14 @@ static void audio_task_service_nsf()
     }
 
     audio_playback_clock_commit_pcm(&g_nsf_playback_clock, frames);
-    if (loop_eof) {
-        audio_task_finish_nsf_track("loop_boundary_near_3m");
+    if (fade_eof) {
+        audio_task_finish_nsf_track(
+            g_nsf_end_plan_kind == NsfEndPlanKind::HardLimit
+                ? "unresolved_360s_hard_limit"
+                : "loop_boundary_near_3m");
     } else if (natural_eof) {
         audio_task_finish_nsf_track("silence_start_analyzed");
-    } else if (silence_eof && !g_nsf_loop_end_active && !g_nsf_natural_end_active &&
+    } else if (silence_eof && g_nsf_end_plan_kind == NsfEndPlanKind::None &&
                !audio_task_nsf_analysis_is_pending()) {
         // 只有后台未得到可靠自然结束点时，才保留实时6秒静音作为异常兜底。
         audio_task_finish_nsf_track("silence_6s_fallback");

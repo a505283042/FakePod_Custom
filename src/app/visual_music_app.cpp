@@ -614,13 +614,15 @@ static void update_nsf_time_label()
     uint64_t display_position_ms = position_ms;
     if (clock.duration_ms > 0ULL) {
         const uint64_t duration_seconds = clock.duration_ms / 1000ULL;
-        snprintf(duration_text, sizeof(duration_text), "%llu:%02llu",
+        snprintf(duration_text, sizeof(duration_text), "%s%llu:%02llu",
+            clock.duration_state == AudioNsfDurationState::Estimated ? "~" : "",
             static_cast<unsigned long long>(duration_seconds / 60ULL),
             static_cast<unsigned long long>(duration_seconds % 60ULL));
-        // NSF 循环曲目：真实 position 单调累加，会超过显示时长。
-        // 按 duration 取模显示，让进度在 0 ~ 时长 之间循环，避免 "5:30 / 3:00"。
-        if (position_ms >= clock.duration_ms) {
-            display_position_ms = position_ms % clock.duration_ms;
+        // Estimated 只是提前提示，不能让播放时间按估算值回绕；
+        // Final EOF 最多只会因最后一个 PCM 块越过结束点几毫秒，此时夹到最终时长。
+        if (clock.eof && clock.duration_state == AudioNsfDurationState::Final &&
+            display_position_ms > clock.duration_ms) {
+            display_position_ms = clock.duration_ms;
         }
     }
     char text[48] = {};

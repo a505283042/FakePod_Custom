@@ -92,6 +92,13 @@ bool audio_service_nsf_set_track(uint8_t track, bool wait = true);
 // restore_music_hardware=false 用于同一 NSF 内切 Subsong，正常列表/退出路径应传 true。
 bool audio_service_nsf_stop(bool restore_music_hardware = true, bool wait = true);
 
+enum class AudioNsfDurationState : uint8_t
+{
+    Unknown = 0U,
+    Estimated,
+    Final,
+};
+
 struct AudioNsfClockSnapshot
 {
     bool active = false;
@@ -102,7 +109,9 @@ struct AudioNsfClockSnapshot
     uint32_t sample_rate_hz = 0U;
     uint64_t submitted_frames = 0ULL;
     uint64_t position_ms = 0ULL;
-    uint64_t duration_ms = 0ULL; // 两轮结构一致可提前显示时长；自动结束仍等待后台可靠确认，无Loop/未知时为0
+    uint64_t duration_ms = 0ULL;
+    // Estimated 只用于提前显示，不能据此判断 EOF；Final 表示 AudioTask 已采用明确结束计划。
+    AudioNsfDurationState duration_state = AudioNsfDurationState::Unknown;
     uint8_t track = 0U;       // 0-based
     uint8_t track_count = 0U;
 };
