@@ -346,6 +346,8 @@ static size_t g_nsf_timeline_loop_end_index = 0U;
 static size_t g_nsf_timeline_loop_play_index = 0U;
 static uint32_t g_nsf_timeline_loop_play_shift_ticks = 0U;
 static size_t g_nsf_render_prepared_original_count = 0U;
+static uint32_t g_nsf_timeline_wait_count = 0U;
+static int64_t g_nsf_timeline_last_wait_log_us = 0LL;
 static uint16_t g_nsf_play_speed_us = 16666U;
 static uint64_t g_nsf_play_interval_q32 = 0ULL;
 static NsfSynthApuEvent g_nsf_render_event_block[NSF_RENDER_EVENT_BLOCK_CAPACITY] = {};
@@ -2363,6 +2365,8 @@ static void nsf_timeline_reset_locked()
     g_nsf_timeline_loop_play_index = 0U;
     g_nsf_timeline_loop_play_shift_ticks = 0U;
     g_nsf_render_prepared_original_count = 0U;
+    g_nsf_timeline_wait_count = 0U;
+    g_nsf_timeline_last_wait_log_us = 0LL;
 }
 
 static bool nsf_timeline_ensure_capacity_locked(size_t required)
@@ -3437,7 +3441,25 @@ static NsfTimelineReadStatus audio_task_prepare_nsf_timeline_block(
     const uint64_t current_ms = current_frame * 1000ULL / rate;
     const uint64_t required_ms = current_ms + NSF_TIMELINE_STARTUP_LEAD_MS;
     if (!g_nsf_timeline_complete && g_nsf_timeline_scanned_ms < required_ms) {
+        ++g_nsf_timeline_wait_count;
+        const uint64_t scanned_ms = g_nsf_timeline_scanned_ms;
+        const int64_t wait_now_us = esp_timer_get_time();
+        const bool log_wait = g_nsf_timeline_last_wait_log_us == 0LL ||
+            wait_now_us - g_nsf_timeline_last_wait_log_us >= 1000000LL;
+        const uint32_t wait_count = g_nsf_timeline_wait_count;
+        if (log_wait) {
+            g_nsf_timeline_last_wait_log_us = wait_now_us;
+            g_nsf_timeline_wait_count = 0U;
+        }
         xSemaphoreGive(g_nsf_timeline_mutex);
+        if (log_wait) {
+            ESP_LOGW(TAG,
+                "NSF Timeline欠载：count=%lu current=%llums scanned=%llums need=%llums",
+                static_cast<unsigned long>(wait_count),
+                static_cast<unsigned long long>(current_ms),
+                static_cast<unsigned long long>(scanned_ms),
+                static_cast<unsigned long long>(required_ms));
+        }
         return NsfTimelineReadStatus::Waiting;
     }
 

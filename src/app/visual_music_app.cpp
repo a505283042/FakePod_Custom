@@ -50,14 +50,17 @@ static constexpr int32_t kRowGap = 8;
 static constexpr size_t kVisibleRows = 5U;
 static constexpr size_t kGestureStepRows = 4U;
 static constexpr uint32_t kBrowserTimerPeriodMs = 20U;
+static constexpr uint32_t kNsfAnalyzingTimerPeriodMs = 20U;
+static constexpr uint32_t kNsfFinalTimerPeriodMs = 10U;
 static constexpr uint32_t kFlacSafePercent = 90U;
 static constexpr size_t kScanBatchNoFlac = 8U;
 static constexpr size_t kScanBatchWithFlac = 1U;
 static constexpr uint32_t kWaitLogIntervalMs = 1000U;
-// NSF 与后台预读/分析共抢 Core1，其瀑布降到8fps，
-// 避免310px绘图区持续刷屏占满CPU1和SPI刷新链路。
-// Browser/解析阶段仍通过 FLAC 水位策略给后台 Music 的 SD 读取让路。
-static constexpr uint32_t kNsfWaterfallFramePeriodMs = 125U;
+// R6.8：时长分析阶段优先保证 Sequencer/音频连续，保持接近 R6.6 的安全刷新率；
+// Final 后 Sequencer 已停止重分析，再切 10ms UI timer + 20fps 瀑布。
+static constexpr uint32_t kNsfWaterfallAnalyzingFramePeriodMs = 120U; // ~8.3fps
+static constexpr uint32_t kNsfWaterfallFinalFramePeriodMs = 50U;      // 20fps
+static constexpr uint32_t kNsfVisualSnapshotHoldMs = 300U;
 static constexpr uint32_t kWaterfallTimeLabelPeriodMs = 250U;
 // NSF 预读受 Core1 CPU 限制，无法持续领先 4s；缩小到预读能喂饱的尺寸，保证满窗且平滑。
 static constexpr uint32_t kWaterfallNsfFutureMs = 2000U;
@@ -121,6 +124,9 @@ static VisualMusicNsf::Image g_nsf_image = {};
 static uint8_t g_nsf_track = 0U;
 static AudioNsfVisualEvent g_nsf_visual_window[kNsfVisualWindowCapacity] = {};
 static uint32_t g_last_waterfall_draw_tick = 0U;
+static size_t g_nsf_visual_window_count = 0U;
+static uint32_t g_last_nsf_visual_snapshot_tick = 0U;
+static bool g_nsf_final_high_fps = false;
 static bool g_nsf_paused = true;
 static bool g_nsf_audio_active = false;
 static bool g_nsf_eof = false;
@@ -319,6 +325,10 @@ static bool stop_nsf_audio(bool restore_music, const char *reason)
         g_nsf_eof = false;
         g_last_nsf_eof_revision = 0U;
         g_nsf_failed = false;
+        g_nsf_final_high_fps = false;
+        g_nsf_visual_window_count = 0U;
+        g_last_nsf_visual_snapshot_tick = 0U;
+        if (g_timer != nullptr) lv_timer_set_period(g_timer, kBrowserTimerPeriodMs);
     }
 
     if (restore_music && g_music_paused_for_nsf) {
@@ -542,15 +552,27 @@ static void waterfall_draw_cb(lv_event_t *event)
         : now_ms + future_ms;
     // R6：PCM、当前音符和未来音符全部消费同一个 Sequencer Timeline。
     // 一次复制覆盖历史+未来窗口，避免 UI 对同一份大时间线做两次扫描。
-    const size_t count = audio_service_nsf_copy_visual_events(
+    const size_t fresh_count = audio_service_nsf_copy_visual_events(
         g_nsf_track,
         history_start,
         future_end,
         g_nsf_visual_window,
         kNsfVisualWindowCapacity);
+    const uint32_t snapshot_tick = lv_tick_get();
+    if (fresh_count > 0U) {
+        g_nsf_visual_window_count = fresh_count;
+        g_last_nsf_visual_snapshot_tick = snapshot_tick;
+    } else if (g_last_nsf_visual_snapshot_tick == 0U ||
+               snapshot_tick - g_last_nsf_visual_snapshot_tick > kNsfVisualSnapshotHoldMs) {
+        // 分析期发布/读取 mutex 偶发冲突时不要把单帧 0 events 当成真实空白；
+        // 最多沿用 300ms 的绝对时间戳快照，超过后再清空。
+        g_nsf_visual_window_count = 0U;
+    }
+    const size_t count = g_nsf_visual_window_count;
     for (size_t i = 0U; i < count; ++i) {
         const AudioNsfVisualEvent &note = g_nsf_visual_window[i];
-        if (note.end_ms < note.start_ms || note.end_ms < history_start) continue;
+        if (note.end_ms < note.start_ms || note.end_ms < history_start ||
+            note.start_ms > future_end) continue;
         int8_t low_lane = -1;
         if (note.voice == AudioNsfVisualVoice::Noise) low_lane = 0;
         else if (note.voice == AudioNsfVisualVoice::Dmc ||
@@ -581,6 +603,9 @@ static void cancel_nsf_player()
     g_last_nsf_eof_revision = 0U;
     g_last_nsf_time_label_tick = 0U;
     g_last_waterfall_draw_tick = 0U;
+    g_nsf_visual_window_count = 0U;
+    g_last_nsf_visual_snapshot_tick = 0U;
+    g_nsf_final_high_fps = false;
 }
 
 static void set_player_loading_ui(const char *message, const char *hint)
@@ -749,9 +774,13 @@ static bool start_nsf_audio_from_image()
     g_nsf_failed = false;
     g_last_nsf_time_label_tick = 0U;
     g_last_waterfall_draw_tick = 0U;
+    g_nsf_visual_window_count = 0U;
+    g_last_nsf_visual_snapshot_tick = 0U;
+    g_nsf_final_high_fps = false;
+    if (g_timer != nullptr) lv_timer_set_period(g_timer, kNsfAnalyzingTimerPeriodMs);
     update_nsf_ready_ui();
     if (g_waterfall_widget != nullptr) lv_obj_invalidate(g_waterfall_widget);
-    ESP_LOGI(TAG, "NSF 2A03音频启动：track=%u/%u 48000Hz 基础5通道",
+    ESP_LOGI(TAG, "NSF 2A03音频启动：track=%u/%u 48000Hz 基础5通道 waterfall=~8->20fps(final)",
         static_cast<unsigned>(g_nsf_track + 1U),
         static_cast<unsigned>(g_nsf_image.track_count));
     return true;
@@ -855,6 +884,10 @@ static bool select_nsf_subsong(int direction, bool allow_wrap)
     g_nsf_failed = false;
     g_last_nsf_time_label_tick = 0U;
     g_last_waterfall_draw_tick = 0U;
+    g_nsf_visual_window_count = 0U;
+    g_last_nsf_visual_snapshot_tick = 0U;
+    g_nsf_final_high_fps = false;
+    if (g_timer != nullptr) lv_timer_set_period(g_timer, kNsfAnalyzingTimerPeriodMs);
     update_nsf_ready_ui();
     if (g_waterfall_widget != nullptr) lv_obj_invalidate(g_waterfall_widget);
     ESP_LOGI(
@@ -1207,6 +1240,7 @@ static void show_browser()
     (void)stop_nsf_audio(true, "back_to_list");
     cancel_nsf_player();
     g_page = VisualMusicPage::Browser;
+    if (g_timer != nullptr) lv_timer_set_period(g_timer, kBrowserTimerPeriodMs);
     set_visible(g_browser_host, true);
     set_browser_header_visible(true);
     set_visible(g_player_host, false);
@@ -1356,20 +1390,44 @@ static void timer_cb(lv_timer_t *timer)
                     update_player_controls();
                 }
             } else {
+                if (paused_changed) {
+                    update_player_controls();
+                    if (clock.paused && g_waterfall_widget != nullptr) {
+                        // Pause 只在状态切换瞬间补一帧，之后不再持续刷新瀑布。
+                        lv_obj_invalidate(g_waterfall_widget);
+                    }
+                }
+                const bool want_final_high_fps =
+                    clock.duration_state == AudioNsfDurationState::Final;
+                if (want_final_high_fps != g_nsf_final_high_fps) {
+                    g_nsf_final_high_fps = want_final_high_fps;
+                    if (g_timer != nullptr) {
+                        lv_timer_set_period(
+                            g_timer,
+                            want_final_high_fps
+                                ? kNsfFinalTimerPeriodMs
+                                : kNsfAnalyzingTimerPeriodMs);
+                    }
+                    g_last_waterfall_draw_tick = 0U;
+                    if (want_final_high_fps) {
+                        ESP_LOGI(TAG, "NSF时长Final：瀑布切换20fps");
+                    }
+                }
                 if (g_last_nsf_time_label_tick == 0U ||
                     now_tick - g_last_nsf_time_label_tick >= kWaterfallTimeLabelPeriodMs) {
                     g_last_nsf_time_label_tick = now_tick;
                     update_nsf_time_label();
-                    if (paused_changed) update_player_controls();
-                    if (clock.paused && g_waterfall_widget != nullptr) {
-                        lv_obj_invalidate(g_waterfall_widget);
-                    }
                 }
-                if (!clock.paused &&
-                    (g_last_waterfall_draw_tick == 0U ||
-                     now_tick - g_last_waterfall_draw_tick >= kNsfWaterfallFramePeriodMs)) {
-                    g_last_waterfall_draw_tick = now_tick;
-                    if (g_waterfall_widget != nullptr) lv_obj_invalidate(g_waterfall_widget);
+                if (!clock.paused) {
+                    const uint32_t waterfall_period_ms =
+                        clock.duration_state == AudioNsfDurationState::Final
+                            ? kNsfWaterfallFinalFramePeriodMs
+                            : kNsfWaterfallAnalyzingFramePeriodMs;
+                    if (g_last_waterfall_draw_tick == 0U ||
+                        now_tick - g_last_waterfall_draw_tick >= waterfall_period_ms) {
+                        g_last_waterfall_draw_tick = now_tick;
+                        if (g_waterfall_widget != nullptr) lv_obj_invalidate(g_waterfall_widget);
+                    }
                 }
             }
         }
