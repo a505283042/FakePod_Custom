@@ -15,6 +15,7 @@
 #include "assets/launcher_animation_frames.h"
 #include "artwork/now_playing_artwork.h"
 #include "artwork/cover_surface_cache.h"
+#include "cassette_view.h"
 #include "board_pins.h"
 #include "display_bounded_spi.h"
 #include "font/font_manager.h"
@@ -181,6 +182,14 @@ static constexpr LauncherMenuItemDef kLauncherItems[kLauncherItemCount] = {
 // R.35.1：播放页页面级手势继续统一用白名单过滤。
 // 封面/歌词/频谱都允许中央纵向 Flick 切歌；各页原有横向导航保持不变。
 // Overlay/Launcher 仍锁住页面切歌，顶部/底部边缘继续保留给曲库与 Launcher。
+enum class MusicVisualMode : uint8_t
+{
+    Artwork = 0,
+    Cassette,
+};
+
+static MusicVisualMode g_music_visual_mode = MusicVisualMode::Artwork;
+
 enum class PlaybackGestureScope : uint8_t
 {
     Home = 0,
@@ -223,6 +232,8 @@ static lv_obj_t *g_overlay = nullptr;
 static lv_obj_t *g_overlay_backdrop = nullptr;
 static lv_timer_t *g_overlay_timer = nullptr;
 static bool g_overlay_visible = false;
+static lv_obj_t *g_visual_mode_button = nullptr;
+static lv_obj_t *g_visual_mode_label = nullptr;
 
 static lv_obj_t *g_launcher = nullptr;
 static lv_obj_t *g_launcher_backdrop = nullptr;
@@ -2058,20 +2069,25 @@ static void player_home_launcher_leave_done(lv_anim_t *anim)
     const bool used_bounded = g_launcher_bounded_session_active;
     bool restored = false;
     if (used_bounded) {
-        // R.36.3：最后一笔仍走同一 BoundedSPI session，把 normal/dimmed current Surface
-        // 恢复到 GRAM；完成后才结束 session 并释放 staging，确保不存在 descriptor UAF。
-        restored = player_home_present_current_cover_bounded("launcher-hide");
+        if (g_music_visual_mode == MusicVisualMode::Artwork) {
+            // Artwork 模式保持 R.36.3：最后一笔恢复当前 Surface 到 GRAM。
+            restored = player_home_present_current_cover_bounded("launcher-hide");
+        }
         display_launcher_bounded_spi_session_end();
         if (!restored) {
-            lv_obj_invalidate(lv_screen_active());
+            // Cassette 模式不能把全屏 Cover 当成最终主页；让 LVGL 重新合成磁带场景。
+            lv_obj_t *screen = lv_screen_active();
+            if (screen != nullptr) lv_obj_invalidate(screen);
         }
     }
     g_launcher_bounded_session_active = false;
-    g_artwork_resume_without_invalidation = restored;
+    g_artwork_resume_without_invalidation =
+        restored && g_music_visual_mode == MusicVisualMode::Artwork;
     if (g_launcher_backdrop != nullptr) {
         lv_obj_set_style_bg_opa(g_launcher_backdrop, kLauncherBackdropOpa, 0);
     }
-    now_playing_artwork_set_bounded_present_allowed(true);
+    now_playing_artwork_set_bounded_present_allowed(
+        g_music_visual_mode == MusicVisualMode::Artwork);
 #if APP_DIAG_LAUNCHER_PERFORMANCE
     const uint32_t elapsed = static_cast<uint32_t>(lv_tick_get()) - g_launcher_anim_started_ms;
     HOME_LAUNCHER_PERF_LOGI(
@@ -2423,7 +2439,10 @@ static void player_home_overlay_apply_dim_path()
 
     // R.20：CoverSurface 命中时直接切预暗 RGB565，backdrop 保持全透明；
     // 只有 Overlay 可见且压缩 JPEG/PNG 回退路径没有 dimmed Surface 时，才启用旧 alpha 黑层。
-    const bool fast_dim = now_playing_artwork_set_dimmed(g_overlay_visible);
+    bool fast_dim = false;
+    if (g_music_visual_mode == MusicVisualMode::Artwork) {
+        fast_dim = now_playing_artwork_set_dimmed(g_overlay_visible);
+    }
     const lv_opa_t backdrop_opa =
         (g_overlay_visible && !fast_dim)
             ? kOverlayDimOpacity
@@ -2444,6 +2463,7 @@ static void player_home_overlay_show()
             player_home_overlay_begin_atomic_transition();
         g_overlay_visible = true;
         player_home_set_volume_adjust_armed(false);
+        cassette_view_set_controls_visible(true);
         player_home_overlay_apply_dim_path();
         player_home_overlay_set_controls_visible(true);
         player_home_overlay_set_backdrop_clickable(true);
@@ -2465,6 +2485,7 @@ static void player_home_overlay_hide()
     if (g_overlay_timer != nullptr) {
         lv_timer_pause(g_overlay_timer);
     }
+    cassette_view_set_controls_visible(false);
 
     // R.34.2：child 显隐和 normal Surface 恢复统一在同一 invalidation 事务中完成。
     player_home_overlay_set_controls_visible(false);
@@ -2623,13 +2644,18 @@ static void player_home_artwork_fast_rebind(const char *reason)
     const uint32_t track_index = static_cast<uint32_t>(player_state_get_index());
 
     const int64_t started_us = esp_timer_get_time();
-    now_playing_artwork_refresh_context();
-    now_playing_artwork_update();
-    player_home_repaint_controls_after_bounded_present();
+    if (g_music_visual_mode == MusicVisualMode::Cassette) {
+        cassette_view_update();
+    } else {
+        now_playing_artwork_refresh_context();
+        now_playing_artwork_update();
+        player_home_repaint_controls_after_bounded_present();
+    }
     g_last_artwork_bound_track = track_index;
 
     HOME_INTERACTION_LOGI(
-        "封面立即重绑：reason=%s track=%lu cost=%lldus",
+        "%s立即重绑：reason=%s track=%lu cost=%lldus",
+        g_music_visual_mode == MusicVisualMode::Cassette ? "磁带封面" : "封面",
         reason != nullptr ? reason : "track-change",
         static_cast<unsigned long>(track_index),
         static_cast<long long>(esp_timer_get_time() - started_us));
@@ -2666,8 +2692,13 @@ static void player_home_update_background_timer_qos()
     // R.36：主页被完整覆盖时释放 Artwork UI lease，让交换槽可立即回收旧 Surface。
     // Launcher 若已用 BoundedSPI 恢复当前封面到 GRAM，则 resume 只同步 LVGL source/lease，
     // 不再额外触发整屏刷新；其它页面恢复仍走普通 invalidation。
-    const bool quiet_resume = should_run && g_artwork_resume_without_invalidation;
-    now_playing_artwork_set_active(should_run, quiet_resume);
+    const bool artwork_should_run =
+        should_run && g_music_visual_mode == MusicVisualMode::Artwork;
+    const bool cassette_should_run =
+        should_run && g_music_visual_mode == MusicVisualMode::Cassette;
+    const bool quiet_resume = artwork_should_run && g_artwork_resume_without_invalidation;
+    now_playing_artwork_set_active(artwork_should_run, quiet_resume);
+    (void)cassette_view_set_active(cassette_should_run);
     if (should_run) {
         g_artwork_resume_without_invalidation = false;
     }
@@ -3316,11 +3347,15 @@ static void player_home_artwork_timer_cb(lv_timer_t *timer)
     if (ui_touch_input_recent_activity(kInteractionYieldMs)) {
         return;
     }
-    now_playing_artwork_update();
-    player_home_repaint_controls_after_bounded_present();
-    // 如果 Overlay 打开期间新 Surface 刚好准备完成，立即切到该曲的 dimmed RGB565。
-    if (g_overlay_visible) {
-        player_home_overlay_apply_dim_path();
+    if (g_music_visual_mode == MusicVisualMode::Cassette) {
+        cassette_view_update();
+    } else {
+        now_playing_artwork_update();
+        player_home_repaint_controls_after_bounded_present();
+        // 如果 Overlay 打开期间新 Surface 刚好准备完成，立即切到该曲的 dimmed RGB565。
+        if (g_overlay_visible) {
+            player_home_overlay_apply_dim_path();
+        }
     }
 }
 
@@ -3403,6 +3438,74 @@ static void player_home_loop_cb(lv_event_t *event)
     player_home_refresh_transport_controls(&snapshot);
 }
 
+static void player_home_refresh_visual_mode_button()
+{
+    if (g_visual_mode_label == nullptr) return;
+    player_home_label_set_text_if_changed(
+        g_visual_mode_label,
+        g_music_visual_mode == MusicVisualMode::Cassette ? "封面" : "磁带");
+}
+
+static bool player_home_set_visual_mode(MusicVisualMode mode)
+{
+    if (mode == g_music_visual_mode) {
+        player_home_refresh_visual_mode_button();
+        return true;
+    }
+
+    if (mode == MusicVisualMode::Cassette) {
+        // 先让 Cassette acquire 当前 CoverSurface，再释放 Artwork lease，避免 pin=0 的交换窗口。
+        if (!cassette_view_set_active(true)) {
+            ESP_LOGW(TAG, "切换磁带模式失败：磁带视觉层未就绪");
+            return false;
+        }
+        cassette_view_set_controls_visible(g_overlay_visible);
+        g_music_visual_mode = MusicVisualMode::Cassette;
+        now_playing_artwork_set_bounded_present_allowed(false);
+        (void)now_playing_artwork_set_dimmed(false);
+        now_playing_artwork_set_active(false);
+        g_artwork_resume_without_invalidation = false;
+    } else {
+        g_music_visual_mode = MusicVisualMode::Artwork;
+        (void)cassette_view_set_active(false);
+        const bool should_run =
+            g_app_foreground &&
+            !library_view_is_visible() &&
+            !lyrics_view_is_visible() &&
+            !spectrum_view_is_visible() &&
+            !g_launcher_visible;
+        now_playing_artwork_set_bounded_present_allowed(should_run);
+        (void)now_playing_artwork_set_dimmed(g_overlay_visible);
+        now_playing_artwork_set_active(should_run);
+        if (should_run) {
+            now_playing_artwork_refresh_context();
+            now_playing_artwork_update();
+            player_home_repaint_controls_after_bounded_present();
+        }
+    }
+
+    player_home_refresh_visual_mode_button();
+    player_home_overlay_apply_dim_path();
+    lv_obj_t *screen = lv_screen_active();
+    if (screen != nullptr) lv_obj_invalidate(screen);
+    ESP_LOGI(TAG, "Music视觉模式：%s",
+        g_music_visual_mode == MusicVisualMode::Cassette ? "磁带" : "封面");
+    return true;
+}
+
+static void player_home_visual_mode_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED || !g_overlay_visible ||
+        player_home_click_suppressed()) {
+        return;
+    }
+    player_home_overlay_show();
+    const MusicVisualMode next = g_music_visual_mode == MusicVisualMode::Artwork
+        ? MusicVisualMode::Cassette
+        : MusicVisualMode::Artwork;
+    (void)player_home_set_visual_mode(next);
+}
+
 static void player_home_volume_mode_cb(lv_event_t *event)
 {
     if (lv_event_get_code(event) != LV_EVENT_CLICKED || !g_overlay_visible ||
@@ -3440,9 +3543,13 @@ static void player_home_refresh()
     // 当前曲 Surface/Loader 状态，避免切歌期间 timer 被暂停后长期停在“准备封面...”。
     player_home_update_background_timer_qos();
     player_home_apply_audio_snapshot(snapshot);
-    now_playing_artwork_refresh_context();
-    now_playing_artwork_update();
-    player_home_repaint_controls_after_bounded_present();
+    if (g_music_visual_mode == MusicVisualMode::Cassette) {
+        cassette_view_update();
+    } else {
+        now_playing_artwork_refresh_context();
+        now_playing_artwork_update();
+        player_home_repaint_controls_after_bounded_present();
+    }
     if (player_state_is_ready() && media_library_get_count() > 0U) {
         g_last_artwork_bound_track = static_cast<uint32_t>(player_state_get_index());
     }
@@ -3454,12 +3561,17 @@ static void player_home_refresh()
 
 bool player_home_prepare_track_transition_hold()
 {
+    if (g_music_visual_mode == MusicVisualMode::Cassette) {
+        return true;
+    }
     return now_playing_artwork_prepare_track_transition_hold();
 }
 
 void player_home_cancel_track_transition_hold()
 {
-    now_playing_artwork_cancel_track_transition_hold();
+    if (g_music_visual_mode == MusicVisualMode::Artwork) {
+        now_playing_artwork_cancel_track_transition_hold();
+    }
 }
 
 void player_home_resume_from_fullscreen_view(const char *reason)
@@ -3544,7 +3656,8 @@ esp_err_t player_home_app_enter_foreground()
     }
 
     g_app_foreground = true;
-    now_playing_artwork_set_bounded_present_allowed(true);
+    now_playing_artwork_set_bounded_present_allowed(
+        g_music_visual_mode == MusicVisualMode::Artwork);
     if (g_gesture_timer != nullptr) {
         lv_timer_reset(g_gesture_timer);
         lv_timer_resume(g_gesture_timer);
@@ -3604,6 +3717,9 @@ void player_home_create(lv_obj_t *screen)
     g_volume_dragging = false;
     g_volume_adjust_armed = false;
     g_overlay_visible = false;
+    g_music_visual_mode = MusicVisualMode::Artwork;
+    g_visual_mode_button = nullptr;
+    g_visual_mode_label = nullptr;
     g_last_loop_mode_valid = false;
     g_overlay_backdrop = nullptr;
     g_launcher = nullptr;
@@ -3657,6 +3773,11 @@ void player_home_create(lv_obj_t *screen)
         lv_obj_move_background(cover);
     } else {
         ESP_LOGW(TAG, "创建全屏封面失败，继续黑底运行：%s", esp_err_to_name(artwork_ret));
+    }
+
+    const esp_err_t cassette_ret = cassette_view_create(screen);
+    if (cassette_ret != ESP_OK) {
+        ESP_LOGW(TAG, "创建磁带视觉层失败，保留封面模式：%s", esp_err_to_name(cassette_ret));
     }
 
     if (player_state_is_ready() && media_library_get_count() > 0U) {
@@ -3884,6 +4005,12 @@ void player_home_create(lv_obj_t *screen)
     lv_obj_set_style_radius(g_volume_slider, LV_RADIUS_CIRCLE, LV_PART_KNOB);
     lv_obj_set_style_bg_color(g_volume_slider, lv_color_hex(0xFFFFFF), LV_PART_KNOB);
     lv_obj_set_style_bg_opa(g_volume_slider, LV_OPA_COVER, LV_PART_KNOB);
+
+    // 视觉模式入口只在 Overlay 显示时出现，不占用四向手势或封面单击。
+    g_visual_mode_button = player_home_create_pill_button(
+        g_overlay, 76, 28, "磁带", &g_visual_mode_label);
+    lv_obj_set_pos(g_visual_mode_button, 18, 310);
+    lv_obj_add_event_cb(g_visual_mode_button, player_home_visual_mode_cb, LV_EVENT_CLICKED, nullptr);
 
     // 百分比仍保留原静音入口，但收在音量条上方，不打断底部“模式-音量条-音量图标”的主结构。
     lv_obj_t *volume_status = player_home_create_pill_button(g_overlay, 68, 28, "80%", &g_volume_label);

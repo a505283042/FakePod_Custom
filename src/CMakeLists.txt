@@ -57,6 +57,8 @@ idf_component_register(
 
         "assets/artwork_loader.cpp"
         "assets/launcher_animation_frames.cpp"
+        "assets/cassette_shell_pink_data.cpp"
+        "assets/cassette_mechanics_data.cpp"
 
         "media/library/media_library.cpp"
         "media/library/media_index_store.cpp"
@@ -86,6 +88,7 @@ idf_component_register(
         "ui/artwork/cover_surface_cache.cpp"
         "ui/artwork/now_playing_artwork.cpp"
         "ui/screens/player_home.cpp"
+        "ui/screens/cassette_view.cpp"
         "ui/screens/library_view.cpp"
 
     INCLUDE_DIRS
@@ -141,6 +144,7 @@ idf_component_register(
         esp_timer
         nvs_flash
         fatfs
+
 )
 
 # SRAM.1.3：LVGL 仍使用内置 TLSF，但把固定 pool 扩容到 128KB，并继续全部放在 PSRAM。
