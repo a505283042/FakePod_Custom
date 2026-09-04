@@ -17,11 +17,12 @@
 #include "media_library.h"
 #include "player_state.h"
 #include "lyrics/lyrics_service.h"
+#include "gesture/gesture_router.h"
 #include "ui_common.h"
 
 static const char *TAG = "磁带视觉";
 
-// Music 磁带视觉：CoverSurface + 静态外壳 + C2机械件 Sprite。音频链保持只读。
+// Music 磁带视觉：CoverSurface + 静态外壳 + 机械件 Sprite + C2.4三段走带。音频链保持只读。
 static constexpr int16_t kCassetteWidth = 460;
 static constexpr int16_t kCassetteHeight = 296;
 static constexpr int16_t kCassetteX = 0;
@@ -49,10 +50,25 @@ static constexpr int16_t kLabelHeight = 186;
 static constexpr uint32_t kCoverBleedWidth = 410U;
 static constexpr uint32_t kLvImageScaleNone = 256U;
 
-// C2.1：用户提供的机械件严格按最终 460x296 外壳像素坐标放置。
-// 大轮 56x56 使用 6 帧（0/10/20/30/40/50°）；8 点小轮 44x44 只保留
-// 2 个唯一相位（0/22.5°）。运行期仅移动 Sprite Strip，不做 LVGL rotate/scale。
-static constexpr uint8_t kBigReelFrameCount = 6U;
+// C2.4.9：封面纵向微调。步进收细到4px；边界不再只靠固定±100px，
+// 而是根据“当前封面实际缩放高度 - Label开窗高度”动态计算安全范围，
+// 并额外保留2px安全余量，保证上下移动都不会露出黑边。
+static constexpr int16_t kCoverYOffsetStepPx = 4;
+static constexpr int16_t kCoverYOffsetLimitPx = 100;
+static constexpr int16_t kCoverEdgeSafetyPx = 2;
+static constexpr int16_t kCoverAdjustButtonSize = 40;
+// C2.4.13：视觉仍保持40x40，但点击热区向四周扩20px（约80x80），进一步提升命中率。
+static constexpr int16_t kCoverAdjustExtraClickPx = 20;
+// C2.4.11：在C2.4.9基础上再下移10px，更贴合横向粉色壳体区域。
+static constexpr int16_t kCoverAdjustButtonY = 222;
+static constexpr int16_t kCoverAdjustUpButtonX = 97;
+static constexpr int16_t kCoverAdjustDownButtonX = 323;
+
+// C2.3：用户提供的机械件严格按最终 460x296 外壳像素坐标放置。
+// 大轮 56x56 使用 12 帧覆盖六齿结构的一个 60°视觉周期（每帧5°）；
+// 8 点小轮 44x44 继续只保留 2 个唯一相位（0/22.5°）。
+// 运行期仅移动 Sprite Strip，不做 LVGL rotate/scale。
+static constexpr uint8_t kBigReelFrameCount = 12U;
 static constexpr uint8_t kSmallRollerFrameCount = 2U;
 static constexpr int16_t kBigReelSize = 56;
 static constexpr int16_t kBigReelLeftX = 106;
@@ -67,14 +83,56 @@ static constexpr int16_t kTapeAmountHeight = 41;
 static constexpr int16_t kTapeAmountBaseX = 150;
 static constexpr int16_t kTapeAmountY = 104;
 static constexpr int16_t kTapeAmountTravelPx = 25;
-static constexpr int64_t kMechanicsFramePeriodUs = 100000LL;  // 10 Hz，沿用主页现有100ms timer
+static constexpr int64_t kMechanicsFramePeriodUs = 50000LL;  // C2.3：20 Hz，12帧大轮真正显示5°中间相位
+static constexpr uint32_t kMechanicsTimerPeriodMs = 50U;
+// C2.4.15：96/192 kHz FLAC 给解码/I2S 留更大的实时预算：机械 timer 仍保持 50ms，
+// 但大轮只允许每 100ms 提交一次新画面，并只使用 12 帧条带中的 6 个 10°相位。
+// 这样不需要切换/重解码 Sprite 资源，也能把高采样率播放时的机械 UI 压力减半。
+static constexpr int64_t kHighRateFlacMechanicsFramePeriodUs = 100000LL;
+static constexpr uint8_t kHighRateFlacBigReelFrameCount = 6U;
+static_assert(kBigReelFrameCount % kHighRateFlacBigReelFrameCount == 0U);
 
-// 大卷轴采用 Q16.16“帧相位”累积。磁带少时约 1.0 frame/tick，
-// 磁带满时约 0.5 frame/tick；随播放进度连续插值，避免左右卷轴同步。
-// 6 齿大轮每帧相差 10°，60° 后外观周期重复。
+// C2.4.1：走带仍采用3段简化路径，但全部锚在圆周而不是圆心。
+// 中间横线贴两个小轮开窗的下圆周；左右斜线只显示在 Label 下方的粉色外壳区域，
+// 其“虚拟”大轮端固定从大轮外侧圆周切点起算，并随磁带量最多向外移动5px。
+// 不做实时切线/三角函数，只用固定锚点 + 线性插值求 Label 下边缘的可见起点。
+static constexpr uint32_t kTapeSideColorHex = 0x83515E;
+static constexpr uint32_t kTapeMiddleColorHex = 0x965B6A;
+static constexpr uint32_t kTapeGlintColorHex = 0xFFD0DC;
+static constexpr uint8_t kTapeSideOpa = 218U;
+static constexpr uint8_t kTapeMiddleOpa = 232U;
+static constexpr uint8_t kTapeLineWidth = 2U;
+static constexpr int64_t kTapeGlintPeriodUs = 100000LL;  // 10 Hz，仅几个像素跳动
+static constexpr uint8_t kTapeGlintPhaseCount = 4U;
+
+// C2.4.1 固定几何（均为 460x296 磁带局部坐标）。
+// 大轮：左轮用左侧圆周切点，右轮用右侧圆周切点；磁带量增加时只沿X向外最多5px。
+static constexpr int16_t kTapeBigLeftBaseX = 107;
+static constexpr int16_t kTapeBigRightBaseX = 350;
+static constexpr int16_t kTapeBigAnchorY = 134;
+static constexpr int16_t kTapeBigOuterTravelPx = 5;
+// C2.4.4：斜线接小轮的位置按最终外壳开孔固定在“外侧上圆周”。
+// 左轮取约10~11点方向，右轮取约1~2点方向；C2.4.6 再各收回1px，取消额外外扩，
+// 让2px走带线端点落在粉色开孔圆周边缘。
+// 坐标均为460x296磁带局部坐标，不做运行时切线/三角函数。
+static constexpr int16_t kTapeSmallLeftSideX = 35;
+static constexpr int16_t kTapeSmallRightSideX = 424;
+static constexpr int16_t kTapeSmallSideY = 250;
+// Label透明开窗 y=25..210，211开始进入粉色外壳；斜线只从这里开始显示。
+static constexpr int16_t kTapeShellVisibleTopY = kLabelY + kLabelHeight;
+// 中间线以两个小轮透明开窗的下圆周为基准，C2.4.2 整体再下移2px。
+static constexpr int16_t kTapeSmallLeftBottomX = 48;
+static constexpr int16_t kTapeSmallRightBottomX = 411;
+static constexpr int16_t kTapeSmallBottomY = 285;
+
+// 大卷轴采用 Q16.16“帧相位”累积。12帧后每帧相差5°；把刷新周期从100ms
+// 缩短到50ms，并保持 0.5~1.0 frame/tick，因此角速度仍约为50~100°/s，
+// 与C2.2一致，但视觉步进从最多10°降到最多5°。
 static constexpr uint32_t kPhaseOneFrameQ16 = 1U << 16U;
 static constexpr uint32_t kBigReelSlowStepQ16 = kPhaseOneFrameQ16 / 2U;
 static constexpr uint32_t kBigReelFastStepQ16 = kPhaseOneFrameQ16;
+// 小滚轮仍保持C2.2约每100ms切换一次相位；20Hz timer下每tick推进半帧。
+static constexpr uint32_t kSmallRollerStepQ16 = kPhaseOneFrameQ16 / 2U;
 
 extern "C" {
 extern const uint8_t g_cassette_shell_png[];
@@ -90,18 +148,29 @@ extern const size_t g_cassette_tape_amount_png_size;
 static lv_obj_t *g_root = nullptr;
 static lv_obj_t *g_label_viewport = nullptr;
 static lv_obj_t *g_cover_image = nullptr;
+static lv_obj_t *g_cover_adjust_buttons[2] = {};
 static lv_obj_t *g_shell_image = nullptr;
 static lv_obj_t *g_tape_amount_image = nullptr;
 static lv_obj_t *g_big_reel_viewports[2] = {};
 static lv_obj_t *g_big_reel_strip_images[2] = {};
 static lv_obj_t *g_small_roller_viewports[2] = {};
 static lv_obj_t *g_small_roller_strip_images[2] = {};
+static lv_obj_t *g_tape_side_lines[2] = {};
+static lv_obj_t *g_tape_middle_line = nullptr;
+static lv_obj_t *g_tape_glints[5] = {};
+static lv_point_precise_t g_tape_side_points[2][2] = {};
+static lv_point_precise_t g_tape_middle_points[2] = {};
 static lv_obj_t *g_title_label = nullptr;
 static lv_obj_t *g_artist_label = nullptr;
 static lv_obj_t *g_current_lyric_label = nullptr;
 static lv_obj_t *g_next_lyric_label = nullptr;
 static bool g_active = false;
 static bool g_controls_visible = false;
+// C2.4.10：进度条拖动和Audio Seek提交期间冻结所有磁带机械刷新。
+static bool g_seek_frozen = false;
+// C2.4.13：Launcher 显示期间冻结 Cassette 机械层。高速 Launcher 会进一步隐藏整个
+// Cassette root；fallback 则保留静态磁带背景，避免菜单切换时大小轮继续重绘。
+static bool g_launcher_suspended = false;
 
 static uint32_t g_text_track = UINT32_MAX;
 static uint32_t g_lyrics_requested_track = UINT32_MAX;
@@ -121,12 +190,139 @@ static bool g_mechanics_ready = false;
 static uint32_t g_big_reel_phase_q16[2] = {};
 static uint32_t g_small_roller_phase_q16 = 0U;
 static int16_t g_last_tape_shift = INT16_MIN;
+static int8_t g_last_tape_path_step = -1;
 static int64_t g_last_mechanics_frame_us = 0LL;
+static lv_timer_t *g_mechanics_timer = nullptr;
+static uint8_t g_tape_glint_phase = 0U;
+static int64_t g_last_tape_glint_us = 0LL;
 
 static CoverSurfaceLease g_cover_lease = {};
 static lv_image_dsc_t g_cover_dsc = {};
 static uint32_t g_cover_generation = 0U;
 static uint32_t g_cover_track = UINT32_MAX;
+static uint32_t g_cover_scale_q8 = kLvImageScaleNone;
+static int16_t g_cover_y_offset_px = 0;
+
+static int16_t cassette_view_cover_safe_offset_limit_px()
+{
+    if (g_cover_lease.height == 0U || g_cover_scale_q8 == 0U) return 0;
+
+    // 保守地按向下取整后的实际缩放高度计算，避免LVGL整数缩放边缘出现1px黑缝。
+    const int32_t scaled_height = static_cast<int32_t>(
+        (static_cast<uint64_t>(g_cover_lease.height) * g_cover_scale_q8) / kLvImageScaleNone);
+    const int32_t extra_height = scaled_height - static_cast<int32_t>(kLabelHeight);
+    if (extra_height <= 2 * kCoverEdgeSafetyPx) return 0;
+
+    int32_t safe = extra_height / 2 - kCoverEdgeSafetyPx;
+    if (safe < 0) safe = 0;
+    if (safe > kCoverYOffsetLimitPx) safe = kCoverYOffsetLimitPx;
+    return static_cast<int16_t>(safe);
+}
+
+static void cassette_view_apply_cover_position()
+{
+    if (g_cover_image == nullptr || g_cover_lease.width == 0U || g_cover_lease.height == 0U) return;
+
+    const int16_t safe_limit = cassette_view_cover_safe_offset_limit_px();
+    if (g_cover_y_offset_px < -safe_limit) g_cover_y_offset_px = -safe_limit;
+    if (g_cover_y_offset_px > safe_limit) g_cover_y_offset_px = safe_limit;
+
+    // 明确使用“未缩放图像居中基准 + Y偏移”。LVGL缩放默认绕图像中心进行，
+    // 因此正Y必然向下、负Y必然向上，不再依赖center()后的相对坐标状态。
+    const int32_t base_x =
+        (static_cast<int32_t>(kLabelWidth) - static_cast<int32_t>(g_cover_lease.width)) / 2;
+    const int32_t base_y =
+        (static_cast<int32_t>(kLabelHeight) - static_cast<int32_t>(g_cover_lease.height)) / 2;
+    lv_obj_set_pos(
+        g_cover_image,
+        static_cast<int16_t>(base_x),
+        static_cast<int16_t>(base_y + g_cover_y_offset_px));
+}
+
+static void cassette_view_cover_adjust_capture_cb(lv_event_t *event)
+{
+    if (event == nullptr) return;
+    const lv_event_code_t code = lv_event_get_code(event);
+    if (code == LV_EVENT_PRESSED) {
+        // 箭头是磁带自身控件：接管本次按压，避免 GestureRouter 把它解释成页面滑动。
+        gesture_router_set_control_capture(true);
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        gesture_router_set_control_capture(false);
+    }
+}
+
+static void cassette_view_cover_adjust_cb(lv_event_t *event)
+{
+    if (event == nullptr || lv_event_get_code(event) != LV_EVENT_CLICKED || !g_active) return;
+
+    // C2.4.9：不再通过user_data里的±1判断方向，直接按实际按钮对象区分，
+    // 避免两个按钮因为方向数据异常而发生同向移动。
+    lv_obj_t *target = static_cast<lv_obj_t *>(lv_event_get_target(event));
+    int16_t delta = 0;
+    const char *action = nullptr;
+    if (target == g_cover_adjust_buttons[0]) {
+        delta = -kCoverYOffsetStepPx;  // 左▲：图像真正向上移动
+        action = "上移";
+    } else if (target == g_cover_adjust_buttons[1]) {
+        delta = +kCoverYOffsetStepPx;  // 右▼：图像真正向下移动
+        action = "下移";
+    } else {
+        return;
+    }
+
+    const int16_t safe_limit = cassette_view_cover_safe_offset_limit_px();
+    int32_t limited = static_cast<int32_t>(g_cover_y_offset_px) + delta;
+    if (limited < -safe_limit) limited = -safe_limit;
+    if (limited > safe_limit) limited = safe_limit;
+    if (limited == g_cover_y_offset_px) {
+        ESP_LOGI(TAG, "磁带封面%s已到安全边界：%dpx", action, static_cast<int>(g_cover_y_offset_px));
+        return;
+    }
+
+    g_cover_y_offset_px = static_cast<int16_t>(limited);
+    cassette_view_apply_cover_position();
+    ESP_LOGI(TAG, "磁带封面%s：%dpx（安全范围±%dpx）",
+        action,
+        static_cast<int>(g_cover_y_offset_px),
+        static_cast<int>(safe_limit));
+}
+
+static lv_obj_t *cassette_view_create_cover_adjust_button(
+    lv_obj_t *parent, int16_t local_x, const char *symbol)
+{
+    lv_obj_t *button = lv_obj_create(parent);
+    if (button == nullptr) return nullptr;
+    ui_common_lock_object(button);
+    lv_obj_set_pos(button, kCassetteX + local_x, kCassetteY + kCoverAdjustButtonY);
+    lv_obj_set_size(button, kCoverAdjustButtonSize, kCoverAdjustButtonSize);
+    lv_obj_set_style_radius(button, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(button, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(button, 0, 0);
+    lv_obj_set_style_shadow_width(button, 0, 0);
+    lv_obj_set_style_pad_all(button, 0, 0);
+    lv_obj_set_style_bg_color(button, lv_color_hex(0xFFD6E2), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(button, 38, LV_STATE_PRESSED);
+    lv_obj_add_flag(button, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(button, kCoverAdjustExtraClickPx);
+    // 明确禁止CLICKED向screen冒泡：点箭头只调封面，不触发主页“单击显示控件”。
+    lv_obj_remove_flag(button, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    lv_obj_t *label = lv_label_create(button);
+    if (label == nullptr) return nullptr;
+    ui_common_lock_object(label);
+    lv_label_set_text(label, symbol);
+    lv_obj_set_style_text_font(label, lv_font_default(), 0);
+    lv_obj_set_style_text_color(label, lv_color_hex(0xFFF0F5), 0);
+    lv_obj_set_style_text_opa(label, 205, 0);
+    lv_obj_center(label);
+    lv_obj_remove_flag(label, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(label, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    lv_obj_add_event_cb(button, cassette_view_cover_adjust_capture_cb, LV_EVENT_ALL, nullptr);
+    lv_obj_add_event_cb(
+        button, cassette_view_cover_adjust_cb, LV_EVENT_CLICKED, nullptr);
+    return button;
+}
 
 
 static lv_obj_t *cassette_view_create_text_label(
@@ -282,6 +478,7 @@ static void cassette_view_release_cover()
     g_cover_dsc = {};
     g_cover_generation = 0U;
     g_cover_track = UINT32_MAX;
+    g_cover_scale_q8 = kLvImageScaleNone;
     if (g_cover_image != nullptr) {
         lv_obj_add_flag(g_cover_image, LV_OBJ_FLAG_HIDDEN);
     }
@@ -426,6 +623,160 @@ static void cassette_view_apply_mechanics_frames(
     }
 }
 
+static lv_obj_t *cassette_view_create_tape_line(
+    lv_obj_t *parent,
+    lv_point_precise_t *points,
+    uint32_t point_count,
+    uint32_t color_hex,
+    uint8_t opacity)
+{
+    lv_obj_t *line = lv_line_create(parent);
+    if (line == nullptr) return nullptr;
+    ui_common_lock_object(line);
+    lv_line_set_points(line, points, point_count);
+    lv_obj_set_style_line_width(line, kTapeLineWidth, 0);
+    lv_obj_set_style_line_color(line, lv_color_hex(color_hex), 0);
+    lv_obj_set_style_line_opa(line, opacity, 0);
+    lv_obj_remove_flag(line, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(line, LV_OBJ_FLAG_HIDDEN);
+    return line;
+}
+
+static lv_obj_t *cassette_view_create_tape_glint(
+    lv_obj_t *parent,
+    int16_t width,
+    int16_t height)
+{
+    lv_obj_t *dot = lv_obj_create(parent);
+    if (dot == nullptr) return nullptr;
+    ui_common_lock_object(dot);
+    lv_obj_set_size(dot, width, height);
+    lv_obj_set_style_radius(dot, 1, 0);
+    lv_obj_set_style_bg_color(dot, lv_color_hex(kTapeGlintColorHex), 0);
+    lv_obj_set_style_bg_opa(dot, 0, 0);
+    lv_obj_set_style_border_width(dot, 0, 0);
+    lv_obj_set_style_shadow_width(dot, 0, 0);
+    lv_obj_set_style_pad_all(dot, 0, 0);
+    lv_obj_remove_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(dot, LV_OBJ_FLAG_HIDDEN);
+    return dot;
+}
+
+static lv_point_precise_t cassette_view_interpolate_point(
+    const lv_point_precise_t &a,
+    const lv_point_precise_t &b,
+    int32_t numerator,
+    int32_t denominator)
+{
+    lv_point_precise_t out = a;
+    if (denominator <= 0) return out;
+    out.x = static_cast<int32_t>(a.x) +
+        ((static_cast<int32_t>(b.x) - static_cast<int32_t>(a.x)) * numerator) / denominator;
+    out.y = static_cast<int32_t>(a.y) +
+        ((static_cast<int32_t>(b.y) - static_cast<int32_t>(a.y)) * numerator) / denominator;
+    return out;
+}
+
+static void cassette_view_apply_tape_glints(bool seeking)
+{
+    const uint8_t phase = static_cast<uint8_t>(g_tape_glint_phase % kTapeGlintPhaseCount);
+    static constexpr int8_t kTravel[4] = {0, 1, 3, 2};
+    static constexpr int8_t kJitterY[4] = {0, -1, 0, 1};
+    static constexpr uint8_t kOpa[4] = {125U, 205U, 165U, 105U};
+
+    const int16_t travel = static_cast<int16_t>(kTravel[phase]) * (seeking ? 2 : 1);
+    const int16_t jitter_y = static_cast<int16_t>(kJitterY[phase]) * (seeking ? 2 : 1);
+    const uint8_t opacity = static_cast<uint8_t>(
+        kOpa[phase] + (seeking && kOpa[phase] <= 225U ? 20U : 0U));
+
+    // 左右斜线高光严格沿当前可见线段移动；大轮端随进度变化后，高光会自动跟随新几何。
+    for (size_t i = 0U; i < 2U; ++i) {
+        lv_obj_t *dot = g_tape_glints[i];
+        if (dot == nullptr) continue;
+        // 以线段中部为基准，每个相位只前后滑动几个像素，不做整条发光。
+        const int32_t t = 16 + static_cast<int32_t>(kTravel[phase]) * (seeking ? 2 : 1);
+        lv_point_precise_t p = cassette_view_interpolate_point(
+            g_tape_side_points[i][0], g_tape_side_points[i][1], t, 32);
+        lv_obj_set_pos(dot, static_cast<int16_t>(p.x), static_cast<int16_t>(p.y + jitter_y));
+        lv_obj_set_style_bg_opa(dot, opacity, 0);
+    }
+
+    // 中间横线只放3个短亮点，不整条发光；整体跟随下移后的固定走带 y=285。
+    static constexpr int16_t kMiddleBaseX[3] = {148, 229, 313};
+    for (size_t i = 0U; i < 3U; ++i) {
+        lv_obj_t *dot = g_tape_glints[i + 2U];
+        if (dot == nullptr) continue;
+        const int16_t stagger = static_cast<int16_t>((i * 2U + phase) % 3U);
+        lv_obj_set_pos(dot,
+            kCassetteX + kMiddleBaseX[i] + travel + stagger,
+            kCassetteY + kTapeSmallBottomY - 1 + jitter_y);
+        const uint8_t local_opa = static_cast<uint8_t>(
+            opacity > i * 12U ? opacity - i * 12U : 70U);
+        lv_obj_set_style_bg_opa(dot, local_opa, 0);
+    }
+}
+
+static void cassette_view_update_tape_path_geometry(uint32_t progress_q16)
+{
+    // 0%：左卷少 -> 左大轮端在基础切点；右卷多 -> 右端向外5px。
+    // 100%：左卷多 -> 左端向外5px；右卷少 -> 右端回基础切点。
+    if (progress_q16 > kPhaseOneFrameQ16) progress_q16 = kPhaseOneFrameQ16;
+    const int16_t left_extra = static_cast<int16_t>(
+        (static_cast<uint64_t>(kTapeBigOuterTravelPx) * progress_q16) / kPhaseOneFrameQ16);
+    const int16_t right_extra = static_cast<int16_t>(
+        (static_cast<uint64_t>(kTapeBigOuterTravelPx) *
+         (kPhaseOneFrameQ16 - progress_q16)) / kPhaseOneFrameQ16);
+    const int8_t step = static_cast<int8_t>((left_extra << 4) | right_extra);
+    if (step == g_last_tape_path_step) return;
+    g_last_tape_path_step = step;
+
+    const int16_t big_x[2] = {
+        static_cast<int16_t>(kTapeBigLeftBaseX - left_extra),
+        static_cast<int16_t>(kTapeBigRightBaseX + right_extra),
+    };
+    const int16_t small_x[2] = {kTapeSmallLeftSideX, kTapeSmallRightSideX};
+
+    for (size_t i = 0U; i < 2U; ++i) {
+        // 先用“虚拟完整线”从大轮圆周锚点连接到小轮圆周锚点，
+        // 再只取与 Label 下边缘 y=211 的交点作为屏幕可见起点。
+        // 因此线不会画在封面上，但大轮端的5px外移仍会自然改变外壳上的斜线方向。
+        const int32_t dy = kTapeSmallSideY - kTapeBigAnchorY;
+        const int32_t visible_dy = kTapeShellVisibleTopY - kTapeBigAnchorY;
+        const int32_t dx = static_cast<int32_t>(small_x[i]) - big_x[i];
+        const int16_t visible_x = static_cast<int16_t>(
+            static_cast<int32_t>(big_x[i]) + (dx * visible_dy) / dy);
+
+        g_tape_side_points[i][0].x = kCassetteX + visible_x;
+        g_tape_side_points[i][0].y = kCassetteY + kTapeShellVisibleTopY;
+        g_tape_side_points[i][1].x = kCassetteX + small_x[i];
+        g_tape_side_points[i][1].y = kCassetteY + kTapeSmallSideY;
+        if (g_tape_side_lines[i] != nullptr) {
+            lv_line_set_points(g_tape_side_lines[i], g_tape_side_points[i], 2U);
+        }
+    }
+
+    cassette_view_apply_tape_glints(false);
+}
+
+static void cassette_view_set_tape_path_visible(bool visible)
+{
+    lv_obj_t *objects[] = {
+        g_tape_side_lines[0], g_tape_side_lines[1], g_tape_middle_line,
+        g_tape_glints[0], g_tape_glints[1], g_tape_glints[2],
+        g_tape_glints[3], g_tape_glints[4],
+    };
+    for (lv_obj_t *obj : objects) {
+        if (obj == nullptr) continue;
+        if (visible && g_mechanics_ready) {
+            lv_obj_remove_flag(obj, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
 static void cassette_view_set_mechanics_visible(bool visible)
 {
     lv_obj_t *objects[] = {
@@ -443,6 +794,7 @@ static void cassette_view_set_mechanics_visible(bool visible)
             lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
         }
     }
+    cassette_view_set_tape_path_visible(visible);
 }
 
 static bool cassette_view_prepare_mechanics()
@@ -503,19 +855,24 @@ static bool cassette_view_prepare_mechanics()
     g_big_reel_phase_q16[1] = 0U;
     g_small_roller_phase_q16 = 0U;
     g_last_tape_shift = INT16_MIN;
+    g_last_tape_path_step = -1;
+    g_tape_glint_phase = 0U;
     g_last_mechanics_frame_us = esp_timer_get_time();
+    g_last_tape_glint_us = g_last_mechanics_frame_us;
     cassette_view_apply_mechanics_frames(0U, 0U, 0U);
+    cassette_view_apply_tape_glints(false);
 
     const size_t mechanics_bytes =
         static_cast<size_t>(g_big_reel_dsc.data_size) +
         static_cast<size_t>(g_small_roller_dsc.data_size) +
         static_cast<size_t>(g_tape_amount_dsc.data_size);
     ESP_LOGI(TAG,
-        "机械件已准备：大轮=%uB(56x56x6) 小轮=%uB(44x44x2) 磁带量=%uB(159x41) total=%uB PSRAM",
+        "机械件已准备：大轮=%uB(56x56x12) 小轮=%uB(44x44x2) 磁带量=%uB(159x41) total=%uB PSRAM",
         static_cast<unsigned>(g_big_reel_dsc.data_size),
         static_cast<unsigned>(g_small_roller_dsc.data_size),
         static_cast<unsigned>(g_tape_amount_dsc.data_size),
         static_cast<unsigned>(mechanics_bytes));
+    ESP_LOGI(TAG, "走带线已准备：3段/2px 粉棕主线 + 5个像素高光，10Hz跳动");
     return true;
 }
 
@@ -587,19 +944,26 @@ static uint32_t cassette_view_advance_phase_q16(
 
 static void cassette_view_update_mechanics()
 {
-    if (!g_mechanics_ready || !g_active) return;
+    // C2.4.12：播放控件可见时保持磁带机械画面为最后一帧，避免20Hz机械刷新
+    // 与全屏半透明Backdrop/控件刷新叠加。Seek冻结优先级相同，二者任一成立都不刷新。
+    if (!g_mechanics_ready || !g_active || g_seek_frozen || g_controls_visible || g_launcher_suspended) return;
 
     AudioStateSnapshot audio = {};
     if (!audio_service_get_snapshot(&audio)) return;
+    const bool high_rate_flac =
+        audio.format == MediaFormat::FLAC && audio.sample_rate_hz >= 96000U;
     cassette_view_update_tape_amount(audio);
+    const uint32_t progress_q16 = cassette_view_progress_q16(audio);
+    cassette_view_update_tape_path_geometry(progress_q16);
 
     const bool moving =
         audio.state == AudioPlaybackState::Playing ||
         audio.state == AudioPlaybackState::Seeking;
     const int64_t now_us = esp_timer_get_time();
     if (!moving) {
-        // Pause/Stopped 时机械运动冻结；恢复播放后从冻结相位继续。
+        // Pause/Stopped 时机械运动与亮点跳动都冻结；恢复后不补跑暂停期间的相位。
         g_last_mechanics_frame_us = now_us;
+        g_last_tape_glint_us = now_us;
         return;
     }
 
@@ -608,20 +972,33 @@ static void cassette_view_update_mechanics()
         return;
     }
     int64_t elapsed_us = now_us - g_last_mechanics_frame_us;
-    if (elapsed_us < kMechanicsFramePeriodUs) return;
+    const int64_t mechanics_frame_period_us = high_rate_flac
+        ? kHighRateFlacMechanicsFramePeriodUs : kMechanicsFramePeriodUs;
+    if (elapsed_us < mechanics_frame_period_us) return;
 
     // C2.2：实机确认左右卷轴快慢映射与当前磁带量视觉相反。
     // 按当前磁带量方向修正为：
     // 0%  左边磁带少 -> 左快、右边磁带多 -> 右慢；
     // 100% 左边磁带多 -> 左慢、右边磁带少 -> 右快。
     // 速度仍按进度连续插值，两个大卷轴会平滑交换快慢。
-    const uint32_t progress_q16 = cassette_view_progress_q16(audio);
     const uint32_t speed_span_q16 = kBigReelFastStepQ16 - kBigReelSlowStepQ16;
     const uint32_t speed_offset_q16 = static_cast<uint32_t>(
         (static_cast<uint64_t>(speed_span_q16) * progress_q16) / kPhaseOneFrameQ16);
     const uint32_t left_speed_q16 = kBigReelFastStepQ16 - speed_offset_q16;
     const uint32_t right_speed_q16 = kBigReelSlowStepQ16 + speed_offset_q16;
     const bool seeking = audio.state == AudioPlaybackState::Seeking;
+
+    if (g_last_tape_glint_us <= 0LL) g_last_tape_glint_us = now_us;
+    const int64_t glint_elapsed_us = now_us - g_last_tape_glint_us;
+    if (glint_elapsed_us >= kTapeGlintPeriodUs) {
+        uint32_t steps = static_cast<uint32_t>(glint_elapsed_us / kTapeGlintPeriodUs);
+        if (steps > kTapeGlintPhaseCount) steps = kTapeGlintPhaseCount;
+        if (seeking) steps *= 2U;
+        g_tape_glint_phase = static_cast<uint8_t>(
+            (g_tape_glint_phase + steps) % kTapeGlintPhaseCount);
+        cassette_view_apply_tape_glints(seeking);
+        g_last_tape_glint_us = now_us;
+    }
 
     g_big_reel_phase_q16[0] = cassette_view_advance_phase_q16(
         g_big_reel_phase_q16[0], left_speed_q16, elapsed_us, kBigReelFrameCount, seeking);
@@ -630,14 +1007,35 @@ static void cassette_view_update_mechanics()
 
     // 小滚轮保持固定线速度；2帧以100ms节拍交替即可。
     g_small_roller_phase_q16 = cassette_view_advance_phase_q16(
-        g_small_roller_phase_q16, kPhaseOneFrameQ16, elapsed_us,
+        g_small_roller_phase_q16, kSmallRollerStepQ16, elapsed_us,
         kSmallRollerFrameCount, seeking);
 
+    uint8_t left_big_frame = static_cast<uint8_t>(
+        (g_big_reel_phase_q16[0] >> 16U) % kBigReelFrameCount);
+    uint8_t right_big_frame = static_cast<uint8_t>(
+        (g_big_reel_phase_q16[1] >> 16U) % kBigReelFrameCount);
+    if (high_rate_flac) {
+        // 12帧条带为每5°一帧；高采样率 FLAC 只取偶数帧，得到原 6 帧的
+        // 0/10/20/30/40/50° 相位。相位累积仍连续，切回普通采样率不会跳速度。
+        constexpr uint8_t kHighRateFrameStride =
+            kBigReelFrameCount / kHighRateFlacBigReelFrameCount;
+        left_big_frame = static_cast<uint8_t>(
+            (left_big_frame / kHighRateFrameStride) * kHighRateFrameStride);
+        right_big_frame = static_cast<uint8_t>(
+            (right_big_frame / kHighRateFrameStride) * kHighRateFrameStride);
+    }
+
     cassette_view_apply_mechanics_frames(
-        static_cast<uint8_t>((g_big_reel_phase_q16[0] >> 16U) % kBigReelFrameCount),
-        static_cast<uint8_t>((g_big_reel_phase_q16[1] >> 16U) % kBigReelFrameCount),
+        left_big_frame,
+        right_big_frame,
         static_cast<uint8_t>((g_small_roller_phase_q16 >> 16U) % kSmallRollerFrameCount));
     g_last_mechanics_frame_us = now_us;
+}
+
+static void cassette_view_mechanics_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    cassette_view_update_mechanics();
 }
 
 static lv_obj_t *cassette_view_create_sprite_viewport(
@@ -796,6 +1194,10 @@ static bool cassette_view_bind_current_cover()
     // 先 acquire 新 Surface，再释放旧 Surface，保持切歌视觉连续。
     CoverSurfaceLease old = g_cover_lease;
     g_cover_lease = next;
+    // C2.4.15：封面纵向手动调节只属于当前歌曲，切歌后新封面回到居中。
+    if (g_cover_track != track) {
+        g_cover_y_offset_px = 0;
+    }
     g_cover_generation = generation;
     g_cover_track = track;
     cassette_view_init_rgb565_dsc(
@@ -807,26 +1209,38 @@ static bool cassette_view_bind_current_cover()
 
     lv_image_set_src(g_cover_image, &g_cover_dsc);
     uint32_t cover_scale = kLvImageScaleNone;
-    if (g_cover_lease.width > 0U) {
-        cover_scale = static_cast<uint32_t>(
+    if (g_cover_lease.width > 0U && g_cover_lease.height > 0U) {
+        // 宽度仍以410px出血为目标；同时保证纵向至少覆盖Label并预留安全边缘。
+        // 两者取更大的scale，避免非正方形封面纵向不足时移动后露黑。
+        const uint32_t width_scale = static_cast<uint32_t>(
             (static_cast<uint64_t>(kCoverBleedWidth) * kLvImageScaleNone +
-             static_cast<uint64_t>(g_cover_lease.width) / 2U) /
+             static_cast<uint64_t>(g_cover_lease.width) - 1U) /
             static_cast<uint64_t>(g_cover_lease.width));
+        const uint32_t min_cover_height =
+            static_cast<uint32_t>(kLabelHeight + 2 * kCoverEdgeSafetyPx);
+        const uint32_t height_scale = static_cast<uint32_t>(
+            (static_cast<uint64_t>(min_cover_height) * kLvImageScaleNone +
+             static_cast<uint64_t>(g_cover_lease.height) - 1U) /
+            static_cast<uint64_t>(g_cover_lease.height));
+        cover_scale = width_scale > height_scale ? width_scale : height_scale;
         if (cover_scale == 0U) cover_scale = 1U;
     }
+    g_cover_scale_q8 = cover_scale;
     lv_image_set_scale(g_cover_image, cover_scale);
     lv_image_set_antialias(g_cover_image, false);
-    lv_obj_center(g_cover_image);
+    cassette_view_apply_cover_position();
     lv_obj_remove_flag(g_cover_image, LV_OBJ_FLAG_HIDDEN);
 
-    ESP_LOGI(TAG, "磁带封面已绑定：track=%lu source=%ux%u label=%dx%d bleed=%upx scale=%u/256",
+    ESP_LOGI(TAG, "磁带封面已绑定：track=%lu source=%ux%u label=%dx%d bleed=%upx scale=%u/256 y=%dpx safe=±%dpx",
         static_cast<unsigned long>(track),
         static_cast<unsigned>(g_cover_lease.width),
         static_cast<unsigned>(g_cover_lease.height),
         static_cast<int>(kLabelWidth),
         static_cast<int>(kLabelHeight),
         static_cast<unsigned>(kCoverBleedWidth),
-        static_cast<unsigned>(cover_scale));
+        static_cast<unsigned>(cover_scale),
+        static_cast<int>(g_cover_y_offset_px),
+        static_cast<int>(cassette_view_cover_safe_offset_limit_px()));
 
     if (old.slot_index != 0xFFU) {
         cover_surface_cache_release(&old);
@@ -839,6 +1253,7 @@ esp_err_t cassette_view_create(lv_obj_t *parent)
     if (parent == nullptr) return ESP_ERR_INVALID_ARG;
     if (g_root != nullptr) return ESP_OK;
 
+    g_launcher_suspended = false;
     g_root = lv_obj_create(parent);
     if (g_root == nullptr) return ESP_ERR_NO_MEM;
     ui_common_lock_object(g_root);
@@ -900,6 +1315,9 @@ esp_err_t cassette_view_create(lv_obj_t *parent)
     lv_obj_remove_flag(g_tape_amount_image, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_remove_flag(g_tape_amount_image, LV_OBJ_FLAG_SCROLLABLE);
 
+    // C2.4.1：左右斜线改到 Shell 之后创建，直接显示在粉色外壳表面；
+    // 具体可见端点稍后由固定圆周锚点初始化。
+
     g_big_reel_viewports[0] = cassette_view_create_sprite_viewport(
         g_root,
         kCassetteX + kBigReelLeftX,
@@ -937,6 +1355,57 @@ esp_err_t cassette_view_create(lv_obj_t *parent)
     lv_obj_set_pos(g_shell_image, kCassetteX, kCassetteY);
     lv_obj_add_flag(g_shell_image, LV_OBJ_FLAG_HIDDEN);
 
+    // C2.4.1：三条走带都位于 Shell 之上，因此只画“应该看得见的外壳表面”部分。
+    // 左右斜线不会再穿过封面：可见起点固定在 Label 下边缘，由大轮圆周虚拟锚点决定斜率。
+    g_tape_side_points[0][0] = {kCassetteX + 77, kCassetteY + kTapeShellVisibleTopY};
+    g_tape_side_points[0][1] = {kCassetteX + kTapeSmallLeftSideX, kCassetteY + kTapeSmallSideY};
+    g_tape_side_points[1][0] = {kCassetteX + 382, kCassetteY + kTapeShellVisibleTopY};
+    g_tape_side_points[1][1] = {kCassetteX + kTapeSmallRightSideX, kCassetteY + kTapeSmallSideY};
+    g_tape_side_lines[0] = cassette_view_create_tape_line(
+        g_root, g_tape_side_points[0], 2U, kTapeSideColorHex, kTapeSideOpa);
+    g_tape_side_lines[1] = cassette_view_create_tape_line(
+        g_root, g_tape_side_points[1], 2U, kTapeSideColorHex, kTapeSideOpa);
+    g_tape_glints[0] = cassette_view_create_tape_glint(g_root, 2, 2);
+    g_tape_glints[1] = cassette_view_create_tape_glint(g_root, 2, 2);
+    if (g_tape_side_lines[0] == nullptr || g_tape_side_lines[1] == nullptr ||
+        g_tape_glints[0] == nullptr || g_tape_glints[1] == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    // 中间线以两个小轮开窗下圆周为基准，并整体再下移2px，不穿过圆心。
+    g_tape_middle_points[0].x = kCassetteX + kTapeSmallLeftBottomX;
+    g_tape_middle_points[0].y = kCassetteY + kTapeSmallBottomY;
+    g_tape_middle_points[1].x = kCassetteX + kTapeSmallRightBottomX;
+    g_tape_middle_points[1].y = kCassetteY + kTapeSmallBottomY;
+    g_tape_middle_line = cassette_view_create_tape_line(
+        g_root, g_tape_middle_points, 2U, kTapeMiddleColorHex, kTapeMiddleOpa);
+    g_tape_glints[2] = cassette_view_create_tape_glint(g_root, 3, 2);
+    g_tape_glints[3] = cassette_view_create_tape_glint(g_root, 4, 2);
+    g_tape_glints[4] = cassette_view_create_tape_glint(g_root, 2, 2);
+    if (g_tape_middle_line == nullptr || g_tape_glints[2] == nullptr ||
+        g_tape_glints[3] == nullptr || g_tape_glints[4] == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    g_last_tape_path_step = -1;
+    cassette_view_update_tape_path_geometry(0U);
+    cassette_view_apply_tape_glints(false);
+
+    // C2.4.13：封面微调箭头放在横向粉色区域左右两侧，并在上一版基础上再下移10px；
+    // 视觉仍为40x40，实际点击热区约80x80。
+    // 左▲固定上移、右▼固定下移；按钮自身接管触摸，因此不会触发主页播放控件。
+    g_cover_adjust_buttons[0] = cassette_view_create_cover_adjust_button(
+        g_root, kCoverAdjustUpButtonX, LV_SYMBOL_UP);
+    g_cover_adjust_buttons[1] = cassette_view_create_cover_adjust_button(
+        g_root, kCoverAdjustDownButtonX, LV_SYMBOL_DOWN);
+    if (g_cover_adjust_buttons[0] == nullptr || g_cover_adjust_buttons[1] == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    g_mechanics_timer = lv_timer_create(
+        cassette_view_mechanics_timer_cb, kMechanicsTimerPeriodMs, nullptr);
+    if (g_mechanics_timer == nullptr) return ESP_ERR_NO_MEM;
+    lv_timer_pause(g_mechanics_timer);
+
     return ESP_OK;
 }
 
@@ -958,6 +1427,14 @@ bool cassette_view_set_active(bool active)
         lv_obj_remove_flag(g_root, LV_OBJ_FLAG_HIDDEN);
         g_active = true;
         g_last_mechanics_frame_us = esp_timer_get_time();
+        g_last_tape_glint_us = g_last_mechanics_frame_us;
+        if (g_mechanics_timer != nullptr) {
+            if (mechanics_ok && !g_seek_frozen && !g_controls_visible && !g_launcher_suspended) {
+                lv_timer_resume(g_mechanics_timer);
+            } else {
+                lv_timer_pause(g_mechanics_timer);
+            }
+        }
         cassette_view_set_mechanics_visible(mechanics_ok);
         cassette_view_update_track_text();
         cassette_view_apply_aux_visibility();
@@ -967,6 +1444,7 @@ bool cassette_view_set_active(bool active)
     }
 
     g_active = false;
+    if (g_mechanics_timer != nullptr) lv_timer_pause(g_mechanics_timer);
     cassette_view_set_mechanics_visible(false);
     lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
     cassette_view_release_cover();
@@ -988,11 +1466,87 @@ void cassette_view_update()
 
 void cassette_view_set_controls_visible(bool visible)
 {
+    if (g_controls_visible == visible) {
+        cassette_view_apply_aux_visibility();
+        return;
+    }
+
     g_controls_visible = visible;
     cassette_view_apply_aux_visibility();
+
+    // C2.4.12：打开播放控件时保留半透明Backdrop，但冻结所有磁带机械刷新。
+    // 只暂停timer并重置时间基准，不隐藏/重建机械对象，因此画面保持最后一帧。
+    const int64_t now_us = esp_timer_get_time();
+    g_last_mechanics_frame_us = now_us;
+    g_last_tape_glint_us = now_us;
+
+    const bool should_resume_mechanics =
+        !visible && g_active && g_mechanics_ready && !g_seek_frozen && !g_launcher_suspended;
+    if (g_mechanics_timer != nullptr && visible) {
+        lv_timer_pause(g_mechanics_timer);
+    }
+
     if (g_active && !visible) {
+        // 控件关闭后先按当前真实播放进度同步一次磁带量/走带几何；
+        // 因时间基准刚重置，不会补跑控件显示期间漏掉的卷轴帧。
         cassette_view_update();
     }
+
+    if (g_mechanics_timer != nullptr && should_resume_mechanics) {
+        lv_timer_reset(g_mechanics_timer);
+        lv_timer_resume(g_mechanics_timer);
+    }
+
+    ESP_LOGI(TAG, "控件机械动画：%s", visible ? "冻结" : "恢复");
+}
+
+void cassette_view_set_launcher_suspended(bool suspended)
+{
+    if (g_launcher_suspended == suspended) return;
+    g_launcher_suspended = suspended;
+
+    // Launcher 切换与 Controls/Seek Freeze 一样：只重置时间基准，不补跑暂停期间的动画。
+    const int64_t now_us = esp_timer_get_time();
+    g_last_mechanics_frame_us = now_us;
+    g_last_tape_glint_us = now_us;
+
+    if (g_mechanics_timer != nullptr) {
+        if (suspended) {
+            lv_timer_pause(g_mechanics_timer);
+        } else if (g_active && g_mechanics_ready && !g_seek_frozen && !g_controls_visible) {
+            // Launcher 收起后先按当前真实播放位置同步一次，再恢复机械 timer。
+            cassette_view_update_mechanics();
+            lv_timer_reset(g_mechanics_timer);
+            lv_timer_resume(g_mechanics_timer);
+        }
+    }
+
+    ESP_LOGI(TAG, "Launcher机械动画：%s", suspended ? "冻结" : "恢复");
+}
+
+void cassette_view_set_seek_frozen(bool frozen)
+{
+    if (g_seek_frozen == frozen) return;
+    g_seek_frozen = frozen;
+
+    // 冻结/解冻时都重置时间基准，恢复后不补跑拖动/Seek期间漏掉的动画帧。
+    const int64_t now_us = esp_timer_get_time();
+    g_last_mechanics_frame_us = now_us;
+    g_last_tape_glint_us = now_us;
+
+    if (g_mechanics_timer != nullptr) {
+        if (frozen) {
+            lv_timer_pause(g_mechanics_timer);
+        } else if (g_active && g_mechanics_ready && !g_controls_visible && !g_launcher_suspended) {
+            // 先按Seek完成后的真实播放位置一次性同步磁带量/走带几何，再恢复20Hz动画。
+            // 若此时播放控件仍可见，则继续保持冻结，等控件关闭后再恢复。
+            cassette_view_update_mechanics();
+            lv_timer_reset(g_mechanics_timer);
+            lv_timer_resume(g_mechanics_timer);
+        }
+    }
+
+    ESP_LOGI(TAG, "Seek机械动画：%s", frozen ? "冻结" : "恢复");
 }
 
 bool cassette_view_is_active()

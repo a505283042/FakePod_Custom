@@ -276,6 +276,9 @@ static uint32_t g_launcher_bounded_stream_us = 0U;
 static uint32_t g_launcher_bounded_stream_max_us = 0U;
 static uint32_t g_launcher_bounded_failures = 0U;
 static bool g_launcher_visible = false;
+// C2.4.13：Cassette 进入高速 Launcher 时先由 Launcher acquire 当前 CoverSurface，
+// 再隐藏/释放 Cassette root。菜单收起后恢复，避免全屏封面背景上叠着大小轮继续转。
+static bool g_launcher_cassette_scene_hidden = false;
 static LauncherMotionState g_launcher_motion = LauncherMotionState::Hidden;
 static uint8_t g_launcher_selected_index = 0U;
 static uint32_t g_launcher_anim_started_ms = 0U;
@@ -2074,13 +2077,26 @@ static void player_home_launcher_leave_done(lv_anim_t *anim)
             restored = player_home_present_current_cover_bounded("launcher-hide");
         }
         display_launcher_bounded_spi_session_end();
-        if (!restored) {
-            // Cassette 模式不能把全屏 Cover 当成最终主页；让 LVGL 重新合成磁带场景。
-            lv_obj_t *screen = lv_screen_active();
-            if (screen != nullptr) lv_obj_invalidate(screen);
-        }
     }
     g_launcher_bounded_session_active = false;
+
+    // C2.4.13：高速 Launcher 在 Cassette 模式下临时隐藏了整个磁带 root。
+    // BoundedSPI 已结束后再重新绑定 Cassette，避免 LVGL 与 Launcher 直接写 GRAM 并发。
+    if (g_music_visual_mode == MusicVisualMode::Cassette) {
+        // fallback 可能临时恢复了 Artwork；回到 Cassette 前明确关掉。
+        now_playing_artwork_set_active(false);
+        if (g_launcher_cassette_scene_hidden) {
+            (void)cassette_view_set_active(true);
+        }
+        cassette_view_set_launcher_suspended(false);
+        g_launcher_cassette_scene_hidden = false;
+        // Cassette 不是一张全屏 Cover，Launcher 退出后必须让 LVGL 重合成完整磁带场景。
+        lv_obj_t *screen = lv_screen_active();
+        if (screen != nullptr) lv_obj_invalidate(screen);
+    } else if (used_bounded && !restored) {
+        lv_obj_t *screen = lv_screen_active();
+        if (screen != nullptr) lv_obj_invalidate(screen);
+    }
     g_artwork_resume_without_invalidation =
         restored && g_music_visual_mode == MusicVisualMode::Artwork;
     if (g_launcher_backdrop != nullptr) {
@@ -2176,10 +2192,32 @@ static void player_home_launcher_show()
         // 旧实现先把 g_background_timers_running 置 false，却漏掉 set_active(false)，导致后续
         // QoS 因状态相等提前 return，主页旧 lease 永久占住一个槽；A→B 后形成 A/B 双 pin，
         // B→C 即无交换槽可用。
+        const bool cassette_launcher = g_music_visual_mode == MusicVisualMode::Cassette;
+        if (cassette_launcher) {
+            // 与 C2.4.12 Controls Freeze 保持同一原则：Launcher 期间不允许机械层继续刷新。
+            cassette_view_set_launcher_suspended(true);
+        }
+
         const bool launcher_surface_ready =
             g_launcher_frame_cache_ready && player_home_launcher_prepare_surface_lease();
         const bool bounded_candidate =
             launcher_surface_ready && kLauncherBoundedSpiEnabled && display_launcher_bounded_spi_available();
+
+        // Cassette 与 Artwork 使用同样的 Surface handoff：必须先让 Launcher pin 当前 Surface，
+        // 再隐藏/释放 Cassette 自己的 lease，避免出现 pin=0 窗口。仅高速候选路径隐藏整页；
+        // 如果 Surface/BoundedSPI 不可用，保留静态 Cassette 作为 LVGL fallback 背景。
+        g_launcher_cassette_scene_hidden = false;
+        if (cassette_launcher && bounded_candidate) {
+            // 与 Artwork 的 quiet suspend 一样，handoff 时不留下稍后才刷出的 460x460 LVGL
+            // invalidation；否则 BoundedSPI 已接管 GRAM 后，迟到的主页重绘仍可能叠回磁带组件。
+            lv_display_t *display = lv_display_get_default();
+            const bool invalidation_was_enabled =
+                display != nullptr && lv_display_is_invalidation_enabled(display);
+            if (invalidation_was_enabled) lv_display_enable_invalidation(display, false);
+            g_launcher_cassette_scene_hidden = cassette_view_set_active(false);
+            if (invalidation_was_enabled) lv_display_enable_invalidation(display, true);
+        }
+
         now_playing_artwork_set_active(false, bounded_candidate);
         g_background_timers_running = false;
         g_artwork_resume_without_invalidation = false;
@@ -2617,6 +2655,7 @@ static void player_home_repaint_controls_after_bounded_present()
         g_total_time,
         g_loop_button,
         g_volume_slider,
+        g_visual_mode_button,
         g_volume_mode_button,
     };
     for (lv_obj_t *obj : objects) {
@@ -3044,6 +3083,7 @@ static void player_home_progress_set_enabled(bool enabled)
 
 static void player_home_cancel_progress_interaction()
 {
+    cassette_view_set_seek_frozen(false);
     g_progress_dragging = false;
     g_progress_seek_pending = false;
     g_progress_total_ms = 0U;
@@ -3080,6 +3120,8 @@ static void player_home_progress_sync(const AudioStateSnapshot &snapshot)
             lv_tick_elaps(g_progress_seek_started_tick) > 10000U;
         if (request_context_stale || seek_committed || seek_failed || seek_wait_expired) {
             g_progress_seek_pending = false;
+            // seek_revision只在AudioTask成功定位后递增；此处恢复动画时已经拿到新播放位置。
+            cassette_view_set_seek_frozen(false);
         }
     }
 
@@ -3127,6 +3169,8 @@ static void player_home_progress_cb(lv_event_t *event)
         g_progress_seek_base_revision = snapshot.seek_revision;
         g_progress_preview_ms = player_home_progress_ms_from_value(
             lv_slider_get_value(g_progress), total_ms);
+        // 从手指按下进度条开始冻结磁带机械层；松手后继续冻结到AudioTask确认Seek完成。
+        cassette_view_set_seek_frozen(true);
         player_home_update_time_labels(g_progress_preview_ms, g_progress_total_ms);
         return;
     }
@@ -3443,7 +3487,7 @@ static void player_home_refresh_visual_mode_button()
     if (g_visual_mode_label == nullptr) return;
     player_home_label_set_text_if_changed(
         g_visual_mode_label,
-        g_music_visual_mode == MusicVisualMode::Cassette ? "封面" : "磁带");
+        g_music_visual_mode == MusicVisualMode::Cassette ? "切换到封面" : "切换到磁带");
 }
 
 static bool player_home_set_visual_mode(MusicVisualMode mode)
@@ -3603,6 +3647,12 @@ static void player_home_launcher_abort_for_app_switch()
     player_home_launcher_release_surface_lease();
     g_launcher_frame_cache_active = false;
     g_launcher_frame_index = kLauncherFrameInvalid;
+    if (g_music_visual_mode == MusicVisualMode::Cassette) {
+        // 直接切换到其他 APP 时不要恢复一帧磁带动画；先保持 Cassette inactive，再清冻结标记。
+        (void)cassette_view_set_active(false);
+        cassette_view_set_launcher_suspended(false);
+    }
+    g_launcher_cassette_scene_hidden = false;
     g_launcher_visible = false;
     g_launcher_motion = LauncherMotionState::Hidden;
     g_launcher_anim_progress = 0;
@@ -3736,6 +3786,7 @@ void player_home_create(lv_obj_t *screen)
     g_launcher_bounded_session_active = false;
     player_home_launcher_reset_bounded_stats();
     g_launcher_visible = false;
+    g_launcher_cassette_scene_hidden = false;
     g_launcher_motion = LauncherMotionState::Hidden;
     g_launcher_selected_index = 0U;
     g_launcher_anim_started_ms = 0U;
@@ -4006,10 +4057,15 @@ void player_home_create(lv_obj_t *screen)
     lv_obj_set_style_bg_color(g_volume_slider, lv_color_hex(0xFFFFFF), LV_PART_KNOB);
     lv_obj_set_style_bg_opa(g_volume_slider, LV_OPA_COVER, LV_PART_KNOB);
 
-    // 视觉模式入口只在 Overlay 显示时出现，不占用四向手势或封面单击。
+    // 视觉模式入口移到音量条下方，并扩大触摸面积。
+    // 这样不占用四向手势，也避免原 76x28 小按钮难以命中。
     g_visual_mode_button = player_home_create_pill_button(
-        g_overlay, 76, 28, "磁带", &g_visual_mode_label);
-    lv_obj_set_pos(g_visual_mode_button, 18, 310);
+        g_overlay, 160, 42, "切换到磁带", &g_visual_mode_label);
+    lv_obj_set_pos(g_visual_mode_button, 150, 404);
+    lv_obj_set_style_bg_opa(g_visual_mode_button, 46, 0);
+    // C2.4.7：视觉仍保持 160x42，但把实际命中区向四周扩 15px。
+    // 最终约 190x72；向上覆盖到不可触摸的音量条下沿，按钮更容易命中，界面外观不变。
+    lv_obj_set_ext_click_area(g_visual_mode_button, 15);
     lv_obj_add_event_cb(g_visual_mode_button, player_home_visual_mode_cb, LV_EVENT_CLICKED, nullptr);
 
     // 百分比仍保留原静音入口，但收在音量条上方，不打断底部“模式-音量条-音量图标”的主结构。

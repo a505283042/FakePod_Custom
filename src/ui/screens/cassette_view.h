@@ -11,4 +11,8 @@ bool cassette_view_set_active(bool active);
 void cassette_view_update();
 // Music 原有播放控件 Overlay 显示时隐藏磁带专属曲目信息/Mini Lyrics。
 void cassette_view_set_controls_visible(bool visible);
+// Launcher 菜单显示期间冻结磁带机械层；高速 Launcher 可同时隐藏整个 Cassette root。
+void cassette_view_set_launcher_suspended(bool suspended);
+// 进度条拖动/Seek期间冻结磁带机械层，避免UI动画与Seek提交争用。
+void cassette_view_set_seek_frozen(bool frozen);
 bool cassette_view_is_active();
