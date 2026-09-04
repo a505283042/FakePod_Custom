@@ -2546,7 +2546,9 @@ static esp_err_t flac_decoder_prepare_seek_runtime(
     // 先利用前后 seekpoint 的 sample/byte 比例估算目标附近字节位置，再向前留出
     // 128~256KB 保护窗口做局部扫描。估算只用于缩短扫描区间，最终锚点仍必须通过
     // FLAC 帧头 sample/frame number + CRC8 校验；局部扫描失败时自动回退完整区间扫描。
+#if APP_DIAG_AUDIO_SEEK
     const FlacSeekPoint table_point = point;
+#endif
     uint64_t refine_scanned_bytes = 0U;
     bool refine_used_estimate = false;
 #if APP_DIAG_AUDIO_SEEK
