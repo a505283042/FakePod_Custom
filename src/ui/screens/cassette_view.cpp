@@ -1473,6 +1473,10 @@ void cassette_view_set_controls_visible(bool visible)
 
     g_controls_visible = visible;
     cassette_view_apply_aux_visibility();
+    if (!g_active) {
+        // Artwork 模式也会同步 Controls 状态；只记状态，不操作未激活的磁带机械层。
+        return;
+    }
 
     // C2.4.12：打开播放控件时保留半透明Backdrop，但冻结所有磁带机械刷新。
     // 只暂停timer并重置时间基准，不隐藏/重建机械对象，因此画面保持最后一帧。
@@ -1528,6 +1532,10 @@ void cassette_view_set_seek_frozen(bool frozen)
 {
     if (g_seek_frozen == frozen) return;
     g_seek_frozen = frozen;
+    if (!g_active) {
+        // Artwork 模式的进度条同样会同步 Seek 状态；磁带未激活时不操作机械 timer。
+        return;
+    }
 
     // 冻结/解冻时都重置时间基准，恢复后不补跑拖动/Seek期间漏掉的动画帧。
     const int64_t now_us = esp_timer_get_time();

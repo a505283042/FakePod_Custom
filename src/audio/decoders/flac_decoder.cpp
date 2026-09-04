@@ -1281,11 +1281,295 @@ static void flac_capture_stream_descriptor(
     out_descriptor->total_frames = decoder->total_frames;
 }
 
+static constexpr size_t FLAC_FRAME_HEADER_MAX_BYTES = 32;
+
+static uint8_t flac_frame_header_crc8(const uint8_t *data, size_t size)
+{
+    uint8_t crc = 0;
+    for (size_t i = 0; i < size; ++i) {
+        crc ^= data[i];
+        for (uint8_t bit = 0; bit < 8; ++bit) {
+            crc = (crc & 0x80U) != 0U
+                ? static_cast<uint8_t>((crc << 1U) ^ 0x07U)
+                : static_cast<uint8_t>(crc << 1U);
+        }
+    }
+    return crc;
+}
+
+static bool flac_parse_utf8_uint64(
+    const uint8_t *data,
+    size_t size,
+    uint64_t *out_value,
+    size_t *out_consumed)
+{
+    if (data == nullptr || size == 0U || out_value == nullptr || out_consumed == nullptr) {
+        return false;
+    }
+
+    const uint8_t first = data[0];
+    if ((first & 0x80U) == 0U) {
+        *out_value = first;
+        *out_consumed = 1U;
+        return true;
+    }
+
+    uint8_t length = 0U;
+    uint8_t mask = 0x80U;
+    while ((first & mask) != 0U && length < 8U) {
+        ++length;
+        mask >>= 1U;
+    }
+    if (length < 2U || length > 7U || length > size) {
+        return false;
+    }
+
+    const uint8_t value_bits = static_cast<uint8_t>(7U - length);
+    uint64_t value = value_bits == 0U
+        ? 0U
+        : static_cast<uint64_t>(first & static_cast<uint8_t>((1U << value_bits) - 1U));
+    for (uint8_t i = 1U; i < length; ++i) {
+        if ((data[i] & 0xC0U) != 0x80U) {
+            return false;
+        }
+        value = (value << 6U) | static_cast<uint64_t>(data[i] & 0x3FU);
+    }
+
+    *out_value = value;
+    *out_consumed = length;
+    return true;
+}
+
+static bool flac_parse_frame_sample_number(
+    const uint8_t *data,
+    size_t size,
+    const FlacStreamDescriptor &descriptor,
+    uint64_t *out_sample_number)
+{
+    if (data == nullptr || size < 6U || out_sample_number == nullptr) {
+        return false;
+    }
+
+    // 14-bit FLAC sync=0x3FFE，随后 reserved bit 必须为0；blocking strategy 位允许0/1。
+    if (data[0] != 0xFFU || (data[1] & 0xFEU) != 0xF8U) {
+        return false;
+    }
+
+    const bool variable_block = (data[1] & 0x01U) != 0U;
+    const uint8_t block_size_code = static_cast<uint8_t>(data[2] >> 4U);
+    const uint8_t sample_rate_code = static_cast<uint8_t>(data[2] & 0x0FU);
+    const uint8_t channel_assignment = static_cast<uint8_t>(data[3] >> 4U);
+    const uint8_t bits_code = static_cast<uint8_t>((data[3] >> 1U) & 0x07U);
+    if (block_size_code == 0U || sample_rate_code == 0x0FU || channel_assignment > 10U ||
+        bits_code == 3U || bits_code == 7U || (data[3] & 0x01U) != 0U) {
+        return false;
+    }
+
+    const uint16_t header_channels = channel_assignment <= 7U
+        ? static_cast<uint16_t>(channel_assignment + 1U)
+        : 2U;
+    if (header_channels != descriptor.channels) {
+        return false;
+    }
+
+    uint16_t header_bits = descriptor.bits_per_sample;
+    switch (bits_code) {
+        case 0U: break;
+        case 1U: header_bits = 8U; break;
+        case 2U: header_bits = 12U; break;
+        case 4U: header_bits = 16U; break;
+        case 5U: header_bits = 20U; break;
+        case 6U: header_bits = 24U; break;
+        default: return false;
+    }
+    if (header_bits != descriptor.bits_per_sample) {
+        return false;
+    }
+
+    size_t cursor = 4U;
+    uint64_t coded_number = 0U;
+    size_t coded_bytes = 0U;
+    if (!flac_parse_utf8_uint64(data + cursor, size - cursor, &coded_number, &coded_bytes)) {
+        return false;
+    }
+    cursor += coded_bytes;
+
+    if (block_size_code == 6U) {
+        cursor += 1U;
+    } else if (block_size_code == 7U) {
+        cursor += 2U;
+    }
+    if (sample_rate_code == 12U) {
+        cursor += 1U;
+    } else if (sample_rate_code == 13U || sample_rate_code == 14U) {
+        cursor += 2U;
+    }
+    if (cursor >= size || flac_frame_header_crc8(data, cursor) != data[cursor]) {
+        return false;
+    }
+
+    uint64_t sample_number = coded_number;
+    if (!variable_block) {
+        if (descriptor.max_block_size == 0U ||
+            coded_number > UINT64_MAX / static_cast<uint64_t>(descriptor.max_block_size)) {
+            return false;
+        }
+        sample_number = coded_number * static_cast<uint64_t>(descriptor.max_block_size);
+    }
+    if (descriptor.total_frames != 0U && sample_number >= descriptor.total_frames) {
+        return false;
+    }
+
+    *out_sample_number = sample_number;
+    return true;
+}
+
+static bool flac_refine_seekpoint_by_frame_scan(
+    AudioSource *source,
+    AudioDecodeWorkspace *workspace,
+    const FlacStreamDescriptor &descriptor,
+    uint64_t target_frame,
+    uint64_t scan_start_stream_offset,
+    uint64_t scan_end_stream_offset,
+    uint64_t max_sample_number,
+    FlacSeekPoint *in_out_point,
+    uint64_t *out_scanned_bytes)
+{
+    if (out_scanned_bytes != nullptr) {
+        *out_scanned_bytes = 0U;
+    }
+    if (!audio_source_is_open(source) || workspace == nullptr || in_out_point == nullptr ||
+        scan_start_stream_offset >= scan_end_stream_offset ||
+        scan_end_stream_offset <= in_out_point->stream_offset ||
+        max_sample_number <= target_frame ||
+        descriptor.audio_data_offset_bytes > descriptor.file_size_bytes) {
+        return false;
+    }
+
+    uint8_t *scan = nullptr;
+    if (audio_decode_workspace_reserve_input(workspace, FLAC_INPUT_BUFFER_BYTES, &scan) != ESP_OK ||
+        scan == nullptr || FLAC_INPUT_BUFFER_BYTES <= FLAC_FRAME_HEADER_MAX_BYTES) {
+        return false;
+    }
+
+    const uint64_t audio_bytes = descriptor.file_size_bytes - descriptor.audio_data_offset_bytes;
+    if (scan_end_stream_offset > audio_bytes) {
+        scan_end_stream_offset = audio_bytes;
+    }
+
+    FlacSeekPoint best = *in_out_point;
+    if (scan_start_stream_offset <= best.stream_offset) {
+        scan_start_stream_offset = best.stream_offset + 1U;
+    }
+    uint64_t buffer_stream_offset = scan_start_stream_offset;
+    uint64_t scanned_bytes = 0U;
+    size_t buffered_bytes = 0U;
+
+    // 这里只做顺序帧头扫描。旧实现为了保留跨 32KB 边界的帧头，每轮都重新 fseek；
+    // SD 上大量小范围 fseek 的固定成本远高于顺序读。现在只定位一次，之后保留尾部
+    // FLAC_FRAME_HEADER_MAX_BYTES 到下一轮开头，既保持跨块解析能力，也避免重复 seek。
+    const uint64_t absolute_start = descriptor.audio_data_offset_bytes + buffer_stream_offset;
+    if (absolute_start > static_cast<uint64_t>(INT64_MAX) ||
+        audio_source_seek(
+            source,
+            static_cast<int64_t>(absolute_start),
+            AudioSourceSeekOrigin::Begin) != ESP_OK) {
+        return false;
+    }
+
+    const uint64_t header_tail = audio_bytes - scan_end_stream_offset < FLAC_FRAME_HEADER_MAX_BYTES
+        ? audio_bytes - scan_end_stream_offset
+        : FLAC_FRAME_HEADER_MAX_BYTES;
+    const uint64_t scan_read_end = scan_end_stream_offset + header_tail;
+
+    while (buffer_stream_offset < scan_end_stream_offset) {
+        const uint64_t source_position = buffer_stream_offset + buffered_bytes;
+        if (source_position < scan_read_end && buffered_bytes < FLAC_INPUT_BUFFER_BYTES) {
+            const uint64_t remaining = scan_read_end - source_position;
+            const size_t capacity = FLAC_INPUT_BUFFER_BYTES - buffered_bytes;
+            const size_t request = remaining < capacity
+                ? static_cast<size_t>(remaining)
+                : capacity;
+            size_t bytes_read = 0U;
+            if (request != 0U &&
+                (audio_source_read(source, scan + buffered_bytes, request, &bytes_read) != ESP_OK ||
+                 bytes_read == 0U)) {
+                break;
+            }
+            buffered_bytes += bytes_read;
+        }
+        if (buffered_bytes < 6U) {
+            break;
+        }
+
+        const uint64_t remaining_scan = scan_end_stream_offset - buffer_stream_offset;
+        size_t inspect = remaining_scan < buffered_bytes
+            ? static_cast<size_t>(remaining_scan)
+            : buffered_bytes;
+        if (buffer_stream_offset + buffered_bytes < scan_read_end) {
+            if (buffered_bytes <= FLAC_FRAME_HEADER_MAX_BYTES) {
+                break;
+            }
+            const size_t safe_inspect = buffered_bytes - FLAC_FRAME_HEADER_MAX_BYTES;
+            if (inspect > safe_inspect) {
+                inspect = safe_inspect;
+            }
+        }
+        if (inspect == 0U) {
+            break;
+        }
+
+        for (size_t i = 0U; i < inspect; ++i) {
+            if (scan[i] != 0xFFU || i + 1U >= buffered_bytes ||
+                (scan[i + 1U] & 0xFEU) != 0xF8U) {
+                continue;
+            }
+
+            uint64_t sample_number = 0U;
+            if (!flac_parse_frame_sample_number(scan + i, buffered_bytes - i, descriptor, &sample_number) ||
+                sample_number <= best.sample_number || sample_number >= max_sample_number) {
+                continue;
+            }
+            if (sample_number > target_frame) {
+                if (out_scanned_bytes != nullptr) {
+                    *out_scanned_bytes = scanned_bytes + i;
+                }
+                if (best.sample_number > in_out_point->sample_number) {
+                    *in_out_point = best;
+                    return true;
+                }
+                return false;
+            }
+
+            best.sample_number = sample_number;
+            best.stream_offset = buffer_stream_offset + i;
+        }
+
+        scanned_bytes += inspect;
+        buffer_stream_offset += inspect;
+        buffered_bytes -= inspect;
+        if (buffered_bytes != 0U) {
+            memmove(scan, scan + inspect, buffered_bytes);
+        }
+    }
+
+    if (out_scanned_bytes != nullptr) {
+        *out_scanned_bytes = scanned_bytes;
+    }
+    if (best.sample_number <= in_out_point->sample_number) {
+        return false;
+    }
+    *in_out_point = best;
+    return true;
+}
+
 static esp_err_t flac_select_seekpoint(
     AudioSource *source,
     const FlacStreamDescriptor &descriptor,
     uint64_t target_frame,
-    FlacSeekPoint *out_point)
+    FlacSeekPoint *out_point,
+    FlacSeekPoint *out_next_point,
+    bool *out_has_next)
 {
     if (!audio_source_is_open(source) || out_point == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -1297,6 +1581,8 @@ static esp_err_t flac_select_seekpoint(
     if (descriptor.seektable_offset_bytes > static_cast<uint64_t>(INT64_MAX)) {
         return ESP_ERR_INVALID_SIZE;
     }
+    if (out_next_point != nullptr) *out_next_point = {};
+    if (out_has_next != nullptr) *out_has_next = false;
 
     esp_err_t ret = audio_source_seek(
         source,
@@ -1308,6 +1594,8 @@ static esp_err_t flac_select_seekpoint(
 
     // 即使首个显式 seekpoint 晚于目标，也允许以第一帧 sample=0/offset=0 作为隐式基点。
     FlacSeekPoint best = {};
+    FlacSeekPoint next = {};
+    bool has_next = false;
     bool found_valid_entry = false;
     const uint32_t count = descriptor.seektable_length_bytes / FLAC_SEEKPOINT_BYTES;
     uint8_t entry[FLAC_SEEKPOINT_BYTES] = {};
@@ -1335,6 +1623,11 @@ static esp_err_t flac_select_seekpoint(
             best.sample_number = sample_number;
             best.stream_offset = stream_offset;
             best.frame_samples = frame_samples;
+        } else if (sample_number > target_frame && (!has_next || sample_number < next.sample_number)) {
+            next.sample_number = sample_number;
+            next.stream_offset = stream_offset;
+            next.frame_samples = frame_samples;
+            has_next = true;
         }
     }
 
@@ -1342,6 +1635,8 @@ static esp_err_t flac_select_seekpoint(
         return ESP_ERR_NOT_SUPPORTED;
     }
     *out_point = best;
+    if (out_next_point != nullptr && has_next) *out_next_point = next;
+    if (out_has_next != nullptr) *out_has_next = has_next;
     return ESP_OK;
 }
 
@@ -2228,14 +2523,102 @@ static esp_err_t flac_decoder_prepare_seek_runtime(
     if (descriptor.seektable_length_bytes < FLAC_SEEKPOINT_BYTES) {
         return ESP_ERR_NOT_SUPPORTED;
     }
+    if (descriptor.audio_data_offset_bytes >= descriptor.file_size_bytes) {
+        return ESP_ERR_INVALID_SIZE;
+    }
 
+#if APP_DIAG_AUDIO_SEEK
+    const int64_t seek_stage_begin_us = esp_timer_get_time();
+#endif
     FlacSeekPoint point = {};
-    esp_err_t ret = flac_select_seekpoint(decoder->source, descriptor, target_frame, &point);
+    FlacSeekPoint next_point = {};
+    bool has_next_point = false;
+    esp_err_t ret = flac_select_seekpoint(
+        decoder->source, descriptor, target_frame, &point, &next_point, &has_next_point);
+#if APP_DIAG_AUDIO_SEEK
+    const int64_t seekpoint_done_us = esp_timer_get_time();
+#endif
     if (ret != ESP_OK) {
         return ret;
     }
-    if (descriptor.audio_data_offset_bytes > descriptor.file_size_bytes ||
-        point.stream_offset > descriptor.file_size_bytes - descriptor.audio_data_offset_bytes) {
+
+    // SEEKTABLE 只给稀疏锚点；在相邻锚点之间只扫描压缩帧头，不解 PCM。
+    // 先利用前后 seekpoint 的 sample/byte 比例估算目标附近字节位置，再向前留出
+    // 128~256KB 保护窗口做局部扫描。估算只用于缩短扫描区间，最终锚点仍必须通过
+    // FLAC 帧头 sample/frame number + CRC8 校验；局部扫描失败时自动回退完整区间扫描。
+    const FlacSeekPoint table_point = point;
+    uint64_t refine_scanned_bytes = 0U;
+    bool refine_used_estimate = false;
+#if APP_DIAG_AUDIO_SEEK
+    bool refine_fell_back = false;
+#endif
+    const uint64_t audio_bytes = descriptor.file_size_bytes - descriptor.audio_data_offset_bytes;
+    const uint64_t scan_end = has_next_point ? next_point.stream_offset : audio_bytes;
+    const uint64_t max_sample = has_next_point ? next_point.sample_number : descriptor.total_frames;
+    const bool discard_exceeds_one_block = descriptor.max_block_size == 0U ||
+        target_frame - point.sample_number > descriptor.max_block_size;
+    if (discard_exceeds_one_block && max_sample > target_frame &&
+        scan_end > point.stream_offset + 1U) {
+        uint64_t scan_start = point.stream_offset + 1U;
+        const uint64_t sample_span = max_sample - point.sample_number;
+        const uint64_t target_delta = target_frame - point.sample_number;
+        const uint64_t byte_span = scan_end - point.stream_offset;
+
+        if (sample_span != 0U && target_delta < sample_span && byte_span != 0U &&
+            target_delta <= UINT64_MAX / byte_span) {
+            const uint64_t estimated_delta = (byte_span * target_delta) / sample_span;
+            uint64_t guard_bytes = 128U * 1024U;
+            if (descriptor.max_frame_size != 0U) {
+                const uint64_t frame_guard =
+                    static_cast<uint64_t>(descriptor.max_frame_size) * 8U;
+                if (frame_guard > guard_bytes) {
+                    guard_bytes = frame_guard;
+                }
+            }
+            const uint64_t max_guard_bytes = 256U * 1024U;
+            if (guard_bytes > max_guard_bytes) {
+                guard_bytes = max_guard_bytes;
+            }
+
+            if (estimated_delta > guard_bytes + 1U) {
+                const uint64_t estimated_start =
+                    point.stream_offset + estimated_delta - guard_bytes;
+                if (estimated_start > scan_start && estimated_start < scan_end) {
+                    scan_start = estimated_start;
+                    refine_used_estimate = true;
+                }
+            }
+        }
+
+        FlacSeekPoint refined_point = point;
+        uint64_t local_scanned_bytes = 0U;
+        bool refined = flac_refine_seekpoint_by_frame_scan(
+            decoder->source, workspace, descriptor, target_frame, scan_start, scan_end, max_sample,
+            &refined_point, &local_scanned_bytes);
+        refine_scanned_bytes = local_scanned_bytes;
+
+        if (!refined && refine_used_estimate) {
+            // 局部窗口若因码率波动落在目标之后，恢复旧的完整区间扫描，
+            // 保证 Phase 2 已有的正确性与性能下限不被新估算路径破坏。
+#if APP_DIAG_AUDIO_SEEK
+            refine_fell_back = true;
+#endif
+            refined_point = point;
+            uint64_t fallback_scanned_bytes = 0U;
+            refined = flac_refine_seekpoint_by_frame_scan(
+                decoder->source, workspace, descriptor, target_frame, point.stream_offset + 1U,
+                scan_end, max_sample, &refined_point, &fallback_scanned_bytes);
+            refine_scanned_bytes += fallback_scanned_bytes;
+        }
+
+        if (refined) {
+            point = refined_point;
+        }
+    }
+#if APP_DIAG_AUDIO_SEEK
+    const int64_t refine_done_us = esp_timer_get_time();
+#endif
+    if (point.stream_offset > descriptor.file_size_bytes - descriptor.audio_data_offset_bytes) {
         return ESP_ERR_INVALID_SIZE;
     }
     const uint64_t absolute_source_offset = descriptor.audio_data_offset_bytes + point.stream_offset;
@@ -2254,15 +2637,21 @@ static esp_err_t flac_decoder_prepare_seek_runtime(
         synthetic_header,
         sizeof(synthetic_header),
         point.sample_number);
+#if APP_DIAG_AUDIO_SEEK
+    const int64_t runtime_ready_us = esp_timer_get_time();
+#endif
     if (ret != ESP_OK) {
         return ret;
     }
 
-    // SEEKTABLE 只负责跳到目标之前的合法帧；剩余距离在 I2S/DAC 启动前直接丢弃 PCM。
+    // 定位锚点只负责跳到目标之前的合法帧；剩余距离在 I2S/DAC 启动前直接丢弃 PCM。
     // 此阶段没有 DMA underrun 截止时间，允许在预取环暂时耗尽时按起播预算等待后台补充。
     decoder->preplay_decode_active = true;
     ret = flac_decoder_discard_to_frame(decoder, target_frame);
     decoder->preplay_decode_active = false;
+#if APP_DIAG_AUDIO_SEEK
+    const int64_t discard_done_us = esp_timer_get_time();
+#endif
     if (ret != ESP_OK) {
         flac_decoder_close(decoder);
         return ret;
@@ -2270,9 +2659,21 @@ static esp_err_t flac_decoder_prepare_seek_runtime(
 
 #if APP_DIAG_AUDIO_SEEK
     ESP_LOGI(TAG,
-        "FLAC_SEEK_TRACE: target=%llu seekpoint=%llu stream_offset=%llu absolute=%llu discard=%llu seekpoints=%lu",
+        "FLAC_SEEK_STAGE: select=%lldms refine=%lldms runtime=%lldms discard=%lldms total=%lldms",
+        static_cast<long long>((seekpoint_done_us - seek_stage_begin_us) / 1000LL),
+        static_cast<long long>((refine_done_us - seekpoint_done_us) / 1000LL),
+        static_cast<long long>((runtime_ready_us - refine_done_us) / 1000LL),
+        static_cast<long long>((discard_done_us - runtime_ready_us) / 1000LL),
+        static_cast<long long>((discard_done_us - seek_stage_begin_us) / 1000LL));
+    ESP_LOGI(TAG,
+        "FLAC_SEEK_TRACE: target=%llu table=%llu refined=%llu saved=%llu scan=%lluB estimate=%u fallback=%u stream_offset=%llu absolute=%llu discard=%llu seekpoints=%lu",
         static_cast<unsigned long long>(target_frame),
+        static_cast<unsigned long long>(table_point.sample_number),
         static_cast<unsigned long long>(point.sample_number),
+        static_cast<unsigned long long>(point.sample_number - table_point.sample_number),
+        static_cast<unsigned long long>(refine_scanned_bytes),
+        refine_used_estimate ? 1U : 0U,
+        refine_fell_back ? 1U : 0U,
         static_cast<unsigned long long>(point.stream_offset),
         static_cast<unsigned long long>(absolute_source_offset),
         static_cast<unsigned long long>(target_frame - point.sample_number),

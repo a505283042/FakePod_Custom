@@ -14,6 +14,7 @@
 #include "pcm_decoder.h"
 #include "audio_decode_workspace.h"
 #include "audio_playback_clock.h"
+#include "audio_rate_profile.h"
 #include "audio_spectrum_snapshot.h"
 #include "nsf_synth.h"
 #include "sources/avi_mp3_audio_source.h"
@@ -3763,6 +3764,87 @@ static void audio_task_handle_play(AudioRequest *request)
     audio_request_complete(request, true, ESP_OK);
 }
 
+static esp_err_t audio_task_fast_seek_flac(
+    uint64_t target_frame,
+    bool was_paused,
+    PcmSeekResult *out_result)
+{
+    if (
+        g_task_format != MediaFormat::FLAC ||
+        g_decoder.type != PcmDecoderType::Flac ||
+        !flac_decoder_is_open(&g_decoder.flac) ||
+        g_task_sample_rate_hz == 0U ||
+        !g_pipeline_clock_prepared ||
+        !g_pipeline_i2s_started ||
+        !g_pipeline_asp_enabled ||
+        !g_pipeline_headphone_enabled ||
+        !i2s_output_is_started() ||
+        i2s_output_sample_rate_hz() != g_task_sample_rate_hz
+    ) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    AudioRateProfile rate_profile = {};
+    if (!audio_rate_profile_get(g_task_sample_rate_hz, &rate_profile) ||
+        rate_profile.i2s_dma_desc_num == 0U) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    esp_err_t ret = cs43131_set_pcm_mute(true);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    g_pcm_unmute_pending = false;
+    audio_task_reset_pcm_fade_in();
+    audio_task_reset_flac_starve_grace();
+
+    // I2S 没有独立的 DMA flush 接口。DAC 已静音后写满一整个 DMA runway，
+    // 确保旧位置 PCM 已被零数据顶出；保持 I2S/ASP/耳放持续工作，不做硬件重启。
+    const size_t drain_frames =
+        static_cast<size_t>(rate_profile.i2s_dma_desc_num) * AUDIO_STREAM_FRAMES;
+    ret = i2s_output_stream_write_silence(drain_frames, AUDIO_I2S_WRITE_TIMEOUT_MS);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = pcm_decoder_seek_frame(&g_decoder, target_frame, nullptr, out_result);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    if (
+        g_decoder.info.sample_rate_hz != g_task_sample_rate_hz ||
+        g_decoder.info.channels != g_task_channels ||
+        g_decoder.info.bits_per_sample != g_task_bits_per_sample
+    ) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const uint64_t actual_frame = out_result != nullptr
+        ? out_result->actual_frame
+        : target_frame;
+    audio_playback_clock_seek(&g_playback_clock, actual_frame);
+    g_last_progress_publish_frame = g_playback_clock.submitted_frames;
+    audio_spectrum_snapshot_reset(
+        g_task_playback_revision,
+        g_task_track_index,
+        g_task_sample_rate_hz);
+
+    if (!was_paused) {
+        audio_task_begin_pcm_fade_in("flac_seek_fast", g_task_sample_rate_hz);
+        g_pcm_unmute_pending = true;
+    }
+
+#if APP_DIAG_AUDIO_SEEK
+    ESP_LOGI(TAG,
+        "SEEK_TRACE: FAST_FLAC frame=%llu drain_frames=%u dma_desc=%u paused=%u",
+        static_cast<unsigned long long>(actual_frame),
+        static_cast<unsigned>(drain_frames),
+        static_cast<unsigned>(rate_profile.i2s_dma_desc_num),
+        static_cast<unsigned>(was_paused));
+#endif
+    return ESP_OK;
+}
+
 static void audio_task_handle_seek(AudioRequest *request)
 {
     if (request == nullptr) {
@@ -3844,39 +3926,60 @@ static void audio_task_handle_seek(AudioRequest *request)
         static_cast<unsigned>(was_paused));
 #endif
 
-    esp_err_t ret = audio_task_shutdown_pipeline();
-    if (ret != ESP_OK) {
-        audio_task_set_state(AudioPlaybackState::Error, ret);
-        audio_request_complete(request, false, ret);
-        return;
-    }
-
-    if (audio_task_transport_request_superseded(request, "seek_after_shutdown")) {
-        // 新 Seek/Play 已经成为最新意图；保持当前 Track/revision，便于后续同 Track Seek 继续接管。
-        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
-        return;
-    }
-
     PcmSeekResult seek_result = {};
-    ret = audio_task_start_pcm_pipeline(
-        decoder_type,
-        audio_request_path(request),
-        request,
-        true,
-        target_ms,
-        &seek_result);
-    if (ret != ESP_OK) {
-        if (!audio_transport_request_is_latest(request)) {
+    bool fast_seek_done = false;
+    esp_err_t ret = ESP_ERR_NOT_SUPPORTED;
+    if (decoder_type == PcmDecoderType::Flac) {
+        ret = audio_task_fast_seek_flac(target_frame, was_paused, &seek_result);
+        fast_seek_done = ret == ESP_OK;
+#if APP_DIAG_AUDIO_SEEK
+        if (!fast_seek_done) {
+            ESP_LOGW(TAG,
+                "SEEK_TRACE: FAST_FLAC_FALLBACK target=%llums ret=%s",
+                static_cast<unsigned long long>(target_ms),
+                esp_err_to_name(ret));
+        }
+#endif
+    }
+
+    if (!fast_seek_done) {
+        ret = audio_task_shutdown_pipeline();
+        if (ret != ESP_OK) {
+            audio_task_set_state(AudioPlaybackState::Error, ret);
+            audio_request_complete(request, false, ret);
+            return;
+        }
+
+        if (audio_task_transport_request_superseded(request, "seek_after_shutdown")) {
+            // 新 Seek/Play 已经成为最新意图；保持当前 Track/revision，便于后续同 Track Seek 继续接管。
             audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
             return;
         }
-        audio_task_set_state(AudioPlaybackState::Error, ret);
-        audio_request_complete(request, false, ret);
-        return;
+
+        ret = audio_task_start_pcm_pipeline(
+            decoder_type,
+            audio_request_path(request),
+            request,
+            true,
+            target_ms,
+            &seek_result);
+        if (ret != ESP_OK) {
+            if (!audio_transport_request_is_latest(request)) {
+                audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+                return;
+            }
+            audio_task_set_state(AudioPlaybackState::Error, ret);
+            audio_request_complete(request, false, ret);
+            return;
+        }
     }
 
     if (audio_task_transport_request_superseded(request, "seek_commit")) {
-        audio_task_shutdown_pipeline();
+        // Fast Seek 已保持当前 decoder/I2S 可继续接管下一次同曲 Seek；
+        // 只有旧的完整重建路径才需要关闭刚启动但已经过期的 pipeline。
+        if (!fast_seek_done) {
+            audio_task_shutdown_pipeline();
+        }
         audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
         return;
     }
@@ -3889,7 +3992,7 @@ static void audio_task_handle_seek(AudioRequest *request)
     g_task_last_seek_target_ms = target_ms;
 
     if (was_paused) {
-        // start pipeline 尚未发送真实 PCM，因此 DAC 仍保持手动静音；Paused 下继续送零维持时钟。
+        // Seek 定位期间 DAC 始终保持手动静音；Paused 下继续送零维持时钟。
         g_pcm_unmute_pending = false;
         audio_task_reset_pcm_fade_in();
         audio_task_set_state(AudioPlaybackState::Paused, ESP_OK);
