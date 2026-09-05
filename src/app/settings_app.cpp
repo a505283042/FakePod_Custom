@@ -26,6 +26,7 @@
 #include "usb_storage_service.h"
 #include "artwork_loader.h"
 #include "lyrics/lyrics_service.h"
+#include "media_library.h"
 #include "screen_lock_simple.h"
 #include "settings_menu_icons.h"
 #include "ui_common.h"
@@ -834,8 +835,8 @@ static void usb_runtime_overlay_set_service_ready()
         lv_label_set_text(
             g_usb_overlay_status,
             "可在电脑上访问存储卡\n"
-            "请先在电脑安全弹出\n"
-            "再恢复");
+            "电脑安全弹出后\n"
+            "即恢复");
         lv_obj_set_style_text_color(g_usb_overlay_status, lv_color_hex(0xC7D5E8), 0);
         lv_obj_invalidate(g_usb_overlay_status);
     }
@@ -854,8 +855,7 @@ static void usb_runtime_overlay_refresh_return_action()
         return;
     }
 
-    // V3.3：恢复按钮在 MSC 服务启动成功后常驻显示。Windows 的“弹出卷”并不保证
-    // 产生设备级 DETACHED/MOUNT_APP，因此不能再用 host_safe_to_return() 决定按钮显隐。
+    // 手动“恢复”始终保留作兜底；正常 V3.5 路径会在 owner=APP 后自动启动归还。
     set_visible(g_usb_overlay_action, true);
 
     const bool safe_to_return = usb_storage_service_host_safe_to_return();
@@ -872,8 +872,8 @@ static void usb_runtime_overlay_refresh_return_action()
             lv_label_set_text(
                 g_usb_overlay_status,
                 "可在电脑上访问存储卡\n"
-                "请先在电脑安全弹出\n"
-                "再恢复");
+                "电脑安全弹出后\n"
+                "即恢复");
             lv_obj_set_style_text_color(g_usb_overlay_status, lv_color_hex(0xC7D5E8), 0);
             lv_obj_invalidate(g_usb_overlay_status);
         }
@@ -942,7 +942,7 @@ static void usb_tf_runtime_enter_task(void *)
     storage_exclusive = false;
     usb_storage_service_finish_runtime_transition();
     usb_runtime_overlay_set_service_ready();
-    ESP_LOGI(TAG, "USB MSC V3.3热切换完成：ESP32未重启，TF owner=TinyUSB MSC；恢复按钮常驻，用户须先在电脑安全弹出");
+    ESP_LOGI(TAG, "USB MSC V3.5热切换完成：TF owner=TinyUSB MSC；Windows安全弹出后将按owner=APP自动归还");
     vTaskDelete(nullptr);
     return;
 
@@ -997,13 +997,35 @@ static void usb_tf_storage_enter_click_cb(lv_event_t *event)
         prompt_visible ? "已显示" : "显示失败");
 }
 
+static char *usb_tf_copy_selected_track_path()
+{
+    if (!player_state_is_ready()) return nullptr;
+    const char *path = player_state_get_path();
+    if (path == nullptr || path[0] == '\0') return nullptr;
+
+    const size_t bytes = strlen(path) + 1U;
+    char *copy = static_cast<char *>(
+        heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (copy == nullptr) {
+        copy = static_cast<char *>(heap_caps_malloc(bytes, MALLOC_CAP_8BIT));
+    }
+    if (copy != nullptr) {
+        memcpy(copy, path, bytes);
+    } else {
+        ESP_LOGW(TAG, "USB归还前无法复制当前歌曲路径；热刷新后将按旧全局索引回退");
+    }
+    return copy;
+}
+
 static void usb_tf_runtime_return_task(void *)
 {
+    const size_t preferred_track_index = player_state_is_ready() ? player_state_get_index() : 0U;
+    char *preferred_track_path = usb_tf_copy_selected_track_path();
     usb_runtime_overlay_set_status("恢复存储卡", 0xC7D5E8);
 
-    // 用户已经按页面要求在电脑端完成安全弹出并点击恢复；若系统同时收到 detach，
-    // 则属于额外的设备级安全确认。先让 deferred writes 落盘并拆掉 LUN/USB，
-    // 再把同一张卡交回 FakePod VFS；两个 owner 在任何时刻都不会并存。
+    // 正常 V3.5 路径由 MSC owner=APP 自动进入；手动按钮只作为兜底。
+    // 先让 deferred writes 落盘并删除 LUN，再把 USB descriptor 收缩为 CDC-only，
+    // 最后把同一张卡交回 FakePod VFS；两个 TF owner 在任何时刻都不会并存。
     const esp_err_t stop_ret = usb_storage_service_stop();
     if (stop_ret != ESP_OK) {
         usb_storage_service_cancel_runtime_return();
@@ -1013,6 +1035,7 @@ static void usb_tf_runtime_return_task(void *)
             0xD9B86C);
         ESP_LOGE(TAG, "USB MSC V3停止服务失败：%s；保持MSC封锁，可再次恢复",
             esp_err_to_name(stop_ret));
+        heap_caps_free(preferred_track_path);
         vTaskDelete(nullptr);
         return;
     }
@@ -1021,6 +1044,7 @@ static void usb_tf_runtime_return_task(void *)
         usb_storage_service_finish_runtime_return(false);
         usb_runtime_overlay_set_status("请重启设备", 0xE28A8A);
         ESP_LOGE(TAG, "USB MSC V3已释放USB但无法取得TF归还闸门；为避免双owner继续封锁，请重启设备");
+        heap_caps_free(preferred_track_path);
         vTaskDelete(nullptr);
         return;
     }
@@ -1032,17 +1056,40 @@ static void usb_tf_runtime_return_task(void *)
         usb_runtime_overlay_set_status("请重启设备", 0xE28A8A);
         ESP_LOGE(TAG, "USB MSC V3归还后重新挂载TF失败：%s；继续封锁普通TF访问",
             esp_err_to_name(mount_ret));
+        heap_caps_free(preferred_track_path);
         vTaskDelete(nullptr);
         return;
     }
+
+    // 仍持有 USB return owner + recursive SD mutex，且 system_loop / Artwork / Lyrics 都未放开。
+    // 在这个唯一安全窗口完成 Catalog 事务热替换，避免任何旧 generation 裸指针并发使用。
+    MusicCatalogV2 retired_catalog = {};
+    const uint32_t old_generation = media_catalog_v2_generation();
+    const size_t old_count = media_library_get_count();
+    const esp_err_t reload_ret = media_library_hot_reload_quiesced(&retired_catalog);
+    if (reload_ret == ESP_OK) {
+        const bool player_rebound = player_state_rebind_after_catalog_reload(preferred_track_path, preferred_track_index);
+        // Player generation 已重绑，后台资产仍停用；现在才允许释放旧 Catalog 内存。
+        media_catalog_v2_release(&retired_catalog);
+        ESP_LOGI(TAG,
+            "USB归还曲库热刷新：generation=%lu->%lu tracks=%u->%u player=%s",
+            static_cast<unsigned long>(old_generation),
+            static_cast<unsigned long>(media_catalog_v2_generation()),
+            static_cast<unsigned>(old_count),
+            static_cast<unsigned>(media_library_get_count()),
+            player_rebound ? "已重绑" : "重绑失败");
+    } else {
+        // 事务失败时 media_library 保留原 Catalog；继续恢复设备，只是目录仍为 USB 前快照。
+        ESP_LOGW(TAG, "USB归还曲库热刷新失败：%s；继续使用旧Catalog", esp_err_to_name(reload_ret));
+    }
+    heap_caps_free(preferred_track_path);
+    preferred_track_path = nullptr;
 
     storage_io_finish_usb_return(true);
     artwork_loader_resume_storage_after_handoff();
     lyrics_service_resume_storage_after_handoff();
 
-    // media_library 的 live catalog 仍采用 generation 内裸指针语义，当前版本明确禁止运行期
-    // 替换 catalog。因此这里不做不安全的二次扫描；只让当前曲目的歌词/封面重新请求。
-    if (player_state_is_ready()) {
+    if (player_state_is_ready() && media_library_get_count() > 0U) {
         (void)lyrics_service_request_track(static_cast<uint32_t>(player_state_get_index()));
     }
 
@@ -1050,36 +1097,56 @@ static void usb_tf_runtime_return_task(void *)
     usb_storage_service_finish_runtime_return(true);
     g_usb_transition_pending = false;
     usb_runtime_overlay_destroy();
-    ESP_LOGI(TAG, "USB MSC V3热归还完成：ESP32未重启，/sdcard 已恢复；现有媒体目录继续使用内存catalog");
+    ESP_LOGI(TAG, "USB MSC热归还完成：/sdcard 已恢复，USB=CDC-only，Catalog generation=%lu tracks=%u",
+        static_cast<unsigned long>(media_catalog_v2_generation()),
+        static_cast<unsigned>(media_library_get_count()));
     vTaskDelete(nullptr);
 }
 
-static void usb_tf_storage_return_click_cb(lv_event_t *event)
+static bool usb_tf_storage_start_return(bool user_confirmed_eject, bool automatic)
 {
-    if (!click_is_valid(event) || !g_usb_transition_pending || !usb_storage_service_is_active()) return;
+    if (!g_usb_transition_pending || !usb_storage_service_is_active()) return false;
+    if (!usb_storage_service_begin_runtime_return(user_confirmed_eject)) return false;
 
-    // 这个按钮本身就是用户的显式确认：页面已经常驻提示“请先在电脑安全弹出”。
-    // Windows 若另外上报了 DETACHED/MOUNT_APP，service 会自动识别；没有上报时仍允许
-    // 用户在完成安全弹出后手动归还，避免永远卡在 MSC 页面。
-    if (!usb_storage_service_begin_runtime_return(true)) {
-        ESP_LOGW(TAG, "USB MSC正在切换中，暂不能热归还");
-        return;
+    if (g_usb_overlay_status != nullptr && lv_obj_is_valid(g_usb_overlay_status)) {
+        lv_label_set_text(g_usb_overlay_status, automatic ? "安全弹出\n恢复存储卡" : "恢复存储卡");
+        lv_obj_set_style_text_color(g_usb_overlay_status, lv_color_hex(0xA9D6B4), 0);
+        lv_obj_invalidate(g_usb_overlay_status);
+    }
+    if (g_usb_overlay_action != nullptr && lv_obj_is_valid(g_usb_overlay_action)) {
+        set_visible(g_usb_overlay_action, false);
     }
 
-    // 点击后立即隐藏按钮，防止重复创建归还任务。若 USB teardown 可重试失败，
-    // runtime return gate 会撤销，refresh timer 会在 Host 仍安全时重新显示按钮。
-    set_visible(g_usb_overlay_action, false);
     const BaseType_t task_created = xTaskCreate(
         usb_tf_runtime_return_task,
         "usb_msc_back",
-        4096,
+        6144,
         nullptr,
         2,
         nullptr);
 
     if (task_created != pdPASS) {
         usb_storage_service_cancel_runtime_return();
-        ESP_LOGE(TAG, "USB MSC V3归还任务创建失败；保留MSC服务，可再次恢复");
+        if (g_usb_overlay_action != nullptr && lv_obj_is_valid(g_usb_overlay_action)) {
+            set_visible(g_usb_overlay_action, true);
+        }
+        ESP_LOGE(TAG, "USB MSC V3.5归还任务创建失败；保留手动恢复入口");
+        return false;
+    }
+
+    ESP_LOGI(TAG, "%s", automatic
+        ? "USB MSC检测到owner=APP：自动开始热归还"
+        : "USB MSC用户确认安全弹出：开始手动热归还");
+    return true;
+}
+
+static void usb_tf_storage_return_click_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event)) return;
+
+    // 手动按钮继续作为兜底：正常 V3.5 路径由 Windows 安全弹出后的 owner=APP 自动归还。
+    if (!usb_tf_storage_start_return(true, false)) {
+        ESP_LOGW(TAG, "USB MSC正在切换中，暂不能热归还");
     }
 }
 
@@ -1230,6 +1297,13 @@ static void refresh_timer_cb(lv_timer_t *timer)
 
     if (g_usb_overlay != nullptr && lv_obj_is_valid(g_usb_overlay)) {
         usb_runtime_overlay_refresh_return_action();
+
+        // V3.5：只在 MSC storage 明确切回 owner=APP 后自动归还。
+        // 不使用 USB DETACHED，避免首次 TinyUSB 重枚举时的短暂断开误触发。
+        if (usb_storage_service_auto_return_requested()) {
+            (void)usb_tf_storage_start_return(false, true);
+            return;
+        }
     }
 
     if (g_page == SettingsPage::Main) return;

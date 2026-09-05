@@ -882,6 +882,49 @@ esp_err_t media_catalog_v2_publish(MusicCatalogV2 *catalog, uint32_t source_crc3
     return ESP_OK;
 }
 
+esp_err_t media_catalog_v2_replace_quiesced(
+    MusicCatalogV2 *catalog,
+    uint32_t source_crc32,
+    MusicCatalogV2 *out_retired)
+{
+    if (catalog == nullptr || out_retired == nullptr || catalog == out_retired) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_ready) {
+        ESP_LOGE(TAG, "运行期替换要求已有活动 Catalog");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const esp_err_t validate_ret = media_catalog_v2_validate(catalog);
+    if (validate_ret != ESP_OK) {
+        return validate_ret;
+    }
+    const esp_err_t groups_ret = media_groups_v2_build(catalog);
+    if (groups_ret != ESP_OK) {
+        ESP_LOGE(TAG, "热替换 Catalog 构建分组失败：%s", esp_err_to_name(groups_ret));
+        return groups_ret;
+    }
+
+    // 先完整构建/校验 next，再做无失败点的 owner swap。旧 Catalog 不在这里释放，
+    // 让调用方有机会先把 Player/UI 的 generation 上下文重新绑定到新目录。
+    *out_retired = s_catalog;
+    s_catalog = *catalog;
+    *catalog = {};
+    s_catalog.source_crc32 = source_crc32;
+    s_catalog.generation = ++s_generation_seq;
+    if (s_catalog.generation == 0U) {
+        s_catalog.generation = ++s_generation_seq;
+    }
+    s_ready = true;
+
+    ESP_LOGI(TAG, "Catalog 热替换完成：old_generation=%lu new_generation=%lu tracks=%lu crc=0x%08lX",
+        static_cast<unsigned long>(out_retired->generation),
+        static_cast<unsigned long>(s_catalog.generation),
+        static_cast<unsigned long>(s_catalog.track_count),
+        static_cast<unsigned long>(s_catalog.source_crc32));
+    return ESP_OK;
+}
+
 bool media_catalog_v2_ready()
 {
     return s_ready;

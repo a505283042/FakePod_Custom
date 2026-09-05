@@ -320,10 +320,13 @@ void system_loop_update()
     // 启动失败只进入降级运行，不反向破坏已经发布的系统 READY。
     system_runtime_update();
 
-    // USB MSC 运行时切换一旦开始，就停止所有可能重新触发本地文件访问的业务调度。
-    // LVGL 有独立 task，因此中文准备/服务页仍可正常刷新；保留电源键轮询用于安全弹出后的关机。
+    // USB MSC 运行时切换一旦开始，就停止所有可能重新触发本地文件/Catalog访问的业务调度。
+    // MSC真正 active 时仍保留电源键轮询；归还/热刷新阶段 g_active 已清除，此时连电源短按
+    // 的上一曲/音量动作也暂时冻结，避免 Player 在 Catalog generation swap 窗口并发读写。
     if (usb_storage_service_blocks_normal_runtime()) {
-        power_service_update();
+        if (usb_storage_service_is_active()) {
+            power_service_update();
+        }
         return;
     }
 

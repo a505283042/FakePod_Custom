@@ -1,5 +1,7 @@
 #include "player_state.h"
 
+#include <strings.h>
+
 #include "esp_log.h"
 
 static const char *TAG = "播放器状态";
@@ -46,6 +48,83 @@ bool player_state_is_ready()
 {
     return g_ready && player_playlist_is_ready();
 }
+
+static bool player_state_find_track_by_path(const char *path, size_t *out_track_index)
+{
+    if (path == nullptr || path[0] == '\0' || out_track_index == nullptr) {
+        return false;
+    }
+
+    size_t lo = 0U;
+    size_t hi = media_library_get_count();
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2U;
+        const char *candidate = media_library_get_path(mid);
+        if (candidate == nullptr) {
+            return false;
+        }
+        const int cmp = strcasecmp(candidate, path);
+        if (cmp < 0) {
+            lo = mid + 1U;
+        } else {
+            hi = mid;
+        }
+    }
+
+    if (lo >= media_library_get_count()) {
+        return false;
+    }
+    const char *candidate = media_library_get_path(lo);
+    if (candidate == nullptr || strcasecmp(candidate, path) != 0) {
+        return false;
+    }
+    *out_track_index = lo;
+    return true;
+}
+
+bool player_state_rebind_after_catalog_reload(const char *preferred_path, size_t fallback_track_index)
+{
+    if (!media_library_is_ready()) {
+        g_ready = false;
+        ESP_LOGE(TAG, "Catalog热刷新后音乐库未就绪，无法重绑Player");
+        return false;
+    }
+
+    const esp_err_t ret = player_playlist_init();
+    if (ret != ESP_OK) {
+        g_ready = false;
+        ESP_LOGE(TAG, "Catalog热刷新后重建播放列表失败：%s", esp_err_to_name(ret));
+        return false;
+    }
+    g_ready = true;
+
+    if (media_library_get_count() == 0U) {
+        ESP_LOGI(TAG, "Catalog热刷新后曲库为空，Player已绑定空列表");
+        return true;
+    }
+
+    size_t restored_track = 0U;
+    const bool found = player_state_find_track_by_path(preferred_path, &restored_track);
+    if (!found) {
+        restored_track = fallback_track_index < media_library_get_count()
+            ? fallback_track_index
+            : media_library_get_count() - 1U;
+    }
+    if (!player_state_select_all_tracks(restored_track)) {
+        ESP_LOGE(TAG, "Catalog热刷新后恢复选择失败：track=%u", static_cast<unsigned>(restored_track));
+        return false;
+    }
+
+    if (found) {
+        ESP_LOGI(TAG, "Catalog热刷新后恢复原歌曲：track=%u %s",
+            static_cast<unsigned>(restored_track), preferred_path);
+    } else {
+        ESP_LOGW(TAG, "Catalog热刷新后原歌曲已不存在，回退相邻有效歌曲：track=%u old=%s",
+            static_cast<unsigned>(restored_track), preferred_path != nullptr ? preferred_path : "<none>");
+    }
+    return true;
+}
+
 
 size_t player_state_get_index()
 {

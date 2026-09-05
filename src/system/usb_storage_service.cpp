@@ -10,7 +10,10 @@
 #include "sdmmc_cmd.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
+#include "tinyusb_cdc_acm.h"
+#include "tinyusb_console.h"
 #include "tinyusb_msc.h"
+#include "tusb.h"
 
 #include "board_pins.h"
 
@@ -18,18 +21,60 @@ namespace {
 
 static const char *TAG = "USB存储";
 
+enum class TinyUsbProfile : uint8_t {
+    None = 0,
+    CompositeMscCdc,
+    CdcOnly,
+};
+
 static sdmmc_card_t *g_card = nullptr;
 static sdmmc_host_t g_host = {};
 static bool g_host_initialized = false;
 static tinyusb_msc_storage_handle_t g_storage = nullptr;
 static bool g_tinyusb_installed = false;
+static TinyUsbProfile g_tinyusb_profile = TinyUsbProfile::None;
+static bool g_cdc_initialized = false;
+static bool g_console_redirected = false;
 static bool g_active = false;
 static volatile bool g_runtime_transitioning = false;
 static volatile bool g_host_seen = false;
 static volatile bool g_host_attached = false;
 static volatile bool g_host_ejected = false;
+static volatile bool g_auto_return_requested = false;
 static TickType_t g_service_start_tick = 0;
 static TickType_t g_host_release_tick = 0;
+
+// V3.5: MSC 退出后仍留在 USB-OTG/TinyUSB，不再尝试回切内建 USB Serial/JTAG。
+// 重新枚举时使用 CDC-only configuration descriptor，把 Windows 中残留的灰色磁盘接口彻底移除。
+// CDC 保持 interface 0/1 和原默认端点 0x81/0x02/0x82，尽量让 Windows 沿用原 COM 号。
+enum : uint8_t {
+    kCdcControlInterface = 0,
+    kCdcDataInterface,
+    kCdcInterfaceCount,
+};
+
+static constexpr uint16_t kCdcOnlyConfigLen = TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN;
+static const uint8_t k_cdc_only_fs_descriptor[] = {
+    TUD_CONFIG_DESCRIPTOR(
+        1,
+        kCdcInterfaceCount,
+        0,
+        kCdcOnlyConfigLen,
+        0,
+        100),
+    TUD_CDC_DESCRIPTOR(
+        kCdcControlInterface,
+        4,
+        0x81,
+        8,
+        0x02,
+        0x82,
+        64),
+};
+
+static_assert(
+    sizeof(k_cdc_only_fs_descriptor) == kCdcOnlyConfigLen,
+    "CDC-only USB descriptor length mismatch");
 
 static void raw_sd_cleanup()
 {
@@ -134,14 +179,16 @@ static void storage_event_cb(
         case TINYUSB_MSC_EVENT_MOUNT_COMPLETE:
             ESP_LOGI(TAG, "MSC挂载完成：owner=%s",
                 event->mount_point == TINYUSB_MSC_STORAGE_MOUNT_USB ? "USB" : "APP");
-            // 这里只覆盖真正的 USB unmount/detach；Windows 文件管理器仅“弹出卷”
-            // 不保证触发这条 mount-point 切换。V3.3 因此保留设备级事件作为绿色提示，
-            // 同时由屏幕“恢复”按钮承担用户完成安全弹出后的显式确认。
+            // 实机已确认 Windows “安全弹出”最终会把 MSC storage 切回 APP owner。
+            // V3.5 以这条 storage-owner 事件作为唯一自动归还触发。
             if (event->mount_point == TINYUSB_MSC_STORAGE_MOUNT_APP) {
                 g_host_seen = true;
                 g_host_attached = false;
                 g_host_ejected = true;
                 g_host_release_tick = xTaskGetTickCount();
+                // 实机 Windows 安全弹出已确认会走到 owner=APP。只用这个 storage-owner
+                // 事件触发自动归还；不要用早期 USB DETACHED，后者在首次枚举时也会抖动。
+                if (g_active) g_auto_return_requested = true;
             }
             break;
         case TINYUSB_MSC_EVENT_MOUNT_FAILED:
@@ -154,6 +201,98 @@ static void storage_event_cb(
         default:
             break;
     }
+}
+
+static esp_err_t ensure_tinyusb_cdc_console()
+{
+    if (!g_tinyusb_installed) return ESP_ERR_INVALID_STATE;
+
+    if (!g_cdc_initialized) {
+        tinyusb_config_cdcacm_t cdc_cfg = {};
+        cdc_cfg.cdc_port = TINYUSB_CDC_ACM_0;
+
+        const esp_err_t cdc_ret = tinyusb_cdcacm_init(&cdc_cfg);
+        if (cdc_ret != ESP_OK) {
+            ESP_LOGE(TAG, "TinyUSB CDC初始化失败：%s", esp_err_to_name(cdc_ret));
+            return cdc_ret;
+        }
+        g_cdc_initialized = true;
+    }
+
+    if (!g_console_redirected) {
+        const esp_err_t console_ret = tinyusb_console_init(TINYUSB_CDC_ACM_0);
+        if (console_ret != ESP_OK) {
+            ESP_LOGE(TAG, "TinyUSB CDC控制台重定向失败：%s", esp_err_to_name(console_ret));
+            return console_ret;
+        }
+        g_console_redirected = true;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t reinstall_tinyusb_profile(TinyUsbProfile target_profile)
+{
+    if (target_profile == TinyUsbProfile::None) return ESP_ERR_INVALID_ARG;
+
+    if (g_tinyusb_installed) {
+        // console_deinit 必须先于 CDC/Device Stack；否则 stdout/stderr 仍指向即将销毁的 VFS。
+        if (g_console_redirected) {
+            const esp_err_t console_ret = tinyusb_console_deinit(TINYUSB_CDC_ACM_0);
+            if (console_ret != ESP_OK) {
+                ESP_LOGW(TAG, "TinyUSB CDC控制台解除重定向失败：%s；继续重枚举",
+                    esp_err_to_name(console_ret));
+            }
+            g_console_redirected = false;
+        }
+
+        if (g_cdc_initialized) {
+            const esp_err_t cdc_ret = tinyusb_cdcacm_deinit(TINYUSB_CDC_ACM_0);
+            if (cdc_ret != ESP_OK) {
+                ESP_LOGW(TAG, "TinyUSB CDC反初始化失败：%s；继续重枚举",
+                    esp_err_to_name(cdc_ret));
+            }
+            g_cdc_initialized = false;
+        }
+
+        const esp_err_t uninstall_ret = tinyusb_driver_uninstall();
+        if (uninstall_ret != ESP_OK) {
+            ESP_LOGE(TAG, "TinyUSB设备卸载失败：%s", esp_err_to_name(uninstall_ret));
+            return uninstall_ret;
+        }
+        g_tinyusb_installed = false;
+        g_tinyusb_profile = TinyUsbProfile::None;
+
+        // 给 Windows 一个明确的断开窗口，保证旧 configuration interfaces 被真正撤销。
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+
+    tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG(tinyusb_device_event_cb);
+    if (target_profile == TinyUsbProfile::CdcOnly) {
+        tusb_cfg.descriptor.full_speed_config = k_cdc_only_fs_descriptor;
+    }
+
+    esp_err_t ret = tinyusb_driver_install(&tusb_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "TinyUSB %s安装失败：%s",
+            target_profile == TinyUsbProfile::CdcOnly ? "CDC-only" : "MSC+CDC",
+            esp_err_to_name(ret));
+        return ret;
+    }
+    g_tinyusb_installed = true;
+    g_tinyusb_profile = target_profile;
+
+    ret = ensure_tinyusb_cdc_console();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "TinyUSB %s控制台建立失败：%s",
+            target_profile == TinyUsbProfile::CdcOnly ? "CDC-only" : "MSC+CDC",
+            esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "USB已重枚举为%s",
+        target_profile == TinyUsbProfile::CdcOnly ? "CDC-only（无磁盘接口）" : "MSC+CDC");
+    return ESP_OK;
 }
 
 static esp_err_t delete_storage_after_host_release()
@@ -186,6 +325,7 @@ esp_err_t usb_storage_service_start()
     g_host_seen = false;
     g_host_attached = false;
     g_host_ejected = false;
+    g_auto_return_requested = false;
     g_service_start_tick = xTaskGetTickCount();
     g_host_release_tick = 0;
 
@@ -215,49 +355,66 @@ esp_err_t usb_storage_service_start()
         return ret;
     }
 
-    tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG(tinyusb_device_event_cb);
-    ret = tinyusb_driver_install(&tusb_cfg);
+    if (!g_tinyusb_installed || g_tinyusb_profile != TinyUsbProfile::CompositeMscCdc) {
+        // 首次进入时从内建 USB Serial/JTAG 切到 TinyUSB；后续再次进入时从
+        // CDC-only 重新枚举回 MSC+CDC，让同一个 TF 文件管理流程可以反复使用。
+        ret = reinstall_tinyusb_profile(TinyUsbProfile::CompositeMscCdc);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "TinyUSB MSC+CDC建立失败：%s", esp_err_to_name(ret));
+            (void)tinyusb_msc_delete_storage(g_storage);
+            g_storage = nullptr;
+            raw_sd_cleanup();
+            return ret;
+        }
+    }
+
+    // reinstall_tinyusb_profile() 已保证 CDC console 在线；保留一次幂等检查，
+    // 兼容未来从已安装 composite profile 直接建立新的 MSC storage。
+    ret = ensure_tinyusb_cdc_console();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "TinyUSB Device安装失败：%s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "TinyUSB CDC控制台建立失败：%s", esp_err_to_name(ret));
         (void)tinyusb_msc_delete_storage(g_storage);
         g_storage = nullptr;
         raw_sd_cleanup();
         return ret;
     }
 
-    g_tinyusb_installed = true;
     g_active = true;
-    ESP_LOGI(TAG, "FakePod TF卡 USB MSC 服务已启动；应用侧不会挂载/访问TF卡");
+    ESP_LOGI(TAG, "FakePod USB服务已启动：TF=MSC，日志串口=TinyUSB CDC；应用侧不会挂载/访问TF卡");
     return ESP_OK;
 }
 
 esp_err_t usb_storage_service_stop()
 {
-    if (!g_active && g_storage == nullptr && !g_tinyusb_installed && g_card == nullptr) {
+    if (!g_active && g_storage == nullptr && g_card == nullptr && !g_host_initialized) {
+        // CDC-only profile 可以跨 MSC 会话常驻；它不属于“MSC仍需停止”的条件。
         return ESP_OK;
     }
 
     esp_err_t ret = delete_storage_after_host_release();
     if (ret != ESP_OK) return ret;
 
-    if (g_tinyusb_installed) {
-        ret = tinyusb_driver_uninstall();
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "TinyUSB Device卸载失败：%s", esp_err_to_name(ret));
-            // storage 已解绑，保留 raw SD owner 和 active 状态，允许用户再次点“恢复”重试卸载。
-            return ret;
-        }
-        g_tinyusb_installed = false;
-    }
-
+    // storage/LUN 已经安全删除，此刻先释放 raw SDMMC，确保下一步普通 VFS 可以重新接管。
     raw_sd_cleanup();
     g_active = false;
+    g_auto_return_requested = false;
+
+    // V3.5：仍留在 TinyUSB/USB-OTG，但从 MSC+CDC 重新枚举成 CDC-only。
+    // 这不会回切 USB Serial/JTAG；只会让 COM 短暂断开后重新出现，同时灰色盘符消失。
+    const esp_err_t usb_ret = reinstall_tinyusb_profile(TinyUsbProfile::CdcOnly);
+    if (usb_ret != ESP_OK) {
+        // TF owner 已经安全释放，不能把失败伪装成“MSC仍活动”。允许上层继续恢复 /sdcard；
+        // 串口若未重新枚举，下一次整机重启仍可恢复正常 USB Serial/JTAG。
+        ESP_LOGE(TAG, "CDC-only重枚举失败：%s；TF仍可归还FakePod，串口需重启恢复",
+            esp_err_to_name(usb_ret));
+    }
+
     g_host_seen = false;
     g_host_attached = false;
     g_host_ejected = false;
     g_service_start_tick = 0;
     g_host_release_tick = 0;
-    ESP_LOGI(TAG, "USB MSC服务已停止：raw SDMMC/USB PHY已释放，等待普通VFS重新挂载");
+    ESP_LOGI(TAG, "USB MSC服务已停止：raw SDMMC已释放，USB目标=CDC-only，等待普通VFS重新挂载");
     return ESP_OK;
 }
 
@@ -266,19 +423,23 @@ bool usb_storage_service_is_active()
     return g_active;
 }
 
+bool usb_storage_service_auto_return_requested()
+{
+    return g_active && !g_runtime_transitioning && g_auto_return_requested;
+}
+
 bool usb_storage_service_host_safe_to_return()
 {
     if (!g_active || g_runtime_transitioning) return false;
 
-    // 设备级 DETACHED/MOUNT_APP 仍作为自动安全信号。Windows 仅“弹出卷”时可能
-    // 不产生这些事件，因此 V3.3 的“恢复”按钮不再依赖本函数是否为 true。
-    if ((g_host_ejected || (g_host_seen && !g_host_attached)) && g_host_release_tick != 0 &&
+    // V3.5 实机确认：Windows 安全弹出最终会产生 MSC MOUNT_COMPLETE owner=APP。
+    // 首次 TinyUSB 枚举也可能出现 DETACHED，因此不再把 device detach 单独当作自动安全信号。
+    if (g_auto_return_requested && g_host_release_tick != 0 &&
         xTaskGetTickCount() - g_host_release_tick >= pdMS_TO_TICKS(250)) {
         return true;
     }
 
-    // 如果根本没有电脑枚举过设备，1.5 秒后允许用户直接恢复；此时 Host 从未拿到块设备，
-    // 不存在待刷新的文件系统写入。
+    // 如果根本没有电脑枚举过设备，1.5 秒后仍允许手动恢复。
     if (!g_host_seen && g_service_start_tick != 0 &&
         xTaskGetTickCount() - g_service_start_tick >= pdMS_TO_TICKS(1500)) {
         return true;
@@ -311,11 +472,11 @@ bool usb_storage_service_begin_runtime_return(bool user_confirmed_eject)
     if (!host_reported_safe && !user_confirmed_eject) return false;
 
     if (!host_reported_safe && user_confirmed_eject) {
-        // Windows “弹出卷”并不保证触发设备级 DETACHED/MOUNT_APP。
-        // 此处只接受来自 UI 明确按钮的人工确认；调用方必须先提示用户在电脑端安全弹出。
-        ESP_LOGW(TAG, "使用用户确认执行MSC热归还：未收到设备级detach事件，确认电脑已安全弹出");
+        // 手动按钮仍作为兜底；正常 V3.5 流程由 owner=APP 自动触发。
+        ESP_LOGW(TAG, "使用用户确认执行MSC热归还：未收到owner=APP，确认电脑已安全弹出");
     }
 
+    g_auto_return_requested = false;
     g_runtime_transitioning = true;
     return true;
 }

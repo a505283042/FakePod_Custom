@@ -128,10 +128,12 @@ static void media_library_release_build_buffers()
     g_path_capacity = 0;
 }
 
-static void media_library_reset()
+static void media_library_reset_build_state(bool preserve_runtime_ready)
 {
     media_library_release_build_buffers();
-    g_ready = false;
+    if (!preserve_runtime_ready) {
+        g_ready = false;
+    }
 }
 
 static bool media_library_ensure_entry_capacity(size_t required)
@@ -356,12 +358,15 @@ static bool media_library_repack_sorted_path_pool()
     return true;
 }
 
-static esp_err_t media_library_scan_with_scratch(MediaLibraryScanScratch *scratch)
+static esp_err_t media_library_scan_with_scratch(
+    MediaLibraryScanScratch *scratch,
+    bool replace_runtime_catalog,
+    MusicCatalogV2 *out_retired)
 {
-    if (scratch == nullptr) {
+    if (scratch == nullptr || (replace_runtime_catalog && out_retired == nullptr)) {
         return ESP_ERR_INVALID_ARG;
     }
-    media_library_reset();
+    media_library_reset_build_state(replace_runtime_catalog);
     LIB_BOOT_LOGI("开始递归扫描：%s", MUSIC_ROOT);
     const int64_t start_us = esp_timer_get_time();
 
@@ -388,6 +393,7 @@ static esp_err_t media_library_scan_with_scratch(MediaLibraryScanScratch *scratc
         directory_stack_destroy(&stack);
         media_catalog_store_v2_release(&previous_v2);
         media_index_store_release(&previous_v1);
+        media_library_reset_build_state(replace_runtime_catalog);
         return ESP_ERR_NO_MEM;
     }
 
@@ -423,6 +429,7 @@ static esp_err_t media_library_scan_with_scratch(MediaLibraryScanScratch *scratc
                 directory_stack_destroy(&stack);
                 media_catalog_store_v2_release(&previous_v2);
                 media_index_store_release(&previous_v1);
+                media_library_reset_build_state(replace_runtime_catalog);
                 return ESP_ERR_TIMEOUT;
             }
             dir = opendir(directory);
@@ -797,7 +804,7 @@ static esp_err_t media_library_scan_with_scratch(MediaLibraryScanScratch *scratc
         ESP_LOGE(TAG, "扫描过程中 PSRAM 不足，音乐库未完成");
         media_catalog_store_v2_release(&previous_v2);
         media_index_store_release(&previous_v1);
-        media_library_reset();
+        media_library_reset_build_state(replace_runtime_catalog);
         return ESP_ERR_NO_MEM;
     }
     if (root_missing) {
@@ -808,7 +815,7 @@ static esp_err_t media_library_scan_with_scratch(MediaLibraryScanScratch *scratc
         ESP_LOGE(TAG, "排序后重建确定性路径池失败");
         media_catalog_store_v2_release(&previous_v2);
         media_index_store_release(&previous_v1);
-        media_library_reset();
+        media_library_reset_build_state(replace_runtime_catalog);
         return ESP_ERR_NO_MEM;
     }
 
@@ -842,12 +849,14 @@ static esp_err_t media_library_scan_with_scratch(MediaLibraryScanScratch *scratc
         next_catalog = previous_v2.catalog;
         previous_v2.catalog = {};
         const uint32_t source_crc = previous_v2.index_crc32;
-        const esp_err_t publish_ret = media_catalog_v2_publish(&next_catalog, source_crc);
+        const esp_err_t publish_ret = replace_runtime_catalog
+            ? media_catalog_v2_replace_quiesced(&next_catalog, source_crc, out_retired)
+            : media_catalog_v2_publish(&next_catalog, source_crc);
         if (publish_ret != ESP_OK) {
             media_catalog_v2_release(&next_catalog);
             media_catalog_store_v2_release(&previous_v2);
             media_index_store_release(&previous_v1);
-            media_library_reset();
+            media_library_reset_build_state(replace_runtime_catalog);
             return publish_ret;
         }
         LIB_BOOT_LOGI("V2 Catalog 全量命中 Manifest，直接复用已校验运行时目录，不重建、不写盘");
@@ -906,7 +915,7 @@ static esp_err_t media_library_scan_with_scratch(MediaLibraryScanScratch *scratc
         ESP_LOGE(TAG, "构建 MusicCatalogV2 失败：%s", esp_err_to_name(catalog_ret));
         media_catalog_store_v2_release(&previous_v2);
         media_index_store_release(&previous_v1);
-        media_library_reset();
+        media_library_reset_build_state(replace_runtime_catalog);
         return catalog_ret;
     }
 
@@ -928,13 +937,15 @@ static esp_err_t media_library_scan_with_scratch(MediaLibraryScanScratch *scratc
     const uint32_t final_track_bytes = next_catalog.track_count * sizeof(TrackRowV2);
     const uint32_t final_artist_bytes = next_catalog.artist_count * sizeof(ArtistRowV2);
     const uint32_t final_album_bytes = next_catalog.album_count * sizeof(AlbumRowV2);
-    catalog_ret = media_catalog_v2_publish(&next_catalog, catalog_crc);
+    catalog_ret = replace_runtime_catalog
+        ? media_catalog_v2_replace_quiesced(&next_catalog, catalog_crc, out_retired)
+        : media_catalog_v2_publish(&next_catalog, catalog_crc);
     if (catalog_ret != ESP_OK) {
         ESP_LOGE(TAG, "发布 MusicCatalogV2 失败：%s", esp_err_to_name(catalog_ret));
         media_catalog_v2_release(&next_catalog);
         media_catalog_store_v2_release(&previous_v2);
         media_index_store_release(&previous_v1);
-        media_library_reset();
+        media_library_reset_build_state(replace_runtime_catalog);
         return catalog_ret;
     }
 
@@ -1004,9 +1015,49 @@ esp_err_t media_library_scan()
         return ESP_ERR_NO_MEM;
     }
 
-    const esp_err_t ret = media_library_scan_with_scratch(scratch);
+    const esp_err_t ret = media_library_scan_with_scratch(scratch, false, nullptr);
     media_library_scan_scratch_release(scratch);
     return ret;
+}
+
+esp_err_t media_library_hot_reload_quiesced(MusicCatalogV2 *out_retired)
+{
+    if (out_retired == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_retired = {};
+    if (!g_ready || !media_catalog_v2_ready() || !sdcard_is_mounted()) {
+        ESP_LOGE(TAG, "热刷新要求旧Catalog有效且TF已重新挂载");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!storage_io_usb_handoff_blocked()) {
+        ESP_LOGE(TAG, "拒绝未隔离普通TF访问的Catalog热刷新");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    MediaLibraryScanScratch *scratch = static_cast<MediaLibraryScanScratch *>(
+        heap_caps_calloc(1, sizeof(MediaLibraryScanScratch), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+    );
+    if (scratch == nullptr) {
+        ESP_LOGE(TAG, "创建热刷新PSRAM scratch失败");
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(TAG, "开始USB归还后的Catalog事务热刷新：old_generation=%lu tracks=%u",
+        static_cast<unsigned long>(media_catalog_v2_generation()),
+        static_cast<unsigned>(media_library_get_count()));
+    const esp_err_t ret = media_library_scan_with_scratch(scratch, true, out_retired);
+    media_library_scan_scratch_release(scratch);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Catalog事务热刷新失败：%s；继续保留旧Catalog", esp_err_to_name(ret));
+        media_catalog_v2_release(out_retired);
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "Catalog事务热刷新成功：new_generation=%lu tracks=%u",
+        static_cast<unsigned long>(media_catalog_v2_generation()),
+        static_cast<unsigned>(media_library_get_count()));
+    return ESP_OK;
 }
 
 bool media_library_is_ready()

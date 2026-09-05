@@ -8,8 +8,13 @@
 
 // 启动期扫描 TF 卡音乐目录并建立运行时 MusicCatalogV2，同时维护 /sdcard/System/library 下的 V2 Index/Manifest。
 // 未变化文件通过 FAST(size+mtime) Manifest 复用旧技术信息；V1 仅作为首次升级迁移源。
-// 当前运行时 Catalog 不支持热替换，因此每次启动周期只允许调用一次。
+// 启动扫描每次启动周期只调用一次；USB运行时归还后的刷新走 quiesced hot reload。
 esp_err_t media_library_scan();
+
+// USB/维护模式专用事务热刷新。调用前必须已停止 Audio/Artwork/Lyrics 并保持普通TF访问封锁。
+// 成功后旧 Catalog 所有权移动到 out_retired；调用方完成 Player/UI generation 重绑定后必须释放它。
+// 失败时当前运行时 Catalog 不变。
+esp_err_t media_library_hot_reload_quiesced(MusicCatalogV2 *out_retired);
 
 // 判断音乐库扫描是否完成。
 bool media_library_is_ready();

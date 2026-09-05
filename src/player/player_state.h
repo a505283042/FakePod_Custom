@@ -12,6 +12,10 @@ esp_err_t player_state_init();
 // 判断选择状态是否可用。
 bool player_state_is_ready();
 
+// Catalog generation 热替换后重建 Playlist Context。preferred_path 仍存在时恢复到该歌曲；
+// 已删除时按旧全局索引回退到相邻有效歌曲，空库保持空列表，不自动播放。
+bool player_state_rebind_after_catalog_reload(const char *preferred_path, size_t fallback_track_index);
+
 // 获取当前歌曲全局 Track 索引，从 0 开始。
 size_t player_state_get_index();
 

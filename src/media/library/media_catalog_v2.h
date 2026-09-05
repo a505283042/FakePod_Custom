@@ -245,8 +245,17 @@ void media_catalog_v2_release(MusicCatalogV2 *catalog);
 esp_err_t media_catalog_v2_validate(const MusicCatalogV2 *catalog);
 
 // 将构建/加载好的 Catalog 发布为本次启动周期的运行时只读目录，并生成 generation。
-// 当前 View 直接引用 Catalog 内存，因此每次启动只允许发布一次；运行期热替换尚不支持。
+// 启动路径仍只允许首次发布；运行期替换必须走 quiesced replace API。
 esp_err_t media_catalog_v2_publish(MusicCatalogV2 *catalog, uint32_t source_crc32);
+
+// 在所有 Catalog 裸指针消费者已停用/隔离时，事务式替换当前运行时 Catalog。
+// 成功后旧 Catalog 的所有权移动到 out_retired，调用方必须在完成 Playlist/UI generation
+// 重绑定后调用 media_catalog_v2_release(out_retired)。失败时当前 Catalog 完全不变。
+esp_err_t media_catalog_v2_replace_quiesced(
+    MusicCatalogV2 *catalog,
+    uint32_t source_crc32,
+    MusicCatalogV2 *out_retired);
+
 bool media_catalog_v2_ready();
 const MusicCatalogV2 *media_catalog_v2_current();
 uint32_t media_catalog_v2_generation();
