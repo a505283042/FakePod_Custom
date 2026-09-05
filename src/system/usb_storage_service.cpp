@@ -134,8 +134,9 @@ static void storage_event_cb(
         case TINYUSB_MSC_EVENT_MOUNT_COMPLETE:
             ESP_LOGI(TAG, "MSC挂载完成：owner=%s",
                 event->mount_point == TINYUSB_MSC_STORAGE_MOUNT_USB ? "USB" : "APP");
-            // Host detach 时 esp_tinyusb 会把 storage 从 USB 归还到 APP mount point。
-            // 应用仍受 StorageSdLock USB 闸门保护，不会在 V3 正式 teardown 前访问该 VFS。
+            // 这里只覆盖真正的 USB unmount/detach；Windows 文件管理器仅“弹出卷”
+            // 不保证触发这条 mount-point 切换。V3.3 因此保留设备级事件作为绿色提示，
+            // 同时由屏幕“恢复”按钮承担用户完成安全弹出后的显式确认。
             if (event->mount_point == TINYUSB_MSC_STORAGE_MOUNT_APP) {
                 g_host_seen = true;
                 g_host_attached = false;
@@ -177,29 +178,6 @@ static esp_err_t delete_storage_after_host_release()
 }
 
 } // namespace
-
-// TinyUSB core 对 START STOP UNIT 提供 weak callback；esp_tinyusb 2.x 没有替应用暴露
-// “Windows安全弹出”专用事件，因此这里只接管这一条 SCSI 通知。
-// load_eject=1,start=0 表示 Host 请求弹出介质；这里只记状态，不在 USB task 回调里做重挂载。
-extern "C" bool tud_msc_start_stop_cb(
-    uint8_t,
-    uint8_t,
-    bool start,
-    bool load_eject)
-{
-    if (load_eject && !start) {
-        g_host_seen = true;
-        g_host_ejected = true;
-        g_host_release_tick = xTaskGetTickCount();
-        ESP_LOGI(TAG, "Host已发送MSC安全弹出命令：允许V3热返回");
-    } else if (load_eject && start) {
-        g_host_seen = true;
-        g_host_attached = true;
-        g_host_ejected = false;
-        g_host_release_tick = 0;
-    }
-    return true;
-}
 
 esp_err_t usb_storage_service_start()
 {
@@ -292,8 +270,8 @@ bool usb_storage_service_host_safe_to_return()
 {
     if (!g_active || g_runtime_transitioning) return false;
 
-    // 安全弹出回调发生在 SCSI START STOP UNIT 处理路径里；给命令状态阶段和 detach/app-mount
-    // 收尾留 250ms，再向 UI 开放“恢复”，避免在 Host 刚宣布放手的同一瞬间拆 LUN。
+    // 设备级 DETACHED/MOUNT_APP 仍作为自动安全信号。Windows 仅“弹出卷”时可能
+    // 不产生这些事件，因此 V3.3 的“恢复”按钮不再依赖本函数是否为 true。
     if ((g_host_ejected || (g_host_seen && !g_host_attached)) && g_host_release_tick != 0 &&
         xTaskGetTickCount() - g_host_release_tick >= pdMS_TO_TICKS(250)) {
         return true;
@@ -325,11 +303,19 @@ void usb_storage_service_finish_runtime_transition()
     if (g_active) g_runtime_transitioning = false;
 }
 
-bool usb_storage_service_begin_runtime_return()
+bool usb_storage_service_begin_runtime_return(bool user_confirmed_eject)
 {
-    if (!g_active || g_runtime_transitioning || !usb_storage_service_host_safe_to_return()) {
-        return false;
+    if (!g_active || g_runtime_transitioning) return false;
+
+    const bool host_reported_safe = usb_storage_service_host_safe_to_return();
+    if (!host_reported_safe && !user_confirmed_eject) return false;
+
+    if (!host_reported_safe && user_confirmed_eject) {
+        // Windows “弹出卷”并不保证触发设备级 DETACHED/MOUNT_APP。
+        // 此处只接受来自 UI 明确按钮的人工确认；调用方必须先提示用户在电脑端安全弹出。
+        ESP_LOGW(TAG, "使用用户确认执行MSC热归还：未收到设备级detach事件，确认电脑已安全弹出");
     }
+
     g_runtime_transitioning = true;
     return true;
 }

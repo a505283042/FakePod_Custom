@@ -93,6 +93,7 @@ static_assert(sizeof(kCategories) / sizeof(kCategories[0]) ==
     static_cast<size_t>(SettingsCategory::Count));
 
 static bool g_usb_transition_pending = false;
+static bool g_usb_return_safe_ui = false;
 static lv_obj_t *g_usb_overlay = nullptr;
 static lv_obj_t *g_usb_overlay_status = nullptr;
 static lv_obj_t *g_usb_overlay_action = nullptr;
@@ -738,6 +739,7 @@ static bool show_usb_runtime_overlay()
     lv_obj_t *screen = lv_screen_active();
     if (screen == nullptr) return false;
 
+    g_usb_return_safe_ui = false;
     g_usb_overlay = lv_obj_create(screen);
     if (g_usb_overlay == nullptr) return false;
 
@@ -820,14 +822,63 @@ static void usb_runtime_overlay_destroy()
     g_usb_overlay = nullptr;
     g_usb_overlay_status = nullptr;
     g_usb_overlay_action = nullptr;
+    g_usb_return_safe_ui = false;
+    lvgl_port_unlock();
+}
+
+static void usb_runtime_overlay_set_service_ready()
+{
+    if (!lvgl_port_lock(1000)) return;
+
+    if (g_usb_overlay_status != nullptr && lv_obj_is_valid(g_usb_overlay_status)) {
+        lv_label_set_text(
+            g_usb_overlay_status,
+            "可在电脑上访问存储卡\n"
+            "请先在电脑安全弹出\n"
+            "再恢复");
+        lv_obj_set_style_text_color(g_usb_overlay_status, lv_color_hex(0xC7D5E8), 0);
+        lv_obj_invalidate(g_usb_overlay_status);
+    }
+    if (g_usb_overlay_action != nullptr && lv_obj_is_valid(g_usb_overlay_action)) {
+        set_visible(g_usb_overlay_action, true);
+        lv_obj_invalidate(g_usb_overlay_action);
+    }
+    g_usb_return_safe_ui = false;
     lvgl_port_unlock();
 }
 
 static void usb_runtime_overlay_refresh_return_action()
 {
-    if (g_usb_overlay_action == nullptr || !lv_obj_is_valid(g_usb_overlay_action)) return;
+    if (!usb_storage_service_is_active() ||
+        g_usb_overlay_action == nullptr || !lv_obj_is_valid(g_usb_overlay_action)) {
+        return;
+    }
+
+    // V3.3：恢复按钮在 MSC 服务启动成功后常驻显示。Windows 的“弹出卷”并不保证
+    // 产生设备级 DETACHED/MOUNT_APP，因此不能再用 host_safe_to_return() 决定按钮显隐。
+    set_visible(g_usb_overlay_action, true);
+
     const bool safe_to_return = usb_storage_service_host_safe_to_return();
-    set_visible(g_usb_overlay_action, safe_to_return);
+    if (safe_to_return && !g_usb_return_safe_ui) {
+        if (g_usb_overlay_status != nullptr && lv_obj_is_valid(g_usb_overlay_status)) {
+            lv_label_set_text(g_usb_overlay_status, "安全弹出\n可恢复");
+            lv_obj_set_style_text_color(g_usb_overlay_status, lv_color_hex(0xA9D6B4), 0);
+            lv_obj_invalidate(g_usb_overlay_status);
+        }
+        g_usb_return_safe_ui = true;
+        ESP_LOGI(TAG, "USB MSC收到设备级安全释放信号：恢复按钮保持可用");
+    } else if (!safe_to_return && g_usb_return_safe_ui) {
+        if (g_usb_overlay_status != nullptr && lv_obj_is_valid(g_usb_overlay_status)) {
+            lv_label_set_text(
+                g_usb_overlay_status,
+                "可在电脑上访问存储卡\n"
+                "请先在电脑安全弹出\n"
+                "再恢复");
+            lv_obj_set_style_text_color(g_usb_overlay_status, lv_color_hex(0xC7D5E8), 0);
+            lv_obj_invalidate(g_usb_overlay_status);
+        }
+        g_usb_return_safe_ui = false;
+    }
 }
 
 static void usb_tf_runtime_enter_task(void *)
@@ -890,12 +941,8 @@ static void usb_tf_runtime_enter_task(void *)
     storage_io_finish_usb_handoff(true);
     storage_exclusive = false;
     usb_storage_service_finish_runtime_transition();
-    usb_runtime_overlay_set_status(
-        "可在电脑上访问存储卡\n"
-        "请先安全弹出\n"
-        "安全弹出后恢复",
-        0xC7D5E8);
-    ESP_LOGI(TAG, "USB MSC V3热切换完成：ESP32未重启，TF owner=TinyUSB MSC；等待安全弹出后热归还");
+    usb_runtime_overlay_set_service_ready();
+    ESP_LOGI(TAG, "USB MSC V3.3热切换完成：ESP32未重启，TF owner=TinyUSB MSC；恢复按钮常驻，用户须先在电脑安全弹出");
     vTaskDelete(nullptr);
     return;
 
@@ -954,7 +1001,8 @@ static void usb_tf_runtime_return_task(void *)
 {
     usb_runtime_overlay_set_status("恢复存储卡", 0xC7D5E8);
 
-    // Host 已经通过安全弹出或 detach 放弃块设备。先让 deferred writes 落盘并拆掉 LUN/USB，
+    // 用户已经按页面要求在电脑端完成安全弹出并点击恢复；若系统同时收到 detach，
+    // 则属于额外的设备级安全确认。先让 deferred writes 落盘并拆掉 LUN/USB，
     // 再把同一张卡交回 FakePod VFS；两个 owner 在任何时刻都不会并存。
     const esp_err_t stop_ret = usb_storage_service_stop();
     if (stop_ret != ESP_OK) {
@@ -1009,8 +1057,12 @@ static void usb_tf_runtime_return_task(void *)
 static void usb_tf_storage_return_click_cb(lv_event_t *event)
 {
     if (!click_is_valid(event) || !g_usb_transition_pending || !usb_storage_service_is_active()) return;
-    if (!usb_storage_service_begin_runtime_return()) {
-        ESP_LOGW(TAG, "USB MSC尚未收到安全弹出/断开信号，拒绝热归还");
+
+    // 这个按钮本身就是用户的显式确认：页面已经常驻提示“请先在电脑安全弹出”。
+    // Windows 若另外上报了 DETACHED/MOUNT_APP，service 会自动识别；没有上报时仍允许
+    // 用户在完成安全弹出后手动归还，避免永远卡在 MSC 页面。
+    if (!usb_storage_service_begin_runtime_return(true)) {
+        ESP_LOGW(TAG, "USB MSC正在切换中，暂不能热归还");
         return;
     }
 
