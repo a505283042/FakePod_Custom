@@ -5,6 +5,8 @@
 namespace SystemPaths
 {
 static constexpr const char *kSystemDirectory = "/sdcard/System";
+static constexpr const char *kNoCoverArtwork = "/sdcard/System/no_cover_artwork.jpg";
+static constexpr const char *kNoCoverCassette = "/sdcard/System/no_cover_cassette.jpg";
 static constexpr const char *kLibraryDirectory = "/sdcard/System/library";
 static constexpr const char *kMusicIndex = "/sdcard/System/music_index_v1.bin";
 static constexpr const char *kMusicIndexTemp = "/sdcard/System/music_index_v1.bin.tmp";

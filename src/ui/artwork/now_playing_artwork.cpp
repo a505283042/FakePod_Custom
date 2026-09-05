@@ -9,6 +9,7 @@
 
 #include "app_diag_config.h"
 #include "artwork_loader.h"
+#include "fallback_cover_images.h"
 #include "board_pins.h"
 #include "cover_surface_cache.h"
 #include "display.h"
@@ -39,6 +40,9 @@ static constexpr uint32_t kLvImageScaleNone = 256U;
 
 static lv_obj_t *g_container = nullptr;
 static lv_obj_t *g_image = nullptr;
+static lv_obj_t *g_no_artwork_fallback = nullptr;
+static FallbackCoverImageLease g_no_artwork_lease = {};
+static lv_image_dsc_t g_no_artwork_dsc = {};
 static lv_obj_t *g_placeholder_icon = nullptr;
 static lv_obj_t *g_status = nullptr;
 static int32_t g_image_max_size = 0;
@@ -67,8 +71,16 @@ static bool g_has_compressed_source = false;
 
 static uint32_t g_context_generation = 0U;
 static uint32_t g_context_track = UINT32_MAX;
+static bool g_context_has_artwork = false;
 static uint32_t g_last_loader_state_revision = UINT32_MAX;
 static bool g_active = true;
+
+static void artwork_ui_init_rgb565_dsc(
+    lv_image_dsc_t *dsc,
+    const uint8_t *data,
+    uint16_t width,
+    uint16_t height,
+    size_t size);
 
 static lv_obj_t *artwork_ui_create_label(
     lv_obj_t *parent,
@@ -106,8 +118,29 @@ static bool artwork_ui_source_matches_context()
 
 // R.22：等待新封面时不显示“准备封面/读取封面”。
 // 已经有上一首封面就继续保持；首次启动还没有任何 Source 时保持纯黑底。
+static void artwork_ui_release_no_artwork_fallback_source()
+{
+    if (g_no_artwork_lease.slot_index != 0xFFU) {
+        fallback_cover_image_release(&g_no_artwork_lease);
+    }
+    g_no_artwork_dsc = {};
+    fallback_cover_image_discard_unpinned();
+}
+
+static void artwork_ui_set_no_artwork_fallback_visible(bool visible)
+{
+    if (g_no_artwork_fallback == nullptr) return;
+    if (visible) {
+        lv_obj_remove_flag(g_no_artwork_fallback, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(g_no_artwork_fallback, LV_OBJ_FLAG_HIDDEN);
+        artwork_ui_release_no_artwork_fallback_source();
+    }
+}
+
 static void artwork_ui_show_waiting_without_placeholder()
 {
+    artwork_ui_set_no_artwork_fallback_visible(false);
     if (g_placeholder_icon != nullptr) lv_obj_add_flag(g_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
     if (g_status != nullptr) lv_obj_add_flag(g_status, LV_OBJ_FLAG_HIDDEN);
     if (!g_has_surface_source && !g_has_compressed_source && g_image != nullptr) {
@@ -115,8 +148,56 @@ static void artwork_ui_show_waiting_without_placeholder()
     }
 }
 
+static void artwork_ui_show_no_artwork_fallback()
+{
+    if (g_image != nullptr) lv_obj_add_flag(g_image, LV_OBJ_FLAG_HIDDEN);
+    if (g_placeholder_icon != nullptr) lv_obj_add_flag(g_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
+    if (g_status != nullptr) lv_obj_add_flag(g_status, LV_OBJ_FLAG_HIDDEN);
+
+    if (g_no_artwork_fallback == nullptr) return;
+    if (g_no_artwork_lease.slot_index == 0xFFU) {
+        if (!fallback_cover_image_acquire(
+                FallbackCoverImageKind::Artwork, &g_no_artwork_lease) ||
+            g_no_artwork_lease.rgb565 == nullptr ||
+            g_no_artwork_lease.width == 0U || g_no_artwork_lease.height == 0U) {
+            artwork_ui_release_no_artwork_fallback_source();
+            lv_obj_add_flag(g_no_artwork_fallback, LV_OBJ_FLAG_HIDDEN);
+            if (g_placeholder_icon != nullptr) {
+                lv_obj_remove_flag(g_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (g_status != nullptr) {
+                lv_label_set_text(g_status, "替补封面缺失");
+                lv_obj_remove_flag(g_status, LV_OBJ_FLAG_HIDDEN);
+            }
+            return;
+        }
+
+        artwork_ui_init_rgb565_dsc(
+            &g_no_artwork_dsc,
+            g_no_artwork_lease.rgb565,
+            g_no_artwork_lease.width,
+            g_no_artwork_lease.height,
+            g_no_artwork_lease.data_size);
+        lv_image_set_src(g_no_artwork_fallback, &g_no_artwork_dsc);
+        uint32_t scale = kLvImageScaleNone;
+        if (g_no_artwork_lease.width > 0U) {
+            scale = static_cast<uint32_t>(
+                (static_cast<uint64_t>(g_image_max_size) * kLvImageScaleNone +
+                 g_no_artwork_lease.width - 1U) /
+                g_no_artwork_lease.width);
+            if (scale == 0U) scale = 1U;
+        }
+        lv_image_set_scale(g_no_artwork_fallback, scale);
+        lv_image_set_antialias(g_no_artwork_fallback, false);
+        lv_obj_center(g_no_artwork_fallback);
+    }
+
+    artwork_ui_set_no_artwork_fallback_visible(true);
+}
+
 static void artwork_ui_show_placeholder(const char *status)
 {
+    artwork_ui_set_no_artwork_fallback_visible(false);
     if (g_image != nullptr) lv_obj_add_flag(g_image, LV_OBJ_FLAG_HIDDEN);
     if (g_placeholder_icon != nullptr) lv_obj_remove_flag(g_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
     if (g_status != nullptr) {
@@ -223,6 +304,7 @@ static bool artwork_ui_apply_transition_hold()
     lv_image_set_antialias(g_image, false);
     lv_obj_center(g_image);
     lv_obj_remove_flag(g_image, LV_OBJ_FLAG_HIDDEN);
+    artwork_ui_set_no_artwork_fallback_visible(false);
     if (g_placeholder_icon != nullptr) lv_obj_add_flag(g_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
     if (g_status != nullptr) lv_obj_add_flag(g_status, LV_OBJ_FLAG_HIDDEN);
     g_has_surface_source = true;
@@ -323,6 +405,7 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
     lv_image_set_antialias(g_image, false);
     lv_obj_center(g_image);
     lv_obj_remove_flag(g_image, LV_OBJ_FLAG_HIDDEN);
+    artwork_ui_set_no_artwork_fallback_visible(false);
     lv_obj_add_flag(g_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(g_status, LV_OBJ_FLAG_HIDDEN);
 
@@ -545,6 +628,7 @@ static bool artwork_ui_apply_compressed_fallback(uint32_t track_index)
     lv_image_set_antialias(g_image, true);
     lv_obj_center(g_image);
     lv_obj_remove_flag(g_image, LV_OBJ_FLAG_HIDDEN);
+    artwork_ui_set_no_artwork_fallback_visible(false);
     lv_obj_add_flag(g_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(g_status, LV_OBJ_FLAG_HIDDEN);
     g_has_compressed_source = true;
@@ -567,16 +651,21 @@ static void artwork_ui_sync_context(bool force)
     g_last_loader_state_revision = UINT32_MAX;
     g_last_surface_state_revision = UINT32_MAX;
 
-    // R.22：先尝试新曲最终 Surface。命中时 artwork_ui_apply_surface() 会“先 acquire 新、后 release 旧”。
+    MediaArtworkViewV2 artwork = {};
+    g_context_has_artwork = media_library_get_artwork_view(track_index, &artwork);
+    if (!g_context_has_artwork) {
+        // Catalog 已经明确没有封面，不再尝试 Surface/Decoder；立即使用最终替补视觉。
+        artwork_ui_release_transition_hold();
+        artwork_ui_release_all_sources();
+        artwork_ui_show_no_artwork_fallback();
+        return;
+    }
+
+    // R.22：有真实封面时先尝试新曲最终 Surface。命中时会“先 acquire 新、后 release 旧”。
     // 未命中时绝不先释放旧封面，也不显示“准备封面”。
     if (cover_surface_cache_is_ready() && artwork_ui_apply_surface(track_index)) return;
 
-    MediaArtworkViewV2 artwork = {};
-    if (!media_library_get_artwork_view(track_index, &artwork)) {
-        artwork_ui_release_transition_hold();
-        artwork_ui_release_all_sources();
-        artwork_ui_show_placeholder("暂无封面");
-    } else if (!artwork_loader_is_ready()) {
+    if (!artwork_loader_is_ready()) {
         artwork_ui_release_transition_hold();
         artwork_ui_release_all_sources();
         artwork_ui_show_placeholder("封面服务不可用");
@@ -614,10 +703,23 @@ esp_err_t now_playing_artwork_create(lv_obj_t *parent, int32_t size_px, lv_obj_t
     lv_obj_remove_flag(g_container, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_remove_flag(g_container, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
 
+    // 无封面歌曲使用 TF 卡固定 JPG：/sdcard/System/no_cover_artwork.jpg。
+    // 图片固定 460x460，首次显示时解码为 RGB565 PSRAM；不让 LVGL 在每次重绘时重复解码 JPG。
+    g_no_artwork_fallback = lv_image_create(g_container);
+    if (g_no_artwork_fallback == nullptr) {
+        lv_obj_delete(g_container);
+        g_container = nullptr;
+        return ESP_ERR_NO_MEM;
+    }
+    ui_common_lock_object(g_no_artwork_fallback);
+    lv_obj_remove_flag(g_no_artwork_fallback, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(g_no_artwork_fallback, LV_OBJ_FLAG_HIDDEN);
+
     g_image = lv_image_create(g_container);
     if (g_image == nullptr) {
         lv_obj_delete(g_container);
         g_container = nullptr;
+        g_no_artwork_fallback = nullptr;
         return ESP_ERR_NO_MEM;
     }
     ui_common_lock_object(g_image);
@@ -667,6 +769,7 @@ void now_playing_artwork_set_active(bool active, bool suppress_invalidation)
         // 页面被完整覆盖后立即释放 UI lease。quiet 模式只抑制物理重绘请求，
         // hidden/source 状态仍同步更新，因此不会留下悬空 Surface 指针。
         artwork_ui_release_all_sources();
+        artwork_ui_set_no_artwork_fallback_visible(false);
         if (g_placeholder_icon != nullptr) lv_obj_add_flag(g_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
         if (g_status != nullptr) lv_obj_add_flag(g_status, LV_OBJ_FLAG_HIDDEN);
         ARTWORK_UI_TRACE("SUSPEND release leases context_track=%lu quiet=%u",
@@ -692,6 +795,9 @@ void now_playing_artwork_update()
 
     artwork_ui_sync_context(false);
     if (g_context_track == UINT32_MAX) return;
+    // Catalog 已明确“当前歌曲没有封面”时，替补封面就是最终视觉。
+    // 不再消费 CoverSurface/ArtworkLoader 状态，避免旧状态把它误切成“封面不可显示”。
+    if (!g_context_has_artwork) return;
 
     // 先直接查当前曲最终 RGB565 Surface。显示正确性以 cache 命中为准，
     // 不依赖 UI 必须消费某一次 Ready Snapshot。
@@ -752,7 +858,7 @@ void now_playing_artwork_update()
         case ArtworkLoadState::NoArtwork:
             artwork_ui_release_transition_hold();
             artwork_ui_release_all_sources();
-            artwork_ui_show_placeholder("暂无封面");
+            artwork_ui_show_no_artwork_fallback();
             break;
 
         case ArtworkLoadState::Failed:

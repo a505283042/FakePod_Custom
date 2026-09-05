@@ -12,6 +12,7 @@
 #include "audio_service.h"
 #include "board_pins.h"
 #include "cover_surface_cache.h"
+#include "fallback_cover_images.h"
 #include "font/font_manager.h"
 #include "media_catalog_v2.h"
 #include "media_library.h"
@@ -198,19 +199,43 @@ static uint8_t g_tape_glint_phase = 0U;
 static int64_t g_last_tape_glint_us = 0LL;
 
 static CoverSurfaceLease g_cover_lease = {};
+static FallbackCoverImageLease g_fallback_cover_lease = {};
 static lv_image_dsc_t g_cover_dsc = {};
 static uint32_t g_cover_generation = 0U;
 static uint32_t g_cover_track = UINT32_MAX;
 static uint32_t g_cover_scale_q8 = kLvImageScaleNone;
 static int16_t g_cover_y_offset_px = 0;
+static bool g_cover_is_no_artwork_fallback = false;
+
+static void cassette_view_init_rgb565_dsc(
+    lv_image_dsc_t *dsc,
+    const uint8_t *data,
+    uint16_t width,
+    uint16_t height,
+    size_t size);
+
+static uint16_t cassette_view_cover_source_width()
+{
+    return g_cover_is_no_artwork_fallback
+        ? g_fallback_cover_lease.width
+        : g_cover_lease.width;
+}
+
+static uint16_t cassette_view_cover_source_height()
+{
+    return g_cover_is_no_artwork_fallback
+        ? g_fallback_cover_lease.height
+        : g_cover_lease.height;
+}
 
 static int16_t cassette_view_cover_safe_offset_limit_px()
 {
-    if (g_cover_lease.height == 0U || g_cover_scale_q8 == 0U) return 0;
+    const uint16_t source_height = cassette_view_cover_source_height();
+    if (source_height == 0U || g_cover_scale_q8 == 0U) return 0;
 
     // 保守地按向下取整后的实际缩放高度计算，避免LVGL整数缩放边缘出现1px黑缝。
     const int32_t scaled_height = static_cast<int32_t>(
-        (static_cast<uint64_t>(g_cover_lease.height) * g_cover_scale_q8) / kLvImageScaleNone);
+        (static_cast<uint64_t>(source_height) * g_cover_scale_q8) / kLvImageScaleNone);
     const int32_t extra_height = scaled_height - static_cast<int32_t>(kLabelHeight);
     if (extra_height <= 2 * kCoverEdgeSafetyPx) return 0;
 
@@ -222,7 +247,9 @@ static int16_t cassette_view_cover_safe_offset_limit_px()
 
 static void cassette_view_apply_cover_position()
 {
-    if (g_cover_image == nullptr || g_cover_lease.width == 0U || g_cover_lease.height == 0U) return;
+    const uint16_t source_width = cassette_view_cover_source_width();
+    const uint16_t source_height = cassette_view_cover_source_height();
+    if (g_cover_image == nullptr || source_width == 0U || source_height == 0U) return;
 
     const int16_t safe_limit = cassette_view_cover_safe_offset_limit_px();
     if (g_cover_y_offset_px < -safe_limit) g_cover_y_offset_px = -safe_limit;
@@ -231,9 +258,9 @@ static void cassette_view_apply_cover_position()
     // 明确使用“未缩放图像居中基准 + Y偏移”。LVGL缩放默认绕图像中心进行，
     // 因此正Y必然向下、负Y必然向上，不再依赖center()后的相对坐标状态。
     const int32_t base_x =
-        (static_cast<int32_t>(kLabelWidth) - static_cast<int32_t>(g_cover_lease.width)) / 2;
+        (static_cast<int32_t>(kLabelWidth) - static_cast<int32_t>(source_width)) / 2;
     const int32_t base_y =
-        (static_cast<int32_t>(kLabelHeight) - static_cast<int32_t>(g_cover_lease.height)) / 2;
+        (static_cast<int32_t>(kLabelHeight) - static_cast<int32_t>(source_height)) / 2;
     lv_obj_set_pos(
         g_cover_image,
         static_cast<int16_t>(base_x),
@@ -470,19 +497,93 @@ static void cassette_view_update_mini_lyrics()
         next.valid ? next.text : "");
 }
 
+static bool cassette_view_bind_no_artwork_label(uint32_t generation, uint32_t track)
+{
+    if (g_cover_image == nullptr) return false;
+
+    CoverSurfaceLease old_cover = g_cover_lease;
+    FallbackCoverImageLease old_fallback = g_fallback_cover_lease;
+    g_cover_lease = {};
+    g_fallback_cover_lease = {};
+    g_cover_dsc = {};
+    g_cover_scale_q8 = kLvImageScaleNone;
+    if (g_cover_track != track) {
+        g_cover_y_offset_px = 0;
+    }
+    g_cover_generation = generation;
+    g_cover_track = track;
+    g_cover_is_no_artwork_fallback = true;
+
+    const bool acquired = fallback_cover_image_acquire(
+        FallbackCoverImageKind::Cassette, &g_fallback_cover_lease);
+    if (acquired && g_fallback_cover_lease.rgb565 != nullptr &&
+        g_fallback_cover_lease.width > 0U && g_fallback_cover_lease.height > 0U) {
+        cassette_view_init_rgb565_dsc(
+            &g_cover_dsc,
+            g_fallback_cover_lease.rgb565,
+            g_fallback_cover_lease.width,
+            g_fallback_cover_lease.height,
+            g_fallback_cover_lease.data_size);
+        lv_image_set_src(g_cover_image, &g_cover_dsc);
+
+        const uint32_t width_scale = static_cast<uint32_t>(
+            (static_cast<uint64_t>(kCoverBleedWidth) * kLvImageScaleNone +
+             g_fallback_cover_lease.width - 1U) /
+            g_fallback_cover_lease.width);
+        const uint32_t min_cover_height =
+            static_cast<uint32_t>(kLabelHeight + 2 * kCoverEdgeSafetyPx);
+        const uint32_t height_scale = static_cast<uint32_t>(
+            (static_cast<uint64_t>(min_cover_height) * kLvImageScaleNone +
+             g_fallback_cover_lease.height - 1U) /
+            g_fallback_cover_lease.height);
+        g_cover_scale_q8 = width_scale > height_scale ? width_scale : height_scale;
+        if (g_cover_scale_q8 == 0U) g_cover_scale_q8 = 1U;
+
+        lv_image_set_scale(g_cover_image, g_cover_scale_q8);
+        lv_image_set_antialias(g_cover_image, false);
+        cassette_view_apply_cover_position();
+        lv_obj_remove_flag(g_cover_image, LV_OBJ_FLAG_HIDDEN);
+        ESP_LOGI(TAG,
+            "磁带标签使用TF替补封面：track=%lu path=/sdcard/System/no_cover_cassette.jpg scale=%u/256",
+            static_cast<unsigned long>(track),
+            static_cast<unsigned>(g_cover_scale_q8));
+    } else {
+        // 文件缺失/尺寸错误时只保留黑色Label底，不退回代码绘制替补。
+        lv_obj_add_flag(g_cover_image, LV_OBJ_FLAG_HIDDEN);
+        ESP_LOGW(TAG,
+            "磁带标签替补JPG不可用：track=%lu；请放置460x460 /sdcard/System/no_cover_cassette.jpg",
+            static_cast<unsigned long>(track));
+    }
+
+    if (old_cover.slot_index != 0xFFU) {
+        cover_surface_cache_release(&old_cover);
+    }
+    if (old_fallback.slot_index != 0xFFU) {
+        fallback_cover_image_release(&old_fallback);
+    }
+    fallback_cover_image_discard_unpinned();
+    return true;
+}
+
 static void cassette_view_release_cover()
 {
     if (g_cover_lease.slot_index != 0xFFU) {
         cover_surface_cache_release(&g_cover_lease);
     }
+    if (g_fallback_cover_lease.slot_index != 0xFFU) {
+        fallback_cover_image_release(&g_fallback_cover_lease);
+    }
     g_cover_lease = {};
+    g_fallback_cover_lease = {};
     g_cover_dsc = {};
     g_cover_generation = 0U;
     g_cover_track = UINT32_MAX;
     g_cover_scale_q8 = kLvImageScaleNone;
+    g_cover_is_no_artwork_fallback = false;
     if (g_cover_image != nullptr) {
         lv_obj_add_flag(g_cover_image, LV_OBJ_FLAG_HIDDEN);
     }
+    fallback_cover_image_discard_unpinned();
 }
 
 static void cassette_view_init_rgb565_dsc(
@@ -1189,9 +1290,20 @@ static bool cassette_view_bind_current_cover()
 
     const uint32_t generation = media_catalog_v2_generation();
     const uint32_t track = static_cast<uint32_t>(player_state_get_index());
+    if (g_cover_is_no_artwork_fallback &&
+        g_cover_generation == generation && g_cover_track == track) {
+        return true;
+    }
     if (g_cover_lease.slot_index != 0xFFU &&
         g_cover_generation == generation && g_cover_track == track) {
         return true;
+    }
+
+    // “没有封面”与“封面仍在后台准备”必须分开处理：
+    // 前者立即切到磁带专用标签纸替补；后者继续保留上一张视觉，直到新 Surface ready。
+    MediaArtworkViewV2 artwork = {};
+    if (!media_library_get_artwork_view(track, &artwork)) {
+        return cassette_view_bind_no_artwork_label(generation, track);
     }
 
     CoverSurfaceLease next = {};
@@ -1200,9 +1312,12 @@ static bool cassette_view_bind_current_cover()
         return false;
     }
 
-    // 先 acquire 新 Surface，再释放旧 Surface，保持切歌视觉连续。
+    // 先 acquire 新 Surface，再释放旧 Surface/替补图，保持切歌视觉连续。
     CoverSurfaceLease old = g_cover_lease;
+    FallbackCoverImageLease old_fallback = g_fallback_cover_lease;
+    g_fallback_cover_lease = {};
     g_cover_lease = next;
+    g_cover_is_no_artwork_fallback = false;
     // C2.4.15：封面纵向手动调节只属于当前歌曲，切歌后新封面回到居中。
     if (g_cover_track != track) {
         g_cover_y_offset_px = 0;
@@ -1253,6 +1368,10 @@ static bool cassette_view_bind_current_cover()
 
     if (old.slot_index != 0xFFU) {
         cover_surface_cache_release(&old);
+    }
+    if (old_fallback.slot_index != 0xFFU) {
+        fallback_cover_image_release(&old_fallback);
+        fallback_cover_image_discard_unpinned();
     }
     return true;
 }
@@ -1305,6 +1424,10 @@ esp_err_t cassette_view_create(lv_obj_t *parent)
     lv_obj_remove_flag(g_label_viewport, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_remove_flag(g_label_viewport, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_remove_flag(g_label_viewport, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+
+    // 无封面歌曲的磁带标签直接使用 TF 卡 460x460 JPG：
+    // /sdcard/System/no_cover_cassette.jpg。它与真实封面共用下面的 g_cover_image，
+    // 由 400x186 Label viewport 裁切，因此不会增加持续 JPG 解码开销。
 
     g_cover_image = lv_image_create(g_label_viewport);
     if (g_cover_image == nullptr) return ESP_ERR_NO_MEM;

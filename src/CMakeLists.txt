@@ -56,6 +56,7 @@ idf_component_register(
         "audio/decoders/mp3_decoder.cpp"
 
         "assets/artwork_loader.cpp"
+        "assets/fallback_cover_images.cpp"
         "assets/launcher_animation_frames.cpp"
         "assets/cassette_shell_pink_data.cpp"
         "assets/cassette_mechanics_data.cpp"

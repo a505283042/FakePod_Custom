@@ -13,6 +13,7 @@
 #include "app_manager.h"
 #include "app_diag_config.h"
 #include "assets/launcher_animation_frames.h"
+#include "assets/fallback_cover_images.h"
 #include "artwork/now_playing_artwork.h"
 #include "artwork/cover_surface_cache.h"
 #include "cassette_view.h"
@@ -118,7 +119,8 @@ static constexpr int16_t kLauncherTouchOuterRadius =
 static constexpr uint32_t kLauncherAnimDurationMs = 300U;
 // P1.5.3.2R.36.6.2：保持 0B PanelWork + PackBits run fast path；producer 直接生成 SPI wire-order，融合背景 copy+swap。
 // BoundedSPI 每次请求下一块 DMA staging 时，Strip Compositor 直接从当前
-// CoverSurface.dimmed 做 fused copy+native→wire、顺序展开 I4 RLE、叠加中心圆/图标，
+// dimmed 背景（真实 CoverSurface 或无封面 TF 替补图）做 fused copy+native→wire、
+// 顺序展开 I4 RLE、叠加中心圆/图标，
 // DMA staging 产出即为 SPI wire-order，显示层不再第二次整块 byte-swap。这样继续复用 R.36.4 的有界 transaction 生命周期，同时
 // 再释放 231,200B Launcher 专用 PSRAM。
 static constexpr uint32_t kLauncherSurfaceStride = FAKEPOD_LCD_WIDTH * sizeof(uint16_t);
@@ -239,7 +241,11 @@ static lv_obj_t *g_launcher = nullptr;
 static lv_obj_t *g_launcher_backdrop = nullptr;
 static lv_obj_t *g_launcher_panel = nullptr;
 static CoverSurfaceLease g_launcher_surface_lease = {};
+static FallbackCoverImageLease g_launcher_fallback_lease = {};
+// 无封面 Launcher 只在菜单打开期间持有一张暗化副本；收起立即释放，不长期增加 PSRAM 常驻量。
+static uint8_t *g_launcher_fallback_dimmed = nullptr;
 static const uint8_t *g_launcher_surface_source = nullptr;
+static bool g_launcher_surface_is_fallback = false;
 static bool g_launcher_frame_cache_ready = false;
 static bool g_launcher_frame_cache_active = false;
 static bool g_launcher_surface_lease_ready = false;
@@ -932,9 +938,21 @@ static void player_home_launcher_release_surface_lease()
     if (g_launcher_surface_lease.slot_index != 0xFFU) {
         cover_surface_cache_release(&g_launcher_surface_lease);
     }
+    if (g_launcher_fallback_lease.slot_index != 0xFFU) {
+        fallback_cover_image_release(&g_launcher_fallback_lease);
+    }
+    if (g_launcher_fallback_dimmed != nullptr) {
+        heap_caps_free(g_launcher_fallback_dimmed);
+    }
+    g_launcher_surface_lease = {};
+    g_launcher_fallback_lease = {};
+    g_launcher_fallback_dimmed = nullptr;
     g_launcher_surface_source = nullptr;
+    g_launcher_surface_is_fallback = false;
     g_launcher_surface_lease_ready = false;
     g_launcher_surface_lease_track = UINT32_MAX;
+    g_launcher_surface_lease_us = 0U;
+    fallback_cover_image_discard_unpinned();
 }
 
 static bool player_home_launcher_acquire_surface(
@@ -971,6 +989,174 @@ static bool player_home_launcher_acquire_surface(
     return true;
 }
 
+struct LauncherSurfaceCandidate
+{
+    CoverSurfaceLease cover = {};
+    FallbackCoverImageLease fallback = {};
+    uint8_t *owned_dimmed = nullptr;
+    const uint8_t *source = nullptr;
+    uint32_t track = UINT32_MAX;
+    uint32_t acquire_us = 0U;
+    bool is_fallback = false;
+};
+
+static inline uint16_t player_home_launcher_dim_rgb565(uint16_t pixel)
+{
+    // 与 CoverSurface.dimmed 保持同一亮度比例：13/32。
+    static constexpr uint32_t kDimNum = 13U;
+    static constexpr uint32_t kDimShift = 5U;
+    static constexpr uint32_t kRound = 1U << (kDimShift - 1U);
+    const uint32_t r =
+        (static_cast<uint32_t>((pixel >> 11U) & 0x1FU) * kDimNum + kRound) >> kDimShift;
+    const uint32_t g =
+        (static_cast<uint32_t>((pixel >> 5U) & 0x3FU) * kDimNum + kRound) >> kDimShift;
+    const uint32_t b =
+        (static_cast<uint32_t>(pixel & 0x1FU) * kDimNum + kRound) >> kDimShift;
+    return static_cast<uint16_t>((r << 11U) | (g << 5U) | b);
+}
+
+static void player_home_launcher_release_candidate(LauncherSurfaceCandidate *candidate)
+{
+    if (candidate == nullptr) return;
+    if (candidate->cover.slot_index != 0xFFU) {
+        cover_surface_cache_release(&candidate->cover);
+    }
+    if (candidate->fallback.slot_index != 0xFFU) {
+        fallback_cover_image_release(&candidate->fallback);
+    }
+    if (candidate->owned_dimmed != nullptr) {
+        heap_caps_free(candidate->owned_dimmed);
+    }
+    *candidate = {};
+    fallback_cover_image_discard_unpinned();
+}
+
+static bool player_home_launcher_acquire_fallback_surface(
+    uint32_t track_index,
+    LauncherSurfaceCandidate *out_candidate)
+{
+    if (out_candidate == nullptr) return false;
+
+    MediaArtworkViewV2 artwork = {};
+    if (media_library_get_artwork_view(track_index, &artwork)) {
+        // 有真实封面但 Surface 还没 ready 时继续等待，不允许替补图抢占真实封面。
+        return false;
+    }
+
+    const FallbackCoverImageKind kind =
+        g_music_visual_mode == MusicVisualMode::Cassette
+            ? FallbackCoverImageKind::Cassette
+            : FallbackCoverImageKind::Artwork;
+
+    const int64_t started_us = esp_timer_get_time();
+    FallbackCoverImageLease fallback = {};
+    if (!fallback_cover_image_acquire(kind, &fallback) || fallback.rgb565 == nullptr ||
+        fallback.width != FAKEPOD_LCD_WIDTH || fallback.height != FAKEPOD_LCD_HEIGHT ||
+        fallback.data_size < static_cast<size_t>(FAKEPOD_LCD_WIDTH) * FAKEPOD_LCD_HEIGHT * 2U) {
+        if (fallback.slot_index != 0xFFU) {
+            fallback_cover_image_release(&fallback);
+            fallback_cover_image_discard_unpinned();
+        }
+        return false;
+    }
+
+    const size_t bytes =
+        static_cast<size_t>(FAKEPOD_LCD_WIDTH) * FAKEPOD_LCD_HEIGHT * sizeof(uint16_t);
+    uint8_t *dimmed = static_cast<uint8_t *>(heap_caps_aligned_alloc(
+        16U, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (dimmed == nullptr) {
+        fallback_cover_image_release(&fallback);
+        fallback_cover_image_discard_unpinned();
+        ESP_LOGW(TAG,
+            "Launcher替补背景暗化缓存分配失败：track=%u bytes=%u，回退LVGL背景",
+            static_cast<unsigned>(track_index),
+            static_cast<unsigned>(bytes));
+        return false;
+    }
+
+    const uint16_t *src = reinterpret_cast<const uint16_t *>(fallback.rgb565);
+    uint16_t *dst = reinterpret_cast<uint16_t *>(dimmed);
+    const size_t pixels = static_cast<size_t>(FAKEPOD_LCD_WIDTH) * FAKEPOD_LCD_HEIGHT;
+    for (size_t i = 0U; i < pixels; ++i) {
+        dst[i] = player_home_launcher_dim_rgb565(src[i]);
+    }
+
+    out_candidate->fallback = fallback;
+    out_candidate->owned_dimmed = dimmed;
+    out_candidate->source = dimmed;
+    out_candidate->track = track_index;
+    out_candidate->acquire_us = static_cast<uint32_t>(esp_timer_get_time() - started_us);
+    out_candidate->is_fallback = true;
+    return true;
+}
+
+static bool player_home_launcher_acquire_candidate(
+    uint32_t track_index,
+    LauncherSurfaceCandidate *out_candidate)
+{
+    if (out_candidate == nullptr) return false;
+    *out_candidate = {};
+
+    CoverSurfaceLease cover = {};
+    uint32_t acquire_us = 0U;
+    if (player_home_launcher_acquire_surface(track_index, &cover, &acquire_us)) {
+        out_candidate->cover = cover;
+        out_candidate->source = cover.dimmed_rgb565;
+        out_candidate->track = track_index;
+        out_candidate->acquire_us = acquire_us;
+        out_candidate->is_fallback = false;
+        return true;
+    }
+
+    return player_home_launcher_acquire_fallback_surface(track_index, out_candidate);
+}
+
+static LauncherSurfaceCandidate player_home_launcher_detach_current_surface()
+{
+    LauncherSurfaceCandidate current = {};
+    current.cover = g_launcher_surface_lease;
+    current.fallback = g_launcher_fallback_lease;
+    current.owned_dimmed = g_launcher_fallback_dimmed;
+    current.source = g_launcher_surface_source;
+    current.track = g_launcher_surface_lease_track;
+    current.acquire_us = g_launcher_surface_lease_us;
+    current.is_fallback = g_launcher_surface_is_fallback;
+
+    g_launcher_surface_lease = {};
+    g_launcher_fallback_lease = {};
+    g_launcher_fallback_dimmed = nullptr;
+    g_launcher_surface_source = nullptr;
+    g_launcher_surface_lease_track = UINT32_MAX;
+    g_launcher_surface_lease_us = 0U;
+    g_launcher_surface_lease_ready = false;
+    g_launcher_surface_is_fallback = false;
+    return current;
+}
+
+static void player_home_launcher_commit_candidate(LauncherSurfaceCandidate *candidate)
+{
+    if (candidate == nullptr || candidate->source == nullptr || candidate->track == UINT32_MAX) {
+        return;
+    }
+
+    g_launcher_surface_lease = candidate->cover;
+    g_launcher_fallback_lease = candidate->fallback;
+    g_launcher_fallback_dimmed = candidate->owned_dimmed;
+    g_launcher_surface_source = candidate->source;
+    g_launcher_surface_lease_track = candidate->track;
+    g_launcher_surface_lease_us = candidate->acquire_us;
+    g_launcher_surface_lease_ready = true;
+    g_launcher_surface_is_fallback = candidate->is_fallback;
+
+    candidate->cover = {};
+    candidate->fallback = {};
+    candidate->owned_dimmed = nullptr;
+    candidate->source = nullptr;
+    candidate->track = UINT32_MAX;
+    candidate->acquire_us = 0U;
+    candidate->is_fallback = false;
+}
+
 static bool player_home_launcher_prepare_surface_lease()
 {
     player_home_launcher_release_surface_lease();
@@ -980,19 +1166,14 @@ static bool player_home_launcher_prepare_surface_lease()
     }
 
     const uint32_t track_index = static_cast<uint32_t>(player_state_get_index());
-    CoverSurfaceLease lease = {};
-    uint32_t acquire_us = 0U;
-    if (!player_home_launcher_acquire_surface(track_index, &lease, &acquire_us)) {
+    LauncherSurfaceCandidate candidate = {};
+    if (!player_home_launcher_acquire_candidate(track_index, &candidate)) {
         return false;
     }
 
-    // R.36.6：lease 必须贯穿整个 Launcher 生命周期。Cover cache 的 pin_count 保证
-    // 切歌/retain 时这张 Surface 不会被回收；退出 Launcher 后再统一 release。
-    g_launcher_surface_lease = lease;
-    g_launcher_surface_source = lease.dimmed_rgb565;
-    g_launcher_surface_lease_us = acquire_us;
-    g_launcher_surface_lease_track = track_index;
-    g_launcher_surface_lease_ready = true;
+    // 真实封面继续 pin CoverSurface；无封面时 pin 当前视图对应的 TF 替补 JPG，
+    // 并只在 Launcher 生命周期内持有暗化副本。
+    player_home_launcher_commit_candidate(&candidate);
     return true;
 }
 
@@ -1602,45 +1783,33 @@ static void player_home_launcher_try_surface_rebind()
         return;
     }
 
-    CoverSurfaceLease new_lease = {};
-    uint32_t acquire_us = 0U;
-    if (!player_home_launcher_acquire_surface(current_track, &new_lease, &acquire_us)) {
-        // 新曲 Surface 尚未 ready 时继续 pin/显示旧曲；SystemLoop 会继续准备 current Surface。
+    LauncherSurfaceCandidate next = {};
+    if (!player_home_launcher_acquire_candidate(current_track, &next)) {
+        // 有真实封面但 Surface 尚未 ready 时继续旧背景；真正无封面歌曲会直接取得 TF 替补图。
         return;
     }
-    // acquire 与提交之间 Playlist 仍可能由 AudioTask/EOF 推进；迟到 Surface 不允许覆盖更新后的 current。
     if (!player_state_is_ready() || static_cast<uint32_t>(player_state_get_index()) != current_track) {
-        cover_surface_cache_release(&new_lease);
+        player_home_launcher_release_candidate(&next);
         return;
     }
 
-    const uint32_t old_track = g_launcher_surface_lease_track;
-    CoverSurfaceLease old_lease = g_launcher_surface_lease;
-    const uint8_t *old_source = g_launcher_surface_source;
-    const uint32_t old_acquire_us = g_launcher_surface_lease_us;
+    LauncherSurfaceCandidate old = player_home_launcher_detach_current_surface();
     const uint8_t frame_index = g_launcher_frame_index < kLauncherAnimationAssetFrameCount
         ? g_launcher_frame_index
         : static_cast<uint8_t>(kLauncherAnimationAssetFrameCount - 1U);
 
-    // R.36.6：先同时 pin A/B，再临时把 source 指向 B；当前菜单帧不再预生成 Work，
-    // 而是在 B 全屏底图提交后直接 strip-recompose。旧 A 一直保留到 B frame 提交完成。
-    g_launcher_surface_lease = new_lease;
-    g_launcher_surface_source = new_lease.dimmed_rgb565;
-    g_launcher_surface_lease_track = current_track;
-    g_launcher_surface_lease_us = acquire_us;
-    g_launcher_surface_lease_ready = true;
+    // 先同时 pin A/B，再把 source 指向 B。B 可以是真实 CoverSurface，也可以是当前视图
+    // 对应的无封面 TF 替补图；旧 A 一直保留到 B frame 提交完成。
+    player_home_launcher_commit_candidate(&next);
 
     if (!player_home_launcher_decode_cached_frame(frame_index)) {
-        g_launcher_surface_lease = old_lease;
-        g_launcher_surface_source = old_source;
-        g_launcher_surface_lease_track = old_track;
-        g_launcher_surface_lease_us = old_acquire_us;
-        g_launcher_surface_lease_ready = true;
-        cover_surface_cache_release(&new_lease);
+        LauncherSurfaceCandidate failed = player_home_launcher_detach_current_surface();
+        player_home_launcher_release_candidate(&failed);
+        player_home_launcher_commit_candidate(&old);
         (void) player_home_launcher_decode_cached_frame(frame_index);
         ESP_LOGW(TAG,
-            "Launcher 背景换绑取消：%u -> %u，新Surface/帧身份校验失败，继续旧背景",
-            static_cast<unsigned>(old_track),
+            "Launcher 背景换绑取消：%u -> %u，新背景/帧身份校验失败，继续旧背景",
+            static_cast<unsigned>(g_launcher_surface_lease_track),
             static_cast<unsigned>(current_track));
         return;
     }
@@ -1674,11 +1843,12 @@ static void player_home_launcher_try_surface_rebind()
         }
     }
 
-    // B 已成为唯一 Launcher source 后才释放 A pin。若 BoundedSPI 发生有界故障并降级，
-    // R.32 fallback 使用当前状态实时绘制，不再依赖任何整帧 RGB565 Work。
-    cover_surface_cache_release(&old_lease);
+    const uint32_t old_track = old.track;
+    const uint32_t acquire_us = g_launcher_surface_lease_us;
+    const bool fallback_source = g_launcher_surface_is_fallback;
+    player_home_launcher_release_candidate(&old);
     HOME_DISPLAY_LOGI(
-        "Launcher封面换绑：%u -> %u acquire=%uus gen=%u base=%uus stream=%uus frame=%u bounded=%d",
+        "Launcher背景换绑：%u -> %u acquire=%uus gen=%u base=%uus stream=%uus frame=%u bounded=%d fallback=%d",
         static_cast<unsigned>(old_track),
         static_cast<unsigned>(current_track),
         static_cast<unsigned>(acquire_us),
@@ -1686,7 +1856,8 @@ static void player_home_launcher_try_surface_rebind()
         static_cast<unsigned>(base_stats.total_us),
         static_cast<unsigned>(base_stats.stream_us),
         static_cast<unsigned>(frame_index),
-        bounded_ok ? 1 : 0);
+        bounded_ok ? 1 : 0,
+        fallback_source ? 1 : 0);
 }
 
 static bool player_home_launcher_present_frame_bounded(uint8_t frame_index)
@@ -1744,13 +1915,14 @@ static bool player_home_launcher_begin_bounded_scene()
     player_home_launcher_reset_bounded_stats();
     g_launcher_frame_index = 0U;
     HOME_LAUNCHER_PERF_LOGI(
-        "Launcher scene：gen=%u lease=%uus track=%u fullPresent=%uus drain=%uus stream=%uus base=CoverSurface.dimmed owner=bounded-spi root=hidden",
+        "Launcher scene：gen=%u lease=%uus track=%u fullPresent=%uus drain=%uus stream=%uus base=%s owner=bounded-spi root=hidden",
         static_cast<unsigned>(stats.generation),
         static_cast<unsigned>(g_launcher_surface_lease_us),
         static_cast<unsigned>(g_launcher_surface_lease_track),
         static_cast<unsigned>(stats.total_us),
         static_cast<unsigned>(stats.panel_drain_us),
-        static_cast<unsigned>(stats.stream_us));
+        static_cast<unsigned>(stats.stream_us),
+        g_launcher_surface_is_fallback ? "TF-fallback.dimmed" : "CoverSurface.dimmed");
     return true;
 }
 
@@ -1761,10 +1933,29 @@ static bool player_home_present_current_cover_bounded(const char *reason)
     }
     const uint32_t track_index = static_cast<uint32_t>(player_state_get_index());
     CoverSurfaceLease lease = {};
-    if (!cover_surface_cache_acquire(track_index, &lease)) {
-        return false;
+    const bool has_cover_surface = cover_surface_cache_acquire(track_index, &lease);
+    const uint8_t *source = nullptr;
+    FallbackCoverImageLease fallback = {};
+    bool using_fallback = false;
+
+    if (has_cover_surface) {
+        source = g_overlay_visible ? lease.dimmed_rgb565 : lease.normal_rgb565;
+    } else {
+        MediaArtworkViewV2 artwork = {};
+        if (media_library_get_artwork_view(track_index, &artwork) ||
+            !fallback_cover_image_acquire(FallbackCoverImageKind::Artwork, &fallback)) {
+            return false;
+        }
+        source = fallback.rgb565;
+        using_fallback = source != nullptr &&
+            fallback.width == FAKEPOD_LCD_WIDTH && fallback.height == FAKEPOD_LCD_HEIGHT;
+        if (!using_fallback) {
+            fallback_cover_image_release(&fallback);
+            fallback_cover_image_discard_unpinned();
+            return false;
+        }
     }
-    const uint8_t *source = g_overlay_visible ? lease.dimmed_rgb565 : lease.normal_rgb565;
+
     DisplayBoundedSpiStats stats = {};
     const esp_err_t ret = source == nullptr
         ? ESP_ERR_INVALID_STATE
@@ -1777,16 +1968,23 @@ static bool player_home_present_current_cover_bounded(const char *reason)
             false,
             true,
             &stats);
-    cover_surface_cache_release(&lease);
+    if (has_cover_surface) {
+        cover_surface_cache_release(&lease);
+    }
+    if (fallback.slot_index != 0xFFU) {
+        fallback_cover_image_release(&fallback);
+        fallback_cover_image_discard_unpinned();
+    }
     if (ret == ESP_OK) {
         HOME_DISPLAY_LOGI(
-            "Launcher退出封面恢复：reason=%s track=%lu gen=%u total=%uus drain=%uus stream=%uus",
+            "Launcher退出封面恢复：reason=%s track=%lu gen=%u total=%uus drain=%uus stream=%uus fallback=%d",
             reason != nullptr ? reason : "unknown",
             static_cast<unsigned long>(track_index),
             static_cast<unsigned>(stats.generation),
             static_cast<unsigned>(stats.total_us),
             static_cast<unsigned>(stats.panel_drain_us),
-            static_cast<unsigned>(stats.stream_us));
+            static_cast<unsigned>(stats.stream_us),
+            using_fallback ? 1 : 0);
         return true;
     }
     ESP_LOGW(TAG,
