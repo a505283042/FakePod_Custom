@@ -442,7 +442,8 @@ static void finish_browser_load()
 static void browser_load_tick()
 {
     if (g_page != VideoPage::Browser || g_browser_load.phase == BrowserLoadPhase::Idle ||
-        g_current_dir == nullptr || app_manager_foreground() != AppId::Video) return;
+        g_current_dir == nullptr || app_manager_foreground() != AppId::Video ||
+        app_launcher_overlay_is_visible()) return;
 
     bool competing = false;
     uint32_t percent = 100U;

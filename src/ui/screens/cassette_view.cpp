@@ -16,6 +16,7 @@
 #include "media_catalog_v2.h"
 #include "media_library.h"
 #include "player_state.h"
+#include "system/screen_lock_simple.h"
 #include "lyrics/lyrics_service.h"
 #include "gesture/gesture_router.h"
 #include "ui_common.h"
@@ -1035,6 +1036,10 @@ static void cassette_view_update_mechanics()
 static void cassette_view_mechanics_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
+    // 屏幕动作菜单保持半透明，因此底层机械件必须停在最后一帧。
+    if (screen_action_menu_is_open()) {
+        return;
+    }
     cassette_view_update_mechanics();
 }
 

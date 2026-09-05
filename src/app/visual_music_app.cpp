@@ -1178,7 +1178,8 @@ static void browser_load_tick()
 {
     if (g_page != VisualMusicPage::Browser ||
         g_browser_load.phase == BrowserLoadPhase::Idle ||
-        g_current_dir == nullptr || app_manager_foreground() != AppId::Nsf) {
+        g_current_dir == nullptr || app_manager_foreground() != AppId::Nsf ||
+        app_launcher_overlay_is_visible()) {
         return;
     }
 

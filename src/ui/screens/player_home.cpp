@@ -3388,6 +3388,11 @@ static void player_home_apply_audio_snapshot(const AudioStateSnapshot &snapshot)
 static void player_home_artwork_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
+    // 屏幕动作菜单是半透明悬浮层；菜单显示期间底层主页必须保持最后一帧，
+    // 避免封面/磁带在胶囊菜单背后继续刷新。
+    if (screen_action_menu_is_open()) {
+        return;
+    }
     if (ui_touch_input_recent_activity(kInteractionYieldMs)) {
         return;
     }
@@ -3406,6 +3411,10 @@ static void player_home_artwork_timer_cb(lv_timer_t *timer)
 static void player_home_audio_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
+    // 动作菜单覆盖主页时，底层进度/标题也停止刷新；音频服务本身继续运行。
+    if (screen_action_menu_is_open()) {
+        return;
+    }
     if (ui_touch_input_recent_activity(kInteractionYieldMs)) {
         return;
     }

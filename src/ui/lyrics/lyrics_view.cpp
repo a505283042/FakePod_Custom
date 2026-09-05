@@ -132,6 +132,8 @@ static uint64_t g_clock_observed_position_ms = UINT64_MAX;
 static uint64_t g_clock_anchor_position_ms = 0U;
 static int64_t g_clock_anchor_us = 0;
 
+static void lyrics_view_cancel_motion(bool snap_to_rest);
+
 static lv_obj_t *lyrics_view_create_label(
     lv_obj_t *parent,
     const char *text,
@@ -375,6 +377,9 @@ static void lyrics_view_overlay_show()
         return;
     }
     if (!g_overlay_visible) {
+        // 半透明控制栏打开时先把歌词缓动收束到当前静态帧；控制栏显示期间
+        // 只更新控制栏自身，底层歌词不再滚动/换行。
+        lyrics_view_cancel_motion(true);
         g_overlay_visible = true;
         lyrics_view_set_volume_adjust_armed(false);
         lv_obj_remove_flag(g_control_overlay, LV_OBJ_FLAG_HIDDEN);
@@ -1081,6 +1086,10 @@ static uint64_t lyrics_view_estimated_position_ms(const AudioStateSnapshot &audi
 static void lyrics_view_motion_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
+    // 屏幕动作菜单位于歌词页上方时，底层缓动保持最后一帧。
+    if (screen_action_menu_is_open()) {
+        return;
+    }
     if (!g_visible || !g_motion_active || !g_have_layout) {
         if (g_motion_timer != nullptr) {
             lv_timer_pause(g_motion_timer);
@@ -1122,6 +1131,10 @@ static void lyrics_view_timer_cb(lv_timer_t *timer)
     if (!g_visible || g_root == nullptr) {
         return;
     }
+    // 全局屏幕动作菜单显示时，歌词页整层保持最后一帧。
+    if (screen_action_menu_is_open()) {
+        return;
+    }
 
     if (!lyrics_service_is_ready()) {
         if (g_status != nullptr) {
@@ -1156,6 +1169,9 @@ static void lyrics_view_timer_cb(lv_timer_t *timer)
                 g_overlay_volume, "%u%%", static_cast<unsigned>(audio.volume_percent));
         }
         lyrics_view_overlay_progress_sync(audio, position_ms);
+
+        // 控制栏是半透明层：它自己的进度/音量仍需要更新，但底层歌词保持静止。
+        return;
     }
 
     LyricsWindowSnapshot window = {};

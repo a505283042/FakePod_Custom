@@ -1311,6 +1311,11 @@ static void spectrum_timer_cb(lv_timer_t *timer)
     if (!g_visible || g_root == nullptr || lv_obj_has_flag(g_root, LV_OBJ_FLAG_HIDDEN)) {
         return;
     }
+    // 锁屏/AOD/熄屏动作菜单覆盖频谱时，50ms 频谱刷新完全让路；
+    // 只冻结屏幕呈现，不影响后台音频播放。
+    if (screen_action_menu_is_open()) {
+        return;
+    }
 
     AudioStateSnapshot audio = {};
     if (!audio_service_get_snapshot(&audio)) {
