@@ -887,7 +887,9 @@ static void cassette_view_update_tape_amount(const AudioStateSnapshot &audio)
 {
     if (!g_mechanics_ready || g_tape_amount_image == nullptr) return;
 
-    int16_t shift = 0;
+    // 换曲时 player_state 会先切到新曲，而 audio snapshot 可能仍短暂保留旧曲。
+    // 过渡态直接显示新磁带的起始量，避免先回中间再跳到左边最少。
+    int16_t shift = -kTapeAmountTravelPx;
     const uint64_t total_ms = cassette_view_audio_total_ms(audio);
     const bool same_track =
         player_state_is_ready() &&
@@ -916,7 +918,9 @@ static uint32_t cassette_view_progress_q16(const AudioStateSnapshot &audio)
     const bool same_track =
         player_state_is_ready() &&
         audio.track_index == static_cast<uint32_t>(player_state_get_index());
-    if (!audio.ready || !same_track || total_ms == 0U) return kPhaseOneFrameQ16 / 2U;
+    // 新曲音频快照尚未 ready / 尚未切到当前 track 时，按 0% 起始状态显示。
+    // 不再使用 50% 中位兜底，避免切歌瞬间走带几何先回中间。
+    if (!audio.ready || !same_track || total_ms == 0U) return 0U;
 
     const uint64_t position_ms = audio.position_ms < total_ms ? audio.position_ms : total_ms;
     return static_cast<uint32_t>(
@@ -1314,7 +1318,8 @@ esp_err_t cassette_view_create(lv_obj_t *parent)
     ui_common_lock_object(g_tape_amount_image);
     lv_obj_set_pos(
         g_tape_amount_image,
-        kCassetteX + kTapeAmountBaseX,
+        // 初始即使用新磁带 0% 状态，避免对象第一次显示时短暂位于中间。
+        kCassetteX + kTapeAmountBaseX - kTapeAmountTravelPx,
         kCassetteY + kTapeAmountY);
     lv_obj_add_flag(g_tape_amount_image, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(g_tape_amount_image, LV_OBJ_FLAG_CLICKABLE);

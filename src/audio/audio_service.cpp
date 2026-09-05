@@ -4047,9 +4047,31 @@ static void audio_task_handle_stop(AudioRequest *request)
     audio_request_complete(request, true, ESP_OK);
 }
 
+static bool audio_task_request_matches_playback_context(const AudioRequest *request)
+{
+    return request != nullptr &&
+        request->expected_playback_revision != 0U &&
+        request->expected_playback_revision == g_task_playback_revision &&
+        request->track_index != UINT32_MAX &&
+        request->track_index == g_task_track_index;
+}
+
 static void audio_task_handle_pause(AudioRequest *request)
 {
     g_task_last_request_id = request->request_id;
+    // Pause 不是 transport intent，但必须绑定提交时的歌曲世代。否则切歌后的旧 Pause
+    // 可能排在新 Play 后执行，把刚启动的新歌误暂停。
+    if (!audio_task_request_matches_playback_context(request)) {
+        ESP_LOGW(TAG,
+            "忽略过期暂停请求：request=%lu expected_rev=%lu current_rev=%lu req_track=%lu current_track=%lu",
+            static_cast<unsigned long>(request->request_id),
+            static_cast<unsigned long>(request->expected_playback_revision),
+            static_cast<unsigned long>(g_task_playback_revision),
+            static_cast<unsigned long>(request->track_index),
+            static_cast<unsigned long>(g_task_track_index));
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
     if (g_video_mp3_active || g_nsf_active) {
         ESP_LOGW(TAG, "临时音频活动期间拒绝Music Pause重复请求");
         audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
@@ -4085,6 +4107,18 @@ static void audio_task_handle_pause(AudioRequest *request)
 static void audio_task_handle_resume(AudioRequest *request)
 {
     g_task_last_request_id = request->request_id;
+    // Resume 与 Pause 使用同一世代保护，避免旧恢复请求跨 Track 生效。
+    if (!audio_task_request_matches_playback_context(request)) {
+        ESP_LOGW(TAG,
+            "忽略过期恢复请求：request=%lu expected_rev=%lu current_rev=%lu req_track=%lu current_track=%lu",
+            static_cast<unsigned long>(request->request_id),
+            static_cast<unsigned long>(request->expected_playback_revision),
+            static_cast<unsigned long>(g_task_playback_revision),
+            static_cast<unsigned long>(request->track_index),
+            static_cast<unsigned long>(g_task_track_index));
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
     if (g_video_mp3_active || g_nsf_active) {
         ESP_LOGW(TAG, "临时音频活动期间拒绝Music Resume；必须先停止当前临时音频");
         audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
@@ -4729,15 +4763,40 @@ bool audio_service_stop(bool wait)
     return audio_service_submit(request, wait);
 }
 
+static bool audio_service_bind_current_playback_context(AudioRequest *request)
+{
+    if (request == nullptr) {
+        return false;
+    }
+
+    AudioStateSnapshot snapshot = {};
+    if (!audio_service_get_snapshot(&snapshot) || !snapshot.ready ||
+        snapshot.track_index == UINT32_MAX || snapshot.playback_revision == 0U) {
+        return false;
+    }
+
+    request->track_index = snapshot.track_index;
+    request->expected_playback_revision = snapshot.playback_revision;
+    return true;
+}
+
 bool audio_service_pause(bool wait)
 {
     AudioRequest *request = audio_request_create(AudioCommandType::Pause, wait);
+    if (!audio_service_bind_current_playback_context(request)) {
+        audio_request_release(request);
+        return false;
+    }
     return audio_service_submit(request, wait);
 }
 
 bool audio_service_resume(bool wait)
 {
     AudioRequest *request = audio_request_create(AudioCommandType::Resume, wait);
+    if (!audio_service_bind_current_playback_context(request)) {
+        audio_request_release(request);
+        return false;
+    }
     return audio_service_submit(request, wait);
 }
 
