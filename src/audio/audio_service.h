@@ -5,6 +5,13 @@
 #include "audio_types.h"
 #include "nsf_synth.h"
 
+// CS43131 模拟输出档位。运行期切换仍由 AudioTask 串行执行，UI不得直接写DAC寄存器。
+enum class AudioOutputMode : uint8_t {
+    NormalHeadphones = 0,
+    HighImpedanceHeadphones,
+    LineOut,
+};
+
 // 启动唯一的 AudioTask。运行期所有 DAC/I2S 控制都必须由该任务执行。
 esp_err_t audio_service_start();
 
@@ -170,6 +177,10 @@ bool audio_service_seek_track(
 // 用户音量/静音同样只能通过 AudioTask 命令队列改变。
 // percent 范围 0~100；R.13 默认 50%≈-18dB，保持接近旧版 80%=-20dB 的启动实际响度。
 bool audio_service_set_volume(uint8_t percent, bool wait = false);
+
+// 设置 CS43131 模拟输出档。若当前正在输出，AudioTask 会软静音后执行 pop-free 安全切档；
+// 若当前未播放，仅更新下一次输出使用的档位。
+bool audio_service_set_output_mode(AudioOutputMode mode, bool wait = true);
 bool audio_service_set_mute(bool mute, bool wait = false);
 
 // 当前播放世代。播放新曲或停止时递增，用于后续取消过期异步操作。

@@ -82,7 +82,7 @@ static constexpr TickType_t AUDIO_QUEUE_SEND_TIMEOUT = pdMS_TO_TICKS(50);
 static constexpr TickType_t AUDIO_SYNC_WAIT_TIMEOUT = pdMS_TO_TICKS(1500);
 static constexpr TickType_t AUDIO_START_WAIT_TIMEOUT = pdMS_TO_TICKS(1500);
 
-// 用户音量继续保持此前实机验证的安全模拟基线：CS43131 0.5Vrms 满量程。
+// 默认模拟输出保持实机验证的普通耳机安全档 0.5Vrms；Settings 可由 AudioTask 安全切换高阻/线路档。
 // P1.5.3.2R.13 重新分配逻辑音量曲线后，默认逻辑音量改为 50%（约 -18dB），
 // 保持接近旧版 80%=-20dB 的启动实际响度；运行期音量仍只能由 AudioTask 写 DAC。
 // SRAM.2 压力审计记录峰值栈使用 5588B；收敛到 8192B，仍保留 2604B 观测余量。
@@ -96,6 +96,7 @@ enum class AudioCommandType : uint8_t
     Resume,
     Seek,
     SetVolume,
+    SetOutputMode,
     SetMute,
     VideoMp3Start,
     VideoMp3ReleaseStart,
@@ -117,6 +118,7 @@ struct AudioRequest
     bool has_technical_info = false;
     MediaTechnicalInfo technical_info = {};
     uint8_t volume_percent = 50;
+    AudioOutputMode output_mode = AudioOutputMode::NormalHeadphones;
     bool mute = false;
     uint32_t video_sample_rate_hz = 0U;
     uint8_t video_channels = 0U;
@@ -190,6 +192,7 @@ static uint32_t g_pcm_fade_in_total_frames = 0;
 static uint32_t g_pcm_fade_in_done_frames = 0;
 static bool g_pcm_fade_in_logged_done = true;
 static uint8_t g_task_volume_percent = 50U;
+static AudioOutputMode g_task_output_mode = AudioOutputMode::NormalHeadphones;
 static bool g_task_user_muted = false;
 static uint32_t g_flac_starve_grace_attempts = 0;
 static int64_t g_flac_starve_grace_started_us = 0;
@@ -745,6 +748,7 @@ static const char *audio_command_name(AudioCommandType type)
         case AudioCommandType::Resume: return "RESUME";
         case AudioCommandType::Seek: return "SEEK";
         case AudioCommandType::SetVolume: return "VOLUME";
+        case AudioCommandType::SetOutputMode: return "OUTPUT_MODE";
         case AudioCommandType::SetMute: return "MUTE";
         case AudioCommandType::VideoMp3Start: return "VIDEO_MP3_START";
         case AudioCommandType::VideoMp3ReleaseStart: return "VIDEO_MP3_RELEASE_START";
@@ -925,6 +929,26 @@ static_assert(audio_volume_percent_to_half_db_steps(50U) == 36U, "50% 应对应 
 static_assert(audio_volume_percent_to_half_db_steps(30U) == 52U, "30% 应对应 -26dB");
 static_assert(audio_volume_percent_to_half_db_steps(20U) == 66U, "20% 应对应 -33dB");
 static_assert(audio_volume_percent_to_half_db_steps(0U) == 200U, "0% 应对应 -100dB 数字衰减");
+
+static bool audio_output_mode_valid(AudioOutputMode mode)
+{
+    return mode == AudioOutputMode::NormalHeadphones ||
+        mode == AudioOutputMode::HighImpedanceHeadphones ||
+        mode == AudioOutputMode::LineOut;
+}
+
+static Cs43131OutputProfile audio_output_mode_to_cs43131(AudioOutputMode mode)
+{
+    switch (mode) {
+        case AudioOutputMode::HighImpedanceHeadphones:
+            return Cs43131OutputProfile::HighImpedance;
+        case AudioOutputMode::LineOut:
+            return Cs43131OutputProfile::LineOut;
+        case AudioOutputMode::NormalHeadphones:
+        default:
+            return Cs43131OutputProfile::NormalHeadphones;
+    }
+}
 
 static esp_err_t audio_task_apply_user_volume()
 {
@@ -1270,7 +1294,7 @@ static esp_err_t audio_task_start_output_hardware(
     }
 
     g_pipeline_headphone_enabled = true;
-    ret = cs43131_prepare_headphone_playback_low_volume();
+    ret = cs43131_prepare_headphone_playback(audio_output_mode_to_cs43131(g_task_output_mode));
     if (ret != ESP_OK) {
         audio_task_shutdown_output_hardware(sample_rate_hz, label);
         return ret;
@@ -4180,6 +4204,82 @@ static void audio_task_handle_set_volume(AudioRequest *request)
     audio_request_complete(request, true, ESP_OK);
 }
 
+static void audio_task_handle_set_output_mode(AudioRequest *request)
+{
+    if (request == nullptr) return;
+    g_task_last_request_id = request->request_id;
+
+    if (!audio_output_mode_valid(request->output_mode)) {
+        audio_request_complete(request, false, ESP_ERR_INVALID_ARG);
+        return;
+    }
+
+    const AudioOutputMode previous_mode = g_task_output_mode;
+    if (previous_mode == request->output_mode) {
+        audio_request_complete(request, true, ESP_OK);
+        return;
+    }
+
+    // 未开启耳放时只更新“下一次启动”使用的档位；不为设置动作额外启动音频硬件。
+    if (!g_pipeline_headphone_enabled) {
+        g_task_output_mode = request->output_mode;
+        ESP_LOGI(TAG, "CS43131输出档已预设：mode=%u（当前耳放未开启）",
+            static_cast<unsigned>(g_task_output_mode));
+        audio_request_complete(request, true, ESP_OK);
+        return;
+    }
+
+    bool was_muted = true;
+    esp_err_t ret = cs43131_get_pcm_mute(&was_muted);
+    if (ret != ESP_OK) {
+        audio_request_complete(request, false, ret);
+        return;
+    }
+
+    // 运行期切档：先软静音并保持一段零PCM，让滤波器/耳放进入稳定静音状态。
+    ret = cs43131_set_pcm_mute(true);
+    if (ret == ESP_OK && g_pipeline_i2s_started && i2s_output_is_started()) {
+        const size_t settle_frames = static_cast<size_t>(
+            (static_cast<uint64_t>(g_task_sample_rate_hz > 0U ? g_task_sample_rate_hz : 48000U) *
+                AUDIO_PCM_MUTE_SETTLE_MS + 999ULL) / 1000ULL);
+        ret = i2s_output_stream_write_silence(settle_frames, AUDIO_I2S_WRITE_TIMEOUT_MS);
+    }
+    if (ret == ESP_OK) {
+        ret = cs43131_switch_headphone_output_profile(
+            audio_output_mode_to_cs43131(request->output_mode));
+    }
+    if (ret == ESP_OK) {
+        g_task_output_mode = request->output_mode;
+        ret = audio_task_apply_user_volume();
+    }
+    if (ret == ESP_OK && g_pipeline_i2s_started && i2s_output_is_started()) {
+        ret = i2s_output_stream_write_silence(AUDIO_STREAM_FRAMES * 2U, AUDIO_I2S_WRITE_TIMEOUT_MS);
+    }
+    if (ret == ESP_OK && !was_muted) {
+        ret = cs43131_set_pcm_mute(false);
+    }
+
+    if (ret != ESP_OK) {
+        // 切换失败时尽力恢复旧模拟档；恢复失败则保持静音，避免未知增益状态直接出声。
+        const esp_err_t rollback = cs43131_switch_headphone_output_profile(
+            audio_output_mode_to_cs43131(previous_mode));
+        if (rollback == ESP_OK) {
+            g_task_output_mode = previous_mode;
+            (void)audio_task_apply_user_volume();
+            if (!was_muted) (void)cs43131_set_pcm_mute(false);
+        } else {
+            (void)cs43131_set_pcm_mute(true);
+            ESP_LOGE(TAG, "CS43131输出档回滚失败：%s", esp_err_to_name(rollback));
+        }
+        audio_task_set_state(g_task_state, ret);
+        audio_request_complete(request, false, ret);
+        return;
+    }
+
+    ESP_LOGI(TAG, "CS43131输出档已切换：mode=%u", static_cast<unsigned>(g_task_output_mode));
+    audio_request_complete(request, true, ESP_OK);
+}
+
 static void audio_task_handle_set_mute(AudioRequest *request)
 {
     if (request == nullptr) {
@@ -4232,6 +4332,9 @@ static void audio_task_process_request(AudioRequest *request)
             break;
         case AudioCommandType::SetVolume:
             audio_task_handle_set_volume(request);
+            break;
+        case AudioCommandType::SetOutputMode:
+            audio_task_handle_set_output_mode(request);
             break;
         case AudioCommandType::SetMute:
             audio_task_handle_set_mute(request);
@@ -4846,6 +4949,15 @@ bool audio_service_set_volume(uint8_t percent, bool wait)
         return false;
     }
     request->volume_percent = percent > 100U ? 100U : percent;
+    return audio_service_submit(request, wait);
+}
+
+bool audio_service_set_output_mode(AudioOutputMode mode, bool wait)
+{
+    if (!audio_output_mode_valid(mode)) return false;
+    AudioRequest *request = audio_request_create(AudioCommandType::SetOutputMode, wait);
+    if (request == nullptr) return false;
+    request->output_mode = mode;
     return audio_service_submit(request, wait);
 }
 

@@ -4,8 +4,10 @@
 #include "esp_log.h"
 
 #include "audio_spectrum_snapshot.h"
+#include "audio_service.h"
 #include "app_manager.h"
 #include "music_app_adapter.h"
+#include "settings_app.h"
 #include "ebook_app.h"
 #include "visual_music_app.h"
 #include "video_app.h"
@@ -16,11 +18,26 @@
 #include "lyrics/lyrics_service.h"
 #include "power_service.h"
 #include "gpio0_service.h"
+#include "device_settings.h"
+#include "screen_lock_simple.h"
 
 static const char *TAG = "运行期";
 
 static bool g_ready_published = false;
 static bool g_background_start_attempted = false;
+
+static AudioOutputMode runtime_audio_output_mode(DeviceAudioOutputMode mode)
+{
+    switch (mode) {
+        case DeviceAudioOutputMode::HighImpedanceHeadphones:
+            return AudioOutputMode::HighImpedanceHeadphones;
+        case DeviceAudioOutputMode::LineOut:
+            return AudioOutputMode::LineOut;
+        case DeviceAudioOutputMode::NormalHeadphones:
+        default:
+            return AudioOutputMode::NormalHeadphones;
+    }
+}
 
 void system_ready_publish()
 {
@@ -71,6 +88,42 @@ void system_runtime_update()
             esp_err_to_name(video_ret));
     }
 
+    const esp_err_t device_settings_ret = device_settings_init();
+    if (device_settings_ret != ESP_OK) {
+        ESP_LOGW(TAG, "设备设置NVS初始化失败：%s；Settings仍使用RAM默认值",
+            esp_err_to_name(device_settings_ret));
+    }
+    if (device_settings_ret == ESP_OK) {
+        DeviceSettingsSnapshot settings_snapshot = {};
+        if (device_settings_get_snapshot(&settings_snapshot)) {
+            const esp_err_t brightness_ret =
+                screen_lock_simple_set_normal_brightness(settings_snapshot.brightness_level);
+            if (brightness_ret != ESP_OK) {
+                ESP_LOGW(TAG, "恢复屏幕亮度失败：level=%u %s",
+                    static_cast<unsigned>(settings_snapshot.brightness_level),
+                    esp_err_to_name(brightness_ret));
+            }
+
+            screen_lock_simple_configure_auto_off(
+                settings_snapshot.auto_screen_off_seconds,
+                settings_snapshot.aod_enabled);
+
+            if (!audio_service_set_output_mode(
+                    runtime_audio_output_mode(settings_snapshot.audio_output_mode), true)) {
+                ESP_LOGW(TAG, "恢复CS43131输出档失败：%s；继续使用普通耳机安全档",
+                    device_settings_audio_output_mode_name(settings_snapshot.audio_output_mode));
+            }
+        }
+    }
+
+    const esp_err_t settings_ret = app_ret == ESP_OK
+        ? settings_app_register()
+        : ESP_ERR_INVALID_STATE;
+    if (settings_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Settings APP 注册失败：%s；Launcher仍保持选择但不会进入",
+            esp_err_to_name(settings_ret));
+    }
+
     const esp_err_t power_ret = power_service_init();
     if (power_ret != ESP_OK) {
         ESP_LOGW(TAG, "GPIO48 关机保存不可用：%s；硬件3秒断电仍保持原行为", esp_err_to_name(power_ret));
@@ -78,7 +131,7 @@ void system_runtime_update()
 
     const esp_err_t auxkey_ret = gpio0_service_init();
     if (auxkey_ret != ESP_OK) {
-        ESP_LOGW(TAG, "GPIO0 辅助键（音量-/锁/AOD/熄屏）不可用：%s", esp_err_to_name(auxkey_ret));
+        ESP_LOGW(TAG, "GPIO0 辅助键（音量/切歌 + 锁/AOD/熄屏长按）不可用：%s", esp_err_to_name(auxkey_ret));
     }
 
     const esp_err_t spectrum_ret = audio_spectrum_snapshot_start();
@@ -111,12 +164,14 @@ void system_runtime_update()
 
     ESP_LOGI(
         TAG,
-        "READY 后台服务：Apps=%s MusicAdapter=%s Ebook=%s VisualMusic=%s Video=%s PowerKey=%s AuxKey=%s Spectrum=%s Artwork=%s CoverSurface=%s Lyrics=%s",
+        "READY 后台服务：Apps=%s MusicAdapter=%s Ebook=%s VisualMusic=%s Video=%s DeviceSettings=%s Settings=%s PowerKey=%s AuxKey=%s Spectrum=%s Artwork=%s CoverSurface=%s Lyrics=%s",
         esp_err_to_name(app_ret),
         esp_err_to_name(music_adapter_ret),
         esp_err_to_name(ebook_ret),
         esp_err_to_name(visual_music_ret),
         esp_err_to_name(video_ret),
+        esp_err_to_name(device_settings_ret),
+        esp_err_to_name(settings_ret),
         esp_err_to_name(power_ret),
         esp_err_to_name(auxkey_ret),
         esp_err_to_name(spectrum_ret),

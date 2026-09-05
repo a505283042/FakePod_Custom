@@ -238,6 +238,8 @@ esp_err_t app_manager_request_foreground(AppId id, AppTransitionMode mode)
             if (ensure_created(previous) == ESP_OK && enter_slot(previous) == ESP_OK) {
                 previous->state = AppRunState::Foreground;
                 g_foreground = previous_id;
+                // Launcher 的默认选中项必须始终跟随真实前台 APP；回滚成功时同步恢复。
+                g_launcher_target = previous_id;
             } else {
                 ESP_LOGE(TAG, "APP rollback失败：系统暂时无Foreground APP");
             }
@@ -247,6 +249,8 @@ esp_err_t app_manager_request_foreground(AppId id, AppTransitionMode mode)
 
     target->state = AppRunState::Foreground;
     g_foreground = id;
+    // 公共 Launcher 每次打开都应高亮当前 APP，而不是保留上一次手动点选的位置。
+    g_launcher_target = id;
     ESP_LOGI(TAG, "前台切换：%s -> %s mode=%s",
         app_manager_name(previous_id),
         app_manager_name(id),

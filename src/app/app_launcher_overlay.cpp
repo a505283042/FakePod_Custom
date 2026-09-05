@@ -289,8 +289,14 @@ esp_err_t app_launcher_overlay_show(lv_obj_t *parent, AppId selected)
     if (create_ret != ESP_OK) return create_ret;
 
     gesture_router_reset();
-    g_selected = selected;
-    app_manager_set_launcher_target(selected);
+
+    // 共享 Launcher 的高亮项以真实前台 APP 为准。selected 仅保留为调用期 fallback，
+    // 避免某个 APP 以后复制/修改调用代码时传入旧值，导致“在哪个 APP 打开却选中别的 APP”。
+    const AppId foreground = app_manager_foreground();
+    const bool foreground_valid =
+        foreground != AppId::None && app_manager_is_registered(foreground);
+    g_selected = foreground_valid ? foreground : selected;
+    app_manager_set_launcher_target(g_selected);
     g_visible = true;
     g_motion = MotionState::Entering;
     g_frame_index = kInvalidFrame;
@@ -302,7 +308,7 @@ esp_err_t app_launcher_overlay_show(lv_obj_t *parent, AppId selected)
     start_animation(0, kAnimProgressMax, show_done);
     ESP_LOGI(TAG,
         "共享Music圆环展开：source=%s selected=%s I4=%uB center=%uB PSRAM=%uB",
-        app_manager_name(app_manager_foreground()), app_manager_name(selected),
+        app_manager_name(app_manager_foreground()), app_manager_name(g_selected),
         static_cast<unsigned>(PLAYER_HOME_LAUNCHER_I4_IMAGE_BYTES),
         static_cast<unsigned>(PLAYER_HOME_LAUNCHER_CENTER_IMAGE_BYTES),
         static_cast<unsigned>(PLAYER_HOME_LAUNCHER_I4_IMAGE_BYTES +

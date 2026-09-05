@@ -7,6 +7,7 @@ idf_component_register(
         "app/app_manager.cpp"
         "app/app_launcher_overlay.cpp"
         "app/music_app_adapter.cpp"
+        "app/settings_app.cpp"
         "app/ebook_app.cpp"
         "app/ebook_bookmark_store.cpp"
         "app/ebook_page_index_cache.cpp"
@@ -23,6 +24,7 @@ idf_component_register(
         "system/system_loop.cpp"
         "system/system_runtime.cpp"
         "system/persistent_state.cpp"
+        "system/device_settings.cpp"
         "system/power_service.cpp"
         "system/gpio0_service.cpp"
         "system/screen_lock_simple.cpp"
@@ -58,6 +60,7 @@ idf_component_register(
         "assets/artwork_loader.cpp"
         "assets/fallback_cover_images.cpp"
         "assets/launcher_animation_frames.cpp"
+        "assets/settings_menu_icons.cpp"
         "assets/cassette_shell_pink_data.cpp"
         "assets/cassette_mechanics_data.cpp"
 

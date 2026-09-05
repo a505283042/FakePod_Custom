@@ -65,6 +65,47 @@ static constexpr uint8_t PCM_PATH_SOFT_RAMP_MUTED = 0xEF;
 static constexpr uint8_t PCM_PATH_SOFT_RAMP_UNMUTED = 0xEC;
 static constexpr int HP_PDN_DONE_WAIT_MS = 100;
 
+static bool cs43131_output_profile_regs(
+    Cs43131OutputProfile profile,
+    uint8_t *class_h,
+    uint8_t *hp_output)
+{
+    if (class_h == nullptr || hp_output == nullptr) return false;
+
+    switch (profile) {
+        case Cs43131OutputProfile::NormalHeadphones:
+            // ADPT_PWR=111，HV_EN=0，OUT_FS=00 -> 0.5 Vrms。
+            *class_h = 0x1C;
+            *hp_output = 0x00;
+            return true;
+        case Cs43131OutputProfile::HighImpedance:
+            // HV_EN=0 时数据手册允许完整耳机负载范围；OUT_FS=10 -> 1.41 Vrms。
+            *class_h = 0x1C;
+            *hp_output = 0x20;
+            return true;
+        case Cs43131OutputProfile::LineOut:
+            // 高阻线路负载：HV_EN=1 + OUT_FS=11 + +1dB_EN=1 -> 2.0 Vrms。
+            *class_h = 0x1E;
+            *hp_output = 0x31;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static esp_err_t cs43131_write_output_profile(Cs43131OutputProfile profile)
+{
+    uint8_t class_h = 0;
+    uint8_t hp_output = 0;
+    if (!cs43131_output_profile_regs(profile, &class_h, &hp_output)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t ret = cs43131_write_reg(REG_CLASS_H_CONTROL, class_h);
+    if (ret == ESP_OK) ret = cs43131_write_reg(REG_HP_OUTPUT_CONTROL, hp_output);
+    return ret;
+}
+
 static esp_err_t cs43131_hardware_reset()
 {
     gpio_config_t config = {};
@@ -417,14 +458,21 @@ esp_err_t cs43131_read_asp_status(uint8_t *status)
 }
 
 
-esp_err_t cs43131_prepare_headphone_playback_low_volume()
+esp_err_t cs43131_prepare_headphone_playback(Cs43131OutputProfile profile)
 {
     if (!g_ready || g_device == nullptr) {
         return ESP_ERR_INVALID_STATE;
     }
 
+    uint8_t class_h = 0;
+    uint8_t hp_output = 0;
+    if (!cs43131_output_profile_regs(profile, &class_h, &hp_output)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
 #if APP_DIAG_AUDIO_POP
-    ESP_LOGI(TAG, "正在配置低音量 PCM 耳放输出：0.5Vrms满量程，PCM数字音量=-20dB");
+    ESP_LOGI(TAG, "正在配置 PCM 耳放输出：profile=%u classH=0x%02X hp=0x%02X，PCM数字音量=-20dB",
+        static_cast<unsigned>(profile), class_h, hp_output);
 #endif
 
     struct RegValue {
@@ -433,15 +481,14 @@ esp_err_t cs43131_prepare_headphone_playback_low_volume()
     };
 
     // 在耳放仍处于掉电状态时先设置模拟满量程、PCM滤波和低数字音量。
-    // 0x80000 的 OUT_FS=00 对应 0.5Vrms，避免第一次模拟输出使用默认 1.73Vrms。
-    static constexpr RegValue config[] = {
+    const RegValue config[] = {
         {REG_PCM_FILTER_OPTION, 0x02},
         {REG_PCM_VOLUME_B, PCM_TEST_VOLUME_MINUS_20_DB},
         {REG_PCM_VOLUME_A, PCM_TEST_VOLUME_MINUS_20_DB},
         {REG_PCM_PATH_CONTROL_1, PCM_PATH_SOFT_RAMP_MUTED},
         {REG_PCM_PATH_CONTROL_2, 0x00},
-        {REG_CLASS_H_CONTROL, 0x1E},
-        {REG_HP_OUTPUT_CONTROL, 0x00},
+        {REG_CLASS_H_CONTROL, class_h},
+        {REG_HP_OUTPUT_CONTROL, hp_output},
         {REG_POP_FREE_POWER_UP_1, 0x99},
         {REG_POP_FREE_POWER_UP_2, 0x20},
     };
@@ -488,6 +535,97 @@ esp_err_t cs43131_prepare_headphone_playback_low_volume()
 #if APP_DIAG_AUDIO_POP
     ESP_LOGI(TAG, "耳放 pop-free 上电完成：POWER_DOWN=0x%02X，PCM仍保持手动静音", power);
 #endif
+    return ESP_OK;
+}
+
+esp_err_t cs43131_get_pcm_mute(bool *muted)
+{
+    if (muted == nullptr) return ESP_ERR_INVALID_ARG;
+    uint8_t path = 0;
+    const esp_err_t ret = cs43131_read_reg(REG_PCM_PATH_CONTROL_1, &path);
+    if (ret == ESP_OK) *muted = (path & 0x03U) != 0U;
+    return ret;
+}
+
+esp_err_t cs43131_switch_headphone_output_profile(Cs43131OutputProfile profile)
+{
+    if (!g_ready || g_device == nullptr) return ESP_ERR_INVALID_STATE;
+
+    uint8_t class_h = 0;
+    uint8_t hp_output = 0;
+    if (!cs43131_output_profile_regs(profile, &class_h, &hp_output)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t power = 0;
+    esp_err_t ret = cs43131_read_reg(REG_POWER_DOWN, &power);
+    if (ret != ESP_OK) return ret;
+
+    // 耳放本来就是掉电状态时只更新档位；真正上电仍由标准 playback 序列负责。
+    if ((power & 0x10U) != 0U) {
+        return cs43131_write_output_profile(profile);
+    }
+
+    uint8_t old_class_h = 0;
+    uint8_t old_hp_output = 0;
+    ret = cs43131_read_reg(REG_CLASS_H_CONTROL, &old_class_h);
+    if (ret == ESP_OK) ret = cs43131_read_reg(REG_HP_OUTPUT_CONTROL, &old_hp_output);
+    if (ret != ESP_OK) return ret;
+
+    uint8_t mask1 = 0;
+    ret = cs43131_read_reg(REG_INTERRUPT_MASK_1, &mask1);
+    if (ret != ESP_OK) return ret;
+    ret = cs43131_write_reg(REG_INTERRUPT_MASK_1, static_cast<uint8_t>(mask1 & 0xFEU));
+    if (ret != ESP_OK) return ret;
+
+    uint8_t status1 = 0;
+    ret = cs43131_read_reg(REG_INTERRUPT_STATUS_1, &status1);
+    if (ret != ESP_OK) return ret;
+
+    // OUT_FS / +1dB_EN 只能在 PDN_HP=1 时修改。这里只关闭耳放，ASP/XTAL/I2S 保持运行。
+    const uint8_t powered_down = static_cast<uint8_t>(power | 0x10U);
+    ret = cs43131_write_reg(REG_POWER_DOWN, powered_down);
+    if (ret != ESP_OK) return ret;
+
+    bool pdn_done = false;
+    for (int attempt = 0; attempt < HP_PDN_DONE_WAIT_MS; ++attempt) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+        ret = cs43131_read_reg(REG_INTERRUPT_STATUS_1, &status1);
+        if (ret != ESP_OK) break;
+        if ((status1 & 0x01U) != 0U) {
+            pdn_done = true;
+            break;
+        }
+    }
+    if (ret == ESP_OK && !pdn_done) ret = ESP_ERR_TIMEOUT;
+
+    if (ret == ESP_OK) ret = cs43131_write_reg(REG_CLASS_H_CONTROL, class_h);
+    if (ret == ESP_OK) ret = cs43131_write_reg(REG_HP_OUTPUT_CONTROL, hp_output);
+    if (ret == ESP_OK) ret = cs43131_write_reg(REG_POP_FREE_POWER_UP_1, 0x99);
+    if (ret == ESP_OK) ret = cs43131_write_reg(REG_POP_FREE_POWER_UP_2, 0x20);
+    if (ret == ESP_OK) ret = cs43131_write_reg(REG_POWER_DOWN, power);
+    if (ret == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(12));
+        ret = cs43131_write_reg(REG_POP_FREE_POWER_UP_2, 0x00);
+        if (ret == ESP_OK) ret = cs43131_write_reg(REG_POP_FREE_POWER_UP_1, 0x00);
+    }
+
+    if (ret != ESP_OK) {
+        const esp_err_t original_error = ret;
+        // 事务中途失败时尽力恢复旧档并重新上电；即使恢复也把原错误返回给 AudioTask。
+        (void)cs43131_write_reg(REG_CLASS_H_CONTROL, old_class_h);
+        (void)cs43131_write_reg(REG_HP_OUTPUT_CONTROL, old_hp_output);
+        (void)cs43131_write_reg(REG_POP_FREE_POWER_UP_1, 0x99);
+        (void)cs43131_write_reg(REG_POP_FREE_POWER_UP_2, 0x20);
+        (void)cs43131_write_reg(REG_POWER_DOWN, power);
+        vTaskDelay(pdMS_TO_TICKS(12));
+        (void)cs43131_write_reg(REG_POP_FREE_POWER_UP_2, 0x00);
+        (void)cs43131_write_reg(REG_POP_FREE_POWER_UP_1, 0x00);
+        return original_error;
+    }
+
+    ESP_LOGI(TAG, "CS43131输出档切换完成：profile=%u classH=0x%02X hp=0x%02X",
+        static_cast<unsigned>(profile), class_h, hp_output);
     return ESP_OK;
 }
 

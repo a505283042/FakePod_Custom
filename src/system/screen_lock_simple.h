@@ -10,7 +10,7 @@
 // ============================================================
 typedef enum ScreenPowerState : uint8_t
 {
-    ScreenPowerNormal = 0,    // 正常显示：亮度 60
+    ScreenPowerNormal = 0,    // 正常显示：使用用户设置亮度（默认60）
     ScreenPowerAOD    = 1,    // AMOLED 息屏显示：中央 [锁]+灰字，亮度 15，30s ±1px 抖动防烧屏
     ScreenPowerOff    = 2     // 真·熄屏：brightness=0，暂停显示输出
 } ScreenPowerState;
@@ -63,6 +63,17 @@ void screen_lock_set_power(ScreenPowerState power);          // 老别名
 void screen_lock_set_lock(ScreenLockState lock);             // 老别名
 void screen_lock_toggle_lock(void);
 void screen_lock_wake_if_needed(void);
+
+// 正常显示亮度（esp_lcd_co5300 API 使用 0~100%，0 保留给真·熄屏）。
+// 设置页拖动时可实时预览；只有当前处于 Normal 才立即写硬件，AOD/Off 状态只更新目标值。
+esp_err_t screen_lock_simple_set_normal_brightness(uint8_t level);
+uint8_t   screen_lock_simple_get_normal_brightness(void);
+
+// 自动熄屏：seconds=0 表示永不；aod_enabled=true 时超时进入 AOD，否则直接全黑。
+// 用户触摸/实体键活动通过 notify_user_activity() 重置计时；system_loop 每轮调用 idle_update()。
+void screen_lock_simple_configure_auto_off(uint16_t seconds, bool aod_enabled);
+void screen_lock_simple_notify_user_activity(void);
+void screen_lock_simple_idle_update(void);
 
 // ============================================================
 // 触摸拦截钩子（ui_manager.cpp 在 ui_touch_read_cb 最开头调用）

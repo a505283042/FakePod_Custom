@@ -330,11 +330,14 @@ void system_loop_update()
     // 不用 ISR，也不提前接管硬件最终断电。
     power_service_update();
 
-    // GPIO0(K1) 辅助按键：音量- / 锁/解锁 / AOD / 熄屏（释放分级）。
+    // GPIO0(K1) 辅助按键：短按按设置执行音量-/上一曲；长按保持锁/解锁/AOD/熄屏菜单。
     // 完全轮询实现，无 ISR；与 GPIO48 独立。
     gpio0_service_update();
 
-    // 屏态渲染心跳：AOD 时钟每秒更新、防烧屏 30s ±1px 抖动。
+    // 自动熄屏只负责从 Normal 进入 AOD/Off；触摸和实体键会重置空闲计时。
+    screen_lock_simple_idle_update();
+
+    // 屏态渲染心跳：AOD 信息刷新、防烧屏 30s ±1px 抖动。
     screen_lock_simple_render();
 
     AudioStateSnapshot audio_state = {};

@@ -37,7 +37,7 @@ static const char *TAG = "屏幕锁";
 // ============================================================
 // 常量
 // ============================================================
-static constexpr uint8_t  kBrightnessNormal = 60U;    // 同 display_reveal_after_first_frame
+static constexpr uint8_t  kBrightnessNormalDefault = 60U; // 与首帧揭屏默认值保持一致
 static constexpr uint8_t  kBrightnessAOD    = 15U;    // AMOLED AOD 极低亮度
 static constexpr uint8_t  kBrightnessOff    = 0U;
 static constexpr uint32_t kJitterIntervalMs = 30000U; // 30s 防烧屏抖动
@@ -63,7 +63,11 @@ static constexpr uint32_t kC_TipText          = 0x8890A3;  // 底部提示
 // ============================================================
 static bool              g_ready         = false;
 static ScreenPowerState  g_power         = ScreenPowerNormal;
+static uint8_t           g_normal_brightness = kBrightnessNormalDefault;
 static ScreenLockState   g_lock          = ScreenLockUnlocked;
+static uint16_t          g_auto_screen_off_seconds = 0U;
+static bool              g_auto_screen_off_to_aod = true;
+static TickType_t        g_last_user_activity_tick = 0;
 static TickType_t        g_last_jitter_tick = 0;
 static int8_t            g_jitter_x      = 0;
 static int8_t            g_jitter_y      = 0;
@@ -630,12 +634,14 @@ static void apply_power_hw(ScreenPowerState next)
 {
     switch (next) {
     case ScreenPowerNormal:
-        display_panel_apply_brightness(kBrightnessNormal);
+        display_panel_apply_brightness(g_normal_brightness);
         display_panel_apply_output(true);
         break;
     case ScreenPowerAOD:
         display_panel_apply_output(true);
-        display_panel_apply_brightness(kBrightnessAOD);
+        // AOD 不允许比用户设定的正常亮度更亮。
+        display_panel_apply_brightness(
+            g_normal_brightness < kBrightnessAOD ? g_normal_brightness : kBrightnessAOD);
         break;
     case ScreenPowerOff:
         display_panel_apply_brightness(kBrightnessOff);
@@ -947,6 +953,7 @@ esp_err_t screen_lock_simple_create()
     g_power = ScreenPowerNormal;
     g_lock  = ScreenLockUnlocked;
     g_last_jitter_tick = 0;
+    g_last_user_activity_tick = xTaskGetTickCount();
     g_press_row        = -1;
     g_press_x = 0; g_press_y = 0;
 
@@ -999,6 +1006,9 @@ void screen_lock_simple_destroy()
     for (auto &p : g_menu_rows) p = nullptr;
     g_menu_tip        = nullptr;
     g_menu_open       = false;
+    g_auto_screen_off_seconds = 0U;
+    g_auto_screen_off_to_aod = true;
+    g_last_user_activity_tick = 0;
     lvgl_port_unlock();
     g_ready = false;
 }
@@ -1023,6 +1033,10 @@ void screen_lock_simple_set_power(ScreenPowerState power)
     if (!g_ready) return;
     const ScreenPowerState prev = g_power;
     if (prev == power) return;
+    if (power == ScreenPowerNormal) {
+        // 任何显式唤醒都从“刚刚有用户活动”重新计时，避免刚亮屏就再次自动熄屏。
+        g_last_user_activity_tick = xTaskGetTickCount();
+    }
     g_power = power;
     if (power == ScreenPowerAOD) {              // 进入 AOD 自动锁定
         g_lock = ScreenLockLocked;
@@ -1049,6 +1063,9 @@ void screen_lock_simple_set_lock(ScreenLockState lock)
     }
     if (g_lock == lock) return;
     g_lock = lock;
+    if (lock == ScreenLockUnlocked) {
+        g_last_user_activity_tick = xTaskGetTickCount();
+    }
 
     if (!lvgl_port_lock(200)) {
         ESP_LOGW(TAG, "screen_lock_set_lock LVGL 锁超时");
@@ -1058,6 +1075,80 @@ void screen_lock_simple_set_lock(ScreenLockState lock)
     }
     ESP_LOGI(TAG, "锁状态切换：%s",
         g_lock == ScreenLockLocked ? "LOCKED" : "UNLOCKED");
+}
+
+esp_err_t screen_lock_simple_set_normal_brightness(uint8_t level)
+{
+    // esp_lcd_co5300 v2.x 的亮度 API 接收 0~100 百分比；0 专用于 ScreenPowerOff。
+    if (level < 5U || level > 100U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const uint8_t previous = g_normal_brightness;
+    g_normal_brightness = level;
+    if (g_power != ScreenPowerNormal) {
+        return ESP_OK;
+    }
+
+    esp_lcd_panel_handle_t panel = display_get_panel_handle();
+    if (panel == nullptr) {
+        g_normal_brightness = previous;
+        return ESP_ERR_INVALID_STATE;
+    }
+    const esp_err_t ret = esp_lcd_panel_co5300_set_brightness(panel, level);
+    if (ret != ESP_OK) {
+        g_normal_brightness = previous;
+        ESP_LOGW(TAG, "设置正常亮度失败 level=%u %s",
+            static_cast<unsigned>(level), esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+uint8_t screen_lock_simple_get_normal_brightness(void)
+{
+    return g_normal_brightness;
+}
+
+void screen_lock_simple_configure_auto_off(uint16_t seconds, bool aod_enabled)
+{
+    g_auto_screen_off_seconds = seconds;
+    g_auto_screen_off_to_aod = aod_enabled;
+    // 修改超时时间/目标态后重新起算，避免设置页刚切换到较短时间就立即灭屏。
+    g_last_user_activity_tick = xTaskGetTickCount();
+    ESP_LOGI(TAG, "自动熄屏配置：timeout=%us target=%s",
+        static_cast<unsigned>(seconds),
+        aod_enabled ? "AOD" : "OFF");
+}
+
+void screen_lock_simple_notify_user_activity(void)
+{
+    g_last_user_activity_tick = xTaskGetTickCount();
+}
+
+void screen_lock_simple_idle_update(void)
+{
+    if (!g_ready || g_power != ScreenPowerNormal || g_auto_screen_off_seconds == 0U) return;
+    if (g_menu_open) return;
+
+    const TickType_t now = xTaskGetTickCount();
+    if (g_last_user_activity_tick == 0) {
+        g_last_user_activity_tick = now;
+        return;
+    }
+
+    const uint64_t timeout_ms = static_cast<uint64_t>(g_auto_screen_off_seconds) * 1000ULL;
+    const uint64_t idle_ms = static_cast<uint64_t>(now - g_last_user_activity_tick) * portTICK_PERIOD_MS;
+    if (idle_ms < timeout_ms) return;
+
+    // 先重置计时，再切态；即使后续切态被其它逻辑快速恢复，也不会下一轮再次触发。
+    g_last_user_activity_tick = now;
+    const ScreenPowerState target =
+        g_auto_screen_off_to_aod ? ScreenPowerAOD : ScreenPowerOff;
+    ESP_LOGI(TAG, "自动熄屏触发：idle=%llums timeout=%us -> %s",
+        static_cast<unsigned long long>(idle_ms),
+        static_cast<unsigned>(g_auto_screen_off_seconds),
+        target == ScreenPowerAOD ? "AOD" : "OFF");
+    screen_lock_simple_set_power(target);
 }
 
 void screen_lock_set_power(ScreenPowerState power) { screen_lock_simple_set_power(power); } // 老别名
@@ -1157,6 +1248,7 @@ void screen_action_menu_set_highlight(ScreenActionRow row)
 void screen_action_menu_open(void)
 {
     if (!g_ready) return;
+    screen_lock_simple_notify_user_activity();
     // 长按 GPIO0 进入菜单 → 如果屏在暗态，先亮回 Normal 再打开
     // （gpio0_service 在暗态长按已直接解锁流程回了，这里做兜底保持一致）
     if (g_power != ScreenPowerNormal) {
@@ -1182,6 +1274,7 @@ void screen_action_menu_open(void)
 void screen_action_menu_close(bool execute_if_valid)
 {
     if (!g_ready || !g_menu_open) return;
+    screen_lock_simple_notify_user_activity();
     const ScreenActionRow sel = g_menu_highlight;
     const bool do_exec = execute_if_valid && (sel != ScreenActionRowCancel);
     // 先关菜单再执行，避免执行熄屏时被 LVGL 再次刷新

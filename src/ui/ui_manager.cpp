@@ -805,6 +805,9 @@ static uint16_t ui_clamp_coord(uint16_t value, uint16_t max_value)
 // DOWN/UP 走边沿队列；生产端做 RELEASE debounce + 满队列背压合并；MOVE 只按最新 snapshot 分发。
 static void ui_touch_dispatch_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick_ms)
 {
+    if (pressed) {
+        screen_lock_simple_notify_user_activity();
+    }
     if (!library_view_is_visible()) {
         gesture_router_feed_pointer(pressed, x, y, tick_ms);
     } else {
