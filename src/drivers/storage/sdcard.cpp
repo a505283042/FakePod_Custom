@@ -235,6 +235,36 @@ esp_err_t sdcard_init()
 
 
 // ============================================================
+// USB MSC 运行时接管：卸载 VFS/FATFS，并由 IDF mount helper 释放原 SDMMC Host。
+// ============================================================
+
+esp_err_t sdcard_unmount_for_usb()
+{
+    if (!g_mounted || g_card == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    StorageSdLockGuard sd_lock(pdMS_TO_TICKS(1000));
+    if (!sd_lock.locked()) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    sdmmc_card_t *card = g_card;
+    const esp_err_t ret = esp_vfs_fat_sdcard_unmount("/sdcard", card);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "USB接管前卸载TF卡失败：%s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    g_card = nullptr;
+    g_mounted = false;
+    g_capacity_mb = 0;
+    ESP_LOGI(TAG, "TF卡已从 /sdcard 卸载，VFS/普通SDMMC owner 已释放");
+    return ESP_OK;
+}
+
+
+// ============================================================
 // 是否已经挂载
 // ============================================================
 

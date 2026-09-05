@@ -9,6 +9,11 @@
 esp_err_t sdcard_init();
 
 
+// 为 USB MSC 运行时独占接管卸载 VFS/FATFS/SDMMC Host。
+// 调用方必须先完成后台文件任务静默，并持有 storage_io USB handoff 独占权。
+esp_err_t sdcard_unmount_for_usb();
+
+
 // 判断 TF 卡是否已经成功挂载
 bool sdcard_is_mounted();
 

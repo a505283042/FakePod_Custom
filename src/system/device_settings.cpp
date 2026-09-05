@@ -47,11 +47,11 @@ static bool auto_screen_off_valid(uint16_t seconds)
 {
     switch (seconds) {
         case 0U:
+        case 10U:
         case 30U:
         case 60U:
+        case 120U:
         case 180U:
-        case 300U:
-        case 600U:
             return true;
         default:
             return false;
@@ -104,6 +104,7 @@ static void log_commit_failure(const char *key, esp_err_t ret)
 
 esp_err_t device_settings_init()
 {
+    if (g_settings.ready) return ESP_OK;
     g_settings = make_defaults();
 
     nvs_handle_t handle = 0;
@@ -141,8 +142,13 @@ esp_err_t device_settings_init()
     if (nvs_get_u8(handle, "aux", &u8) == ESP_OK && aux_key_mode_valid(u8)) {
         g_settings.aux_key_mode = static_cast<DeviceAuxKeyMode>(u8);
     }
-    if (nvs_get_u16(handle, "screenoff", &u16) == ESP_OK && auto_screen_off_valid(u16)) {
-        g_settings.auto_screen_off_seconds = u16;
+    if (nvs_get_u16(handle, "screenoff", &u16) == ESP_OK) {
+        if (auto_screen_off_valid(u16)) {
+            g_settings.auto_screen_off_seconds = u16;
+        } else if (u16 == 300U || u16 == 600U) {
+            // 旧版允许 5/10 分钟；新版最长 3 分钟，加载时平滑收敛到 180 秒。
+            g_settings.auto_screen_off_seconds = 180U;
+        }
     }
     if (nvs_get_u8(handle, "aod", &u8) == ESP_OK && u8 <= 1U) {
         g_settings.aod_enabled = u8 != 0U;

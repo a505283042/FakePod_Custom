@@ -19,6 +19,8 @@
 #include "ui_manager.h"
 #include "system_runtime.h"
 #include "persistent_state.h"
+#include "device_settings.h"
+#include "usb_storage_service.h"
 #include "power_service.h"
 #include "gpio0_service.h"
 
@@ -47,6 +49,7 @@ static uint32_t g_degraded_issues = 0U;
 static uint32_t g_optional_issues = 0U;
 static BootIssue g_fatal_issue = BootIssue::None;
 static esp_err_t g_fatal_error = ESP_OK;
+static bool g_usb_storage_requested = false;
 
 static uint32_t boot_issue_mask(BootIssue issue)
 {
@@ -68,6 +71,8 @@ static const char *boot_fatal_ui_reason(BootIssue issue)
             return "Audio unavailable";
         case BootIssue::UiUnavailable:
             return "UI unavailable";
+        case BootIssue::UsbStorageUnavailable:
+            return "USB storage unavailable";
         default:
             return "Core startup failure";
     }
@@ -141,6 +146,7 @@ void boot_state_init()
     g_optional_issues = 0U;
     g_fatal_issue = BootIssue::None;
     g_fatal_error = ESP_OK;
+    g_usb_storage_requested = false;
 
 
     ESP_LOGI(
@@ -160,6 +166,9 @@ BootRunResult boot_run()
     if (boot_state_has_error()) {
         return BootRunResult::Fatal;
     }
+    if (g_state == BootState::UsbStorageService) {
+        return BootRunResult::Service;
+    }
     if (boot_state_is_ready()) {
         return boot_state_is_degraded()
             ? BootRunResult::ReadyDegraded
@@ -170,6 +179,9 @@ BootRunResult boot_run()
 
     if (boot_state_has_error()) {
         return BootRunResult::Fatal;
+    }
+    if (g_state == BootState::UsbStorageService) {
+        return BootRunResult::Service;
     }
     if (!boot_state_is_ready()) {
         return BootRunResult::Running;
@@ -255,6 +267,21 @@ static void boot_state_update()
                     persistence_ret,
                     "NVS 持久化不可用，继续使用运行时默认值"
                 );
+            }
+
+            // USB TF卡服务模式必须在普通SD/音频/媒体服务启动前决定。
+            // Settings数据因此前移到Boot NVS阶段加载；system_runtime再次调用时会直接复用。
+            const esp_err_t settings_ret = device_settings_init();
+            if (settings_ret != ESP_OK) {
+                ESP_LOGW(TAG, "设备设置提前加载失败：%s；保持普通串口启动", esp_err_to_name(settings_ret));
+                g_usb_storage_requested = false;
+            } else {
+                DeviceSettingsSnapshot settings = {};
+                g_usb_storage_requested =
+                    device_settings_get_snapshot(&settings) && settings.usb_mode == DeviceUsbMode::TfCard;
+                if (g_usb_storage_requested) {
+                    ESP_LOGI(TAG, "检测到一次性TF卡USB文件管理请求");
+                }
             }
             g_state = BootState::InitI2C;
             break;
@@ -561,7 +588,49 @@ static void boot_state_update()
                 break;
             }
 
-            g_state = BootState::InitTouch;
+            g_state = g_usb_storage_requested
+                ? BootState::InitUsbStorageService
+                : BootState::InitTouch;
+            break;
+        }
+
+        // ====================================================
+        // 一次性 TF 卡 USB MSC 服务模式
+        // ====================================================
+        case BootState::InitUsbStorageService:
+        {
+            // 先把持久化模式恢复为串口，确保服务模式只执行一次。
+            // 即使本轮USB/SD初始化失败，下次重启也能回到普通系统修复问题。
+            const esp_err_t reset_ret = device_settings_set_usb_mode(DeviceUsbMode::Serial);
+            if (reset_ret != ESP_OK) {
+                boot_record_issue(
+                    BootFailureLevel::Fatal,
+                    BootIssue::UsbStorageUnavailable,
+                    reset_ret,
+                    "无法复位USB模式，拒绝进入可能循环启动的服务模式"
+                );
+                break;
+            }
+
+            const esp_err_t service_ret = usb_storage_service_start();
+            if (service_ret != ESP_OK) {
+                boot_record_issue(
+                    BootFailureLevel::Fatal,
+                    BootIssue::UsbStorageUnavailable,
+                    service_ret,
+                    "TF卡 USB MSC 服务启动失败"
+                );
+                break;
+            }
+
+            (void)ui_manager_show_usb_storage_service();
+            g_state = BootState::UsbStorageService;
+            ESP_LOGI(TAG, "USB服务模式就绪：跳过触摸/音频/媒体库/完整UI；下次开机恢复串口模式");
+            break;
+        }
+
+        case BootState::UsbStorageService:
+        {
             break;
         }
 

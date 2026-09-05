@@ -58,6 +58,8 @@ static QueueHandle_t g_queue = nullptr;
 static SemaphoreHandle_t g_mutex = nullptr;
 static TaskHandle_t g_task = nullptr;
 static bool g_ready = false;
+static volatile bool g_storage_handoff = false;
+static volatile bool g_sd_file_open = false;
 static uint32_t g_next_request_id = 1U;
 static uint32_t g_latest_request_id = 0U;
 static LyricsLoadState g_state = LyricsLoadState::Idle;
@@ -97,7 +99,7 @@ static bool lyrics_request_is_latest(uint32_t request_id)
     if (xSemaphoreTake(g_mutex, portMAX_DELAY) != pdTRUE) {
         return false;
     }
-    const bool latest = request_id == g_latest_request_id;
+    const bool latest = !g_storage_handoff && request_id == g_latest_request_id;
     xSemaphoreGive(g_mutex);
     return latest;
 }
@@ -309,7 +311,11 @@ static esp_err_t lyrics_read_file(
             vTaskDelay(LYRICS_RETRY_DELAY_TICKS);
             continue;
         }
+        if (!lyrics_request_is_latest(request.request_id)) {
+            break;
+        }
         file = fopen(path, "rb");
+        if (file != nullptr) g_sd_file_open = true;
         break;
     }
     if (file == nullptr) {
@@ -353,6 +359,7 @@ static esp_err_t lyrics_read_file(
         StorageSdLockGuard guard(portMAX_DELAY);
         if (guard) {
             fclose(file);
+            g_sd_file_open = false;
         }
     }
 
@@ -765,9 +772,43 @@ bool lyrics_service_is_ready()
     return g_ready;
 }
 
+bool lyrics_service_prepare_storage_handoff(TickType_t timeout_ticks)
+{
+    if (!g_ready) return true;
+
+    if (g_mutex != nullptr && xSemaphoreTake(g_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        g_storage_handoff = true;
+        // 让正在读的 request 在下一个 2KB slice 退出；队列中的旧请求也不再成为 latest。
+        ++g_latest_request_id;
+        if (g_latest_request_id == 0U) g_latest_request_id = 1U;
+        xSemaphoreGive(g_mutex);
+    } else {
+        g_storage_handoff = true;
+    }
+    if (g_queue != nullptr) xQueueReset(g_queue);
+
+    const TickType_t start = xTaskGetTickCount();
+    for (;;) {
+        {
+            StorageSdLockGuard guard(pdMS_TO_TICKS(20));
+            if (guard && !g_sd_file_open) return true;
+        }
+        if (timeout_ticks != portMAX_DELAY && xTaskGetTickCount() - start >= timeout_ticks) {
+            ESP_LOGE(TAG, "USB接管等待歌词文件关闭超时");
+            return false;
+        }
+        vTaskDelay(1);
+    }
+}
+
+void lyrics_service_resume_storage_after_handoff()
+{
+    g_storage_handoff = false;
+}
+
 bool lyrics_service_request_track(uint32_t track_index)
 {
-    if (!g_ready || g_queue == nullptr || g_mutex == nullptr || !media_catalog_v2_ready() ||
+    if (g_storage_handoff || !g_ready || g_queue == nullptr || g_mutex == nullptr || !media_catalog_v2_ready() ||
         track_index >= media_catalog_v2_current()->track_count) {
         return false;
     }

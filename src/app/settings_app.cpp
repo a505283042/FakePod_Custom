@@ -5,9 +5,11 @@
 #include <string.h>
 
 #include "esp_heap_caps.h"
-#include "esp_system.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "lvgl.h"
+#include "esp_lvgl_port.h"
 
 #include "app_launcher_overlay.h"
 #include "app_build_info.h"
@@ -15,8 +17,15 @@
 #include "audio_service.h"
 #include "device_settings.h"
 #include "font/font_manager.h"
+#include "font/usb_service_font.h"
 #include "gesture/gesture_router.h"
+#include "persistent_state.h"
+#include "player_state.h"
 #include "sdcard.h"
+#include "storage_io.h"
+#include "usb_storage_service.h"
+#include "artwork_loader.h"
+#include "lyrics/lyrics_service.h"
 #include "screen_lock_simple.h"
 #include "settings_menu_icons.h"
 #include "ui_common.h"
@@ -82,6 +91,11 @@ static constexpr CategoryRow kCategories[] = {
 };
 static_assert(sizeof(kCategories) / sizeof(kCategories[0]) ==
     static_cast<size_t>(SettingsCategory::Count));
+
+static bool g_usb_transition_pending = false;
+static lv_obj_t *g_usb_overlay = nullptr;
+static lv_obj_t *g_usb_overlay_status = nullptr;
+static lv_obj_t *g_usb_overlay_action = nullptr;
 
 static lv_obj_t *g_root = nullptr;
 static lv_obj_t *g_header_back = nullptr;
@@ -584,11 +598,11 @@ static const char *screen_off_name(uint16_t seconds)
 {
     switch (seconds) {
         case 0U: return "永不";
+        case 10U: return "10秒";
         case 30U: return "30秒";
         case 60U: return "1分钟";
+        case 120U: return "2分钟";
         case 180U: return "3分钟";
-        case 300U: return "5分钟";
-        case 600U: return "10分钟";
         default: return "自定义";
     }
 }
@@ -596,12 +610,12 @@ static const char *screen_off_name(uint16_t seconds)
 static uint16_t next_screen_off_seconds(uint16_t current)
 {
     switch (current) {
-        case 0U: return 30U;
+        case 0U: return 10U;
+        case 10U: return 30U;
         case 30U: return 60U;
-        case 60U: return 180U;
-        case 180U: return 300U;
-        case 300U: return 600U;
-        case 600U:
+        case 60U: return 120U;
+        case 120U: return 180U;
+        case 180U:
         default:
             return 0U;
     }
@@ -717,10 +731,321 @@ static void create_brightness_control(const DeviceSettingsSnapshot &settings, in
     brightness_set_armed(g_brightness_adjust_armed);
 }
 
+static void usb_tf_storage_return_click_cb(lv_event_t *event);
+
+static bool show_usb_runtime_overlay()
+{
+    lv_obj_t *screen = lv_screen_active();
+    if (screen == nullptr) return false;
+
+    g_usb_overlay = lv_obj_create(screen);
+    if (g_usb_overlay == nullptr) return false;
+
+    lv_obj_remove_style_all(g_usb_overlay);
+    lv_obj_set_size(g_usb_overlay, LV_PCT(100), LV_PCT(100));
+    lv_obj_center(g_usb_overlay);
+    lv_obj_set_style_bg_color(g_usb_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(g_usb_overlay, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(g_usb_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(g_usb_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    const lv_font_t *service_font = usb_service_font_get();
+
+    lv_obj_t *title = lv_label_create(g_usb_overlay);
+    if (title != nullptr) {
+        lv_label_set_text(title, "USB 磁盘模式");
+        lv_obj_set_style_text_font(title, service_font, 0);
+        lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_align(title, LV_ALIGN_CENTER, 0, -54);
+    }
+
+    g_usb_overlay_status = lv_label_create(g_usb_overlay);
+    if (g_usb_overlay_status != nullptr) {
+        lv_label_set_text(g_usb_overlay_status, "存储卡开启");
+        lv_obj_set_style_text_font(g_usb_overlay_status, service_font, 0);
+        lv_obj_set_style_text_color(g_usb_overlay_status, lv_color_hex(0xBFD1E8), 0);
+        lv_obj_set_style_text_align(g_usb_overlay_status, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_line_space(g_usb_overlay_status, 8, 0);
+        lv_obj_set_width(g_usb_overlay_status, 410);
+        lv_obj_align(g_usb_overlay_status, LV_ALIGN_CENTER, 0, 22);
+    }
+
+    g_usb_overlay_action = lv_button_create(g_usb_overlay);
+    if (g_usb_overlay_action != nullptr) {
+        lv_obj_set_size(g_usb_overlay_action, 138, 52);
+        lv_obj_align(g_usb_overlay_action, LV_ALIGN_CENTER, 0, 124);
+        lv_obj_set_style_radius(g_usb_overlay_action, 16, 0);
+        lv_obj_set_style_border_width(g_usb_overlay_action, 0, 0);
+        lv_obj_set_style_bg_color(g_usb_overlay_action, lv_color_hex(0x326CA8), 0);
+        lv_obj_set_style_bg_opa(g_usb_overlay_action, LV_OPA_COVER, 0);
+        lv_obj_add_flag(g_usb_overlay_action, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(g_usb_overlay_action, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_event_cb(
+            g_usb_overlay_action,
+            usb_tf_storage_return_click_cb,
+            LV_EVENT_CLICKED,
+            nullptr);
+
+        lv_obj_t *action_label = lv_label_create(g_usb_overlay_action);
+        if (action_label != nullptr) {
+            lv_label_set_text(action_label, "恢复");
+            lv_obj_set_style_text_font(action_label, service_font, 0);
+            lv_obj_set_style_text_color(action_label, lv_color_hex(0xFFFFFF), 0);
+            lv_obj_center(action_label);
+        }
+    }
+
+    lv_obj_move_foreground(g_usb_overlay);
+    lv_obj_invalidate(g_usb_overlay);
+    return true;
+}
+
+static void usb_runtime_overlay_set_status(const char *text, uint32_t rgb)
+{
+    if (text == nullptr || !lvgl_port_lock(1000)) return;
+    if (g_usb_overlay_status != nullptr && lv_obj_is_valid(g_usb_overlay_status)) {
+        lv_label_set_text(g_usb_overlay_status, text);
+        lv_obj_set_style_text_color(g_usb_overlay_status, lv_color_hex(rgb), 0);
+        lv_obj_invalidate(g_usb_overlay_status);
+    }
+    lvgl_port_unlock();
+}
+
+static void usb_runtime_overlay_destroy()
+{
+    if (!lvgl_port_lock(1000)) return;
+    if (g_usb_overlay != nullptr && lv_obj_is_valid(g_usb_overlay)) {
+        lv_obj_delete(g_usb_overlay);
+    }
+    g_usb_overlay = nullptr;
+    g_usb_overlay_status = nullptr;
+    g_usb_overlay_action = nullptr;
+    lvgl_port_unlock();
+}
+
+static void usb_runtime_overlay_refresh_return_action()
+{
+    if (g_usb_overlay_action == nullptr || !lv_obj_is_valid(g_usb_overlay_action)) return;
+    const bool safe_to_return = usb_storage_service_host_safe_to_return();
+    set_visible(g_usb_overlay_action, safe_to_return);
+}
+
+static void usb_tf_runtime_enter_task(void *)
+{
+    bool artwork_quiet = false;
+    bool lyrics_quiet = false;
+    bool storage_exclusive = false;
+
+    // 软件热切换不会经过 Settings leave，因此显式提交本会话亮度和播放器持久化状态。
+    brightness_commit_on_exit();
+    const esp_err_t persistent_ret = persistent_state_flush();
+    if (persistent_ret != ESP_OK) {
+        ESP_LOGW(TAG, "进入TF卡USB模式前保存播放器状态失败：%s；继续热切换",
+            esp_err_to_name(persistent_ret));
+    }
+
+    // system_loop 已被 runtime transition gate 截停，不会在 Stop 之后自动续播/换曲。
+    if (!audio_service_stop(true)) {
+        ESP_LOGW(TAG, "进入TF卡USB模式前停止音频失败；取消热切换");
+        goto fail;
+    }
+
+    artwork_quiet = artwork_loader_prepare_storage_handoff(pdMS_TO_TICKS(3000));
+    lyrics_quiet = lyrics_service_prepare_storage_handoff(pdMS_TO_TICKS(3000));
+    if (!artwork_quiet || !lyrics_quiet) {
+        ESP_LOGE(TAG, "后台TF文件任务未能在时限内静默，取消USB接管");
+        goto fail;
+    }
+
+    // 这里拿到全局 SD mutex 后，所有旧临界区都已经退出；blocked 发布后普通任务无法再穿透。
+    storage_exclusive = storage_io_begin_usb_handoff(pdMS_TO_TICKS(3000));
+    if (!storage_exclusive) {
+        ESP_LOGE(TAG, "获取USB独占TF总线超时");
+        goto fail;
+    }
+
+    {
+        const esp_err_t unmount_ret = sdcard_unmount_for_usb();
+        if (unmount_ret != ESP_OK) {
+            ESP_LOGE(TAG, "热切换卸载TF失败：%s", esp_err_to_name(unmount_ret));
+            goto fail;
+        }
+    }
+
+    {
+        const esp_err_t service_ret = usb_storage_service_start();
+        if (service_ret != ESP_OK) {
+            ESP_LOGE(TAG, "运行时启动USB MSC失败：%s；尝试恢复普通TF挂载",
+                esp_err_to_name(service_ret));
+            const esp_err_t remount_ret = sdcard_init();
+            if (remount_ret != ESP_OK) {
+                ESP_LOGE(TAG, "USB启动失败后TF重新挂载也失败：%s", esp_err_to_name(remount_ret));
+            }
+            goto fail;
+        }
+    }
+
+    // TinyUSB raw owner 成功建立：释放 mutex，但继续封锁应用侧 /sdcard；
+    // 直到 Host 安全弹出并由 V3 归还任务重新挂载普通 VFS。
+    storage_io_finish_usb_handoff(true);
+    storage_exclusive = false;
+    usb_storage_service_finish_runtime_transition();
+    usb_runtime_overlay_set_status(
+        "可在电脑上访问存储卡\n"
+        "请先安全弹出\n"
+        "安全弹出后恢复",
+        0xC7D5E8);
+    ESP_LOGI(TAG, "USB MSC V3热切换完成：ESP32未重启，TF owner=TinyUSB MSC；等待安全弹出后热归还");
+    vTaskDelete(nullptr);
+    return;
+
+fail:
+    if (storage_exclusive) {
+        // 若 VFS 已经卸载而服务未成功，尽力恢复原挂载；已挂载时 sdcard_init() 会直接返回 OK。
+        if (!sdcard_is_mounted()) {
+            const esp_err_t remount_ret = sdcard_init();
+            if (remount_ret != ESP_OK) {
+                ESP_LOGE(TAG, "热切换回滚重新挂载TF失败：%s", esp_err_to_name(remount_ret));
+            }
+        }
+        storage_io_finish_usb_handoff(false);
+    }
+    artwork_loader_resume_storage_after_handoff();
+    lyrics_service_resume_storage_after_handoff();
+    usb_storage_service_cancel_runtime_transition();
+    g_usb_transition_pending = false;
+    usb_runtime_overlay_destroy();
+    ESP_LOGW(TAG, "USB MSC热切换失败：已撤销遮罩/运行闸门并恢复正常Music运行");
+    vTaskDelete(nullptr);
+}
+
+static void usb_tf_storage_enter_click_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event) || g_page != SettingsPage::Connection || g_usb_transition_pending) return;
+    if (!sdcard_is_mounted()) {
+        ESP_LOGW(TAG, "TF卡未挂载，不能运行时切换USB MSC");
+        return;
+    }
+    if (!usb_storage_service_begin_runtime_transition()) return;
+
+    g_usb_transition_pending = true;
+    const bool prompt_visible = show_usb_runtime_overlay();
+    const BaseType_t task_created = xTaskCreate(
+        usb_tf_runtime_enter_task,
+        "usb_msc_hot",
+        4096,
+        nullptr,
+        2,
+        nullptr);
+
+    if (task_created != pdPASS) {
+        usb_storage_service_cancel_runtime_transition();
+        g_usb_transition_pending = false;
+        usb_runtime_overlay_destroy();
+        ESP_LOGE(TAG, "USB MSC热切换任务创建失败；已恢复正常Music运行");
+        return;
+    }
+
+    ESP_LOGI(TAG, "请求USB MSC V3热切换：提示=%s，ESP32不重启",
+        prompt_visible ? "已显示" : "显示失败");
+}
+
+static void usb_tf_runtime_return_task(void *)
+{
+    usb_runtime_overlay_set_status("恢复存储卡", 0xC7D5E8);
+
+    // Host 已经通过安全弹出或 detach 放弃块设备。先让 deferred writes 落盘并拆掉 LUN/USB，
+    // 再把同一张卡交回 FakePod VFS；两个 owner 在任何时刻都不会并存。
+    const esp_err_t stop_ret = usb_storage_service_stop();
+    if (stop_ret != ESP_OK) {
+        usb_storage_service_cancel_runtime_return();
+        usb_runtime_overlay_set_status(
+            "请先安全弹出\n"
+            "安全弹出后恢复",
+            0xD9B86C);
+        ESP_LOGE(TAG, "USB MSC V3停止服务失败：%s；保持MSC封锁，可再次恢复",
+            esp_err_to_name(stop_ret));
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    if (!storage_io_begin_usb_return(pdMS_TO_TICKS(3000))) {
+        usb_storage_service_finish_runtime_return(false);
+        usb_runtime_overlay_set_status("请重启设备", 0xE28A8A);
+        ESP_LOGE(TAG, "USB MSC V3已释放USB但无法取得TF归还闸门；为避免双owner继续封锁，请重启设备");
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    const esp_err_t mount_ret = sdcard_init();
+    if (mount_ret != ESP_OK) {
+        storage_io_finish_usb_return(false);
+        usb_storage_service_finish_runtime_return(false);
+        usb_runtime_overlay_set_status("请重启设备", 0xE28A8A);
+        ESP_LOGE(TAG, "USB MSC V3归还后重新挂载TF失败：%s；继续封锁普通TF访问",
+            esp_err_to_name(mount_ret));
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    storage_io_finish_usb_return(true);
+    artwork_loader_resume_storage_after_handoff();
+    lyrics_service_resume_storage_after_handoff();
+
+    // media_library 的 live catalog 仍采用 generation 内裸指针语义，当前版本明确禁止运行期
+    // 替换 catalog。因此这里不做不安全的二次扫描；只让当前曲目的歌词/封面重新请求。
+    if (player_state_is_ready()) {
+        (void)lyrics_service_request_track(static_cast<uint32_t>(player_state_get_index()));
+    }
+
+    // 所有普通TF owner、后台资产服务均恢复后，最后再放开 system_loop。
+    usb_storage_service_finish_runtime_return(true);
+    g_usb_transition_pending = false;
+    usb_runtime_overlay_destroy();
+    ESP_LOGI(TAG, "USB MSC V3热归还完成：ESP32未重启，/sdcard 已恢复；现有媒体目录继续使用内存catalog");
+    vTaskDelete(nullptr);
+}
+
+static void usb_tf_storage_return_click_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event) || !g_usb_transition_pending || !usb_storage_service_is_active()) return;
+    if (!usb_storage_service_begin_runtime_return()) {
+        ESP_LOGW(TAG, "USB MSC尚未收到安全弹出/断开信号，拒绝热归还");
+        return;
+    }
+
+    // 点击后立即隐藏按钮，防止重复创建归还任务。若 USB teardown 可重试失败，
+    // runtime return gate 会撤销，refresh timer 会在 Host 仍安全时重新显示按钮。
+    set_visible(g_usb_overlay_action, false);
+    const BaseType_t task_created = xTaskCreate(
+        usb_tf_runtime_return_task,
+        "usb_msc_back",
+        4096,
+        nullptr,
+        2,
+        nullptr);
+
+    if (task_created != pdPASS) {
+        usb_storage_service_cancel_runtime_return();
+        ESP_LOGE(TAG, "USB MSC V3归还任务创建失败；保留MSC服务，可再次恢复");
+    }
+}
+
 static void create_connection_page(const DeviceSettingsSnapshot &settings)
 {
-    add_detail_row(0, "USB模式", device_settings_usb_mode_name(settings.usb_mode), SettingsDetailIcon::Usb);
-    add_detail_row(1, "TF卡文件管理", "待接入", SettingsDetailIcon::TfFiles, false);
+    // USB模式仅显示当前启动配置；真正的高风险TF owner切换只允许从下一行显式触发，
+    // 避免用户查看USB状态时误触发一次性MSC handoff。
+    add_detail_row(
+        0,
+        "USB模式",
+        device_settings_usb_mode_name(settings.usb_mode),
+        SettingsDetailIcon::Usb);
+    add_clickable_detail_row(
+        1,
+        "TF卡文件管理",
+        "进入",
+        SettingsDetailIcon::TfFiles,
+        usb_tf_storage_enter_click_cb);
     add_detail_row(2, "BLE模式", "待接入", SettingsDetailIcon::Bluetooth, false);
     add_detail_row(3, "飞行模式", "待接入", SettingsDetailIcon::Airplane, false);
 }
@@ -850,6 +1175,10 @@ static void refresh_timer_cb(lv_timer_t *timer)
     (void)timer;
     if (g_root == nullptr || app_manager_foreground() != AppId::Settings ||
         app_launcher_overlay_is_visible()) return;
+
+    if (g_usb_overlay != nullptr && lv_obj_is_valid(g_usb_overlay)) {
+        usb_runtime_overlay_refresh_return_action();
+    }
 
     if (g_page == SettingsPage::Main) return;
 

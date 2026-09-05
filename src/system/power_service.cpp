@@ -21,7 +21,7 @@ static constexpr int POWER_KEY_ACTIVE_LEVEL = 0;
 static constexpr TickType_t POWER_KEY_DEBOUNCE_TICKS = pdMS_TO_TICKS(40);
 static constexpr TickType_t POWER_KEY_SAVE_HOLD_TICKS = pdMS_TO_TICKS(1000);
 
-// 释放分级：0 ~ 500ms 的稳定按压 → 按设置执行“音量+ / 下一曲”
+// 释放分级：0 ~ 500ms 的稳定按压 → 按设置执行“音量+ / 上一曲”
 //           ≥ 1000ms 按压 → NVS 保存（接着硬件 EC190707 ~2s 自动断电）
 // 500~1000ms 之间的释放不动作（留给关机长按的判定间隔，避免临界误操作）
 static constexpr uint32_t SHORT_ACTION_MAX_HOLD_MS = 500U;
@@ -116,9 +116,9 @@ void power_service_update()
                     const bool track_mode = device_settings_get_snapshot(&settings) &&
                         settings.aux_key_mode == DeviceAuxKeyMode::Track;
                     if (track_mode) {
-                        ESP_LOGI(TAG, "电源键短按释放：hold=%lums → 下一曲",
+                        ESP_LOGI(TAG, "电源键短按释放：hold=%lums → 上一曲",
                             (unsigned long)held_ms);
-                        (void)player_control_next();
+                        (void)player_control_previous();
                     } else {
                         ESP_LOGI(TAG, "电源键短按释放：hold=%lums → 音量+1",
                             (unsigned long)held_ms);

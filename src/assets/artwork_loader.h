@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
 #include "media_types.h"
 
 // R.36：ArtworkLoader 只承担“当前曲压缩封面临时缓冲”。JPEG/PNG 读入 PSRAM 后由
@@ -62,6 +63,10 @@ struct ArtworkCacheLease
 // 启动独立 ArtworkTask。服务不依赖 LVGL，也不读取/修改 AudioTask 状态。
 esp_err_t artwork_loader_start();
 bool artwork_loader_is_ready();
+
+// USB MSC 热切换前阻止新封面读取，并等待已经打开的 TF 文件安全 fclose。
+bool artwork_loader_prepare_storage_handoff(TickType_t timeout_ticks);
+void artwork_loader_resume_storage_after_handoff();
 
 // 请求加载指定 Track 的首选 ArtworkRef。请求会复制 locator/path，异步任务不持有 Catalog 裸指针。
 // 多次快速请求采用 latest-wins：队列中最多保留一个待执行请求，正在读取的旧请求会在 8KB 分块边界取消。

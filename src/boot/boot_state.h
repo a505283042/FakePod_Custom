@@ -14,6 +14,8 @@ enum class BootState
     InitI2C,
     InitDisplay,
     InitUIBootstrap,
+    InitUsbStorageService,
+    UsbStorageService,
     InitTouch,
     InitIMU,
     InitAudioService,
@@ -41,7 +43,8 @@ enum class BootIssue : uint32_t
     DisplayUnavailable = 1U << 18,
     UiBootstrapUnavailable = 1U << 19,
     AudioUnavailable = 1U << 20,
-    UiUnavailable = 1U << 21
+    UiUnavailable = 1U << 21,
+    UsbStorageUnavailable = 1U << 22
 };
 
 // 启动编排器的顶层推进结果。
@@ -50,6 +53,7 @@ enum class BootRunResult
     Running,
     Ready,
     ReadyDegraded,
+    Service,
     Fatal
 };
 

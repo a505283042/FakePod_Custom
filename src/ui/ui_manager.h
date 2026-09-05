@@ -16,6 +16,10 @@ bool ui_manager_is_ready();
 // 若显示/LVGL 尚不可用则返回 false，Boot 仅保留串口错误并进入安全终态。
 bool ui_manager_show_boot_fatal(const char *reason, esp_err_t error);
 
+// 一次性 TF 卡 USB MSC 服务模式复用启动页，不建立完整 Music/Settings UI。
+// 返回 false 仅表示提示页不可用，不影响 USB 服务本身。
+bool ui_manager_show_usb_storage_service();
+
 // 最终触摸能力状态：不仅要求 CST820 就绪，还要求 LVGL 输入设备已经建立。
 // Touch Fast Path 失败但同步读取回退可用时仍视为可用。
 bool ui_manager_touch_available();

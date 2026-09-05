@@ -55,3 +55,12 @@ CONFIG_AUDIO_ES_EXTRACTOR_SUPPORT=n
 CONFIG_CAF_EXTRACTOR_SUPPORT=n
 CONFIG_FLV_EXTRACTOR_SUPPORT=n
 CONFIG_EXTRACTOR_HELPER_FILE_IO_CACHE_SIZE=4096
+# ------------------------------------------------------------
+# USB Device / TF Card maintenance mode
+# 一次性启动维护模式与 V2 运行时热切换共用 TinyUSB MSC。
+# ------------------------------------------------------------
+CONFIG_TINYUSB_MSC_ENABLED=y
+CONFIG_TINYUSB_MSC_BUFSIZE=8192
+CONFIG_TINYUSB_DESC_MANUFACTURER_STRING="FakePod"
+CONFIG_TINYUSB_DESC_PRODUCT_STRING="FakePod TF Storage"
+CONFIG_TINYUSB_DESC_MSC_STRING="FakePod TF Card"

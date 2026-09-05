@@ -26,6 +26,14 @@ extern "C" void app_main(void)
         }
     }
 
+    if (boot_result == BootRunResult::Service) {
+        // TF卡 USB MSC 为独占维护模式：TinyUSB 自有任务继续服务电脑，
+        // FakePod 正常 system_loop 永不启动，因此应用侧不会同时访问 TF 卡。
+        while (true) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+
     // NORMAL / DEGRADED 都共享同一运行期入口；后台服务仍由 READY 闸门统一启动。
     while (true) {
         system_loop_update();

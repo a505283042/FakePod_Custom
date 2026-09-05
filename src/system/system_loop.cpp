@@ -21,6 +21,7 @@
 #include "app_diag_config.h"
 #include "flac_decoder.h"
 #include "audio_service.h"
+#include "usb_storage_service.h"
 #if APP_DIAG_MP3_PERFORMANCE
 #include "mp3_decoder.h"
 #endif
@@ -229,8 +230,15 @@ static void system_artwork_current_update()
             }
             ArtworkLoaderSnapshot snapshot = {};
             if (!artwork_loader_get_snapshot(&snapshot) ||
-                snapshot.catalog_generation != generation || snapshot.track_index != current_track) break;
-            if (snapshot.state == ArtworkLoadState::Failed && snapshot.result == ESP_ERR_TIMEOUT) {
+                snapshot.catalog_generation != generation || snapshot.track_index != current_track) {
+                // USB handoff may cancel a queued request before ArtworkTask starts it.
+                // Never leave the orchestrator stuck forever in WaitCompressed.
+                system_artwork_schedule_retry(current_track);
+                break;
+            }
+            if (snapshot.state == ArtworkLoadState::Idle) {
+                system_artwork_schedule_retry(current_track);
+            } else if (snapshot.state == ArtworkLoadState::Failed && snapshot.result == ESP_ERR_TIMEOUT) {
                 system_artwork_schedule_retry(current_track);
             } else if (snapshot.state == ArtworkLoadState::NoArtwork ||
                        snapshot.state == ArtworkLoadState::Failed) {
@@ -311,6 +319,13 @@ void system_loop_update()
     // READY 之后第一轮业务循环统一启动可选后台服务。
     // 启动失败只进入降级运行，不反向破坏已经发布的系统 READY。
     system_runtime_update();
+
+    // USB MSC 运行时切换一旦开始，就停止所有可能重新触发本地文件访问的业务调度。
+    // LVGL 有独立 task，因此中文准备/服务页仍可正常刷新；保留电源键轮询用于安全弹出后的关机。
+    if (usb_storage_service_blocks_normal_runtime()) {
+        power_service_update();
+        return;
+    }
 
 
     // Player transport 只观察 AudioTask POD Snapshot；自然 EOF 的续播决策在 loopTask 执行，

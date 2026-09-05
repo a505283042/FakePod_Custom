@@ -86,6 +86,8 @@ static SemaphoreHandle_t g_submit_mutex = nullptr;
 static SemaphoreHandle_t g_cache_mutex = nullptr;
 static TaskHandle_t g_artwork_task = nullptr;
 static volatile bool g_ready = false;
+static volatile bool g_storage_handoff = false;
+static volatile bool g_sd_file_open = false;
 
 static portMUX_TYPE g_request_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t g_next_request_id = 1U;
@@ -205,7 +207,7 @@ static void artwork_publish_state(
 
 static bool artwork_request_is_latest(const ArtworkLoadRequest *request)
 {
-    if (request == nullptr || request->request_id != artwork_latest_request_id()) {
+    if (g_storage_handoff || request == nullptr || request->request_id != artwork_latest_request_id()) {
         return false;
     }
     return request->catalog_generation == media_catalog_v2_generation();
@@ -556,6 +558,7 @@ static void artwork_close_file_cooperatively(FILE *file)
         vTaskDelay(ARTWORK_SD_RETRY_DELAY);
     }
     fclose(file);
+    g_sd_file_open = false;
     storage_sd_unlock();
 }
 
@@ -599,7 +602,12 @@ static __attribute__((noinline)) esp_err_t artwork_read_blob(
             heap_caps_free(data);
             return ESP_ERR_INVALID_STATE;
         }
+        if (!artwork_request_is_latest(request)) {
+            heap_caps_free(data);
+            return ESP_ERR_INVALID_STATE;
+        }
         file = fopen(request->source_path, "rb");
+        if (file != nullptr) g_sd_file_open = true;
         if (file == nullptr) {
             heap_caps_free(data);
             return ESP_ERR_NOT_FOUND;
@@ -854,9 +862,46 @@ bool artwork_loader_is_ready()
     return g_ready && g_artwork_task != nullptr;
 }
 
+bool artwork_loader_prepare_storage_handoff(TickType_t timeout_ticks)
+{
+    g_storage_handoff = true;
+
+    // 清掉尚未被 ArtworkTask 取走的单槽请求；正在执行的请求会在下一个 slice
+    // 看到 handoff=true，并先拿正常 SD 锁完成 fclose。此阶段还没有关闭 StorageSdLock。
+    if (g_submit_mutex != nullptr && xSemaphoreTake(g_submit_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        ArtworkLoadRequest *pending = nullptr;
+        if (g_request_queue != nullptr && xQueueReceive(g_request_queue, &pending, 0) == pdTRUE && pending != nullptr) {
+            artwork_count_superseded();
+            artwork_request_release(pending);
+        }
+        xSemaphoreGive(g_submit_mutex);
+    }
+
+    const TickType_t start = xTaskGetTickCount();
+    for (;;) {
+        // handoff 标志发布后再拿一次正常 SD 锁作为内存/调度屏障：
+        // 若某个 slice 已经通过 latest 检查但尚未 fopen，这里会等它离开临界区，
+        // 然后看到 g_sd_file_open=true，继续让它在下一轮安全 fclose。
+        {
+            StorageSdLockGuard guard(pdMS_TO_TICKS(20));
+            if (guard && !g_sd_file_open) return true;
+        }
+        if (timeout_ticks != portMAX_DELAY && xTaskGetTickCount() - start >= timeout_ticks) {
+            ESP_LOGE(TAG, "USB接管等待封面文件关闭超时");
+            return false;
+        }
+        vTaskDelay(1);
+    }
+}
+
+void artwork_loader_resume_storage_after_handoff()
+{
+    g_storage_handoff = false;
+}
+
 bool artwork_loader_request_track(uint32_t track_index, uint32_t *out_request_id)
 {
-    if (!artwork_loader_is_ready() || g_request_queue == nullptr || g_submit_mutex == nullptr ||
+    if (g_storage_handoff || !artwork_loader_is_ready() || g_request_queue == nullptr || g_submit_mutex == nullptr ||
         track_index >= media_library_get_count()) {
         return false;
     }

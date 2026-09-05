@@ -18,6 +18,7 @@
 #include "display.h"
 #include "display_backend.h"
 #include "font/font_manager.h"
+#include "font/usb_service_font.h"
 #include "gesture/gesture_router.h"
 #include "input/touch_input.h"
 #include "lyrics/lyrics_view.h"
@@ -1224,6 +1225,42 @@ esp_err_t ui_manager_init()
 bool ui_manager_is_ready()
 {
     return g_ready;
+}
+
+bool ui_manager_show_usb_storage_service()
+{
+    if (!g_bootstrap_ready || g_display == nullptr || g_boot_root == nullptr ||
+        g_boot_title == nullptr || g_boot_status == nullptr) {
+        return false;
+    }
+
+    if (!lvgl_port_lock(1000)) {
+        ESP_LOGW(TAG, "USB服务提示页获取LVGL互斥锁超时");
+        return false;
+    }
+
+    // 服务模式不会挂载 TF 卡，因此使用编译进 Flash 的精简中文字体。
+    // ASCII 的 USB 由该字体 fallback 到 LVGL 内置字体，汉字本身完全不依赖 /sdcard/FONTS。
+    const lv_font_t *service_font = usb_service_font_get();
+    lv_label_set_text(g_boot_title, "USB 磁盘模式");
+    lv_obj_set_style_text_font(g_boot_title, service_font, 0);
+    lv_obj_set_style_text_color(g_boot_title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(g_boot_title, LV_ALIGN_CENTER, 0, -62);
+
+    lv_label_set_text(
+        g_boot_status,
+        "可在电脑上访问存储卡\n"
+        "请先安全弹出后再关机\n"
+        "下次开机恢复串口模式");
+    lv_obj_set_style_text_font(g_boot_status, service_font, 0);
+    lv_obj_set_style_text_color(g_boot_status, lv_color_hex(0xC7D5E8), 0);
+    lv_obj_set_style_text_align(g_boot_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_line_space(g_boot_status, 8, 0);
+    lv_obj_set_width(g_boot_status, 410);
+    lv_obj_align(g_boot_status, LV_ALIGN_CENTER, 0, 24);
+    lv_obj_invalidate(g_boot_root);
+    lvgl_port_unlock();
+    return true;
 }
 
 bool ui_manager_show_boot_fatal(const char *reason, esp_err_t error)

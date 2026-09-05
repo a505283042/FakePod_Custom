@@ -19,7 +19,7 @@ static constexpr int AUX_KEY_ACTIVE_LEVEL = 0;
 static constexpr TickType_t KEY_DEBOUNCE_TICKS = pdMS_TO_TICKS(40);
 
 // ============ 阈值（用户新交互） ============
-static constexpr uint32_t SHORT_MAX_MS     = 400U;   // <400ms 释放 = 按设置执行音量- / 上一曲
+static constexpr uint32_t SHORT_MAX_MS     = 400U;   // <400ms 释放 = 按设置执行音量- / 下一曲
 static constexpr uint32_t LONG_PRESS_MS    = 400U;   // ≥400ms 仍按住 = 触发「长按」
                                                      //   暗态/锁定时：直接一键解锁
                                                      //   正常态 + 菜单未开：打开菜单（松手后保持）
@@ -69,7 +69,7 @@ esp_err_t gpio0_service_init()
     ESP_LOGI(
         TAG,
         "GPIO0 辅助键就绪：level=%d pressed=%s armed=%s"
-        "；<400ms=按设置执行音量-/上一曲；≥400ms长按=暗态解锁/正打开菜单；菜单已开时长按=退出菜单",
+        "；<400ms=按设置执行音量-/下一曲；≥400ms长按=暗态解锁/正打开菜单；菜单已开时长按=退出菜单",
         gpio_get_level(static_cast<gpio_num_t>(FAKEPOD_AUX_KEY)),
         g_stable_pressed ? "YES" : "NO",
         g_armed ? "YES" : "WAIT_RELEASE"
@@ -116,8 +116,8 @@ void gpio0_service_update()
                 const bool track_mode = device_settings_get_snapshot(&settings) &&
                     settings.aux_key_mode == DeviceAuxKeyMode::Track;
                 if (track_mode) {
-                    ESP_LOGI(TAG, "GPIO0 释放：短按 %lums → 上一曲", (unsigned long)held);
-                    (void)player_control_previous();
+                    ESP_LOGI(TAG, "GPIO0 释放：短按 %lums → 下一曲", (unsigned long)held);
+                    (void)player_control_next();
                 } else {
                     ESP_LOGI(TAG, "GPIO0 释放：短按 %lums → 音量-1", (unsigned long)held);
                     (void)player_control_volume_down(1U);
@@ -136,7 +136,7 @@ void gpio0_service_update()
         g_press_started_tick = now;
         g_long_fired = false;
         screen_lock_simple_notify_user_activity();
-        ESP_LOGI(TAG, "GPIO0 按下：短按按设置执行音量-/上一曲；≥400ms保持现有长按档位");
+        ESP_LOGI(TAG, "GPIO0 按下：短按按设置执行音量-/下一曲；≥400ms保持现有长按档位");
         return;
     }
 
