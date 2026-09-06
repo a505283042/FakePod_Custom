@@ -10,6 +10,7 @@
 #include "boot_state.h"
 #include "system_runtime.h"
 #include "battery_service.h"
+#include "motion_service.h"
 #include "app_manager.h"
 #include "persistent_state.h"
 #include "power_service.h"
@@ -410,6 +411,10 @@ void system_loop_update()
     // Player transport 只观察 AudioTask POD Snapshot；自然 EOF 的续播决策在 loopTask 执行，
     // AudioTask 本身不依赖 Player/Catalog，也不会直接选择下一首。
     player_control_update();
+
+    // QMI8658 Motion Controls：Accel+Gyro burst限频100Hz；INT1 ISR只记边沿，播放器动作仍在loopTask串行执行。
+    // 放在USB owner闸门之后，避免MSC/Catalog generation swap期间通过翻转手势触发切歌。
+    motion_service_update();
 
     // NVS V1 只低频同步 RAM 快照/dirty，不执行任何 Flash 写入。
     // 关机 flush 内部会再次即时捕获，因此这里降频不会丢失最后一次用户操作。

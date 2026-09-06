@@ -26,6 +26,7 @@ idf_component_register(
         "system/persistent_state.cpp"
         "system/device_settings.cpp"
         "system/battery_service.cpp"
+        "system/motion_service.cpp"
         "system/usb_storage_service.cpp"
         "system/power_service.cpp"
         "system/gpio0_service.cpp"
