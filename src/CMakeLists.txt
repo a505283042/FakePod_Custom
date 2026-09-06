@@ -25,6 +25,7 @@ idf_component_register(
         "system/system_runtime.cpp"
         "system/persistent_state.cpp"
         "system/device_settings.cpp"
+        "system/battery_service.cpp"
         "system/usb_storage_service.cpp"
         "system/power_service.cpp"
         "system/gpio0_service.cpp"
@@ -137,6 +138,7 @@ idf_component_register(
         "ui/spectrum"
 
     REQUIRES
+        esp_adc
         esp_driver_i2c
         esp_driver_gpio
         esp_driver_i2s

@@ -19,6 +19,7 @@
 #include "power_service.h"
 #include "gpio0_service.h"
 #include "device_settings.h"
+#include "battery_service.h"
 #include "screen_lock_simple.h"
 
 static const char *TAG = "运行期";
@@ -124,6 +125,11 @@ void system_runtime_update()
             esp_err_to_name(settings_ret));
     }
 
+    const esp_err_t battery_ret = battery_service_init();
+    if (battery_ret != ESP_OK) {
+        ESP_LOGW(TAG, "电池ADC服务初始化失败：%s；V1暂不提供电量数据", esp_err_to_name(battery_ret));
+    }
+
     const esp_err_t power_ret = power_service_init();
     if (power_ret != ESP_OK) {
         ESP_LOGW(TAG, "GPIO48 关机保存不可用：%s；硬件3秒断电仍保持原行为", esp_err_to_name(power_ret));
@@ -164,7 +170,7 @@ void system_runtime_update()
 
     ESP_LOGI(
         TAG,
-        "READY 后台服务：Apps=%s MusicAdapter=%s Ebook=%s VisualMusic=%s Video=%s DeviceSettings=%s Settings=%s PowerKey=%s AuxKey=%s Spectrum=%s Artwork=%s CoverSurface=%s Lyrics=%s",
+        "READY 后台服务：Apps=%s MusicAdapter=%s Ebook=%s VisualMusic=%s Video=%s DeviceSettings=%s Settings=%s Battery=%s PowerKey=%s AuxKey=%s Spectrum=%s Artwork=%s CoverSurface=%s Lyrics=%s",
         esp_err_to_name(app_ret),
         esp_err_to_name(music_adapter_ret),
         esp_err_to_name(ebook_ret),
@@ -172,6 +178,7 @@ void system_runtime_update()
         esp_err_to_name(video_ret),
         esp_err_to_name(device_settings_ret),
         esp_err_to_name(settings_ret),
+        esp_err_to_name(battery_ret),
         esp_err_to_name(power_ret),
         esp_err_to_name(auxkey_ret),
         esp_err_to_name(spectrum_ret),

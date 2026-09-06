@@ -29,6 +29,7 @@
 #include "library_view.h"
 #include "lyrics/lyrics_view.h"
 #include "spectrum/spectrum_view.h"
+#include "system/battery_service.h"
 #include "system/screen_lock_simple.h"
 #include "ui_common.h"
 
@@ -318,6 +319,12 @@ static bool g_last_loop_mode_valid = false;
 static lv_obj_t *g_volume_label = nullptr;
 static lv_obj_t *g_volume_slider = nullptr;
 static lv_obj_t *g_volume_mode_button = nullptr;
+// Battery UI V1：控件页把电量与音量百分比并排显示；图标完全自绘，不依赖额外字体 glyph。
+static lv_obj_t *g_battery_status = nullptr;
+static lv_obj_t *g_battery_label = nullptr;
+static uint32_t g_last_battery_sequence = UINT32_MAX;
+static uint8_t g_last_battery_percent = 0U;
+static bool g_last_battery_valid = false;
 
 // Stage 11.2：进度条使用 0~10000 的归一化范围，避免把超长音频毫秒数直接塞进 LVGL int32_t range。
 // 拖动期间只做 UI 本地预览；松手时才向 Player 提交一次 Seek。
@@ -677,6 +684,159 @@ static lv_obj_t *player_home_create_pill_button(
         *out_label = label;
     }
     return button;
+}
+
+static void player_home_volume_status_draw_cb(lv_event_t *event)
+{
+    if (event == nullptr || lv_event_get_code(event) != LV_EVENT_DRAW_MAIN) {
+        return;
+    }
+
+    lv_layer_t *layer = lv_event_get_layer(event);
+    lv_obj_t *obj = lv_event_get_current_target_obj(event);
+    if (layer == nullptr || obj == nullptr) {
+        return;
+    }
+
+    lv_area_t coords = {};
+    lv_obj_get_coords(obj, &coords);
+    const int32_t cx = coords.x1 + 21;
+    const int32_t cy = (coords.y1 + coords.y2) / 2;
+
+    lv_draw_line_dsc_t line = {};
+    lv_draw_line_dsc_init(&line);
+    line.color = lv_color_hex(0xF5F7FA);
+    line.width = 2;
+    line.opa = LV_OPA_COVER;
+    line.round_start = 1U;
+    line.round_end = 1U;
+
+    auto draw = [&](int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
+        line.p1.x = x0; line.p1.y = y0;
+        line.p2.x = x1; line.p2.y = y1;
+        lv_draw_line(layer, &line);
+    };
+
+    // 小扬声器只画一层声波，尺寸与右侧电池图标匹配。
+    draw(cx - 8, cy - 4, cx - 4, cy - 4);
+    draw(cx - 8, cy + 4, cx - 4, cy + 4);
+    draw(cx - 8, cy - 4, cx - 8, cy + 4);
+    draw(cx - 4, cy - 4, cx + 2, cy - 9);
+    draw(cx - 4, cy + 4, cx + 2, cy + 9);
+    draw(cx + 2, cy - 9, cx + 2, cy + 9);
+    draw(cx + 7, cy - 5, cx + 10, cy - 2);
+    draw(cx + 10, cy - 2, cx + 10, cy + 2);
+    draw(cx + 10, cy + 2, cx + 7, cy + 5);
+}
+
+static void player_home_battery_status_draw_cb(lv_event_t *event)
+{
+    if (event == nullptr || lv_event_get_code(event) != LV_EVENT_DRAW_MAIN) {
+        return;
+    }
+
+    lv_layer_t *layer = lv_event_get_layer(event);
+    lv_obj_t *obj = lv_event_get_current_target_obj(event);
+    if (layer == nullptr || obj == nullptr) {
+        return;
+    }
+
+    lv_area_t coords = {};
+    lv_obj_get_coords(obj, &coords);
+    const int32_t x = coords.x1 + 10;
+    const int32_t y = (coords.y1 + coords.y2) / 2 - 6;
+    const lv_opa_t icon_opa = g_last_battery_valid ? LV_OPA_COVER : LV_OPA_50;
+
+    lv_draw_line_dsc_t line = {};
+    lv_draw_line_dsc_init(&line);
+    line.color = lv_color_hex(0xF5F7FA);
+    line.width = 2;
+    line.opa = icon_opa;
+    line.round_start = 0U;
+    line.round_end = 0U;
+
+    auto draw = [&](int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
+        line.p1.x = x0; line.p1.y = y0;
+        line.p2.x = x1; line.p2.y = y1;
+        lv_draw_line(layer, &line);
+    };
+
+    // 18x12 电池轮廓 + 2px 正极帽；与百分比放在同一胶囊内。
+    draw(x, y, x + 18, y);
+    draw(x, y + 12, x + 18, y + 12);
+    draw(x, y, x, y + 12);
+    draw(x + 18, y, x + 18, y + 12);
+    draw(x + 20, y + 4, x + 20, y + 8);
+
+    if (!g_last_battery_valid || g_last_battery_percent == 0U) {
+        return;
+    }
+
+    const int32_t inner_width = 14;
+    int32_t fill_width = (inner_width * static_cast<int32_t>(g_last_battery_percent) + 99) / 100;
+    if (fill_width < 1) fill_width = 1;
+    if (fill_width > inner_width) fill_width = inner_width;
+
+    lv_draw_rect_dsc_t fill = {};
+    lv_draw_rect_dsc_init(&fill);
+    fill.bg_color = lv_color_hex(0xF5F7FA);
+    fill.bg_opa = 220;
+    fill.border_width = 0;
+    fill.radius = 1;
+    lv_area_t fill_area = {x + 2, y + 2, x + 1 + fill_width, y + 10};
+    lv_draw_rect(layer, &fill, &fill_area);
+}
+
+static lv_obj_t *player_home_create_battery_status(lv_obj_t *parent)
+{
+    lv_obj_t *status = lv_obj_create(parent);
+    ui_common_lock_object(status);
+    lv_obj_set_size(status, 94, 28);
+    lv_obj_set_style_radius(status, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(status, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(status, 28, 0);
+    lv_obj_set_style_border_width(status, 0, 0);
+    lv_obj_set_style_shadow_width(status, 0, 0);
+    lv_obj_set_style_pad_all(status, 0, 0);
+    lv_obj_remove_flag(status, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(status, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(status, player_home_battery_status_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
+
+    g_battery_label = player_home_create_label(
+        status, "--%", lv_color_hex(0xF5F7FA), font_manager_get_ui_font());
+    lv_obj_set_size(g_battery_label, 50, 28);
+    lv_obj_set_style_text_align(g_battery_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(g_battery_label, LV_ALIGN_RIGHT_MID, -4, 0);
+    return status;
+}
+
+static void player_home_refresh_battery_status()
+{
+    if (g_battery_status == nullptr || g_battery_label == nullptr) {
+        return;
+    }
+
+    BatterySnapshot battery = {};
+    const bool valid = battery_service_get_snapshot(&battery);
+    if (valid && g_last_battery_valid && battery.sequence == g_last_battery_sequence) {
+        return;
+    }
+    if (!valid && !g_last_battery_valid && g_last_battery_sequence == 0U) {
+        return;
+    }
+
+    g_last_battery_valid = valid;
+    g_last_battery_sequence = valid ? battery.sequence : 0U;
+    g_last_battery_percent = valid ? battery.percent : 0U;
+
+    if (valid) {
+        char label[16] = {};
+        snprintf(label, sizeof(label), "%u%%", static_cast<unsigned>(battery.percent));
+        player_home_label_set_text_if_changed(g_battery_label, label);
+    } else {
+        player_home_label_set_text_if_changed(g_battery_label, "--%");
+    }
+    lv_obj_invalidate(g_battery_status);
 }
 
 static void player_home_launcher_draw_line(
@@ -2855,6 +3015,7 @@ static void player_home_repaint_controls_after_bounded_present()
         g_volume_slider,
         g_visual_mode_button,
         g_volume_mode_button,
+        g_battery_status,
     };
     for (lv_obj_t *obj : objects) {
         if (obj != nullptr) {
@@ -3616,6 +3777,10 @@ static void player_home_audio_timer_cb(lv_timer_t *timer)
     if (ui_touch_input_recent_activity(kInteractionYieldMs)) {
         return;
     }
+    // BatteryService 每2秒才更新一次 sequence；100ms Home timer 只做轻量快照比较，
+    // 不会重复重绘电池胶囊。它必须独立于 Audio state_revision，否则暂停时电量不会更新。
+    player_home_refresh_battery_status();
+
     AudioStateSnapshot snapshot = {};
     if (!audio_service_get_snapshot(&snapshot)) {
         return;
@@ -4004,6 +4169,11 @@ void player_home_create(lv_obj_t *screen)
     g_play_symbol = nullptr;
     g_play_icon_pause = false;
     g_volume_mode_button = nullptr;
+    g_battery_status = nullptr;
+    g_battery_label = nullptr;
+    g_last_battery_sequence = UINT32_MAX;
+    g_last_battery_percent = 0U;
+    g_last_battery_valid = false;
     g_audio_timer = nullptr;
     g_artwork_timer = nullptr;
     g_gesture_timer = nullptr;
@@ -4275,10 +4445,20 @@ void player_home_create(lv_obj_t *screen)
     lv_obj_set_ext_click_area(g_visual_mode_button, 15);
     lv_obj_add_event_cb(g_visual_mode_button, player_home_visual_mode_cb, LV_EVENT_CLICKED, nullptr);
 
-    // 百分比仍保留原静音入口，但收在音量条上方，不打断底部“模式-音量条-音量图标”的主结构。
-    lv_obj_t *volume_status = player_home_create_pill_button(g_overlay, 68, 28, "80%", &g_volume_label);
-    lv_obj_align(volume_status, LV_ALIGN_TOP_MID, 0, 319);
+    // 音量与电量使用等宽胶囊并排显示。音量左侧自绘小扬声器，右侧保留百分比/静音文本。
+    // 音量胶囊扩为 94x28，并把实际点击范围再向四周额外扩大 8px，提升静音点击命中率；
+    // 两个胶囊之间保留 8px 间距，扩展后的命中区不会覆盖电池区域。
+    lv_obj_t *volume_status = player_home_create_pill_button(g_overlay, 94, 28, "80%", &g_volume_label);
+    lv_obj_set_pos(volume_status, 132, 319);
+    lv_obj_set_ext_click_area(volume_status, 8);
+    lv_obj_add_event_cb(volume_status, player_home_volume_status_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
+    lv_obj_set_size(g_volume_label, 54, 28);
+    lv_obj_set_style_text_align(g_volume_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(g_volume_label, LV_ALIGN_RIGHT_MID, -3, 0);
     lv_obj_add_event_cb(volume_status, player_home_mute_cb, LV_EVENT_CLICKED, nullptr);
+
+    g_battery_status = player_home_create_battery_status(g_overlay);
+    lv_obj_set_pos(g_battery_status, 234, 319);
 
     g_volume_mode_button = player_home_create_volume_mode_button(g_overlay);
     lv_obj_set_pos(g_volume_mode_button, 352, 346);
@@ -4287,6 +4467,7 @@ void player_home_create(lv_obj_t *screen)
     AudioStateSnapshot snapshot = {};
     audio_service_get_snapshot(&snapshot);
     player_home_apply_audio_snapshot(snapshot);
+    player_home_refresh_battery_status();
     g_last_audio_state_revision = snapshot.state_revision;
 
     g_audio_timer = lv_timer_create(player_home_audio_timer_cb, 100, nullptr);

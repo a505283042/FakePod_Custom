@@ -9,6 +9,7 @@
 
 #include "boot_state.h"
 #include "system_runtime.h"
+#include "battery_service.h"
 #include "app_manager.h"
 #include "persistent_state.h"
 #include "power_service.h"
@@ -389,6 +390,9 @@ void system_loop_update()
     // READY 之后第一轮业务循环统一启动可选后台服务。
     // 启动失败只进入降级运行，不反向破坏已经发布的系统 READY。
     system_runtime_update();
+
+    // 电池ADC完全不依赖TF/Catalog；放在USB owner闸门之前，MSC服务期也可继续采样。
+    battery_service_update();
 
     // USB MSC 运行时切换一旦开始，就停止所有可能重新触发本地文件/Catalog访问的业务调度。
     // MSC真正 active 时仍保留电源键轮询；归还/热刷新阶段 g_active 已清除，此时连电源短按
