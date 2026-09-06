@@ -744,7 +744,9 @@ static void cover_task_main(void *)
 
 esp_err_t cover_surface_cache_start()
 {
-    if (g_ready) return ESP_OK;
+    // xTaskCreatePinnedToCore 成功后，CoverTask 可能还没来得及把 g_ready 置位。
+    // 健康检查在这个窗口再次调用 start 时必须视为“已经在启动”，避免创建第二个任务。
+    if (g_ready || g_task != nullptr) return ESP_OK;
     if (g_queue == nullptr) g_queue = xQueueCreate(1, sizeof(CoverRequest));
     if (g_submit_mutex == nullptr) g_submit_mutex = xSemaphoreCreateMutex();
     if (g_cache_mutex == nullptr) g_cache_mutex = xSemaphoreCreateMutex();

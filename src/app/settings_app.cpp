@@ -814,6 +814,48 @@ static void usb_runtime_overlay_set_status(const char *text, uint32_t rgb)
     lvgl_port_unlock();
 }
 
+static void usb_library_scan_event(MediaLibraryScanEvent event, void *)
+{
+    if (event == MediaLibraryScanEvent::ChangesDetected) {
+        usb_runtime_overlay_set_status("正在更新音乐库...", 0xC7D5E8);
+    }
+}
+
+static void usb_runtime_overlay_show_library_summary(const MediaLibraryChangeSummary &changes)
+{
+    char status[160] = {};
+    size_t used = static_cast<size_t>(snprintf(status, sizeof(status), "音乐库已更新"));
+    const auto append_count = [&](const char *label, uint32_t count) {
+        if (count == 0U || used >= sizeof(status) - 1U) {
+            return;
+        }
+
+        char line[48] = {};
+        const int written = snprintf(
+            line,
+            sizeof(line),
+            "\n%s %lu 首歌曲",
+            label,
+            static_cast<unsigned long>(count));
+        if (written <= 0) {
+            return;
+        }
+
+        const size_t line_len = static_cast<size_t>(written);
+        const size_t remaining = sizeof(status) - 1U - used;
+        if (line_len > remaining || line_len >= sizeof(line)) {
+            return;
+        }
+        memcpy(status + used, line, line_len);
+        used += line_len;
+        status[used] = '\0';
+    };
+    append_count("新增", changes.added_count);
+    append_count("删除", changes.removed_count);
+    append_count("更新", changes.updated_count);
+    usb_runtime_overlay_set_status(status, 0xA9D6B4);
+}
+
 static void usb_runtime_overlay_destroy()
 {
     if (!lvgl_port_lock(1000)) return;
@@ -1064,20 +1106,33 @@ static void usb_tf_runtime_return_task(void *)
     // 仍持有 USB return owner + recursive SD mutex，且 system_loop / Artwork / Lyrics 都未放开。
     // 在这个唯一安全窗口完成 Catalog 事务热替换，避免任何旧 generation 裸指针并发使用。
     MusicCatalogV2 retired_catalog = {};
+    MediaLibraryChangeSummary library_changes = {};
     const uint32_t old_generation = media_catalog_v2_generation();
     const size_t old_count = media_library_get_count();
-    const esp_err_t reload_ret = media_library_hot_reload_quiesced(&retired_catalog);
+    const esp_err_t reload_ret = media_library_hot_reload_quiesced(
+        &retired_catalog,
+        &library_changes,
+        usb_library_scan_event,
+        nullptr
+    );
     if (reload_ret == ESP_OK) {
         const bool player_rebound = player_state_rebind_after_catalog_reload(preferred_track_path, preferred_track_index);
         // Player generation 已重绑，后台资产仍停用；现在才允许释放旧 Catalog 内存。
         media_catalog_v2_release(&retired_catalog);
         ESP_LOGI(TAG,
-            "USB归还曲库热刷新：generation=%lu->%lu tracks=%u->%u player=%s",
+            "USB归还曲库热刷新：generation=%lu->%lu tracks=%u->%u player=%s 新增=%lu 删除=%lu 更新=%lu",
             static_cast<unsigned long>(old_generation),
             static_cast<unsigned long>(media_catalog_v2_generation()),
             static_cast<unsigned>(old_count),
             static_cast<unsigned>(media_library_get_count()),
-            player_rebound ? "已重绑" : "重绑失败");
+            player_rebound ? "已重绑" : "重绑失败",
+            static_cast<unsigned long>(library_changes.added_count),
+            static_cast<unsigned long>(library_changes.removed_count),
+            static_cast<unsigned long>(library_changes.updated_count));
+        if (library_changes.changed) {
+            usb_runtime_overlay_show_library_summary(library_changes);
+            vTaskDelay(pdMS_TO_TICKS(800));
+        }
     } else {
         // 事务失败时 media_library 保留原 Catalog；继续恢复设备，只是目录仍为 USB 前快照。
         ESP_LOGW(TAG, "USB归还曲库热刷新失败：%s；继续使用旧Catalog", esp_err_to_name(reload_ret));

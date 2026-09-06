@@ -2,6 +2,7 @@
 #include "ui_common.h"
 
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -1225,6 +1226,147 @@ esp_err_t ui_manager_init()
 bool ui_manager_is_ready()
 {
     return g_ready;
+}
+
+bool ui_manager_show_library_build_progress()
+{
+    if (!g_bootstrap_ready || g_display == nullptr || g_boot_root == nullptr ||
+        g_boot_status == nullptr) {
+        return false;
+    }
+
+    if (!lvgl_port_lock(1000)) {
+        ESP_LOGW(TAG, "曲库建立提示获取LVGL互斥锁超时");
+        return false;
+    }
+
+    lv_label_set_text(g_boot_status, "正在建立音乐库...");
+    lv_obj_set_style_text_font(g_boot_status, usb_service_font_get(), 0);
+    lv_obj_set_style_text_color(g_boot_status, lv_color_hex(0xC7D5E8), 0);
+    lv_obj_set_style_text_align(g_boot_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_line_space(g_boot_status, 6, 0);
+    lv_obj_set_width(g_boot_status, 410);
+    lv_obj_align(g_boot_status, LV_ALIGN_CENTER, 0, 18);
+    lv_obj_invalidate(g_boot_root);
+    lvgl_port_unlock();
+    return true;
+}
+
+bool ui_manager_show_library_build_complete(uint32_t total_count)
+{
+    if (!g_bootstrap_ready || g_display == nullptr || g_boot_root == nullptr ||
+        g_boot_status == nullptr) {
+        return false;
+    }
+
+    char status[96] = {};
+    const int written = snprintf(
+        status,
+        sizeof(status),
+        "音乐库建立完成\n共 %lu 首歌曲",
+        static_cast<unsigned long>(total_count));
+    if (written <= 0 || static_cast<size_t>(written) >= sizeof(status)) {
+        return false;
+    }
+
+    if (!lvgl_port_lock(1000)) {
+        ESP_LOGW(TAG, "曲库建立完成提示获取LVGL互斥锁超时");
+        return false;
+    }
+
+    lv_label_set_text(g_boot_status, status);
+    lv_obj_set_style_text_font(g_boot_status, usb_service_font_get(), 0);
+    lv_obj_set_style_text_color(g_boot_status, lv_color_hex(0xA9D6B4), 0);
+    lv_obj_set_style_text_align(g_boot_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_line_space(g_boot_status, 5, 0);
+    lv_obj_set_width(g_boot_status, 420);
+    lv_obj_align(g_boot_status, LV_ALIGN_CENTER, 0, 24);
+    lv_obj_invalidate(g_boot_root);
+    lvgl_port_unlock();
+    return true;
+}
+
+bool ui_manager_show_library_update_progress()
+{
+    if (!g_bootstrap_ready || g_display == nullptr || g_boot_root == nullptr ||
+        g_boot_status == nullptr) {
+        return false;
+    }
+
+    if (!lvgl_port_lock(1000)) {
+        ESP_LOGW(TAG, "曲库更新提示获取LVGL互斥锁超时");
+        return false;
+    }
+
+    lv_label_set_text(g_boot_status, "正在更新音乐库...");
+    lv_obj_set_style_text_font(g_boot_status, usb_service_font_get(), 0);
+    lv_obj_set_style_text_color(g_boot_status, lv_color_hex(0xC7D5E8), 0);
+    lv_obj_set_style_text_align(g_boot_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_line_space(g_boot_status, 6, 0);
+    lv_obj_set_width(g_boot_status, 410);
+    lv_obj_align(g_boot_status, LV_ALIGN_CENTER, 0, 18);
+    lv_obj_invalidate(g_boot_root);
+    lvgl_port_unlock();
+    return true;
+}
+
+bool ui_manager_show_library_update_complete(
+    uint32_t added_count,
+    uint32_t removed_count,
+    uint32_t updated_count)
+{
+    if (!g_bootstrap_ready || g_display == nullptr || g_boot_root == nullptr ||
+        g_boot_status == nullptr) {
+        return false;
+    }
+
+    char status[160] = {};
+    size_t used = static_cast<size_t>(
+        snprintf(status, sizeof(status), "音乐库已更新"));
+    const auto append_count = [&](const char *label, uint32_t count) {
+        if (count == 0U || used >= sizeof(status) - 1U) {
+            return;
+        }
+
+        char line[48] = {};
+        const int written = snprintf(
+            line,
+            sizeof(line),
+            "\n%s %lu 首歌曲",
+            label,
+            static_cast<unsigned long>(count));
+        if (written <= 0) {
+            return;
+        }
+
+        const size_t line_len = static_cast<size_t>(written);
+        const size_t remaining = sizeof(status) - 1U - used;
+        if (line_len > remaining || line_len >= sizeof(line)) {
+            return;
+        }
+        memcpy(status + used, line, line_len);
+        used += line_len;
+        status[used] = '\0';
+    };
+    append_count("新增", added_count);
+    append_count("删除", removed_count);
+    append_count("更新", updated_count);
+
+    if (!lvgl_port_lock(1000)) {
+        ESP_LOGW(TAG, "曲库更新完成提示获取LVGL互斥锁超时");
+        return false;
+    }
+
+    lv_label_set_text(g_boot_status, status);
+    lv_obj_set_style_text_font(g_boot_status, usb_service_font_get(), 0);
+    lv_obj_set_style_text_color(g_boot_status, lv_color_hex(0xA9D6B4), 0);
+    lv_obj_set_style_text_align(g_boot_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_line_space(g_boot_status, 5, 0);
+    lv_obj_set_width(g_boot_status, 420);
+    lv_obj_align(g_boot_status, LV_ALIGN_CENTER, 0, 24);
+    lv_obj_invalidate(g_boot_root);
+    lvgl_port_unlock();
+    return true;
 }
 
 bool ui_manager_show_usb_storage_service()

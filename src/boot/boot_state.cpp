@@ -3,6 +3,8 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_psram.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "app_build_info.h"
 #include "app_diag_config.h"
@@ -44,6 +46,15 @@ enum class BootFailureLevel : uint8_t
 static void boot_state_update();
 static bool boot_state_is_degraded();
 static bool boot_state_has_error();
+
+static void boot_library_scan_event(MediaLibraryScanEvent event, void *)
+{
+    if (event == MediaLibraryScanEvent::InitialBuild) {
+        (void)ui_manager_show_library_build_progress();
+    } else if (event == MediaLibraryScanEvent::ChangesDetected) {
+        (void)ui_manager_show_library_update_progress();
+    }
+}
 
 static uint32_t g_degraded_issues = 0U;
 static uint32_t g_optional_issues = 0U;
@@ -476,7 +487,12 @@ static void boot_state_update()
             );
 #endif
 
-            const esp_err_t library_ret = media_library_scan();
+            MediaLibraryChangeSummary changes = {};
+            const esp_err_t library_ret = media_library_scan(
+                &changes,
+                boot_library_scan_event,
+                nullptr
+            );
             if (library_ret != ESP_OK) {
                 boot_record_issue(
                     BootFailureLevel::Degraded,
@@ -484,6 +500,32 @@ static void boot_state_update()
                     library_ret,
                     "音乐库不可用，继续保留基础界面"
                 );
+            } else if (!changes.had_previous_catalog) {
+                ESP_LOGI(
+                    TAG,
+                    "首次建立音乐库完成：tracks=%lu",
+                    static_cast<unsigned long>(changes.current_count)
+                );
+                if (ui_manager_show_library_build_complete(changes.current_count)) {
+                    vTaskDelay(pdMS_TO_TICKS(900));
+                }
+            } else if (changes.changed) {
+                ESP_LOGI(
+                    TAG,
+                    "启动曲库增量更新：tracks=%lu->%lu 新增=%lu 删除=%lu 更新=%lu",
+                    static_cast<unsigned long>(changes.previous_count),
+                    static_cast<unsigned long>(changes.current_count),
+                    static_cast<unsigned long>(changes.added_count),
+                    static_cast<unsigned long>(changes.removed_count),
+                    static_cast<unsigned long>(changes.updated_count)
+                );
+                if (ui_manager_show_library_update_complete(
+                        changes.added_count,
+                        changes.removed_count,
+                        changes.updated_count)) {
+                    // LVGL 刷新任务独立运行；只在真实曲库变化时短暂保留结果提示。
+                    vTaskDelay(pdMS_TO_TICKS(900));
+                }
             }
 
             g_state = BootState::InitPlayer;

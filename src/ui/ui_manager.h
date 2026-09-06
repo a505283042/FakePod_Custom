@@ -16,6 +16,16 @@ bool ui_manager_is_ready();
 // 若显示/LVGL 尚不可用则返回 false，Boot 仅保留串口错误并进入安全终态。
 bool ui_manager_show_boot_fatal(const char *reason, esp_err_t error);
 
+// 启动期复用启动页显示首次建库或增量更新状态；已有曲库且无变化时不会额外提示。
+bool ui_manager_show_library_build_progress();
+bool ui_manager_show_library_build_complete(uint32_t total_count);
+bool ui_manager_show_library_update_progress();
+bool ui_manager_show_library_update_complete(
+    uint32_t added_count,
+    uint32_t removed_count,
+    uint32_t updated_count
+);
+
 // 一次性 TF 卡 USB MSC 服务模式复用启动页，不建立完整 Music/Settings UI。
 // 返回 false 仅表示提示页不可用，不影响 USB 服务本身。
 bool ui_manager_show_usb_storage_service();

@@ -5,6 +5,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_err.h"
 
 #include "boot_state.h"
 #include "system_runtime.h"
@@ -16,6 +17,7 @@
 #include "player_control.h"
 #include "player_state.h"
 #include "media_catalog_v2.h"
+#include "sdcard.h"
 #include "artwork_loader.h"
 #include "cover_surface_cache.h"
 #include "app_diag_config.h"
@@ -80,6 +82,12 @@ static uint8_t g_artwork_current_retry_count = 0U;
 static constexpr uint32_t ARTWORK_CURRENT_FLAC_RING_MIN_PERCENT = 90U;
 static constexpr TickType_t ARTWORK_STORAGE_WINDOW_LOG_INTERVAL = pdMS_TO_TICKS(1000);
 static TickType_t g_artwork_storage_wait_last_log_tick = 0;
+
+// READY 后的封面后台任务原本只启动一次。任务创建/存储状态若在开机瞬间发生一次抖动，
+// 后续就永远没有补启动机会。这里仅做 2s 低频健康检查；任务 start 自身保持幂等。
+static constexpr TickType_t ARTWORK_SERVICE_HEALTH_INTERVAL = pdMS_TO_TICKS(2000);
+static TickType_t g_artwork_service_health_due_tick = 0;
+static bool g_artwork_service_ready_logged = false;
 
 static bool system_artwork_storage_window_open(uint32_t track_index)
 {
@@ -151,6 +159,42 @@ static bool system_artwork_compressed_cached(uint32_t track_index)
     return true;
 }
 
+static void system_artwork_service_health_update()
+{
+    if (!sdcard_is_mounted() || !media_catalog_v2_ready()) return;
+
+    const bool artwork_ready = artwork_loader_is_ready();
+    const bool surface_ready = cover_surface_cache_is_ready();
+    if (artwork_ready && surface_ready) {
+        if (!g_artwork_service_ready_logged) {
+            g_artwork_service_ready_logged = true;
+            ESP_LOGI(TAG, "封面后台服务已就绪：Artwork=READY CoverSurface=READY");
+        }
+        return;
+    }
+    g_artwork_service_ready_logged = false;
+
+    const TickType_t now = xTaskGetTickCount();
+    if (g_artwork_service_health_due_tick != 0 &&
+        !system_tick_due(now, g_artwork_service_health_due_tick)) {
+        return;
+    }
+    g_artwork_service_health_due_tick = now + ARTWORK_SERVICE_HEALTH_INTERVAL;
+
+    esp_err_t artwork_ret = ESP_OK;
+    if (!artwork_ready) artwork_ret = artwork_loader_start();
+
+    esp_err_t surface_ret = ESP_OK;
+    if (artwork_ret == ESP_OK && !surface_ready) {
+        surface_ret = cover_surface_cache_start();
+    }
+
+    if (artwork_ret != ESP_OK || surface_ret != ESP_OK) {
+        ESP_LOGW(TAG, "封面后台服务补启动未完成：Artwork=%s CoverSurface=%s；2秒后重试",
+            esp_err_to_name(artwork_ret), esp_err_to_name(surface_ret));
+    }
+}
+
 static void system_artwork_begin_context(uint32_t generation, uint32_t current_track)
 {
     g_artwork_context_generation = generation;
@@ -160,10 +204,14 @@ static void system_artwork_begin_context(uint32_t generation, uint32_t current_t
     g_artwork_current_retry_count = 0U;
     g_artwork_storage_wait_last_log_tick = 0;
 
-    if (cover_surface_cache_is_ready() && system_cover_surface_cached(current_track)) {
+    const bool surface_ready = cover_surface_cache_is_ready();
+    if (surface_ready && system_cover_surface_cached(current_track)) {
         g_artwork_stage = ArtworkCurrentStage::Complete;
     } else if (system_artwork_compressed_cached(current_track)) {
-        if (cover_surface_cache_request_track(current_track, nullptr)) {
+        if (!surface_ready) {
+            // CoverSurface 可选任务即使暂时不可用，压缩图仍可直接交给 LVGL fallback 显示。
+            g_artwork_stage = ArtworkCurrentStage::Complete;
+        } else if (cover_surface_cache_request_track(current_track, nullptr)) {
             g_artwork_stage = ArtworkCurrentStage::WaitSurface;
         } else {
             system_artwork_schedule_retry(current_track);
@@ -175,7 +223,9 @@ static void system_artwork_begin_context(uint32_t generation, uint32_t current_t
         if (same_inflight && loader.state == ArtworkLoadState::Loading) {
             g_artwork_stage = ArtworkCurrentStage::WaitCompressed;
         } else if (same_inflight && loader.state == ArtworkLoadState::Ready) {
-            if (cover_surface_cache_request_track(current_track, nullptr)) {
+            if (!surface_ready) {
+                g_artwork_stage = ArtworkCurrentStage::Complete;
+            } else if (cover_surface_cache_request_track(current_track, nullptr)) {
                 g_artwork_stage = ArtworkCurrentStage::WaitSurface;
             } else {
                 system_artwork_schedule_retry(current_track);
@@ -201,8 +251,9 @@ static void system_artwork_begin_context(uint32_t generation, uint32_t current_t
 
 static void system_artwork_current_update()
 {
-    if (!artwork_loader_is_ready() || !cover_surface_cache_is_ready() ||
-        !player_state_is_ready() || !media_catalog_v2_ready()) return;
+    // CoverSurface 是性能优化层，不是封面可用性的硬依赖；它没起来时仍允许 ArtworkLoader
+    // 读取压缩图，并由 NowPlaying 直接走 LVGL compressed fallback。
+    if (!artwork_loader_is_ready() || !player_state_is_ready() || !media_catalog_v2_ready()) return;
 
     // Music 进入 Background 后 UI 已不可见，不再为后台切曲读 TF / 解码封面 / 生成 Surface。
     // 已在执行的任务不强制取消；返回前台后会按当前 track 自动补齐资源。
@@ -221,7 +272,9 @@ static void system_artwork_current_update()
         case ArtworkCurrentStage::WaitCompressed:
         {
             if (system_artwork_compressed_cached(current_track)) {
-                if (cover_surface_cache_request_track(current_track, nullptr)) {
+                if (!cover_surface_cache_is_ready()) {
+                    g_artwork_stage = ArtworkCurrentStage::Complete;
+                } else if (cover_surface_cache_request_track(current_track, nullptr)) {
                     g_artwork_stage = ArtworkCurrentStage::WaitSurface;
                 } else {
                     system_artwork_schedule_retry(current_track);
@@ -250,7 +303,9 @@ static void system_artwork_current_update()
         case ArtworkCurrentStage::RetryCompressed:
             if (!system_tick_due(xTaskGetTickCount(), g_artwork_retry_due_tick)) break;
             if (system_artwork_compressed_cached(current_track)) {
-                if (cover_surface_cache_request_track(current_track, nullptr)) {
+                if (!cover_surface_cache_is_ready()) {
+                    g_artwork_stage = ArtworkCurrentStage::Complete;
+                } else if (cover_surface_cache_request_track(current_track, nullptr)) {
                     g_artwork_stage = ArtworkCurrentStage::WaitSurface;
                 } else {
                     system_artwork_schedule_retry(current_track);
@@ -268,6 +323,11 @@ static void system_artwork_current_update()
 
         case ArtworkCurrentStage::WaitSurface:
         {
+            if (!cover_surface_cache_is_ready()) {
+                // Surface 服务若运行期失效，压缩图仍是合法终态；健康检查会继续尝试补启动服务。
+                g_artwork_stage = ArtworkCurrentStage::Complete;
+                break;
+            }
             if (system_cover_surface_cached(current_track)) {
                 g_artwork_stage = ArtworkCurrentStage::Complete;
                 break;
@@ -296,6 +356,16 @@ static void system_artwork_current_update()
             break;
 
         case ArtworkCurrentStage::Complete:
+            // CoverSurface 若比 ArtworkLoader 晚启动，在压缩 fallback 已经可见的情况下补做一次 Surface。
+            if (cover_surface_cache_is_ready() &&
+                !system_cover_surface_cached(current_track) &&
+                system_artwork_compressed_cached(current_track)) {
+                if (cover_surface_cache_request_track(current_track, nullptr)) {
+                    g_artwork_stage = ArtworkCurrentStage::WaitSurface;
+                }
+            }
+            break;
+
         default:
             break;
     }
@@ -330,6 +400,8 @@ void system_loop_update()
         return;
     }
 
+    // 开机瞬态启动失败不能永久丢失封面服务；这里只在正常 TF owner 下低频补启动。
+    system_artwork_service_health_update();
 
     // Player transport 只观察 AudioTask POD Snapshot；自然 EOF 的续播决策在 loopTask 执行，
     // AudioTask 本身不依赖 Player/Catalog，也不会直接选择下一首。

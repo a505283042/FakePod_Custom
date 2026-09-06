@@ -666,9 +666,13 @@ static void artwork_ui_sync_context(bool force)
     if (cover_surface_cache_is_ready() && artwork_ui_apply_surface(track_index)) return;
 
     if (!artwork_loader_is_ready()) {
-        artwork_ui_release_transition_hold();
-        artwork_ui_release_all_sources();
-        artwork_ui_show_placeholder("封面服务不可用");
+        // UI 会早于 READY 后台服务创建：冷启动此处的 not-ready 只是 ArtworkTask
+        // 尚未进入 task_main，并不代表服务失败。保持纯黑底/旧封面，不先闪一帧
+        // “封面服务不可用”；真正的 Failed/Stopped 仍由 update() 的明确状态处理。
+        if (!g_has_surface_source && !g_has_compressed_source) {
+            (void)artwork_ui_apply_transition_hold();
+        }
+        artwork_ui_show_waiting_without_placeholder();
     } else {
         // 曲库选歌返回时，新 Surface 尚未 ready 就把点击前短暂 pin 的旧封面重新绑定。
         // 它故意不匹配当前 context，因此 update() 仍会持续尝试获取新 Surface。
@@ -803,6 +807,9 @@ void now_playing_artwork_update()
     // 不依赖 UI 必须消费某一次 Ready Snapshot。
     if (cover_surface_cache_is_ready() && !artwork_ui_source_matches_context()) {
         (void)artwork_ui_apply_surface(g_context_track);
+    } else if (!cover_surface_cache_is_ready() && !artwork_ui_source_matches_context()) {
+        // SurfaceTask 开机瞬态失败时也允许从压缩缓存自愈，不依赖必须恰好消费一次 Ready Snapshot。
+        (void)artwork_ui_apply_compressed_fallback(g_context_track);
     }
 
     // Snapshot 仍用于 Preparing/Failed 状态提示与兼容回退。

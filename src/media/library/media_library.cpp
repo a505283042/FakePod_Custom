@@ -361,10 +361,16 @@ static bool media_library_repack_sorted_path_pool()
 static esp_err_t media_library_scan_with_scratch(
     MediaLibraryScanScratch *scratch,
     bool replace_runtime_catalog,
-    MusicCatalogV2 *out_retired)
+    MusicCatalogV2 *out_retired,
+    MediaLibraryChangeSummary *out_changes,
+    MediaLibraryScanEventCallback on_scan_event,
+    void *callback_context)
 {
     if (scratch == nullptr || (replace_runtime_catalog && out_retired == nullptr)) {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (out_changes != nullptr) {
+        *out_changes = {};
     }
     media_library_reset_build_state(replace_runtime_catalog);
     LIB_BOOT_LOGI("开始递归扫描：%s", MUSIC_ROOT);
@@ -382,6 +388,21 @@ static esp_err_t media_library_scan_with_scratch(
 
     const bool have_previous_v2 = media_catalog_store_v2_load(&previous_v2) == ESP_OK;
     const bool have_previous_v1 = !have_previous_v2 && media_index_store_load(&previous_v1) == ESP_OK;
+    const size_t previous_track_count =
+        have_previous_v2 ? static_cast<size_t>(previous_v2.catalog.track_count) : 0U;
+    size_t existing_path_count = 0U;
+    size_t added_count = 0U;
+    size_t updated_count = 0U;
+    bool changes_notified = false;
+    const auto notify_changes_detected = [&]() {
+        if (!changes_notified && on_scan_event != nullptr) {
+            changes_notified = true;
+            on_scan_event(MediaLibraryScanEvent::ChangesDetected, callback_context);
+        }
+    };
+    if (!have_previous_v2 && on_scan_event != nullptr) {
+        on_scan_event(MediaLibraryScanEvent::InitialBuild, callback_context);
+    }
     if (have_previous_v1) {
         ESP_LOGI(TAG, "检测到旧 V1 索引，本次迁移复用技术信息并生成 V2 Catalog");
     } else if (!have_previous_v2) {
@@ -517,6 +538,7 @@ static esp_err_t media_library_scan_with_scratch(
                     bool artwork_reused = false;
                     bool artwork_unchanged = false;
                     bool v2_signature_match = false;
+                    bool catalog_change_counted = false;
                     const TrackRowV2 *old_v2_track = nullptr;
 
                     const bool deep_probe_format =
@@ -524,9 +546,12 @@ static esp_err_t media_library_scan_with_scratch(
 
                     if (have_previous_v2) {
                         const MediaManifestRecordV2 *old_manifest = nullptr;
-                        if (media_catalog_store_v2_find(
-                                &previous_v2, full_path, &old_v2_track, &old_manifest) &&
-                            old_v2_track != nullptr && old_manifest != nullptr &&
+                        const bool old_v2_found = media_catalog_store_v2_find(
+                            &previous_v2, full_path, &old_v2_track, &old_manifest);
+                        if (old_v2_found && old_v2_track != nullptr) {
+                            existing_path_count++;
+                        }
+                        if (old_v2_found && old_v2_track != nullptr && old_manifest != nullptr &&
                             old_v2_track->format == format && old_manifest->format == format &&
                             old_manifest->file_size_bytes == static_cast<uint64_t>(info.st_size) &&
                             old_manifest->modified_time == static_cast<int64_t>(info.st_mtime)) {
@@ -601,6 +626,20 @@ static esp_err_t media_library_scan_with_scratch(
                             reused_count++;
                         }
                     }
+
+                    // 新增/文件签名变化在深度 probe 前就能确定，先通知启动页，避免用户只在扫描快结束时才看到提示。
+                    if (have_previous_v2) {
+                        if (old_v2_track == nullptr) {
+                            added_count++;
+                            catalog_change_counted = true;
+                            notify_changes_detected();
+                        } else if (!v2_signature_match) {
+                            updated_count++;
+                            catalog_change_counted = true;
+                            notify_changes_detected();
+                        }
+                    }
+
                     if (out_of_memory) {
                         if (metadata_build != nullptr) {
                             media_metadata_build_release(metadata_build);
@@ -717,8 +756,19 @@ static esp_err_t media_library_scan_with_scratch(
                         artwork_none_count++;
                     }
 
-                    if (v2_signature_match && (!deep_probe_format || (reused && metadata_reused)) && artwork_unchanged) {
+                    const bool full_track_reused =
+                        v2_signature_match &&
+                        (!deep_probe_format || (reused && metadata_reused)) &&
+                        artwork_unchanged;
+                    if (full_track_reused) {
                         full_track_reused_count++;
+                    }
+
+                    // 歌曲文件自身未变，但目录 fallback 封面变化也属于可见媒体更新。
+                    if (have_previous_v2 && old_v2_track != nullptr &&
+                        !catalog_change_counted && v2_signature_match && !artwork_unchanged) {
+                        updated_count++;
+                        notify_changes_detected();
                     }
 
                     if (!media_library_add_track(full_path, format, info, technical, metadata_build, artwork_build)) {
@@ -811,6 +861,30 @@ static esp_err_t media_library_scan_with_scratch(
         ESP_LOGW(TAG, "音乐目录不存在：%s，音乐库保持为空", MUSIC_ROOT);
     }
     media_library_sort_entries();
+
+    const size_t removed_count =
+        have_previous_v2 && previous_track_count > existing_path_count
+        ? previous_track_count - existing_path_count
+        : 0U;
+    if (removed_count > 0U) {
+        notify_changes_detected();
+    }
+
+    const auto publish_change_summary = [&](size_t current_count) {
+        if (out_changes == nullptr) {
+            return;
+        }
+        out_changes->had_previous_catalog = have_previous_v2;
+        out_changes->previous_count = static_cast<uint32_t>(previous_track_count);
+        out_changes->current_count = static_cast<uint32_t>(current_count);
+        out_changes->added_count = static_cast<uint32_t>(added_count);
+        out_changes->removed_count = static_cast<uint32_t>(removed_count);
+        out_changes->updated_count = static_cast<uint32_t>(updated_count);
+        out_changes->changed =
+            have_previous_v2 &&
+            (added_count > 0U || removed_count > 0U || updated_count > 0U);
+    };
+
     if (!media_library_repack_sorted_path_pool()) {
         ESP_LOGE(TAG, "排序后重建确定性路径池失败");
         media_catalog_store_v2_release(&previous_v2);
@@ -902,6 +976,7 @@ static esp_err_t media_library_scan_with_scratch(
             static_cast<unsigned long>(final_string_bytes),
             static_cast<unsigned>(media_groups_v2_psram_bytes(published)),
             static_cast<unsigned long>(media_catalog_v2_generation()));
+        publish_change_summary(final_track_count);
         return ESP_OK;
     }
 
@@ -991,10 +1066,14 @@ static esp_err_t media_library_scan_with_scratch(
         static_cast<unsigned long>(final_string_bytes),
         static_cast<unsigned>(media_groups_v2_psram_bytes(published)),
         static_cast<unsigned long>(media_catalog_v2_generation()));
+    publish_change_summary(final_track_count);
     return ESP_OK;
 }
 
-esp_err_t media_library_scan()
+esp_err_t media_library_scan(
+    MediaLibraryChangeSummary *out_changes,
+    MediaLibraryScanEventCallback on_scan_event,
+    void *callback_context)
 {
     if (g_ready || media_catalog_v2_ready()) {
         // 当前 Catalog View 使用“generation 未变化期间有效”的裸指针语义；
@@ -1015,12 +1094,17 @@ esp_err_t media_library_scan()
         return ESP_ERR_NO_MEM;
     }
 
-    const esp_err_t ret = media_library_scan_with_scratch(scratch, false, nullptr);
+    const esp_err_t ret = media_library_scan_with_scratch(
+        scratch, false, nullptr, out_changes, on_scan_event, callback_context);
     media_library_scan_scratch_release(scratch);
     return ret;
 }
 
-esp_err_t media_library_hot_reload_quiesced(MusicCatalogV2 *out_retired)
+esp_err_t media_library_hot_reload_quiesced(
+    MusicCatalogV2 *out_retired,
+    MediaLibraryChangeSummary *out_changes,
+    MediaLibraryScanEventCallback on_scan_event,
+    void *callback_context)
 {
     if (out_retired == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -1046,7 +1130,8 @@ esp_err_t media_library_hot_reload_quiesced(MusicCatalogV2 *out_retired)
     ESP_LOGI(TAG, "开始USB归还后的Catalog事务热刷新：old_generation=%lu tracks=%u",
         static_cast<unsigned long>(media_catalog_v2_generation()),
         static_cast<unsigned>(media_library_get_count()));
-    const esp_err_t ret = media_library_scan_with_scratch(scratch, true, out_retired);
+    const esp_err_t ret = media_library_scan_with_scratch(
+        scratch, true, out_retired, out_changes, on_scan_event, callback_context);
     media_library_scan_scratch_release(scratch);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Catalog事务热刷新失败：%s；继续保留旧Catalog", esp_err_to_name(ret));

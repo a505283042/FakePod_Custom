@@ -3715,10 +3715,17 @@ static void audio_task_handle_play(AudioRequest *request)
     if (audio_task_pipeline_has_resources()) {
         esp_err_t cleanup_ret = audio_task_shutdown_pipeline();
         if (cleanup_ret != ESP_OK) {
-            g_task_last_request_id = request->request_id;
-            audio_task_set_state(AudioPlaybackState::Error, cleanup_ret);
-            audio_request_complete(request, false, cleanup_ret);
-            return;
+            // shutdown 是 best-effort：即使静音收敛/I2S stop 返回一次瞬态错误，它仍会继续关闭
+            // Decoder/DAC/I2S 并清空资源标记。资源已经全部释放时不能因此把“最新 Play”丢掉，
+            // 否则表现正是旧歌停止、新歌没有启动。
+            if (audio_task_pipeline_has_resources()) {
+                g_task_last_request_id = request->request_id;
+                audio_task_set_state(AudioPlaybackState::Error, cleanup_ret);
+                audio_request_complete(request, false, cleanup_ret);
+                return;
+            }
+            ESP_LOGW(TAG, "切歌旧链路收尾出现瞬态错误：%s；资源已释放，继续启动最新曲目",
+                esp_err_to_name(cleanup_ret));
         }
     } else {
         AUDIO_POP_TRACE_LOG("PLAY_REUSE_IDLE_PIPELINE no_shutdown");
@@ -3764,6 +3771,20 @@ static void audio_task_handle_play(AudioRequest *request)
     }
 
     esp_err_t ret = audio_task_start_pcm_pipeline(decoder_type, path, request);
+    if (ret == ESP_ERR_TIMEOUT &&
+        audio_transport_request_is_latest(request) &&
+        !audio_task_pipeline_has_resources()) {
+        // MP3/WAV 顺序预读 prime 或 SD 短锁竞争偶发超时，只对最新 intent 做一次有界重试。
+        // 不重试损坏文件/格式错误，也不在仍持有旧硬件资源时冒险二次打开。
+        ESP_LOGW(TAG, "切歌新链路启动瞬态超时：30ms后重试一次，曲目=%lu",
+            static_cast<unsigned long>(request->track_index + 1U));
+        vTaskDelay(pdMS_TO_TICKS(30));
+        if (audio_transport_request_is_latest(request)) {
+            ret = audio_task_start_pcm_pipeline(decoder_type, path, request);
+        } else {
+            ret = ESP_ERR_INVALID_STATE;
+        }
+    }
     if (ret != ESP_OK) {
         if (!audio_transport_request_is_latest(request)) {
             // 最新 intent 已经在等待，旧请求失败属于主动取消而不是播放器错误。
