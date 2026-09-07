@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -28,6 +29,20 @@ enum class DeviceAnimationMode : uint8_t {
     Eco,
 };
 
+enum class DeviceMusicListScope : uint8_t {
+    All = 0,
+    Level1,
+    Level2,
+};
+
+static constexpr size_t DEVICE_MUSIC_FOLDER_PATH_MAX = 384U;
+
+struct DeviceMusicListSelection {
+    DeviceMusicListScope scope = DeviceMusicListScope::All;
+    char level1_path[DEVICE_MUSIC_FOLDER_PATH_MAX] = {};
+    char level2_path[DEVICE_MUSIC_FOLDER_PATH_MAX] = {};
+};
+
 struct DeviceSettingsSnapshot {
     bool ready = false;
     bool loaded_from_nvs = false;
@@ -38,6 +53,7 @@ struct DeviceSettingsSnapshot {
     uint16_t auto_screen_off_seconds = 0U;   // 0=永不。
     bool aod_enabled = true;
     DeviceAnimationMode animation_mode = DeviceAnimationMode::Auto;
+    DeviceMusicListScope music_list_scope = DeviceMusicListScope::All;
     bool remember_volume = true;
 };
 
@@ -53,6 +69,15 @@ esp_err_t device_settings_set_aux_key_mode(DeviceAuxKeyMode mode);
 esp_err_t device_settings_set_auto_screen_off_seconds(uint16_t seconds);
 esp_err_t device_settings_set_aod_enabled(bool enabled);
 esp_err_t device_settings_set_animation_mode(DeviceAnimationMode mode);
+esp_err_t device_settings_set_music_list_scope(DeviceMusicListScope scope);
+
+// 播放列表目录选择与范围一起提交到同一个 NVS 事务。路径使用 Catalog 中的规范化完整目录路径，
+// 以 '/' 结尾；总列表可传空路径。这样切换一级/二级列表时不会出现 scope 已保存但目录未保存的半状态。
+bool device_settings_get_music_list_selection(DeviceMusicListSelection *out_selection);
+esp_err_t device_settings_set_music_list_selection(
+    DeviceMusicListScope scope,
+    const char *level1_path,
+    const char *level2_path);
 esp_err_t device_settings_set_remember_volume(bool enabled);
 
 // 恢复 Settings V1 默认值；只重置 device_cfg namespace，不触碰音乐持久化/TF 卡文件。
@@ -63,3 +88,4 @@ const char *device_settings_audio_output_mode_name(DeviceAudioOutputMode mode);
 const char *device_settings_audio_output_level_name(DeviceAudioOutputMode mode);
 const char *device_settings_aux_key_mode_name(DeviceAuxKeyMode mode);
 const char *device_settings_animation_mode_name(DeviceAnimationMode mode);
+const char *device_settings_music_list_scope_name(DeviceMusicListScope scope);

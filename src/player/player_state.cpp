@@ -1,5 +1,7 @@
 #include "player_state.h"
 
+#include <stdio.h>
+#include <string.h>
 #include <strings.h>
 
 #include "esp_log.h"
@@ -7,8 +9,27 @@
 static const char *TAG = "播放器状态";
 static bool g_ready = false;
 
+static bool player_state_select(bool selected, const char *action);
+
 static void player_state_log_current(const char *action)
 {
+    if (player_playlist_get_folder_scope() != PlayerFolderScope::All) {
+        PlayerFolderQueueSnapshot queue = {};
+        if (player_playlist_get_folder_queue_snapshot(&queue) &&
+            queue.track_count > 0U && queue.track_index != UINT32_MAX) {
+            const char *path = media_library_get_path(queue.track_index);
+            ESP_LOGI(TAG, "%s：范围=%s 实际=%s 位置=%lu/%lu track=%lu %s",
+                action != nullptr ? action : "选择",
+                player_playlist_folder_scope_name(queue.preferred_scope),
+                player_playlist_folder_scope_name(queue.effective_scope),
+                static_cast<unsigned long>(queue.current_in_queue ? queue.position + 1U : 0U),
+                static_cast<unsigned long>(queue.track_count),
+                static_cast<unsigned long>(queue.track_index),
+                path != nullptr ? path : "<invalid>");
+            return;
+        }
+    }
+
     PlayerListSnapshot snapshot = {};
     if (!player_playlist_get_snapshot(&snapshot)) {
         ESP_LOGW(TAG, "%s后播放列表不可用", action != nullptr ? action : "选择");
@@ -163,12 +184,20 @@ bool player_state_get_list_snapshot(PlayerListSnapshot *out_snapshot)
 
 size_t player_state_get_list_position()
 {
+    if (player_playlist_get_folder_scope() != PlayerFolderScope::All) {
+        PlayerFolderQueueSnapshot queue = {};
+        return player_state_get_folder_queue_snapshot(&queue) ? queue.position : 0U;
+    }
     PlayerListSnapshot snapshot = {};
     return player_state_get_list_snapshot(&snapshot) ? snapshot.position : 0U;
 }
 
 size_t player_state_get_list_count()
 {
+    if (player_playlist_get_folder_scope() != PlayerFolderScope::All) {
+        PlayerFolderQueueSnapshot queue = {};
+        return player_state_get_folder_queue_snapshot(&queue) ? queue.track_count : 0U;
+    }
     PlayerListSnapshot snapshot = {};
     return player_state_get_list_snapshot(&snapshot) ? snapshot.track_count : 0U;
 }
@@ -181,7 +210,69 @@ PlayerListType player_state_get_list_type()
 
 bool player_state_copy_list_label(char *buffer, size_t buffer_size)
 {
-    return g_ready && player_playlist_copy_label(buffer, buffer_size);
+    if (!g_ready || buffer == nullptr || buffer_size == 0U) {
+        return false;
+    }
+    if (player_playlist_get_folder_scope() != PlayerFolderScope::All) {
+        PlayerFolderQueueSnapshot queue = {};
+        if (!player_state_get_folder_queue_snapshot(&queue)) {
+            return false;
+        }
+        if (queue.effective_scope == PlayerFolderScope::Level1 ||
+            queue.effective_scope == PlayerFolderScope::Level2) {
+            char folder_path[PLAYER_FOLDER_PATH_MAX] = {};
+            if (player_playlist_copy_folder_selection(
+                    queue.effective_scope, folder_path, sizeof(folder_path))) {
+                size_t length = strlen(folder_path);
+                while (length > 0U && folder_path[length - 1U] == '/') {
+                    folder_path[--length] = '\0';
+                }
+                const char *slash = strrchr(folder_path, '/');
+                const char *leaf = slash != nullptr ? slash + 1U : folder_path;
+                if (leaf[0] != '\0') {
+                    snprintf(buffer, buffer_size, "%s", leaf);
+                    return true;
+                }
+            }
+        }
+        snprintf(buffer, buffer_size, "%s",
+            player_playlist_folder_scope_name(queue.effective_scope));
+        return true;
+    }
+    return player_playlist_copy_label(buffer, buffer_size);
+}
+
+bool player_state_set_folder_scope(PlayerFolderScope scope)
+{
+    return g_ready && player_playlist_set_folder_scope(scope);
+}
+
+PlayerFolderScope player_state_get_folder_scope()
+{
+    return player_playlist_get_folder_scope();
+}
+
+bool player_state_set_folder_selection(PlayerFolderScope scope, const char *folder_path)
+{
+    return g_ready && player_playlist_set_folder_selection(scope, folder_path);
+}
+
+bool player_state_copy_folder_selection(
+    PlayerFolderScope scope, char *buffer, size_t buffer_size)
+{
+    return g_ready && player_playlist_copy_folder_selection(scope, buffer, buffer_size);
+}
+
+bool player_state_get_folder_queue_snapshot(PlayerFolderQueueSnapshot *out_snapshot)
+{
+    return g_ready && player_playlist_get_folder_queue_snapshot(out_snapshot);
+}
+
+bool player_state_select_folder_queue_position(size_t position)
+{
+    return player_state_select(
+        player_playlist_select_folder_queue_position(position),
+        "目录播放范围选择");
 }
 
 static bool player_state_select(bool selected, const char *action)
@@ -220,7 +311,7 @@ bool player_state_select_position(size_t position)
 
 bool player_state_previous()
 {
-    if (!g_ready || !player_playlist_previous()) {
+    if (!g_ready || !player_playlist_folder_previous()) {
         return false;
     }
     player_state_log_current("上一首");
@@ -229,7 +320,7 @@ bool player_state_previous()
 
 bool player_state_next()
 {
-    if (!g_ready || !player_playlist_next()) {
+    if (!g_ready || !player_playlist_folder_next()) {
         return false;
     }
     player_state_log_current("下一首");

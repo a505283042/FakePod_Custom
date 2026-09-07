@@ -1,5 +1,8 @@
 #include "device_settings.h"
 
+#include <stdio.h>
+#include <string.h>
+
 #include "esp_log.h"
 #include "nvs.h"
 
@@ -11,6 +14,14 @@ static constexpr uint16_t kSchemaVersion = 1U;
 static constexpr const char *kNamespace = "device_cfg";
 
 static DeviceSettingsSnapshot g_settings = {};
+static DeviceMusicListSelection g_music_selection = {};
+
+static DeviceMusicListSelection make_music_selection_defaults()
+{
+    DeviceMusicListSelection defaults = {};
+    defaults.scope = DeviceMusicListScope::All;
+    return defaults;
+}
 
 static DeviceSettingsSnapshot make_defaults()
 {
@@ -24,6 +35,7 @@ static DeviceSettingsSnapshot make_defaults()
     defaults.auto_screen_off_seconds = 0U;
     defaults.aod_enabled = true;
     defaults.animation_mode = DeviceAnimationMode::Auto;
+    defaults.music_list_scope = DeviceMusicListScope::All;
     defaults.remember_volume = true;
     return defaults;
 }
@@ -61,6 +73,11 @@ static bool auto_screen_off_valid(uint16_t seconds)
 static bool animation_mode_valid(uint8_t raw)
 {
     return raw <= static_cast<uint8_t>(DeviceAnimationMode::Eco);
+}
+
+static bool music_list_scope_valid(uint8_t raw)
+{
+    return raw <= static_cast<uint8_t>(DeviceMusicListScope::Level2);
 }
 
 static esp_err_t open_rw(nvs_handle_t *out_handle)
@@ -106,6 +123,7 @@ esp_err_t device_settings_init()
 {
     if (g_settings.ready) return ESP_OK;
     g_settings = make_defaults();
+    g_music_selection = make_music_selection_defaults();
 
     nvs_handle_t handle = 0;
     esp_err_t ret = nvs_open(kNamespace, NVS_READONLY, &handle);
@@ -155,6 +173,19 @@ esp_err_t device_settings_init()
     }
     if (nvs_get_u8(handle, "anim", &u8) == ESP_OK && animation_mode_valid(u8)) {
         g_settings.animation_mode = static_cast<DeviceAnimationMode>(u8);
+    }
+    if (nvs_get_u8(handle, "muscope", &u8) == ESP_OK && music_list_scope_valid(u8)) {
+        g_settings.music_list_scope = static_cast<DeviceMusicListScope>(u8);
+        g_music_selection.scope = g_settings.music_list_scope;
+    }
+
+    size_t path_bytes = sizeof(g_music_selection.level1_path);
+    if (nvs_get_str(handle, "mul1", g_music_selection.level1_path, &path_bytes) != ESP_OK) {
+        g_music_selection.level1_path[0] = '\0';
+    }
+    path_bytes = sizeof(g_music_selection.level2_path);
+    if (nvs_get_str(handle, "mul2", g_music_selection.level2_path, &path_bytes) != ESP_OK) {
+        g_music_selection.level2_path[0] = '\0';
     }
     if (nvs_get_u8(handle, "memvol", &u8) == ESP_OK && u8 <= 1U) {
         g_settings.remember_volume = u8 != 0U;
@@ -255,6 +286,59 @@ esp_err_t device_settings_set_animation_mode(DeviceAnimationMode mode)
     return ret;
 }
 
+bool device_settings_get_music_list_selection(DeviceMusicListSelection *out_selection)
+{
+    if (out_selection == nullptr || !g_settings.ready) return false;
+    *out_selection = g_music_selection;
+    out_selection->scope = g_settings.music_list_scope;
+    return true;
+}
+
+esp_err_t device_settings_set_music_list_selection(
+    DeviceMusicListScope scope,
+    const char *level1_path,
+    const char *level2_path)
+{
+    if (!music_list_scope_valid(static_cast<uint8_t>(scope))) return ESP_ERR_INVALID_ARG;
+    if (level1_path == nullptr) level1_path = "";
+    if (level2_path == nullptr) level2_path = "";
+    if (strlen(level1_path) >= sizeof(g_music_selection.level1_path) ||
+        strlen(level2_path) >= sizeof(g_music_selection.level2_path)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    const DeviceSettingsSnapshot old_settings = g_settings;
+    const DeviceMusicListSelection old_selection = g_music_selection;
+    g_settings.music_list_scope = scope;
+    g_music_selection.scope = scope;
+    snprintf(g_music_selection.level1_path, sizeof(g_music_selection.level1_path), "%s", level1_path);
+    snprintf(g_music_selection.level2_path, sizeof(g_music_selection.level2_path), "%s", level2_path);
+
+    nvs_handle_t handle = 0;
+    esp_err_t ret = open_rw(&handle);
+    if (ret == ESP_OK) ret = nvs_set_u16(handle, "schema", kSchemaVersion);
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, "muscope", static_cast<uint8_t>(scope));
+    if (ret == ESP_OK) ret = nvs_set_str(handle, "mul1", g_music_selection.level1_path);
+    if (ret == ESP_OK) ret = nvs_set_str(handle, "mul2", g_music_selection.level2_path);
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    if (handle != 0) nvs_close(handle);
+
+    if (ret != ESP_OK) {
+        g_settings = old_settings;
+        g_music_selection = old_selection;
+        log_commit_failure("music_list", ret);
+    }
+    return ret;
+}
+
+esp_err_t device_settings_set_music_list_scope(DeviceMusicListScope scope)
+{
+    return device_settings_set_music_list_selection(
+        scope,
+        g_music_selection.level1_path,
+        g_music_selection.level2_path);
+}
+
 esp_err_t device_settings_set_remember_volume(bool enabled)
 {
     const bool old = g_settings.remember_volume;
@@ -278,6 +362,7 @@ esp_err_t device_settings_reset_defaults()
     nvs_close(handle);
     if (ret == ESP_OK) {
         g_settings = make_defaults();
+        g_music_selection = make_music_selection_defaults();
         g_settings.ready = true;
         g_settings.loaded_from_nvs = true;
         ESP_LOGI(TAG, "Settings V1已恢复默认值");
@@ -330,6 +415,16 @@ const char *device_settings_animation_mode_name(DeviceAnimationMode mode)
         case DeviceAnimationMode::Auto: return "自动";
         case DeviceAnimationMode::Full: return "完整";
         case DeviceAnimationMode::Eco: return "省资源";
+        default: return "未知";
+    }
+}
+
+const char *device_settings_music_list_scope_name(DeviceMusicListScope scope)
+{
+    switch (scope) {
+        case DeviceMusicListScope::All: return "总列表";
+        case DeviceMusicListScope::Level1: return "一级列表";
+        case DeviceMusicListScope::Level2: return "二级列表";
         default: return "未知";
     }
 }

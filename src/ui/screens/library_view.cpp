@@ -2,11 +2,14 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
+#include <strings.h>
 
 #include "esp_log.h"
 #include "app_diag_config.h"
 #include "esp_heap_caps.h"
 #include "board_pins.h"
+#include "device_settings.h"
 #include "flac_decoder.h"
 #include "font/font_manager.h"
 #include "media_catalog_v2.h"
@@ -63,6 +66,13 @@ static constexpr int32_t LIBRARY_BACK_BUTTON_X = 20;
 static constexpr int32_t LIBRARY_SEARCH_BUTTON_X = FAKEPOD_LCD_WIDTH - 20 - LIBRARY_HEADER_BUTTON_W;
 static constexpr int32_t LIBRARY_TITLE_X = 110;
 static constexpr int32_t LIBRARY_TITLE_W = FAKEPOD_LCD_WIDTH - LIBRARY_TITLE_X * 2;
+// 目录范围标题保持居中，右侧只放一个极小层级图标，避免标题栏堆字。
+static constexpr int32_t LIBRARY_SCOPE_TITLE_X = 124;
+static constexpr int32_t LIBRARY_SCOPE_TITLE_W = 206;
+static constexpr int32_t LIBRARY_SCOPE_ICON_X = 336;
+static constexpr int32_t LIBRARY_SCOPE_ICON_Y = 21;
+static constexpr int32_t LIBRARY_SCOPE_ICON_W = 22;
+static constexpr int32_t LIBRARY_SCOPE_ICON_H = 20;
 
 // P1.3.5.1：搜索模式保留 5 行结果，上方继续使用原 Header，下方固定 2x5 快速索引键盘。
 static constexpr int32_t LIBRARY_SEARCH_LIST_Y = 68;
@@ -104,10 +114,23 @@ enum class LibraryRowAction : uint8_t
 {
     None = 0,
     PlayAllTrack,
+    PlayFolderTrack,
     OpenArtist,
     OpenAlbum,
     OpenDecade,
     PlayGroupTrack,
+    SelectLevel1Folder,
+    SelectLevel2Folder,
+    SelectLevel2Parent,
+    FolderUp,
+};
+
+enum class LibraryFolderView : uint8_t
+{
+    Tracks = 0,
+    Level1Folders,
+    Level2Folders,
+    Level2Parents,
 };
 
 enum class LibraryGestureAxis : uint8_t
@@ -161,6 +184,7 @@ struct LibraryVirtualRow
     lv_obj_t *button = nullptr;
     lv_obj_t *accent = nullptr;
     lv_obj_t *label = nullptr;
+    lv_obj_t *meta = nullptr;
     lv_obj_t *arrow = nullptr;
     LibraryRowBinding binding = {};
     uint32_t item_index = UINT32_MAX;
@@ -174,6 +198,9 @@ struct LibraryBrowseState
     int32_t top_scroll_y[4] = {};
     int32_t detail_scroll_y = 0;
     int32_t parent_scroll_y = 0;
+    LibraryFolderView folder_view = LibraryFolderView::Tracks;
+    int32_t folder_scroll_y[3] = {};
+    char level2_parent_path[PLAYER_FOLDER_PATH_MAX] = {};
 };
 
 struct LibraryGestureState
@@ -247,10 +274,17 @@ struct LibrarySearchState
     LibraryBrowseMode cache_mode = LibraryBrowseMode::AllTracks;
     PlayerListType cache_detail_type = PlayerListType::AllTracks;
     uint32_t cache_detail_group_index = UINT32_MAX;
+    PlayerFolderScope cache_folder_scope = PlayerFolderScope::All;
+    uint32_t cache_folder_context_id = 0U;
 };
 
 static lv_obj_t *g_root = nullptr;
 static lv_obj_t *g_header_title = nullptr;
+static lv_obj_t *g_scope_icon = nullptr;
+static lv_obj_t *g_scope_icon_back = nullptr;
+static lv_obj_t *g_scope_icon_back_tab = nullptr;
+static lv_obj_t *g_scope_icon_front = nullptr;
+static lv_obj_t *g_scope_icon_front_tab = nullptr;
 static lv_obj_t *g_back_button = nullptr;
 static lv_obj_t *g_search_button = nullptr;
 static lv_obj_t *g_indicator[4] = {};
@@ -307,6 +341,16 @@ static bool library_click_suppressed()
 
 static LibraryThemeColors library_view_theme_colors()
 {
+    // 目录列表只用轻微色相区分层级：一级冷青、二级暖琥珀。
+    // 总列表继续沿用原有“歌曲/歌手/专辑/年代”主题，不受影响。
+    const PlayerFolderScope folder_scope = player_control_get_folder_scope();
+    if (folder_scope == PlayerFolderScope::Level1) {
+        return LibraryThemeColors{0x091216, 0x79D8E2, 0x58C8D5, 0x111C21, 0x18343B};
+    }
+    if (folder_scope == PlayerFolderScope::Level2) {
+        return LibraryThemeColors{0x151008, 0xE7BC69, 0xD9A84F, 0x1D1810, 0x382B18};
+    }
+
     const LibraryBrowseMode parent = library_view_category_mode_for_detail();
     const bool detail = g_state.mode == LibraryBrowseMode::GroupTracks;
 
@@ -430,10 +474,233 @@ static LibraryBrowseMode library_view_category_mode_for_detail()
     return LibraryBrowseMode::AllTracks;
 }
 
+static bool library_view_folder_scope_active()
+{
+    if (player_control_get_folder_scope() == PlayerFolderScope::All) {
+        return false;
+    }
+    PlayerFolderQueueSnapshot queue = {};
+    return player_state_get_folder_queue_snapshot(&queue) &&
+        queue.ready && queue.effective_scope != PlayerFolderScope::All;
+}
+
+static bool library_view_folder_browser_active()
+{
+    return library_view_folder_scope_active() && g_state.folder_view != LibraryFolderView::Tracks;
+}
+
+static const char *library_folder_leaf_in_place(char *path)
+{
+    if (path == nullptr || path[0] == '\0') return nullptr;
+    size_t length = strlen(path);
+    while (length > 0U && path[length - 1U] == '/') {
+        path[--length] = '\0';
+    }
+    if (length == 0U) return nullptr;
+    char *slash = strrchr(path, '/');
+    return slash != nullptr ? slash + 1U : path;
+}
+
+static bool library_folder_level2_parent(
+    const char *level2_path, char *buffer, size_t buffer_size)
+{
+    if (level2_path == nullptr || level2_path[0] == '\0' ||
+        buffer == nullptr || buffer_size == 0U || strlen(level2_path) + 1U > buffer_size) {
+        return false;
+    }
+    snprintf(buffer, buffer_size, "%s", level2_path);
+    size_t length = strlen(buffer);
+    while (length > 0U && buffer[length - 1U] == '/') {
+        buffer[--length] = '\0';
+    }
+    char *slash = strrchr(buffer, '/');
+    if (slash == nullptr || slash == buffer) return false;
+    slash[1] = '\0';
+    return player_playlist_folder_selection_available(
+        PlayerFolderScope::Level1, buffer, nullptr);
+}
+
+static bool library_view_resolve_level2_parent()
+{
+    if (g_state.level2_parent_path[0] != '\0' &&
+        player_playlist_folder_selection_available(
+            PlayerFolderScope::Level1, g_state.level2_parent_path, nullptr)) {
+        return true;
+    }
+
+    char level2_path[PLAYER_FOLDER_PATH_MAX] = {};
+    if (player_control_copy_folder_selection(
+            PlayerFolderScope::Level2, level2_path, sizeof(level2_path)) &&
+        library_folder_level2_parent(
+            level2_path, g_state.level2_parent_path, sizeof(g_state.level2_parent_path))) {
+        return true;
+    }
+
+    char level1_path[PLAYER_FOLDER_PATH_MAX] = {};
+    if (player_control_copy_folder_selection(
+            PlayerFolderScope::Level1, level1_path, sizeof(level1_path)) &&
+        player_playlist_folder_selection_available(
+            PlayerFolderScope::Level1, level1_path, nullptr)) {
+        snprintf(g_state.level2_parent_path, sizeof(g_state.level2_parent_path), "%s", level1_path);
+        return true;
+    }
+
+    return player_playlist_copy_folder_option_at(
+        PlayerFolderScope::Level1,
+        nullptr,
+        0U,
+        g_state.level2_parent_path,
+        sizeof(g_state.level2_parent_path),
+        nullptr);
+}
+
+// 二级列表“上一级”只展示真正拥有二级音乐文件夹的一级目录，
+// 避免把没有可进入二级列表的一级目录也堆在这里。
+static size_t library_view_level2_parent_count()
+{
+    const size_t level1_count =
+        player_playlist_get_folder_option_count(PlayerFolderScope::Level1, nullptr);
+    size_t visible_count = 0U;
+    for (size_t level1_pos = 0U; level1_pos < level1_count; ++level1_pos) {
+        char path[PLAYER_FOLDER_PATH_MAX] = {};
+        if (!player_playlist_copy_folder_option_at(
+                PlayerFolderScope::Level1, nullptr, level1_pos,
+                path, sizeof(path), nullptr)) {
+            continue;
+        }
+        if (player_playlist_get_folder_option_count(PlayerFolderScope::Level2, path) > 0U) {
+            ++visible_count;
+        }
+    }
+    return visible_count;
+}
+
+static bool library_view_level2_parent_at(
+    size_t visible_position,
+    size_t *out_level1_position,
+    char *out_path,
+    size_t out_path_size,
+    uint32_t *out_child_count)
+{
+    if (out_level1_position == nullptr || out_path == nullptr || out_path_size == 0U) {
+        return false;
+    }
+    out_path[0] = '\0';
+    const size_t level1_count =
+        player_playlist_get_folder_option_count(PlayerFolderScope::Level1, nullptr);
+    size_t visible_index = 0U;
+    for (size_t level1_pos = 0U; level1_pos < level1_count; ++level1_pos) {
+        char path[PLAYER_FOLDER_PATH_MAX] = {};
+        if (!player_playlist_copy_folder_option_at(
+                PlayerFolderScope::Level1, nullptr, level1_pos,
+                path, sizeof(path), nullptr)) {
+            continue;
+        }
+        const size_t children =
+            player_playlist_get_folder_option_count(PlayerFolderScope::Level2, path);
+        if (children == 0U) continue;
+        if (visible_index++ != visible_position) continue;
+        if (strlen(path) + 1U > out_path_size) return false;
+        snprintf(out_path, out_path_size, "%s", path);
+        *out_level1_position = level1_pos;
+        if (out_child_count != nullptr) {
+            *out_child_count = static_cast<uint32_t>(children);
+        }
+        return true;
+    }
+    return false;
+}
+
+static PlayerFolderScope library_folder_scope_from_setting(DeviceMusicListScope scope)
+{
+    switch (scope) {
+        case DeviceMusicListScope::All: return PlayerFolderScope::All;
+        case DeviceMusicListScope::Level1: return PlayerFolderScope::Level1;
+        case DeviceMusicListScope::Level2: return PlayerFolderScope::Level2;
+    }
+    return PlayerFolderScope::All;
+}
+
+static bool library_view_persist_folder_selection(
+    PlayerFolderScope scope, const char *folder_path)
+{
+    if ((scope != PlayerFolderScope::Level1 && scope != PlayerFolderScope::Level2) ||
+        folder_path == nullptr || folder_path[0] == '\0') {
+        return false;
+    }
+
+    DeviceMusicListSelection previous = {};
+    if (!device_settings_get_music_list_selection(&previous)) return false;
+    const PlayerFolderScope previous_runtime_scope = player_control_get_folder_scope();
+
+    if (!player_control_set_folder_selection(scope, folder_path) ||
+        !player_control_set_folder_scope(scope)) {
+        return false;
+    }
+
+    const char *level1_path = scope == PlayerFolderScope::Level1
+        ? folder_path : previous.level1_path;
+    const char *level2_path = scope == PlayerFolderScope::Level2
+        ? folder_path : previous.level2_path;
+    const DeviceMusicListScope setting_scope = scope == PlayerFolderScope::Level1
+        ? DeviceMusicListScope::Level1 : DeviceMusicListScope::Level2;
+    const esp_err_t ret = device_settings_set_music_list_selection(
+        setting_scope, level1_path, level2_path);
+    if (ret == ESP_OK) {
+        return true;
+    }
+
+    if (previous.level1_path[0] != '\0') {
+        (void)player_control_set_folder_selection(PlayerFolderScope::Level1, previous.level1_path);
+    }
+    if (previous.level2_path[0] != '\0') {
+        (void)player_control_set_folder_selection(PlayerFolderScope::Level2, previous.level2_path);
+    }
+    (void)player_control_set_folder_scope(
+        previous_runtime_scope != PlayerFolderScope::All
+            ? previous_runtime_scope
+            : library_folder_scope_from_setting(previous.scope));
+    ESP_LOGW(TAG, "保存主页文件夹选择失败：%s", esp_err_to_name(ret));
+    return false;
+}
+
+static bool library_view_folder_queue_snapshot(PlayerFolderQueueSnapshot *out_snapshot)
+{
+    return out_snapshot != nullptr &&
+        player_state_get_folder_queue_snapshot(out_snapshot) &&
+        out_snapshot->ready;
+}
+
+static bool library_view_top_track_index(uint32_t position, uint32_t *out_track_index)
+{
+    if (out_track_index == nullptr) {
+        return false;
+    }
+    if (!library_view_folder_scope_active()) {
+        if (position >= media_library_get_count()) {
+            return false;
+        }
+        *out_track_index = position;
+        return true;
+    }
+
+    size_t track_index = 0U;
+    if (!player_playlist_get_folder_queue_track_index_at_position(position, &track_index) ||
+        track_index > UINT32_MAX) {
+        return false;
+    }
+    *out_track_index = static_cast<uint32_t>(track_index);
+    return true;
+}
+
 static uint32_t library_view_top_level_count(LibraryBrowseMode mode)
 {
     switch (mode) {
         case LibraryBrowseMode::AllTracks:
+            if (library_view_folder_scope_active()) {
+                PlayerFolderQueueSnapshot queue = {};
+                return library_view_folder_queue_snapshot(&queue) ? queue.track_count : 0U;
+            }
             return static_cast<uint32_t>(media_library_get_count());
         case LibraryBrowseMode::Artists:
             return static_cast<uint32_t>(media_groups_v2_artist_count());
@@ -570,6 +837,22 @@ static int32_t library_view_row_step()
 
 static uint32_t library_view_source_item_count()
 {
+    if (library_view_folder_browser_active()) {
+        switch (g_state.folder_view) {
+            case LibraryFolderView::Level1Folders:
+                return static_cast<uint32_t>(
+                    player_playlist_get_folder_option_count(PlayerFolderScope::Level1, nullptr));
+            case LibraryFolderView::Level2Parents:
+                return static_cast<uint32_t>(library_view_level2_parent_count());
+            case LibraryFolderView::Level2Folders:
+                if (!library_view_resolve_level2_parent()) return 1U;
+                return static_cast<uint32_t>(
+                    1U + player_playlist_get_folder_option_count(
+                        PlayerFolderScope::Level2, g_state.level2_parent_path));
+            case LibraryFolderView::Tracks:
+                break;
+        }
+    }
     if (g_state.mode != LibraryBrowseMode::GroupTracks) {
         return library_view_top_level_count(g_state.mode);
     }
@@ -592,8 +875,12 @@ static const char *library_search_source_text(uint32_t source_index)
     }
 
     if (g_state.mode == LibraryBrowseMode::AllTracks) {
+        uint32_t track_index = UINT32_MAX;
+        if (!library_view_top_track_index(source_index, &track_index)) {
+            return nullptr;
+        }
         MediaTrackViewV2 track = {};
-        if (!media_catalog_v2_get_track_view(source_index, &track)) {
+        if (!media_catalog_v2_get_track_view(track_index, &track)) {
             return nullptr;
         }
         return track.title != nullptr && track.title[0] != '\0' ? track.title : track.path;
@@ -666,14 +953,36 @@ static void *library_search_alloc(size_t bytes)
     return memory;
 }
 
+static void library_search_folder_cache_identity(
+    PlayerFolderScope *out_scope,
+    uint32_t *out_context_id)
+{
+    PlayerFolderScope scope = player_control_get_folder_scope();
+    uint32_t context_id = 0U;
+    if (scope != PlayerFolderScope::All) {
+        PlayerFolderQueueSnapshot queue = {};
+        if (library_view_folder_queue_snapshot(&queue)) {
+            context_id = queue.context_id;
+        }
+    }
+    if (out_scope != nullptr) *out_scope = scope;
+    if (out_context_id != nullptr) *out_context_id = context_id;
+}
+
 static bool library_search_cache_signature_matches(uint32_t source_count)
 {
+    PlayerFolderScope folder_scope = PlayerFolderScope::All;
+    uint32_t folder_context_id = 0U;
+    library_search_folder_cache_identity(&folder_scope, &folder_context_id);
+
     return g_search.key_entries != nullptr && g_search.key_pool != nullptr &&
         g_search.key_count == source_count &&
         g_search.cache_generation == media_catalog_v2_generation() &&
         g_search.cache_mode == g_state.mode &&
         g_search.cache_detail_type == g_state.detail_type &&
-        g_search.cache_detail_group_index == g_state.detail_group_index;
+        g_search.cache_detail_group_index == g_state.detail_group_index &&
+        g_search.cache_folder_scope == folder_scope &&
+        g_search.cache_folder_context_id == folder_context_id;
 }
 
 static bool library_search_build_key_cache()
@@ -734,6 +1043,9 @@ static bool library_search_build_key_cache()
     g_search.cache_mode = g_state.mode;
     g_search.cache_detail_type = g_state.detail_type;
     g_search.cache_detail_group_index = g_state.detail_group_index;
+    library_search_folder_cache_identity(
+        &g_search.cache_folder_scope,
+        &g_search.cache_folder_context_id);
 
     ESP_LOGI(TAG,
         "多首字母SearchKey缓存完成：scope=%s rows=%lu entries=%uB pool=%uB time=%lums",
@@ -1025,6 +1337,13 @@ static void library_view_store_scroll_position()
         g_search.scroll_y = y;
         return;
     }
+    if (library_view_folder_browser_active()) {
+        const uint8_t view = static_cast<uint8_t>(g_state.folder_view);
+        if (view >= 1U && view <= 3U) {
+            g_state.folder_scroll_y[view - 1U] = y;
+        }
+        return;
+    }
     if (g_state.mode == LibraryBrowseMode::GroupTracks) {
         g_state.detail_scroll_y = y;
         return;
@@ -1121,6 +1440,10 @@ static int32_t library_view_saved_scroll_position()
     if (g_search.active) {
         return g_search.scroll_y;
     }
+    if (library_view_folder_browser_active()) {
+        const uint8_t view = static_cast<uint8_t>(g_state.folder_view);
+        return view >= 1U && view <= 3U ? g_state.folder_scroll_y[view - 1U] : 0;
+    }
     if (g_state.mode == LibraryBrowseMode::GroupTracks) {
         return g_state.detail_scroll_y;
     }
@@ -1184,6 +1507,44 @@ static void library_search_format_query(char *out, size_t out_size)
     }
 }
 
+static void library_view_apply_scope_icon()
+{
+    if (g_scope_icon == nullptr || g_scope_icon_front == nullptr ||
+        g_scope_icon_front_tab == nullptr || g_scope_icon_back == nullptr ||
+        g_scope_icon_back_tab == nullptr) {
+        return;
+    }
+
+    const PlayerFolderScope scope = player_control_get_folder_scope();
+    if (scope == PlayerFolderScope::All) {
+        lv_obj_add_flag(g_scope_icon, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+
+    const LibraryThemeColors theme = library_view_theme_colors();
+    const lv_color_t color = lv_color_hex(theme.accent);
+    lv_obj_remove_flag(g_scope_icon, LV_OBJ_FLAG_HIDDEN);
+
+    // 前层文件夹：一级/二级共用。图标全部由 LVGL 基础对象绘制，不依赖 emoji/字体资源。
+    lv_obj_set_style_border_color(g_scope_icon_front, color, 0);
+    lv_obj_set_style_bg_color(g_scope_icon_front, color, 0);
+    lv_obj_set_style_border_color(g_scope_icon_front_tab, color, 0);
+    lv_obj_set_style_bg_color(g_scope_icon_front_tab, color, 0);
+
+    const bool level2 = scope == PlayerFolderScope::Level2;
+    if (level2) {
+        lv_obj_set_style_border_color(g_scope_icon_back, color, 0);
+        lv_obj_set_style_bg_color(g_scope_icon_back, color, 0);
+        lv_obj_set_style_border_color(g_scope_icon_back_tab, color, 0);
+        lv_obj_set_style_bg_color(g_scope_icon_back_tab, color, 0);
+        lv_obj_remove_flag(g_scope_icon_back, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(g_scope_icon_back_tab, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(g_scope_icon_back, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(g_scope_icon_back_tab, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 static void library_view_set_header()
 {
     if (g_header_title == nullptr) {
@@ -1207,6 +1568,28 @@ static void library_view_set_header()
             snprintf(search_title, sizeof(search_title), "%s · %s", library_search_scope_name(), query_text);
         }
         lv_label_set_text(g_header_title, search_title);
+    } else if (library_view_folder_browser_active()) {
+        if (g_state.folder_view == LibraryFolderView::Level1Folders) {
+            lv_label_set_text(g_header_title, "Music");
+        } else if (g_state.folder_view == LibraryFolderView::Level2Parents) {
+            lv_label_set_text(g_header_title, "Music");
+        } else if (g_state.folder_view == LibraryFolderView::Level2Folders) {
+            char parent_copy[PLAYER_FOLDER_PATH_MAX] = {};
+            if (library_view_resolve_level2_parent()) {
+                snprintf(parent_copy, sizeof(parent_copy), "%s", g_state.level2_parent_path);
+            }
+            const char *parent_name = library_folder_leaf_in_place(parent_copy);
+            lv_label_set_text(g_header_title, parent_name != nullptr ? parent_name : "文件夹");
+        }
+    } else if (library_view_folder_scope_active()) {
+        char folder_label[96] = {};
+        if (player_state_copy_list_label(folder_label, sizeof(folder_label))) {
+            lv_label_set_text(g_header_title, folder_label);
+        } else {
+            lv_label_set_text(
+                g_header_title,
+                player_playlist_folder_scope_name(player_control_get_folder_scope()));
+        }
     } else if (g_state.mode == LibraryBrowseMode::GroupTracks) {
         const char *title = nullptr;
         if (library_view_get_detail_identity(&title, nullptr, nullptr) && title != nullptr && title[0] != '\0') {
@@ -1233,8 +1616,11 @@ static void library_view_set_header()
     if (g_back_button != nullptr) {
         lv_obj_remove_flag(g_back_button, LV_OBJ_FLAG_HIDDEN);
     }
-    lv_obj_set_x(g_header_title, LIBRARY_TITLE_X);
-    lv_obj_set_width(g_header_title, LIBRARY_TITLE_W);
+
+    library_view_apply_scope_icon();
+    const bool folder_scope = player_control_get_folder_scope() != PlayerFolderScope::All;
+    lv_obj_set_x(g_header_title, folder_scope ? LIBRARY_SCOPE_TITLE_X : LIBRARY_TITLE_X);
+    lv_obj_set_width(g_header_title, folder_scope ? LIBRARY_SCOPE_TITLE_W : LIBRARY_TITLE_W);
     lv_obj_set_style_text_align(g_header_title, LV_TEXT_ALIGN_CENTER, 0);
 }
 
@@ -1245,7 +1631,7 @@ static void library_view_apply_indicator()
         if (g_indicator[i] == nullptr) {
             continue;
         }
-        if (g_search.active) {
+        if (g_search.active || library_view_folder_scope_active()) {
             lv_obj_add_flag(g_indicator[i], LV_OBJ_FLAG_HIDDEN);
             continue;
         }
@@ -1320,10 +1706,15 @@ static void library_view_apply_list_layout()
 
     quick_index_keyboard_set_visible(&g_search_keyboard, g_search.active);
     if (g_search_button != nullptr) {
-        lv_obj_set_style_bg_color(
-            g_search_button,
-            lv_color_hex(g_search.active ? 0x2D3745 : 0x171C24),
-            LV_STATE_DEFAULT);
+        if (library_view_folder_browser_active()) {
+            lv_obj_add_flag(g_search_button, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_remove_flag(g_search_button, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_bg_color(
+                g_search_button,
+                lv_color_hex(g_search.active ? 0x2D3745 : 0x171C24),
+                LV_STATE_DEFAULT);
+        }
     }
     if (g_search.active) {
         library_search_apply_keyboard_layout();
@@ -1333,7 +1724,7 @@ static void library_view_apply_list_layout()
 
 static void library_search_enter()
 {
-    if (g_search.active) {
+    if (g_search.active || library_view_folder_browser_active()) {
         return;
     }
 
@@ -1404,10 +1795,33 @@ static void library_search_keyboard_cb(uint8_t key_index, void *user_data)
 static void library_view_set_row_text(LibraryVirtualRow &row, const char *primary, const char *secondary)
 {
     const char *safe_primary = primary != nullptr && primary[0] != '\0' ? primary : "未知";
+    lv_obj_set_y(row.label, 15);
+    lv_obj_set_height(row.label, 32);
+    if (row.meta != nullptr) {
+        lv_obj_add_flag(row.meta, LV_OBJ_FLAG_HIDDEN);
+    }
     if (secondary != nullptr && secondary[0] != '\0') {
         lv_label_set_text_fmt(row.label, "%s · %s", safe_primary, secondary);
     } else {
         lv_label_set_text(row.label, safe_primary);
+    }
+}
+
+static void library_view_set_folder_row_text(
+    LibraryVirtualRow &row, const char *name, uint32_t count)
+{
+    const char *safe_name = name != nullptr && name[0] != '\0' ? name : "未知";
+    lv_label_set_text(row.label, safe_name);
+    lv_obj_set_y(row.label, 15);
+    lv_obj_set_height(row.label, 32);
+    lv_obj_set_width(row.label, LIBRARY_ROW_W - 146);
+    if (row.meta != nullptr) {
+        // 文件夹行保持纯粹的左右结构：左侧名称，右侧仅数量数字。
+        // 当前目录由左侧 accent 色标表达，不再重复“当前”文字。
+        lv_label_set_text_fmt(row.meta, "%lu", static_cast<unsigned long>(count));
+        lv_obj_set_y(row.meta, 15);
+        lv_obj_set_height(row.meta, 32);
+        lv_obj_remove_flag(row.meta, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -1418,6 +1832,17 @@ static void library_view_reset_row_style(LibraryVirtualRow &row, bool current, b
     lv_obj_set_style_text_color(row.label, lv_color_hex(current ? 0xFFFFFF : 0xE9ECF1), 0);
     if (row.accent != nullptr) {
         lv_obj_set_style_bg_color(row.accent, lv_color_hex(theme.accent), 0);
+        if (current && library_view_folder_browser_active()) {
+            // 文件夹选择页的当前项用一个小圆点表达，不占用“当前”文字空间。
+            lv_obj_set_pos(row.accent, 7, 27);
+            lv_obj_set_size(row.accent, 8, 8);
+            lv_obj_set_style_radius(row.accent, 4, 0);
+        } else {
+            // 歌曲当前项继续沿用原来的细竖条。
+            lv_obj_set_pos(row.accent, 0, 12);
+            lv_obj_set_size(row.accent, 3, 38);
+            lv_obj_set_style_radius(row.accent, 2, 0);
+        }
         if (current) lv_obj_remove_flag(row.accent, LV_OBJ_FLAG_HIDDEN);
         else lv_obj_add_flag(row.accent, LV_OBJ_FLAG_HIDDEN);
     }
@@ -1456,9 +1881,87 @@ static bool library_view_bind_track_row(LibraryVirtualRow &row, uint32_t positio
         row.binding.action = LibraryRowAction::PlayGroupTrack;
         row.binding.group_type = g_state.detail_type;
     } else {
-        row.binding.action = LibraryRowAction::PlayAllTrack;
+        row.binding.action = library_view_folder_scope_active()
+            ? LibraryRowAction::PlayFolderTrack
+            : LibraryRowAction::PlayAllTrack;
         row.binding.group_type = PlayerListType::AllTracks;
     }
+    return true;
+}
+
+static bool library_view_bind_folder_row(LibraryVirtualRow &row, uint32_t item_index)
+{
+    row.binding = {};
+    row.binding.generation = media_catalog_v2_generation();
+
+    if (g_state.folder_view == LibraryFolderView::Level2Folders && item_index == 0U) {
+        library_view_set_row_text(row, "上一级", nullptr);
+        library_view_reset_row_style(row, false, true);
+        row.binding.action = LibraryRowAction::FolderUp;
+        return true;
+    }
+
+    PlayerFolderScope option_scope = PlayerFolderScope::Level1;
+    const char *parent_path = nullptr;
+    size_t option_position = item_index;
+    uint32_t child_count = 0U;
+    LibraryRowAction action = LibraryRowAction::SelectLevel1Folder;
+    if (g_state.folder_view == LibraryFolderView::Level2Folders) {
+        if (!library_view_resolve_level2_parent() || item_index == 0U) return false;
+        option_scope = PlayerFolderScope::Level2;
+        parent_path = g_state.level2_parent_path;
+        option_position = static_cast<size_t>(item_index - 1U);
+        action = LibraryRowAction::SelectLevel2Folder;
+    } else if (g_state.folder_view == LibraryFolderView::Level2Parents) {
+        action = LibraryRowAction::SelectLevel2Parent;
+    }
+
+    char path[PLAYER_FOLDER_PATH_MAX] = {};
+    uint32_t track_count = 0U;
+    if (g_state.folder_view == LibraryFolderView::Level2Parents) {
+        if (!library_view_level2_parent_at(
+                item_index, &option_position, path, sizeof(path), &child_count)) {
+            return false;
+        }
+    } else if (!player_playlist_copy_folder_option_at(
+            option_scope,
+            parent_path,
+            option_position,
+            path,
+            sizeof(path),
+            &track_count)) {
+        return false;
+    }
+
+    char name_path[PLAYER_FOLDER_PATH_MAX] = {};
+    snprintf(name_path, sizeof(name_path), "%s", path);
+    const char *name = library_folder_leaf_in_place(name_path);
+    if (name == nullptr) return false;
+
+    bool current = false;
+    char current_path[PLAYER_FOLDER_PATH_MAX] = {};
+    if (g_state.folder_view == LibraryFolderView::Level1Folders) {
+        current = player_control_copy_folder_selection(
+            PlayerFolderScope::Level1, current_path, sizeof(current_path)) &&
+            strcasecmp(current_path, path) == 0;
+    } else if (g_state.folder_view == LibraryFolderView::Level2Folders) {
+        current = player_control_copy_folder_selection(
+            PlayerFolderScope::Level2, current_path, sizeof(current_path)) &&
+            strcasecmp(current_path, path) == 0;
+    } else if (g_state.folder_view == LibraryFolderView::Level2Parents) {
+        current = g_state.level2_parent_path[0] != '\0' &&
+            strcasecmp(g_state.level2_parent_path, path) == 0;
+    }
+
+    const uint32_t folder_count = g_state.folder_view == LibraryFolderView::Level2Parents
+        ? child_count
+        : track_count;
+    library_view_set_folder_row_text(row, name, folder_count);
+    library_view_reset_row_style(row, current, true);
+    // reset_row_style() 会按箭头恢复通用宽度；文件夹行再次收窄，给右侧数量留固定空间。
+    lv_obj_set_width(row.label, LIBRARY_ROW_W - 146);
+    row.binding.action = action;
+    row.binding.position = static_cast<uint32_t>(option_position);
     return true;
 }
 
@@ -1469,7 +1972,9 @@ static bool library_view_bind_top_row(LibraryVirtualRow &row, uint32_t item_inde
     row.binding.group_index = item_index;
 
     if (g_state.mode == LibraryBrowseMode::AllTracks) {
-        return library_view_bind_track_row(row, item_index, item_index, false);
+        uint32_t track_index = UINT32_MAX;
+        return library_view_top_track_index(item_index, &track_index) &&
+            library_view_bind_track_row(row, item_index, track_index, false);
     }
 
     char secondary[96] = {};
@@ -1584,9 +2089,11 @@ static void library_view_refresh_virtual_rows(bool force)
 
         row.binding = {};
         row.item_index = item_index;
-        const bool ok = g_state.mode == LibraryBrowseMode::GroupTracks
-            ? library_view_bind_detail_row(row, source_index)
-            : library_view_bind_top_row(row, source_index);
+        const bool ok = library_view_folder_browser_active()
+            ? library_view_bind_folder_row(row, source_index)
+            : (g_state.mode == LibraryBrowseMode::GroupTracks
+                ? library_view_bind_detail_row(row, source_index)
+                : library_view_bind_top_row(row, source_index));
         if (ok) {
             lv_obj_remove_flag(row.button, LV_OBJ_FLAG_HIDDEN);
         } else {
@@ -1646,9 +2153,44 @@ static void library_view_close_to_home()
     UI_PAGE_INTERACTION_LOGI("曲库返回主页");
 }
 
+static void library_view_switch_folder_panel(int direction)
+{
+    if (!library_view_folder_scope_active() || g_search.active || direction == 0) {
+        return;
+    }
+
+    const PlayerFolderScope scope = player_control_get_folder_scope();
+    LibraryFolderView next = g_state.folder_view;
+    if (direction > 0) { // 左滑：歌曲 -> 文件夹。
+        if (g_state.folder_view == LibraryFolderView::Tracks) {
+            if (scope == PlayerFolderScope::Level1) {
+                next = LibraryFolderView::Level1Folders;
+            } else if (scope == PlayerFolderScope::Level2) {
+                (void)library_view_resolve_level2_parent();
+                next = LibraryFolderView::Level2Folders;
+            }
+        }
+    } else { // 右滑：文件夹 -> 歌曲；二级父目录先退回二级文件夹。
+        if (g_state.folder_view == LibraryFolderView::Level2Parents) {
+            next = LibraryFolderView::Level2Folders;
+        } else if (g_state.folder_view != LibraryFolderView::Tracks) {
+            next = LibraryFolderView::Tracks;
+        }
+    }
+
+    if (next == g_state.folder_view) return;
+    library_view_store_scroll_position();
+    g_state.folder_view = next;
+    library_view_render(true);
+    UI_PAGE_INTERACTION_LOGI("目录横滑切换：scope=%s view=%u",
+        player_playlist_folder_scope_name(scope),
+        static_cast<unsigned>(g_state.folder_view));
+}
+
 static void library_view_switch_category(int direction)
 {
-    if (g_search.active || g_state.mode == LibraryBrowseMode::GroupTracks || direction == 0) {
+    if (g_search.active || library_view_folder_scope_active() ||
+        g_state.mode == LibraryBrowseMode::GroupTracks || direction == 0) {
         return;
     }
 
@@ -1675,10 +2217,16 @@ static void library_view_apply_pending_gesture_async(void *user_data)
 
     switch (action) {
         case LibraryPendingGesture::SwipeLeft:
-            library_view_switch_category(+1);
+            if (library_view_folder_scope_active()) {
+                library_view_switch_folder_panel(+1);
+            } else {
+                library_view_switch_category(+1);
+            }
             break;
         case LibraryPendingGesture::SwipeRight:
-            if (g_state.mode == LibraryBrowseMode::GroupTracks) {
+            if (library_view_folder_scope_active()) {
+                library_view_switch_folder_panel(-1);
+            } else if (g_state.mode == LibraryBrowseMode::GroupTracks) {
                 library_view_return_to_parent_category();
             } else {
                 library_view_switch_category(-1);
@@ -1717,6 +2265,7 @@ static void library_view_row_clicked_cb(lv_event_t *event)
 
     const bool selecting_track =
         row->action == LibraryRowAction::PlayAllTrack ||
+        row->action == LibraryRowAction::PlayFolderTrack ||
         row->action == LibraryRowAction::PlayGroupTrack;
     const bool transition_hold = selecting_track && player_home_prepare_track_transition_hold();
 
@@ -1758,6 +2307,14 @@ static void library_view_row_clicked_cb(lv_event_t *event)
             }
             break;
 
+        case LibraryRowAction::PlayFolderTrack:
+            if (!player_control_select_folder_queue_position(row->position)) {
+                if (transition_hold) player_home_cancel_track_transition_hold();
+                ESP_LOGW(TAG, "选择目录列表位置失败：%lu", static_cast<unsigned long>(row->position));
+                return;
+            }
+            break;
+
         case LibraryRowAction::PlayGroupTrack:
         {
             bool selected = false;
@@ -1785,6 +2342,72 @@ static void library_view_row_clicked_cb(lv_event_t *event)
             }
             break;
         }
+
+
+        case LibraryRowAction::SelectLevel1Folder:
+        {
+            char path[PLAYER_FOLDER_PATH_MAX] = {};
+            if (!player_playlist_copy_folder_option_at(
+                    PlayerFolderScope::Level1, nullptr, row->position,
+                    path, sizeof(path), nullptr) ||
+                !library_view_persist_folder_selection(PlayerFolderScope::Level1, path)) {
+                ESP_LOGW(TAG, "一级文件夹切换失败：pos=%lu",
+                    static_cast<unsigned long>(row->position));
+                return;
+            }
+            g_state.folder_view = LibraryFolderView::Tracks;
+            PlayerFolderQueueSnapshot queue = {};
+            g_state.top_scroll_y[0] = library_view_folder_queue_snapshot(&queue) && queue.current_in_queue
+                ? library_view_scroll_for_position(queue.position) : 0;
+            library_view_schedule_render();
+            UI_PAGE_INTERACTION_LOGI("一级列表文件夹已切换：%s", path);
+            return;
+        }
+
+        case LibraryRowAction::SelectLevel2Folder:
+        {
+            if (!library_view_resolve_level2_parent()) return;
+            char path[PLAYER_FOLDER_PATH_MAX] = {};
+            if (!player_playlist_copy_folder_option_at(
+                    PlayerFolderScope::Level2, g_state.level2_parent_path, row->position,
+                    path, sizeof(path), nullptr) ||
+                !library_view_persist_folder_selection(PlayerFolderScope::Level2, path)) {
+                ESP_LOGW(TAG, "二级文件夹切换失败：parent=%s pos=%lu",
+                    g_state.level2_parent_path,
+                    static_cast<unsigned long>(row->position));
+                return;
+            }
+            g_state.folder_view = LibraryFolderView::Tracks;
+            PlayerFolderQueueSnapshot queue = {};
+            g_state.top_scroll_y[0] = library_view_folder_queue_snapshot(&queue) && queue.current_in_queue
+                ? library_view_scroll_for_position(queue.position) : 0;
+            library_view_schedule_render();
+            UI_PAGE_INTERACTION_LOGI("二级列表文件夹已切换：%s", path);
+            return;
+        }
+
+        case LibraryRowAction::SelectLevel2Parent:
+        {
+            char path[PLAYER_FOLDER_PATH_MAX] = {};
+            if (!player_playlist_copy_folder_option_at(
+                    PlayerFolderScope::Level1, nullptr, row->position,
+                    path, sizeof(path), nullptr)) {
+                return;
+            }
+            snprintf(g_state.level2_parent_path, sizeof(g_state.level2_parent_path), "%s", path);
+            g_state.folder_view = LibraryFolderView::Level2Folders;
+            g_state.folder_scroll_y[1] = 0;
+            library_view_schedule_render();
+            UI_PAGE_INTERACTION_LOGI("二级目录父级切换：%s", path);
+            return;
+        }
+
+        case LibraryRowAction::FolderUp:
+            g_state.folder_view = LibraryFolderView::Level2Parents;
+            g_state.folder_scroll_y[2] = 0;
+            library_view_schedule_render();
+            UI_PAGE_INTERACTION_LOGI("二级文件夹：进入上一级目录列表");
+            return;
 
         case LibraryRowAction::None:
             return;
@@ -1825,6 +2448,15 @@ static void library_view_back_cb(lv_event_t *event)
     }
     if (g_search.active) {
         library_search_exit();
+        return;
+    }
+    if (library_view_folder_browser_active()) {
+        if (g_state.folder_view == LibraryFolderView::Level2Parents) {
+            g_state.folder_view = LibraryFolderView::Level2Folders;
+        } else {
+            g_state.folder_view = LibraryFolderView::Tracks;
+        }
+        library_view_render(true);
         return;
     }
     if (g_state.mode != LibraryBrowseMode::GroupTracks) {
@@ -1879,6 +2511,13 @@ static void library_view_create_virtual_rows()
         lv_obj_set_size(row.label, LIBRARY_ROW_W - 36, 32);
         lv_obj_set_style_text_align(row.label, LV_TEXT_ALIGN_LEFT, 0);
 
+        row.meta = library_view_create_label(
+            row.button, "", lv_color_hex(0x98A3B2), font_manager_get_ui_font());
+        lv_obj_set_pos(row.meta, LIBRARY_ROW_W - 116, 15);
+        lv_obj_set_size(row.meta, 54, 32);
+        lv_obj_set_style_text_align(row.meta, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_add_flag(row.meta, LV_OBJ_FLAG_HIDDEN);
+
         row.arrow = library_view_create_label(row.button, LV_SYMBOL_RIGHT, lv_color_hex(0x697382), lv_font_default());
         lv_obj_align(row.arrow, LV_ALIGN_RIGHT_MID, -16, 0);
         lv_obj_add_flag(row.arrow, LV_OBJ_FLAG_HIDDEN);
@@ -1912,6 +2551,54 @@ void library_view_create(lv_obj_t *screen)
     lv_obj_set_pos(g_header_title, LIBRARY_TITLE_X, 17);
     lv_obj_set_size(g_header_title, LIBRARY_TITLE_W, 34);
     lv_obj_set_style_text_align(g_header_title, LV_TEXT_ALIGN_CENTER, 0);
+
+    g_scope_icon = lv_obj_create(g_root);
+    ui_common_lock_object(g_scope_icon);
+    lv_obj_set_pos(g_scope_icon, LIBRARY_SCOPE_ICON_X, LIBRARY_SCOPE_ICON_Y);
+    lv_obj_set_size(g_scope_icon, LIBRARY_SCOPE_ICON_W, LIBRARY_SCOPE_ICON_H);
+    lv_obj_set_style_bg_opa(g_scope_icon, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(g_scope_icon, 0, 0);
+    lv_obj_set_style_pad_all(g_scope_icon, 0, 0);
+    lv_obj_clear_flag(g_scope_icon, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(g_scope_icon, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(g_scope_icon, LV_OBJ_FLAG_HIDDEN);
+
+    // 二级模式多一层后置文件夹；一级模式只显示前层。
+    g_scope_icon_back = lv_obj_create(g_scope_icon);
+    ui_common_lock_object(g_scope_icon_back);
+    lv_obj_set_pos(g_scope_icon_back, 1, 4);
+    lv_obj_set_size(g_scope_icon_back, 14, 11);
+    lv_obj_set_style_radius(g_scope_icon_back, 2, 0);
+    lv_obj_set_style_bg_opa(g_scope_icon_back, LV_OPA_10, 0);
+    lv_obj_set_style_border_width(g_scope_icon_back, 2, 0);
+    lv_obj_set_style_pad_all(g_scope_icon_back, 0, 0);
+
+    g_scope_icon_back_tab = lv_obj_create(g_scope_icon);
+    ui_common_lock_object(g_scope_icon_back_tab);
+    lv_obj_set_pos(g_scope_icon_back_tab, 1, 2);
+    lv_obj_set_size(g_scope_icon_back_tab, 7, 5);
+    lv_obj_set_style_radius(g_scope_icon_back_tab, 2, 0);
+    lv_obj_set_style_bg_opa(g_scope_icon_back_tab, LV_OPA_10, 0);
+    lv_obj_set_style_border_width(g_scope_icon_back_tab, 2, 0);
+    lv_obj_set_style_pad_all(g_scope_icon_back_tab, 0, 0);
+
+    g_scope_icon_front = lv_obj_create(g_scope_icon);
+    ui_common_lock_object(g_scope_icon_front);
+    lv_obj_set_pos(g_scope_icon_front, 6, 7);
+    lv_obj_set_size(g_scope_icon_front, 15, 11);
+    lv_obj_set_style_radius(g_scope_icon_front, 2, 0);
+    lv_obj_set_style_bg_opa(g_scope_icon_front, LV_OPA_10, 0);
+    lv_obj_set_style_border_width(g_scope_icon_front, 2, 0);
+    lv_obj_set_style_pad_all(g_scope_icon_front, 0, 0);
+
+    g_scope_icon_front_tab = lv_obj_create(g_scope_icon);
+    ui_common_lock_object(g_scope_icon_front_tab);
+    lv_obj_set_pos(g_scope_icon_front_tab, 6, 5);
+    lv_obj_set_size(g_scope_icon_front_tab, 7, 5);
+    lv_obj_set_style_radius(g_scope_icon_front_tab, 2, 0);
+    lv_obj_set_style_bg_opa(g_scope_icon_front_tab, LV_OPA_10, 0);
+    lv_obj_set_style_border_width(g_scope_icon_front_tab, 2, 0);
+    lv_obj_set_style_pad_all(g_scope_icon_front_tab, 0, 0);
 
     g_search_button = library_view_create_search_button(
         g_root, LIBRARY_SEARCH_BUTTON_X, LIBRARY_HEADER_BUTTON_Y,
@@ -2043,25 +2730,35 @@ void library_view_open()
     g_search.scroll_y = 0;
     g_search.match_count = 0U;
     quick_index_keyboard_set_visible(&g_search_keyboard, false);
-    PlayerListSnapshot playlist = {};
-    if (player_state_get_list_snapshot(&playlist) &&
-        playlist.catalog_generation == media_catalog_v2_generation() &&
-        playlist.track_count > 0U) {
-        if (playlist.type == PlayerListType::AllTracks) {
-            g_state.mode = LibraryBrowseMode::AllTracks;
-            g_state.top_scroll_y[0] = library_view_scroll_for_position(playlist.position);
-        } else {
-            g_state.mode = LibraryBrowseMode::GroupTracks;
-            g_state.detail_type = playlist.type;
-            g_state.detail_group_index = playlist.group_index;
-            g_state.detail_scroll_y = library_view_scroll_for_position(playlist.position);
-            g_state.parent_scroll_y = library_view_scroll_for_position(playlist.group_index);
-            uint8_t parent_mode = 0U;
-            if (playlist.type == PlayerListType::Artist) parent_mode = static_cast<uint8_t>(LibraryBrowseMode::Artists);
-            else if (playlist.type == PlayerListType::Album) parent_mode = static_cast<uint8_t>(LibraryBrowseMode::Albums);
-            else if (playlist.type == PlayerListType::Decade) parent_mode = static_cast<uint8_t>(LibraryBrowseMode::Decades);
-            if (parent_mode < 4U) {
-                g_state.top_scroll_y[parent_mode] = g_state.parent_scroll_y;
+    if (library_view_folder_scope_active()) {
+        PlayerFolderQueueSnapshot queue = {};
+        g_state.mode = LibraryBrowseMode::AllTracks;
+        g_state.detail_type = PlayerListType::AllTracks;
+        g_state.detail_group_index = UINT32_MAX;
+        if (library_view_folder_queue_snapshot(&queue) && queue.track_count > 0U) {
+            g_state.top_scroll_y[0] = library_view_scroll_for_position(queue.position);
+        }
+    } else {
+        PlayerListSnapshot playlist = {};
+        if (player_state_get_list_snapshot(&playlist) &&
+            playlist.catalog_generation == media_catalog_v2_generation() &&
+            playlist.track_count > 0U) {
+            if (playlist.type == PlayerListType::AllTracks) {
+                g_state.mode = LibraryBrowseMode::AllTracks;
+                g_state.top_scroll_y[0] = library_view_scroll_for_position(playlist.position);
+            } else {
+                g_state.mode = LibraryBrowseMode::GroupTracks;
+                g_state.detail_type = playlist.type;
+                g_state.detail_group_index = playlist.group_index;
+                g_state.detail_scroll_y = library_view_scroll_for_position(playlist.position);
+                g_state.parent_scroll_y = library_view_scroll_for_position(playlist.group_index);
+                uint8_t parent_mode = 0U;
+                if (playlist.type == PlayerListType::Artist) parent_mode = static_cast<uint8_t>(LibraryBrowseMode::Artists);
+                else if (playlist.type == PlayerListType::Album) parent_mode = static_cast<uint8_t>(LibraryBrowseMode::Albums);
+                else if (playlist.type == PlayerListType::Decade) parent_mode = static_cast<uint8_t>(LibraryBrowseMode::Decades);
+                if (parent_mode < 4U) {
+                    g_state.top_scroll_y[parent_mode] = g_state.parent_scroll_y;
+                }
             }
         }
     }

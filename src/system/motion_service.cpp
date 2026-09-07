@@ -30,8 +30,9 @@ static const char *TAG = "运动控制";
 
 static constexpr TickType_t IMU_SAMPLE_INTERVAL = pdMS_TO_TICKS(10);  // 100Hz host-side read
 static constexpr TickType_t GYRO_WARMUP = pdMS_TO_TICKS(250);
-static constexpr TickType_t FLIP_SEQUENCE_TIMEOUT = pdMS_TO_TICKS(2200);
+static constexpr TickType_t FLIP_SEQUENCE_TIMEOUT = pdMS_TO_TICKS(1500);
 static constexpr TickType_t FLIP_OUTBOUND_TIMEOUT = pdMS_TO_TICKS(550);
+static constexpr TickType_t FLIP_RETURN_TIMEOUT = pdMS_TO_TICKS(500);
 static constexpr TickType_t FLIP_MIN_ACTION_SPAN = pdMS_TO_TICKS(180);
 static constexpr TickType_t FLIP_RECENTER_STABLE = pdMS_TO_TICKS(150);
 static constexpr TickType_t FLIP_COOLDOWN = pdMS_TO_TICKS(1300);
@@ -102,6 +103,7 @@ static int32_t g_flip_axis_x_mg = 0;
 static int32_t g_flip_axis_y_mg = 0;
 static int32_t g_flip_axis_norm_mg = 0;
 static TickType_t g_flip_started_tick = 0;
+static TickType_t g_flip_reached_tick = 0;
 static TickType_t g_flip_last_sample_tick = 0;
 
 
@@ -150,6 +152,7 @@ static void motion_reset_flip()
     g_flip_axis_y_mg = 0;
     g_flip_axis_norm_mg = 0;
     g_flip_started_tick = 0;
+    g_flip_reached_tick = 0;
     g_flip_last_sample_tick = 0;
 }
 
@@ -381,6 +384,7 @@ static void motion_start_flip(
     g_flip_axis_y_mg = axis_y_mg;
     g_flip_axis_norm_mg = axis_norm_mg;
     g_flip_started_tick = now;
+    g_flip_reached_tick = 0;
     g_flip_last_sample_tick = now;
 
 #if FAKEPOD_MOTION_FLIP_TUNING_LOG
@@ -631,6 +635,7 @@ static void motion_process_flip(
 
         if (g_flip_peak_excursion_mdeg >= FLIP_MIN_EXCURSION_MDEG) {
             g_flip_phase = FlipPhase::ReturningSuccess;
+            g_flip_reached_tick = now;
 #if FAKEPOD_MOTION_FLIP_TUNING_LOG
             ESP_LOGI(
                 TAG,
@@ -657,9 +662,17 @@ static void motion_process_flip(
         return;
     }
 
-    // A successful gesture can lose its qualification if the whole action drags on too
-    // long. It then becomes a failed-return gesture, but still must physically return
-    // before zeroing/rearming.
+    // Once the outbound stroke has reached the target angle, the user must return
+    // promptly. A late return is allowed to re-center the detector, but it must never
+    // execute the track change. Keep the older full-sequence timeout as a secondary
+    // safety guard for abnormal timing.
+    if (g_flip_phase == FlipPhase::ReturningSuccess &&
+        g_flip_reached_tick != 0 &&
+        now - g_flip_reached_tick > FLIP_RETURN_TIMEOUT) {
+        motion_enter_failed_return("到位后未在700ms内回位，取消切歌资格", now);
+        return;
+    }
+
     if (g_flip_phase == FlipPhase::ReturningSuccess &&
         now - g_flip_started_tick > FLIP_SEQUENCE_TIMEOUT) {
         motion_enter_failed_return("完整动作超时，取消切歌资格", now);
@@ -757,7 +770,7 @@ esp_err_t motion_service_init()
         TAG,
         "Motion Controls V2.2就绪：INT1=GPIO%d ForwardFlip=下一首 BackwardFlip=上一首 DoubleTap=播放/暂停",
         FAKEPOD_IMU_INT1);
-    ESP_LOGI(TAG, "Flip：动态零点/成功失败都回位后Recenter；起手姿态宽松；Pocket Guard=Normal+Unlocked+Music");
+    ESP_LOGI(TAG, "Flip：到位后700ms内回位才生效；超时仅回位复位；动态零点Recenter；Pocket Guard=Normal+Unlocked+Music");
     return ESP_OK;
 }
 

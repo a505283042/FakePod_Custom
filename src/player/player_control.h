@@ -5,6 +5,7 @@
 
 #include "esp_err.h"
 #include "player_transport.h"
+#include "player_playlist.h"
 
 // 初始化 Player 控制串行锁。必须在 UI 启动前调用。
 esp_err_t player_control_init();
@@ -30,6 +31,14 @@ PlayerLoopMode player_control_get_loop_mode();
 PlayerLoopMode player_control_cycle_loop_mode();
 bool player_control_set_loop_mode(PlayerLoopMode mode);
 
+// 目录播放范围：总列表 / 一级目录递归 / 二级目录直属。
+// 切换只改变后续 transport 候选，不重启当前正在播放的音频。
+PlayerFolderScope player_control_get_folder_scope();
+bool player_control_set_folder_scope(PlayerFolderScope scope);
+bool player_control_set_folder_selection(PlayerFolderScope scope, const char *folder_path);
+bool player_control_copy_folder_selection(
+    PlayerFolderScope scope, char *buffer, size_t buffer_size);
+
 // 用户音量：0~100，R.13 默认 50（约 -18dB）；30%=-26dB，100%=0dB。
 // 静音状态独立于暂停；所有实际 DAC 寄存器操作仍由 AudioTask 执行。
 bool player_control_set_volume(uint8_t percent);
@@ -43,6 +52,7 @@ bool player_control_seek_ms(uint64_t target_ms);
 // Stage 10.5：由 UI/列表页绑定新的播放上下文。position 是目标 Group 内位置。
 // 这里只切 Player Context，不先单独 Stop；后续 Play 由 AudioTask 串行关闭旧 pipeline。
 bool player_control_select_all_tracks(size_t position);
+bool player_control_select_folder_queue_position(size_t position);
 bool player_control_select_artist_group(size_t group_index, size_t position);
 bool player_control_select_album_group(size_t group_index, size_t position);
 bool player_control_select_decade_group(size_t group_index, size_t position);

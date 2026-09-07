@@ -23,48 +23,42 @@ constexpr uint8_t kShuffleHistoryCapacity = 16U;
 struct ShuffleHistory
 {
     bool valid = false;
-    PlayerListType type = PlayerListType::AllTracks;
+    PlayerFolderScope preferred_scope = PlayerFolderScope::All;
+    PlayerFolderScope effective_scope = PlayerFolderScope::All;
     uint32_t catalog_generation = 0U;
-    uint32_t group_index = UINT32_MAX;
-    uint32_t group_id = UINT32_MAX;
+    uint32_t context_id = 0U;
     uint32_t track_count = 0U;
-    uint16_t decade_start = 0U;
-    bool decade_unknown = false;
     uint32_t positions[kShuffleHistoryCapacity] = {};
     uint8_t count = 0U;
 };
 
 static ShuffleHistory g_shuffle_history = {};
 
-static bool player_transport_shuffle_context_matches(const PlayerListSnapshot &list)
+static bool player_transport_shuffle_context_matches(const PlayerFolderQueueSnapshot &list)
 {
     return g_shuffle_history.valid &&
-        g_shuffle_history.type == list.type &&
+        g_shuffle_history.preferred_scope == list.preferred_scope &&
+        g_shuffle_history.effective_scope == list.effective_scope &&
         g_shuffle_history.catalog_generation == list.catalog_generation &&
-        g_shuffle_history.group_index == list.group_index &&
-        g_shuffle_history.group_id == list.group_id &&
-        g_shuffle_history.track_count == list.track_count &&
-        g_shuffle_history.decade_start == list.decade_start &&
-        g_shuffle_history.decade_unknown == list.decade_unknown;
+        g_shuffle_history.context_id == list.context_id &&
+        g_shuffle_history.track_count == list.track_count;
 }
 
-static void player_transport_shuffle_reset(const PlayerListSnapshot *list = nullptr)
+static void player_transport_shuffle_reset(const PlayerFolderQueueSnapshot *list = nullptr)
 {
     g_shuffle_history = {};
     if (list == nullptr || !list->ready) {
         return;
     }
     g_shuffle_history.valid = true;
-    g_shuffle_history.type = list->type;
+    g_shuffle_history.preferred_scope = list->preferred_scope;
+    g_shuffle_history.effective_scope = list->effective_scope;
     g_shuffle_history.catalog_generation = list->catalog_generation;
-    g_shuffle_history.group_index = list->group_index;
-    g_shuffle_history.group_id = list->group_id;
+    g_shuffle_history.context_id = list->context_id;
     g_shuffle_history.track_count = list->track_count;
-    g_shuffle_history.decade_start = list->decade_start;
-    g_shuffle_history.decade_unknown = list->decade_unknown;
 }
 
-static void player_transport_shuffle_ensure_context(const PlayerListSnapshot &list)
+static void player_transport_shuffle_ensure_context(const PlayerFolderQueueSnapshot &list)
 {
     if (!player_transport_shuffle_context_matches(list)) {
         player_transport_shuffle_reset(&list);
@@ -107,10 +101,22 @@ static bool player_transport_shuffle_pop(uint32_t *out_position)
     return true;
 }
 
-static uint32_t player_transport_shuffle_choose_position(const PlayerListSnapshot &list)
+static uint32_t player_transport_shuffle_choose_position(const PlayerFolderQueueSnapshot &list)
 {
     if (list.track_count <= 1U) {
-        return list.position;
+        return 0U;
+    }
+
+    // R2 刚选择新目录且当前歌曲不在该目录时，没有“当前队列位置”需要避开；
+    // 此时随机可以从全部候选中任选。
+    if (!list.current_in_queue) {
+        for (uint8_t attempt = 0U; attempt < 12U; ++attempt) {
+            const uint32_t candidate = esp_random() % list.track_count;
+            if (!player_transport_shuffle_history_contains(candidate)) {
+                return candidate;
+            }
+        }
+        return esp_random() % list.track_count;
     }
 
     // 优先避开“当前首 + 最近随机历史”。列表很小时若历史占满候选，再退化为只避开当前首。
@@ -161,9 +167,9 @@ bool player_transport_set_loop_mode(PlayerLoopMode mode)
     g_loop_mode.store(static_cast<uint8_t>(mode), std::memory_order_relaxed);
 
     if (mode == PlayerLoopMode::Shuffle && previous != PlayerLoopMode::Shuffle) {
-        PlayerListSnapshot list = {};
+        PlayerFolderQueueSnapshot list = {};
         player_transport_shuffle_reset(
-            player_state_get_list_snapshot(&list) ? &list : nullptr);
+            player_state_get_folder_queue_snapshot(&list) ? &list : nullptr);
     } else if (mode != PlayerLoopMode::Shuffle) {
         player_transport_shuffle_reset();
     }
@@ -230,21 +236,26 @@ bool player_transport_play_current(const char *reason)
 
 static bool player_transport_shuffle_next(const char *reason)
 {
-    PlayerListSnapshot list = {};
-    if (!player_state_get_list_snapshot(&list) || list.track_count == 0U) {
-        ESP_LOGW(TAG, "随机下一首：当前播放列表不可用");
+    PlayerFolderQueueSnapshot list = {};
+    if (!player_state_get_folder_queue_snapshot(&list) || list.track_count == 0U) {
+        ESP_LOGW(TAG, "随机下一首：当前目录播放范围不可用");
         return false;
     }
 
     player_transport_shuffle_ensure_context(list);
     if (list.track_count == 1U) {
+        if (!list.current_in_queue && !player_state_select_folder_queue_position(0U)) {
+            return false;
+        }
         return player_transport_play_current(reason != nullptr ? reason : "随机单曲重播");
     }
 
     const uint32_t next_position = player_transport_shuffle_choose_position(list);
-    player_transport_shuffle_push(list.position);
-    if (!player_state_select_position(next_position)) {
-        ESP_LOGW(TAG, "随机下一首：选择 position=%lu 失败",
+    if (list.current_in_queue) {
+        player_transport_shuffle_push(list.position);
+    }
+    if (!player_state_select_folder_queue_position(next_position)) {
+        ESP_LOGW(TAG, "随机下一首：选择目录队列 position=%lu 失败",
             static_cast<unsigned long>(next_position));
         return false;
     }
@@ -272,16 +283,16 @@ bool player_transport_previous()
     }
 
     if (player_transport_get_loop_mode() == PlayerLoopMode::Shuffle) {
-        PlayerListSnapshot list = {};
-        if (!player_state_get_list_snapshot(&list) || list.track_count == 0U) {
+        PlayerFolderQueueSnapshot list = {};
+        if (!player_state_get_folder_queue_snapshot(&list) || list.track_count == 0U) {
             return false;
         }
         player_transport_shuffle_ensure_context(list);
 
         uint32_t previous_position = 0U;
         if (player_transport_shuffle_pop(&previous_position)) {
-            if (!player_state_select_position(previous_position)) {
-                ESP_LOGW(TAG, "随机上一首：历史 position=%lu 已不可用",
+            if (!player_state_select_folder_queue_position(previous_position)) {
+                ESP_LOGW(TAG, "随机上一首：目录队列历史 position=%lu 已不可用",
                     static_cast<unsigned long>(previous_position));
                 return false;
             }
@@ -347,9 +358,9 @@ static void player_transport_handle_finished(const AudioStateSnapshot &audio)
     }
     g_last_finished_playback_revision = audio.playback_revision;
 
-    PlayerListSnapshot list = {};
-    if (!player_state_get_list_snapshot(&list) || list.track_count == 0U) {
-        ESP_LOGW(TAG, "AUTO_NEXT_TRACE: EOF 后播放列表不可用，停止自动续播");
+    PlayerFolderQueueSnapshot list = {};
+    if (!player_state_get_folder_queue_snapshot(&list) || list.track_count == 0U) {
+        ESP_LOGW(TAG, "AUTO_NEXT_TRACE: EOF 后目录播放范围不可用，停止自动续播");
         return;
     }
 
@@ -368,11 +379,13 @@ static void player_transport_handle_finished(const AudioStateSnapshot &audio)
     const PlayerLoopMode mode = player_transport_get_loop_mode();
 #if APP_DIAG_PLAYER_TRANSPORT
     ESP_LOGI(TAG,
-        "AUTO_NEXT_TRACE: EOF mode=%s list=%s pos=%lu/%lu track=%lu playback_rev=%lu",
+        "AUTO_NEXT_TRACE: EOF mode=%s scope=%s effective=%s pos=%lu/%lu in_queue=%u track=%lu playback_rev=%lu",
         player_transport_loop_mode_name(mode),
-        player_playlist_type_name(list.type),
-        static_cast<unsigned long>(list.position + 1U),
+        player_playlist_folder_scope_name(list.preferred_scope),
+        player_playlist_folder_scope_name(list.effective_scope),
+        static_cast<unsigned long>(list.current_in_queue ? list.position + 1U : 0U),
         static_cast<unsigned long>(list.track_count),
+        list.current_in_queue ? 1U : 0U,
         static_cast<unsigned long>(list.track_index),
         static_cast<unsigned long>(audio.playback_revision));
 #endif
@@ -391,7 +404,8 @@ static void player_transport_handle_finished(const AudioStateSnapshot &audio)
         return;
     }
 
-    if (mode == PlayerLoopMode::Sequential && list.position + 1U >= list.track_count) {
+    if (mode == PlayerLoopMode::Sequential &&
+        list.current_in_queue && list.position + 1U >= list.track_count) {
 #if APP_DIAG_PLAYER_TRANSPORT
         ESP_LOGI(TAG, "AUTO_NEXT_TRACE: 顺序播放已到列表末尾，保持 Finished");
 #endif

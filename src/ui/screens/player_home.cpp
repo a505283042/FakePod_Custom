@@ -3642,6 +3642,13 @@ static void player_home_refresh_track(const AudioStateSnapshot *audio_snapshot)
 
     const size_t index = player_state_get_index();
     const size_t list_position = player_state_get_list_position();
+    size_t list_display_position = list_count > 0U ? list_position + 1U : 0U;
+    if (player_control_get_folder_scope() != PlayerFolderScope::All) {
+        PlayerFolderQueueSnapshot folder_queue = {};
+        if (player_state_get_folder_queue_snapshot(&folder_queue) && !folder_queue.current_in_queue) {
+            list_display_position = 0U;
+        }
+    }
     MediaTrackViewV2 view = {};
     const bool have_view = media_catalog_v2_get_track_view(index, &view);
 
@@ -3681,7 +3688,7 @@ static void player_home_refresh_track(const AudioStateSnapshot *audio_snapshot)
             track_info,
             sizeof(track_info),
             "%u / %u  ·  %s  ·  %s",
-            static_cast<unsigned>(list_position + 1U),
+            static_cast<unsigned>(list_display_position),
             static_cast<unsigned>(list_count),
             media_format_name(player_state_get_format()),
             sample_info);
@@ -3690,7 +3697,7 @@ static void player_home_refresh_track(const AudioStateSnapshot *audio_snapshot)
             track_info,
             sizeof(track_info),
             "%u / %u  ·  %s",
-            static_cast<unsigned>(list_position + 1U),
+            static_cast<unsigned>(list_display_position),
             static_cast<unsigned>(list_count),
             media_format_name(player_state_get_format()));
     }
@@ -4488,11 +4495,19 @@ void player_home_create(lv_obj_t *screen)
     if (!player_state_copy_list_label(list_label, sizeof(list_label))) {
         snprintf(list_label, sizeof(list_label), "未知列表");
     }
+    const size_t boot_list_count = player_state_get_list_count();
+    size_t boot_list_display_position = boot_list_count > 0U ? player_state_get_list_position() + 1U : 0U;
+    if (player_control_get_folder_scope() != PlayerFolderScope::All) {
+        PlayerFolderQueueSnapshot boot_folder_queue = {};
+        if (player_state_get_folder_queue_snapshot(&boot_folder_queue) && !boot_folder_queue.current_in_queue) {
+            boot_list_display_position = 0U;
+        }
+    }
     HOME_BOOT_LOGI(
         "主页配置：list=%s pos=%u/%u track=%u loop=%s volume=%u%% mute=%u Cover=normal+dimmed Launcher=wire-strip",
         list_label,
-        static_cast<unsigned>(player_state_get_list_count() > 0 ? player_state_get_list_position() + 1 : 0),
-        static_cast<unsigned>(player_state_get_list_count()),
+        static_cast<unsigned>(boot_list_display_position),
+        static_cast<unsigned>(boot_list_count),
         static_cast<unsigned>(media_library_get_count() > 0 ? player_state_get_index() : 0),
         player_transport_loop_mode_name(player_control_get_loop_mode()),
         static_cast<unsigned>(snapshot.volume_percent),

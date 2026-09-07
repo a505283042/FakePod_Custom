@@ -507,11 +507,12 @@ static void aod_refresh_now_playing_if_due(const TickType_t now_tick)
     (void)audio_service_get_snapshot(&snap);
 
     // 2) 曲目信息（title / artist）
-    const size_t list_cnt = player_state_get_list_count();
-    const size_t idx      = player_state_get_index();
+    const size_t library_cnt = media_library_get_count();
+    const size_t idx         = player_state_get_index();
     bool    song_changed = false;
 
-    if (list_cnt == 0U || idx >= list_cnt) {
+    // idx 是全局 Catalog Track index，不能拿目录播放队列的 track_count 做边界判断。
+    if (library_cnt == 0U || idx >= library_cnt) {
         if (g_aod_last_track_idx != UINT32_MAX) {
             lv_label_set_text(g_aod_title, "— 未在播放 —");
             lv_label_set_text(g_aod_lyric, "");

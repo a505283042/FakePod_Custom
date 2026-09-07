@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -20,6 +21,7 @@
 #include "font/usb_service_font.h"
 #include "gesture/gesture_router.h"
 #include "persistent_state.h"
+#include "player_control.h"
 #include "player_state.h"
 #include "sdcard.h"
 #include "storage_io.h"
@@ -119,6 +121,11 @@ static uint8_t g_brightness_drag_start = 60U;
 static uint8_t g_brightness_saved_level = 60U;
 static uint8_t g_brightness_pending_level = 60U;
 static bool g_brightness_dirty = false;
+static DeviceMusicListScope g_music_scope_saved = DeviceMusicListScope::All;
+static DeviceMusicListScope g_music_scope_pending = DeviceMusicListScope::All;
+static bool g_music_scope_dirty = false;
+
+static void music_list_commit_on_exit();
 
 static void set_visible(lv_obj_t *obj, bool visible)
 {
@@ -169,6 +176,20 @@ static SettingsPage page_for_category(SettingsCategory category)
         case SettingsCategory::System: return SettingsPage::System;
         case SettingsCategory::About: return SettingsPage::About;
         default: return SettingsPage::Main;
+    }
+}
+
+static SettingsPage parent_page(SettingsPage page)
+{
+    switch (page) {
+        case SettingsPage::Connection:
+        case SettingsPage::Applications:
+        case SettingsPage::System:
+        case SettingsPage::About:
+            return SettingsPage::Main;
+        case SettingsPage::Main:
+        default:
+            return SettingsPage::Main;
     }
 }
 
@@ -929,7 +950,8 @@ static void usb_tf_runtime_enter_task(void *)
     bool lyrics_quiet = false;
     bool storage_exclusive = false;
 
-    // 软件热切换不会经过 Settings leave，因此显式提交本会话亮度和播放器持久化状态。
+    // 软件热切换不会经过 Settings leave，因此显式提交本会话设置与播放器持久化状态。
+    music_list_commit_on_exit();
     brightness_commit_on_exit();
     const esp_err_t persistent_ret = persistent_state_flush();
     if (persistent_ret != ESP_OK) {
@@ -1224,10 +1246,208 @@ static void create_connection_page(const DeviceSettingsSnapshot &settings)
     add_detail_row(3, "飞行模式", "待接入", SettingsDetailIcon::Airplane, false);
 }
 
-static void create_applications_page()
+static PlayerFolderScope player_folder_scope_from_setting(DeviceMusicListScope scope)
 {
+    switch (scope) {
+        case DeviceMusicListScope::All: return PlayerFolderScope::All;
+        case DeviceMusicListScope::Level1: return PlayerFolderScope::Level1;
+        case DeviceMusicListScope::Level2: return PlayerFolderScope::Level2;
+    }
+    return PlayerFolderScope::All;
+}
+
+static bool music_current_folder_path(
+    PlayerFolderScope scope, char *buffer, size_t buffer_size)
+{
+    if ((scope != PlayerFolderScope::Level1 && scope != PlayerFolderScope::Level2) ||
+        buffer == nullptr || buffer_size == 0U) {
+        return false;
+    }
+    buffer[0] = '\0';
+    const char *track_path = player_state_get_path();
+    static constexpr const char *kMusicPrefix = "/sdcard/MUSIC/";
+    const size_t root_length = strlen(kMusicPrefix);
+    if (track_path == nullptr || strncasecmp(track_path, kMusicPrefix, root_length) != 0) {
+        return false;
+    }
+
+    const char *relative = track_path + root_length;
+    const char *first = strchr(relative, '/');
+    if (first == nullptr) return false;
+    const char *end = first;
+    if (scope == PlayerFolderScope::Level2) {
+        const char *second = strchr(first + 1U, '/');
+        if (second == nullptr) return false;
+        end = second;
+    }
+
+    const size_t length = static_cast<size_t>(end - track_path) + 1U;
+    if (length + 1U > buffer_size) return false;
+    memcpy(buffer, track_path, length);
+    buffer[length] = '\0';
+    return player_playlist_folder_selection_available(scope, buffer, nullptr);
+}
+
+static bool music_first_folder_path(
+    PlayerFolderScope scope, char *buffer, size_t buffer_size)
+{
+    if (buffer == nullptr || buffer_size == 0U) return false;
+    buffer[0] = '\0';
+    if (scope == PlayerFolderScope::Level1) {
+        return player_playlist_copy_folder_option_at(
+            PlayerFolderScope::Level1, nullptr, 0U, buffer, buffer_size, nullptr);
+    }
+    if (scope != PlayerFolderScope::Level2) return false;
+
+    const size_t parent_count = player_playlist_get_folder_option_count(PlayerFolderScope::Level1, nullptr);
+    for (size_t parent = 0U; parent < parent_count; ++parent) {
+        char parent_path[PLAYER_FOLDER_PATH_MAX] = {};
+        if (!player_playlist_copy_folder_option_at(
+                PlayerFolderScope::Level1, nullptr, parent,
+                parent_path, sizeof(parent_path), nullptr)) {
+            continue;
+        }
+        if (player_playlist_copy_folder_option_at(
+                PlayerFolderScope::Level2, parent_path, 0U,
+                buffer, buffer_size, nullptr)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool music_resolve_folder_path(
+    PlayerFolderScope scope, const char *saved_path, char *buffer, size_t buffer_size)
+{
+    if (buffer == nullptr || buffer_size == 0U) return false;
+    buffer[0] = '\0';
+    if (saved_path != nullptr && saved_path[0] != '\0' &&
+        player_playlist_folder_selection_available(scope, saved_path, nullptr) &&
+        strlen(saved_path) + 1U <= buffer_size) {
+        snprintf(buffer, buffer_size, "%s", saved_path);
+        return true;
+    }
+    if (music_current_folder_path(scope, buffer, buffer_size)) {
+        return true;
+    }
+    return music_first_folder_path(scope, buffer, buffer_size);
+}
+
+static bool music_list_restore_runtime(const DeviceMusicListSelection &selection)
+{
+    if (selection.level1_path[0] != '\0') {
+        (void)player_control_set_folder_selection(PlayerFolderScope::Level1, selection.level1_path);
+    }
+    if (selection.level2_path[0] != '\0') {
+        (void)player_control_set_folder_selection(PlayerFolderScope::Level2, selection.level2_path);
+    }
+    return player_control_set_folder_scope(player_folder_scope_from_setting(selection.scope));
+}
+
+static bool music_list_apply_scope(DeviceMusicListScope scope)
+{
+    DeviceMusicListSelection previous = {};
+    if (!device_settings_get_music_list_selection(&previous)) return false;
+
+    char level1_path[PLAYER_FOLDER_PATH_MAX] = {};
+    char level2_path[PLAYER_FOLDER_PATH_MAX] = {};
+    snprintf(level1_path, sizeof(level1_path), "%s", previous.level1_path);
+    snprintf(level2_path, sizeof(level2_path), "%s", previous.level2_path);
+
+    const PlayerFolderScope player_scope = player_folder_scope_from_setting(scope);
+    if (scope == DeviceMusicListScope::Level1) {
+        if (!music_resolve_folder_path(
+                PlayerFolderScope::Level1, previous.level1_path,
+                level1_path, sizeof(level1_path)) ||
+            !player_control_set_folder_selection(PlayerFolderScope::Level1, level1_path)) {
+            ESP_LOGW(TAG, "没有可用的一级音乐文件夹");
+            return false;
+        }
+    } else if (scope == DeviceMusicListScope::Level2) {
+        if (!music_resolve_folder_path(
+                PlayerFolderScope::Level2, previous.level2_path,
+                level2_path, sizeof(level2_path)) ||
+            !player_control_set_folder_selection(PlayerFolderScope::Level2, level2_path)) {
+            ESP_LOGW(TAG, "没有含直属音乐的二级文件夹");
+            return false;
+        }
+    }
+
+    if (!player_control_set_folder_scope(player_scope)) {
+        (void)music_list_restore_runtime(previous);
+        return false;
+    }
+
+    const esp_err_t ret = device_settings_set_music_list_selection(scope, level1_path, level2_path);
+    if (ret != ESP_OK) {
+        (void)music_list_restore_runtime(previous);
+        ESP_LOGW(TAG, "保存播放列表范围失败：%s", esp_err_to_name(ret));
+        return false;
+    }
+
+    ESP_LOGI(TAG, "播放列表范围已切换：%s；文件夹在主页下拉列表左滑切换",
+        device_settings_music_list_scope_name(scope));
+    return true;
+}
+
+static DeviceMusicListScope next_music_list_scope(DeviceMusicListScope scope)
+{
+    switch (scope) {
+        case DeviceMusicListScope::All: return DeviceMusicListScope::Level1;
+        case DeviceMusicListScope::Level1: return DeviceMusicListScope::Level2;
+        case DeviceMusicListScope::Level2:
+        default:
+            return DeviceMusicListScope::All;
+    }
+}
+
+static void music_list_scope_cycle_click_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event) || g_page != SettingsPage::Applications) return;
+    g_music_scope_pending = next_music_list_scope(g_music_scope_pending);
+    g_music_scope_dirty = g_music_scope_pending != g_music_scope_saved;
+
+    if (g_detail_values[1] != nullptr) {
+        lv_label_set_text(
+            g_detail_values[1],
+            device_settings_music_list_scope_name(g_music_scope_pending));
+        lv_obj_invalidate(g_detail_values[1]);
+    }
+    ESP_LOGI(TAG, "播放列表范围待保存：%s（退出设置时生效）",
+        device_settings_music_list_scope_name(g_music_scope_pending));
+}
+
+static void music_list_commit_on_exit()
+{
+    if (!g_music_scope_dirty) return;
+
+    const DeviceMusicListScope requested = g_music_scope_pending;
+    if (!music_list_apply_scope(requested)) {
+        ESP_LOGW(TAG, "退出设置时应用播放列表范围失败：%s；保持=%s",
+            device_settings_music_list_scope_name(requested),
+            device_settings_music_list_scope_name(g_music_scope_saved));
+        g_music_scope_pending = g_music_scope_saved;
+        g_music_scope_dirty = false;
+        return;
+    }
+
+    g_music_scope_saved = requested;
+    g_music_scope_pending = requested;
+    g_music_scope_dirty = false;
+    ESP_LOGI(TAG, "退出设置保存播放列表范围：%s",
+        device_settings_music_list_scope_name(requested));
+}
+
+static void create_applications_page(const DeviceSettingsSnapshot &settings)
+{
+    (void)settings;
     add_detail_row(0, "自启动APP", "待接入", SettingsDetailIcon::Startup, false);
-    add_detail_row(1, "音乐播放器", "待接入", SettingsDetailIcon::Music, false);
+    add_clickable_detail_row(
+        1,
+        "播放列表范围",
+        device_settings_music_list_scope_name(g_music_scope_pending),
+        SettingsDetailIcon::Music,
+        music_list_scope_cycle_click_cb);
     add_detail_row(2, "视频播放器", "待接入", SettingsDetailIcon::Video, false);
     add_detail_row(3, "文本阅读", "待接入", SettingsDetailIcon::Reader, false);
     add_detail_row(4, "电子音流", "待接入", SettingsDetailIcon::Synth, false);
@@ -1287,10 +1507,16 @@ static void show_page(SettingsPage page)
     DeviceSettingsSnapshot settings = {};
     (void)device_settings_get_snapshot(&settings);
 
+    // Settings 根容器继续保持不可滚动，避免与底部 Launcher/右滑返回手势冲突。
+    lv_obj_remove_flag(g_content, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(g_content, LV_DIR_NONE);
+    lv_obj_set_scrollbar_mode(g_content, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_scroll_to(g_content, 0, 0, LV_ANIM_OFF);
+
     switch (page) {
         case SettingsPage::Main: create_main_page(); break;
         case SettingsPage::Connection: create_connection_page(settings); break;
-        case SettingsPage::Applications: create_applications_page(); break;
+        case SettingsPage::Applications: create_applications_page(settings); break;
         case SettingsPage::System: create_system_page(settings); break;
         case SettingsPage::About: create_about_page(); break;
     }
@@ -1312,7 +1538,7 @@ static void back_click_cb(lv_event_t *event)
 {
     if (!click_is_valid(event)) return;
     if (g_page != SettingsPage::Main) {
-        show_page(SettingsPage::Main);
+        show_page(parent_page(g_page));
         return;
     }
     lv_async_call(return_music_async, nullptr);
@@ -1339,8 +1565,11 @@ static void gesture_timer_cb(lv_timer_t *timer)
         return;
     }
     if (action == UiGestureAction::SwipeRight) {
-        if (g_page != SettingsPage::Main) show_page(SettingsPage::Main);
-        else lv_async_call(return_music_async, nullptr);
+        if (g_page != SettingsPage::Main) {
+            show_page(parent_page(g_page));
+        } else {
+            lv_async_call(return_music_async, nullptr);
+        }
     }
 }
 
@@ -1498,11 +1727,14 @@ static esp_err_t settings_enter()
     if (device_settings_get_snapshot(&settings)) {
         g_brightness_saved_level = settings.brightness_level;
         g_brightness_pending_level = settings.brightness_level;
+        g_music_scope_saved = settings.music_list_scope;
+        g_music_scope_pending = settings.music_list_scope;
     } else {
         g_brightness_saved_level = screen_lock_simple_get_normal_brightness();
         g_brightness_pending_level = g_brightness_saved_level;
     }
     g_brightness_dirty = false;
+    g_music_scope_dirty = false;
     show_page(SettingsPage::Main);
     lv_timer_reset(g_timer);
     lv_timer_resume(g_timer);
@@ -1520,7 +1752,8 @@ static esp_err_t settings_enter()
 static esp_err_t settings_leave(AppRunState next_state)
 {
     if (next_state != AppRunState::Stopped) return ESP_ERR_NOT_SUPPORTED;
-    // 亮度预览整个Settings会话只驻留RAM；真正离开Settings时才提交一次NVS。
+    // 会话内只预览/滚选；真正离开Settings时才提交一次NVS并切换播放器范围。
+    music_list_commit_on_exit();
     brightness_commit_on_exit();
     if (g_timer != nullptr) lv_timer_pause(g_timer);
     if (g_refresh_timer != nullptr) lv_timer_pause(g_refresh_timer);
@@ -1534,6 +1767,7 @@ static esp_err_t settings_leave(AppRunState next_state)
 static void settings_destroy()
 {
     // 防御性兜底：若生命周期异常直接destroy，也只在dirty时提交一次。
+    music_list_commit_on_exit();
     brightness_commit_on_exit();
     gesture_router_set_control_capture(false);
     gesture_router_set_vertical_adjust_enabled(false);
