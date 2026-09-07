@@ -33,6 +33,7 @@ struct GestureState
     bool control_capture = false;
     bool suppress_click = false;
     bool vertical_adjust_enabled = false;
+    bool vertical_adjust_edges_reserved = false;
     bool vertical_adjust_active = false;
     bool vertical_adjust_released = false;
     uint32_t vertical_adjust_sequence = 0U;
@@ -69,6 +70,10 @@ static bool gesture_speed_ok(int32_t distance_px, uint32_t elapsed_ms, uint32_t 
 static bool gesture_try_activate_vertical_adjust(int32_t dx, int32_t dy)
 {
     if (!g_state.vertical_adjust_enabled) {
+        return false;
+    }
+    if (g_state.vertical_adjust_edges_reserved &&
+        (g_state.start_y <= kTopEdgePx || g_state.start_y >= kBottomEdgePx)) {
         return false;
     }
     if (g_state.vertical_adjust_active) {
@@ -258,6 +263,11 @@ void gesture_router_set_vertical_adjust_enabled(bool enabled)
         g_state.vertical_adjust_active = false;
         g_state.vertical_adjust_released = false;
     }
+}
+
+void gesture_router_set_vertical_adjust_edges_reserved(bool reserved)
+{
+    g_state.vertical_adjust_edges_reserved = reserved;
 }
 
 bool gesture_router_get_vertical_adjust(UiVerticalAdjustSnapshot *out_snapshot)

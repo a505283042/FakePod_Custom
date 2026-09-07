@@ -11,6 +11,7 @@
 
 #include "app_manager.h"
 #include "board_pins.h"
+#include "device_settings.h"
 #include "player_control.h"
 #include "qmi8658.h"
 #include "screen_lock_simple.h"
@@ -127,6 +128,10 @@ static bool motion_tick_before(TickType_t now, TickType_t deadline)
 
 static bool motion_controls_allowed()
 {
+    DeviceSettingsSnapshot settings = {};
+    if (!device_settings_get_snapshot(&settings) || !settings.motion_controls_enabled) {
+        return false;
+    }
     if (!app_manager_is_ready() || app_manager_foreground() != AppId::Music) {
         return false;
     }
@@ -669,7 +674,7 @@ static void motion_process_flip(
     if (g_flip_phase == FlipPhase::ReturningSuccess &&
         g_flip_reached_tick != 0 &&
         now - g_flip_reached_tick > FLIP_RETURN_TIMEOUT) {
-        motion_enter_failed_return("到位后未在700ms内回位，取消切歌资格", now);
+        motion_enter_failed_return("到位后未在500ms内回位，取消切歌资格", now);
         return;
     }
 
@@ -768,9 +773,9 @@ esp_err_t motion_service_init()
 
     ESP_LOGI(
         TAG,
-        "Motion Controls V2.2就绪：INT1=GPIO%d ForwardFlip=下一首 BackwardFlip=上一首 DoubleTap=播放/暂停",
+        "Motion Controls V2.2就绪：INT1=GPIO%d ForwardFlip=下一首 BackwardFlip=上一首 DoubleTap=播放/暂停；设置-系统可关闭",
         FAKEPOD_IMU_INT1);
-    ESP_LOGI(TAG, "Flip：到位后700ms内回位才生效；超时仅回位复位；动态零点Recenter；Pocket Guard=Normal+Unlocked+Music");
+    ESP_LOGI(TAG, "Flip：到位后500ms内回位才生效；超时仅回位复位；动态零点Recenter；Pocket Guard=Normal+Unlocked+Music");
     return ESP_OK;
 }
 

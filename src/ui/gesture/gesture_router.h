@@ -37,6 +37,8 @@ struct UiVerticalAdjustSnapshot
 };
 
 void gesture_router_set_vertical_adjust_enabled(bool enabled);
+// 设置页等滚动页面可保留顶部/底部边缘给全局导航，避免连续纵向拖动抢走Launcher手势。
+void gesture_router_set_vertical_adjust_edges_reserved(bool reserved);
 bool gesture_router_get_vertical_adjust(UiVerticalAdjustSnapshot *out_snapshot);
 bool gesture_router_vertical_adjust_is_engaged();
 void gesture_router_ack_vertical_adjust_release(uint32_t sequence);

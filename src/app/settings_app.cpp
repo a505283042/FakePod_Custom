@@ -56,6 +56,7 @@ static constexpr int16_t kMainGridHeight =
 static constexpr int16_t kContentX = 18;
 static constexpr int16_t kContentWidth = 424;
 static constexpr int16_t kContentTop = 68;
+static constexpr int16_t kContentHeight = 360;
 static constexpr int16_t kDetailRowHeight = 64;
 static constexpr int16_t kDetailRowGap = 8;
 static constexpr uint32_t kRefreshPeriodMs = 500U;
@@ -63,6 +64,8 @@ static constexpr int16_t kTapMovePx = 14;
 static constexpr uint8_t kBrightnessMin = 5U;
 static constexpr uint8_t kBrightnessMax = 100U;
 static constexpr int16_t kBrightnessFullScalePx = 280;
+static constexpr int32_t kDetailInertiaStartPxPerSec = 180;
+static constexpr int32_t kDetailInertiaStopPxPerSec = 45;
 
 enum class SettingsPage : uint8_t {
     Main = 0,
@@ -106,10 +109,11 @@ static lv_obj_t *g_header_back = nullptr;
 static lv_obj_t *g_header_title = nullptr;
 static lv_obj_t *g_header_line = nullptr;
 static lv_obj_t *g_content = nullptr;
+static lv_obj_t *g_detail_host = nullptr;
 static lv_timer_t *g_timer = nullptr;
 static lv_timer_t *g_refresh_timer = nullptr;
 static SettingsPage g_page = SettingsPage::Main;
-static lv_obj_t *g_detail_values[6] = {};
+static lv_obj_t *g_detail_values[16] = {};
 static SettingsPage g_pending_page = SettingsPage::Main;
 static bool g_audio_mode_switching = false;
 static lv_obj_t *g_brightness_card = nullptr;
@@ -124,8 +128,19 @@ static bool g_brightness_dirty = false;
 static DeviceMusicListScope g_music_scope_saved = DeviceMusicListScope::All;
 static DeviceMusicListScope g_music_scope_pending = DeviceMusicListScope::All;
 static bool g_music_scope_dirty = false;
+static int32_t g_detail_saved_scroll_y[5] = {};
+static int32_t g_detail_scroll_y = 0;
+static int32_t g_detail_scroll_max_y = 0;
+static int32_t g_detail_drag_start_scroll_y = 0;
+static int32_t g_detail_drag_last_scroll_y = 0;
+static int32_t g_detail_scroll_velocity_px_s = 0;
+static uint32_t g_detail_drag_sequence = 0U;
+static uint32_t g_detail_drag_last_tick_ms = 0U;
+static uint32_t g_detail_inertia_last_tick_ms = 0U;
+static bool g_detail_inertia_active = false;
 
 static void music_list_commit_on_exit();
+static void settings_update_vertical_adjust_channel();
 
 static void set_visible(lv_obj_t *obj, bool visible)
 {
@@ -196,8 +211,173 @@ static SettingsPage parent_page(SettingsPage page)
 static void clear_detail_value_refs()
 {
     for (lv_obj_t *&label : g_detail_values) label = nullptr;
+    g_detail_host = nullptr;
     g_brightness_card = nullptr;
     g_brightness_value = nullptr;
+}
+
+static size_t settings_page_index(SettingsPage page)
+{
+    const size_t index = static_cast<size_t>(page);
+    return index < 5U ? index : 0U;
+}
+
+static lv_obj_t *detail_parent()
+{
+    return g_detail_host != nullptr ? g_detail_host : g_content;
+}
+
+static int32_t detail_clamp_scroll_y(int32_t y)
+{
+    if (y < 0) return 0;
+    if (y > g_detail_scroll_max_y) return g_detail_scroll_max_y;
+    return y;
+}
+
+static void detail_apply_scroll_y(int32_t y)
+{
+    if (g_detail_host == nullptr) return;
+    const int32_t clamped = detail_clamp_scroll_y(y);
+    g_detail_scroll_y = clamped;
+    g_detail_saved_scroll_y[settings_page_index(g_page)] = clamped;
+    lv_obj_set_y(g_detail_host, -clamped);
+    lv_obj_invalidate(g_content);
+}
+
+static uint16_t detail_row_count_for_page(SettingsPage page)
+{
+    switch (page) {
+        case SettingsPage::Connection: return 4U;
+        case SettingsPage::Applications: return 5U;
+        case SettingsPage::System: return 6U;
+        case SettingsPage::About: return 5U;
+        case SettingsPage::Main:
+        default:
+            return 0U;
+    }
+}
+
+static void detail_prepare(SettingsPage page)
+{
+    g_detail_scroll_velocity_px_s = 0;
+    g_detail_drag_sequence = 0U;
+    g_detail_drag_last_tick_ms = 0U;
+    g_detail_inertia_last_tick_ms = 0U;
+    g_detail_inertia_active = false;
+    g_detail_scroll_max_y = 0;
+    g_detail_scroll_y = 0;
+
+    const uint16_t row_count = detail_row_count_for_page(page);
+    if (row_count == 0U || g_content == nullptr) return;
+
+    const int32_t content_h = static_cast<int32_t>(row_count) *
+        static_cast<int32_t>(kDetailRowHeight + kDetailRowGap) - kDetailRowGap;
+    g_detail_scroll_max_y = content_h > kContentHeight ? content_h - kContentHeight : 0;
+    g_detail_scroll_y = detail_clamp_scroll_y(g_detail_saved_scroll_y[settings_page_index(page)]);
+    g_detail_saved_scroll_y[settings_page_index(page)] = g_detail_scroll_y;
+
+    g_detail_host = lv_obj_create(g_content);
+    if (g_detail_host == nullptr) {
+        g_detail_scroll_max_y = 0;
+        g_detail_scroll_y = 0;
+        return;
+    }
+    ui_common_lock_object(g_detail_host);
+    lv_obj_set_size(g_detail_host, kContentWidth, content_h > kContentHeight ? content_h : kContentHeight);
+    lv_obj_set_pos(g_detail_host, 0, -g_detail_scroll_y);
+    lv_obj_set_style_radius(g_detail_host, 0, 0);
+    lv_obj_set_style_border_width(g_detail_host, 0, 0);
+    lv_obj_set_style_pad_all(g_detail_host, 0, 0);
+    lv_obj_set_style_bg_opa(g_detail_host, LV_OPA_TRANSP, 0);
+    lv_obj_remove_flag(g_detail_host, LV_OBJ_FLAG_SCROLLABLE);
+}
+
+static void settings_update_vertical_adjust_channel()
+{
+    const bool enable = g_brightness_adjust_armed ||
+        (g_page != SettingsPage::Main && g_detail_scroll_max_y > 0);
+    gesture_router_set_vertical_adjust_enabled(enable);
+    gesture_router_set_vertical_adjust_edges_reserved(enable);
+    if (!enable) {
+        g_detail_inertia_active = false;
+        g_detail_scroll_velocity_px_s = 0;
+    }
+}
+
+static bool detail_scroll_gesture_update()
+{
+    if (g_page == SettingsPage::Main || g_brightness_adjust_armed ||
+        g_detail_host == nullptr || g_detail_scroll_max_y <= 0) {
+        return false;
+    }
+
+    UiVerticalAdjustSnapshot drag = {};
+    if (!gesture_router_get_vertical_adjust(&drag)) {
+        return false;
+    }
+
+    const uint32_t now = lv_tick_get();
+    if (g_detail_drag_sequence != drag.sequence) {
+        g_detail_drag_sequence = drag.sequence;
+        g_detail_drag_start_scroll_y = g_detail_scroll_y;
+        g_detail_drag_last_scroll_y = g_detail_scroll_y;
+        g_detail_drag_last_tick_ms = now;
+        g_detail_scroll_velocity_px_s = 0;
+        g_detail_inertia_active = false;
+    }
+
+    detail_apply_scroll_y(g_detail_drag_start_scroll_y - static_cast<int32_t>(drag.delta_y));
+    const uint32_t elapsed = now - g_detail_drag_last_tick_ms;
+    if (elapsed > 0U) {
+        const int32_t delta = g_detail_scroll_y - g_detail_drag_last_scroll_y;
+        const int32_t instant = static_cast<int32_t>(
+            (static_cast<int64_t>(delta) * 1000LL) / static_cast<int64_t>(elapsed));
+        g_detail_scroll_velocity_px_s =
+            (g_detail_scroll_velocity_px_s * 2 + instant * 3) / 5;
+        g_detail_drag_last_scroll_y = g_detail_scroll_y;
+        g_detail_drag_last_tick_ms = now;
+    }
+
+    if (!drag.released) return true;
+
+    gesture_router_ack_vertical_adjust_release(drag.sequence);
+    g_detail_inertia_active =
+        (g_detail_scroll_velocity_px_s >= kDetailInertiaStartPxPerSec ||
+         g_detail_scroll_velocity_px_s <= -kDetailInertiaStartPxPerSec);
+    g_detail_inertia_last_tick_ms = now;
+    return true;
+}
+
+static void detail_scroll_inertia_update()
+{
+    if (!g_detail_inertia_active || g_detail_host == nullptr || g_detail_scroll_max_y <= 0) return;
+
+    const uint32_t now = lv_tick_get();
+    uint32_t elapsed = now - g_detail_inertia_last_tick_ms;
+    if (elapsed == 0U) return;
+    if (elapsed > 50U) elapsed = 50U;
+    g_detail_inertia_last_tick_ms = now;
+
+    int32_t step = static_cast<int32_t>(
+        (static_cast<int64_t>(g_detail_scroll_velocity_px_s) * static_cast<int64_t>(elapsed)) / 1000LL);
+    if (step == 0 && g_detail_scroll_velocity_px_s != 0) {
+        step = g_detail_scroll_velocity_px_s > 0 ? 1 : -1;
+    }
+    const int32_t before = g_detail_scroll_y;
+    detail_apply_scroll_y(before + step);
+    if (g_detail_scroll_y == before || g_detail_scroll_y == 0 || g_detail_scroll_y == g_detail_scroll_max_y) {
+        g_detail_inertia_active = false;
+        g_detail_scroll_velocity_px_s = 0;
+        return;
+    }
+
+    // 与歌曲列表相同的手感方向：松手后保留惯性，再快速衰减停住。
+    g_detail_scroll_velocity_px_s = (g_detail_scroll_velocity_px_s * 92) / 100;
+    if (g_detail_scroll_velocity_px_s < kDetailInertiaStopPxPerSec &&
+        g_detail_scroll_velocity_px_s > -kDetailInertiaStopPxPerSec) {
+        g_detail_inertia_active = false;
+        g_detail_scroll_velocity_px_s = 0;
+    }
 }
 
 static uint8_t brightness_percent(uint8_t level)
@@ -217,10 +397,11 @@ static void brightness_set_armed(bool armed)
 {
     const bool target = armed && g_page == SettingsPage::System;
     g_brightness_adjust_armed = target;
-    gesture_router_set_vertical_adjust_enabled(target);
     if (!target) {
         g_brightness_dragging = false;
     }
+
+    settings_update_vertical_adjust_channel();
 
     if (g_brightness_card != nullptr) {
         lv_obj_set_style_border_width(g_brightness_card, target ? 2 : 1, 0);
@@ -496,7 +677,7 @@ static int16_t detail_row_y(int16_t index)
 static void add_detail_row(int16_t index, const char *title, const char *value, SettingsDetailIcon icon_id, bool active = true)
 {
     lv_obj_t *value_label = create_row(
-        g_content,
+        detail_parent(),
         detail_row_y(index),
         kDetailRowHeight,
         title,
@@ -521,7 +702,7 @@ static void add_clickable_detail_row(
     lv_event_cb_t callback)
 {
     lv_obj_t *value_label = create_row(
-        g_content,
+        detail_parent(),
         detail_row_y(index),
         kDetailRowHeight,
         title,
@@ -602,7 +783,7 @@ static void create_audio_output_control(const DeviceSettingsSnapshot &settings)
 {
     const DeviceAudioOutputMode next = next_audio_output_mode(settings.audio_output_mode);
     lv_obj_t *value_label = create_row(
-        g_content,
+        detail_parent(),
         detail_row_y(0),
         kDetailRowHeight,
         "输出模式",
@@ -697,6 +878,23 @@ static void aux_key_mode_click_cb(lv_event_t *event)
     lv_async_call(show_page_async, nullptr);
 }
 
+static void motion_controls_click_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event) || g_page != SettingsPage::System) return;
+    DeviceSettingsSnapshot settings = {};
+    if (!device_settings_get_snapshot(&settings)) return;
+
+    const bool next = !settings.motion_controls_enabled;
+    const esp_err_t ret = device_settings_set_motion_controls_enabled(next);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "保存手势控歌开关失败：%s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "手势控歌：%s（前翻/后翻/双击播放暂停统一门控）", next ? "开" : "关");
+    g_pending_page = SettingsPage::System;
+    lv_async_call(show_page_async, nullptr);
+}
+
 static void brightness_card_click_cb(lv_event_t *event)
 {
     if (!click_is_valid(event) || g_page != SettingsPage::System) return;
@@ -706,7 +904,7 @@ static void brightness_card_click_cb(lv_event_t *event)
 static void create_brightness_control(const DeviceSettingsSnapshot &settings, int16_t index)
 {
     (void)settings;
-    g_brightness_card = lv_obj_create(g_content);
+    g_brightness_card = lv_obj_create(detail_parent());
     if (g_brightness_card == nullptr) return;
     ui_common_lock_object(g_brightness_card);
     lv_obj_set_size(g_brightness_card, kContentWidth, kDetailRowHeight);
@@ -1475,6 +1673,12 @@ static void create_system_page(const DeviceSettingsSnapshot &settings)
         device_settings_aux_key_mode_name(settings.aux_key_mode),
         SettingsDetailIcon::AuxKey,
         aux_key_mode_click_cb);
+    add_clickable_detail_row(
+        5,
+        "手势控歌",
+        settings.motion_controls_enabled ? "开" : "关",
+        SettingsDetailIcon::Music,
+        motion_controls_click_cb);
 }
 
 static void create_about_page()
@@ -1507,11 +1711,14 @@ static void show_page(SettingsPage page)
     DeviceSettingsSnapshot settings = {};
     (void)device_settings_get_snapshot(&settings);
 
-    // Settings 根容器继续保持不可滚动，避免与底部 Launcher/右滑返回手势冲突。
+    // LVGL 原生滚动仍保持关闭；详情页复用歌曲列表的“原始触摸驱动 + 手动位移 + 惯性”逻辑。
+    // 这样不会触发全局 scroll guard，也能在设置项超过 5 条后自然纵向浏览。
     lv_obj_remove_flag(g_content, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(g_content, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
     lv_obj_set_scroll_dir(g_content, LV_DIR_NONE);
     lv_obj_set_scrollbar_mode(g_content, LV_SCROLLBAR_MODE_OFF);
     lv_obj_scroll_to(g_content, 0, 0, LV_ANIM_OFF);
+    detail_prepare(page);
 
     switch (page) {
         case SettingsPage::Main: create_main_page(); break;
@@ -1520,6 +1727,7 @@ static void show_page(SettingsPage page)
         case SettingsPage::System: create_system_page(settings); break;
         case SettingsPage::About: create_about_page(); break;
     }
+    settings_update_vertical_adjust_channel();
     lv_obj_invalidate(g_content);
 }
 
@@ -1553,6 +1761,10 @@ static void gesture_timer_cb(lv_timer_t *timer)
     if (brightness_gesture_update()) {
         return;
     }
+    if (detail_scroll_gesture_update()) {
+        return;
+    }
+    detail_scroll_inertia_update();
 
     UiGestureAction action = UiGestureAction::None;
     if (!gesture_router_take_action(&action)) return;
@@ -1676,7 +1888,7 @@ static esp_err_t settings_create()
     g_content = lv_obj_create(g_root);
     if (g_content != nullptr) {
         ui_common_lock_object(g_content);
-        lv_obj_set_size(g_content, kContentWidth, 360);
+        lv_obj_set_size(g_content, kContentWidth, kContentHeight);
         lv_obj_set_pos(g_content, kContentX, kContentTop);
         lv_obj_set_style_radius(g_content, 0, 0);
         lv_obj_set_style_border_width(g_content, 0, 0);
@@ -1715,7 +1927,7 @@ static esp_err_t settings_create()
     lv_timer_pause(g_refresh_timer);
     show_page(SettingsPage::Main);
     if (restore_invalidation) lv_display_enable_invalidation(display, true);
-    ESP_LOGI(TAG, "Settings create完成：连接/应用/系统/关于 2x2 四宫格 + 5槽高行详情页");
+    ESP_LOGI(TAG, "Settings create完成：连接/应用/系统/关于 2x2 四宫格 + 可滚动详情列表");
     return ESP_OK;
 }
 
@@ -1757,6 +1969,8 @@ static esp_err_t settings_leave(AppRunState next_state)
     brightness_commit_on_exit();
     if (g_timer != nullptr) lv_timer_pause(g_timer);
     if (g_refresh_timer != nullptr) lv_timer_pause(g_refresh_timer);
+    gesture_router_set_vertical_adjust_enabled(false);
+    gesture_router_set_vertical_adjust_edges_reserved(false);
     gesture_router_reset();
     app_launcher_overlay_hide();
     set_visible(g_root, false);
@@ -1771,6 +1985,7 @@ static void settings_destroy()
     brightness_commit_on_exit();
     gesture_router_set_control_capture(false);
     gesture_router_set_vertical_adjust_enabled(false);
+    gesture_router_set_vertical_adjust_edges_reserved(false);
     app_launcher_overlay_destroy();
     if (g_refresh_timer != nullptr) {
         lv_timer_delete(g_refresh_timer);
@@ -1789,6 +2004,10 @@ static void settings_destroy()
     g_header_line = nullptr;
     g_content = nullptr;
     clear_detail_value_refs();
+    g_detail_scroll_y = 0;
+    g_detail_scroll_max_y = 0;
+    g_detail_inertia_active = false;
+    g_detail_scroll_velocity_px_s = 0;
     g_pending_page = SettingsPage::Main;
     g_page = SettingsPage::Main;
     ESP_LOGI(TAG, "Settings destroy完成");
