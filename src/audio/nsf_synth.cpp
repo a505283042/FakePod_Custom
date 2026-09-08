@@ -1229,9 +1229,9 @@ static float apu_sample(NsfSynthImpl *impl)
 
 static int32_t float_to_pcm32(float value)
 {
-    // NSF 合成平均响度低于常规母带音乐；保留原 1.15x 基础增益，并在最终 PCM 固定再补 +6dB。
-    // 总增益约 2.2946x，峰值继续由下方限幅保护；用户音量仍由 CS43131 控制。
-    value *= 2.2946f;
+    // NSF 合成平均响度低于常规母带音乐；保留原 1.15x 基础增益，并在最终 PCM 固定再补 +12dB。
+    // 总增益约 4.5783x，峰值继续由下方限幅保护；用户音量仍由 CS43131 控制。
+    value *= 4.5783f;
     if (value > 0.999f) value = 0.999f;
     if (value < -0.999f) value = -0.999f;
     const int32_t sample16 = static_cast<int32_t>(value * 32767.0f);
