@@ -106,6 +106,12 @@ static constexpr uint8_t kTapeMiddleOpa = 232U;
 static constexpr uint8_t kTapeLineWidth = 2U;
 static constexpr int64_t kTapeGlintPeriodUs = 100000LL;  // 10 Hz，仅几个像素跳动
 static constexpr uint8_t kTapeGlintPhaseCount = 4U;
+static constexpr uint8_t kCassetteTintHueBins = 18U;
+static constexpr uint8_t kCassetteTintStrength = 200U;  // R17：约78%，动态亮色保持鲜明但不荧光
+static constexpr uint8_t kCassetteTintMinSaturation = 96U;
+static constexpr uint8_t kCassetteTintMaxSaturation = 190U;
+static constexpr uint8_t kCassetteTintMinValue = 200U;
+static constexpr uint8_t kCassetteTintMaxValue = 224U;
 
 // C2.4.1 固定几何（均为 460x296 磁带局部坐标）。
 // 大轮：左轮用左侧圆周切点，右轮用右侧圆周切点；磁带量增加时只沿X向外最多5px。
@@ -181,9 +187,28 @@ static uint32_t g_last_lyrics_line = UINT32_MAX;
 
 static uint8_t *g_shell_pixels = nullptr;
 static lv_image_dsc_t g_shell_dsc = {};
+static uint8_t *g_shell_base_rgb565 = nullptr;
+static uint8_t *g_shell_tint_luma = nullptr;
+static uint32_t g_shell_tintable_pixels = 0U;
+static uint32_t g_shell_tint_generation = 0U;
+static uint32_t g_shell_tint_track = UINT32_MAX;
+
+struct CassetteTintColor
+{
+    uint8_t r = 0U;
+    uint8_t g = 0U;
+    uint8_t b = 0U;
+};
+
+// R17：不再固定落在少数色板中。封面主色保留自己的 Hue，
+// 只把饱和度和明度收敛到明亮、干净、接近原装粉色塑料质感的范围。
+static constexpr CassetteTintColor kCassetteNeutralTint = {122U, 128U, 136U};
 
 static uint8_t *g_big_reel_pixels = nullptr;
 static uint8_t *g_small_roller_pixels = nullptr;
+static uint8_t *g_small_roller_base_rgb565 = nullptr;
+static uint8_t *g_small_roller_tint_luma = nullptr;
+static uint32_t g_small_roller_tintable_pixels = 0U;
 static uint8_t *g_tape_amount_pixels = nullptr;
 static lv_image_dsc_t g_big_reel_dsc = {};
 static lv_image_dsc_t g_small_roller_dsc = {};
@@ -213,6 +238,9 @@ static void cassette_view_init_rgb565_dsc(
     uint16_t width,
     uint16_t height,
     size_t size);
+static void cassette_view_restore_shell_default();
+static void cassette_view_restore_small_roller_default();
+static bool cassette_view_prepare_small_roller_tint_assets();
 
 static uint16_t cassette_view_cover_source_width()
 {
@@ -513,6 +541,9 @@ static bool cassette_view_bind_no_artwork_label(uint32_t generation, uint32_t tr
     g_cover_generation = generation;
     g_cover_track = track;
     g_cover_is_no_artwork_fallback = true;
+    // 真正无封面时保持产品默认粉色，不让替补标签纸参与壳体/小轮取色。
+    cassette_view_restore_shell_default();
+    cassette_view_restore_small_roller_default();
 
     const bool acquired = fallback_cover_image_acquire(
         FallbackCoverImageKind::Cassette, &g_fallback_cover_lease);
@@ -925,6 +956,9 @@ static bool cassette_view_prepare_mechanics()
             &g_small_roller_dsc)) {
         return false;
     }
+    if (!cassette_view_prepare_small_roller_tint_assets()) {
+        ESP_LOGW(TAG, "小滚轮着色缓存准备失败：保留原粉色，不影响机械动画");
+    }
     if (g_tape_amount_pixels == nullptr &&
         !cassette_view_decode_png_rgb565a8(
             g_cassette_tape_amount_png,
@@ -1183,6 +1217,425 @@ static lv_obj_t *cassette_view_create_sprite_viewport(
     return viewport;
 }
 
+static uint8_t cassette_view_clamp_u8(int32_t value)
+{
+    if (value < 0) return 0U;
+    if (value > 255) return 255U;
+    return static_cast<uint8_t>(value);
+}
+
+static uint16_t cassette_view_load_rgb565(const uint8_t *data)
+{
+    return static_cast<uint16_t>(
+        static_cast<uint16_t>(data[0]) |
+        (static_cast<uint16_t>(data[1]) << 8U));
+}
+
+static void cassette_view_store_rgb565(uint8_t *data, uint16_t rgb565)
+{
+    data[0] = static_cast<uint8_t>(rgb565 & 0xFFU);
+    data[1] = static_cast<uint8_t>(rgb565 >> 8U);
+}
+
+static CassetteTintColor cassette_view_rgb565_to_rgb888(uint16_t rgb565)
+{
+    CassetteTintColor color = {};
+    const uint8_t r5 = static_cast<uint8_t>((rgb565 >> 11U) & 0x1FU);
+    const uint8_t g6 = static_cast<uint8_t>((rgb565 >> 5U) & 0x3FU);
+    const uint8_t b5 = static_cast<uint8_t>(rgb565 & 0x1FU);
+    color.r = static_cast<uint8_t>((static_cast<uint16_t>(r5) * 255U + 15U) / 31U);
+    color.g = static_cast<uint8_t>((static_cast<uint16_t>(g6) * 255U + 31U) / 63U);
+    color.b = static_cast<uint8_t>((static_cast<uint16_t>(b5) * 255U + 15U) / 31U);
+    return color;
+}
+
+static uint16_t cassette_view_rgb888_to_rgb565(const CassetteTintColor &color)
+{
+    return static_cast<uint16_t>(
+        ((static_cast<uint16_t>(color.r) & 0xF8U) << 8U) |
+        ((static_cast<uint16_t>(color.g) & 0xFCU) << 3U) |
+        (static_cast<uint16_t>(color.b) >> 3U));
+}
+
+static void cassette_view_rgb_to_hsv(
+    const CassetteTintColor &color, uint16_t *out_hue, uint8_t *out_saturation, uint8_t *out_value)
+{
+    const uint8_t max_value = color.r > color.g
+        ? (color.r > color.b ? color.r : color.b)
+        : (color.g > color.b ? color.g : color.b);
+    const uint8_t min_value = color.r < color.g
+        ? (color.r < color.b ? color.r : color.b)
+        : (color.g < color.b ? color.g : color.b);
+    const int32_t delta = static_cast<int32_t>(max_value) - min_value;
+
+    uint16_t hue = 0U;
+    if (delta > 0) {
+        int32_t hue_signed = 0;
+        if (max_value == color.r) {
+            hue_signed = 60 * (static_cast<int32_t>(color.g) - color.b) / delta;
+        } else if (max_value == color.g) {
+            hue_signed = 120 + 60 * (static_cast<int32_t>(color.b) - color.r) / delta;
+        } else {
+            hue_signed = 240 + 60 * (static_cast<int32_t>(color.r) - color.g) / delta;
+        }
+        while (hue_signed < 0) hue_signed += 360;
+        while (hue_signed >= 360) hue_signed -= 360;
+        hue = static_cast<uint16_t>(hue_signed);
+    }
+
+    const uint8_t saturation = max_value == 0U
+        ? 0U
+        : static_cast<uint8_t>((static_cast<uint32_t>(delta) * 255U + max_value / 2U) / max_value);
+    if (out_hue != nullptr) *out_hue = hue;
+    if (out_saturation != nullptr) *out_saturation = saturation;
+    if (out_value != nullptr) *out_value = max_value;
+}
+
+static CassetteTintColor cassette_view_hsv_to_rgb(
+    uint16_t hue, uint8_t saturation, uint8_t value)
+{
+    hue = static_cast<uint16_t>(hue % 360U);
+    if (saturation == 0U) return {value, value, value};
+
+    const uint32_t region = hue / 60U;
+    const uint32_t remainder = ((hue % 60U) * 255U) / 60U;
+    const uint32_t p = (static_cast<uint32_t>(value) * (255U - saturation) + 127U) / 255U;
+    const uint32_t q = (static_cast<uint32_t>(value) *
+        (255U - (static_cast<uint32_t>(saturation) * remainder + 127U) / 255U) + 127U) / 255U;
+    const uint32_t t = (static_cast<uint32_t>(value) *
+        (255U - (static_cast<uint32_t>(saturation) * (255U - remainder) + 127U) / 255U) + 127U) / 255U;
+
+    switch (region) {
+        case 0U: return {value, static_cast<uint8_t>(t), static_cast<uint8_t>(p)};
+        case 1U: return {static_cast<uint8_t>(q), value, static_cast<uint8_t>(p)};
+        case 2U: return {static_cast<uint8_t>(p), value, static_cast<uint8_t>(t)};
+        case 3U: return {static_cast<uint8_t>(p), static_cast<uint8_t>(q), value};
+        case 4U: return {static_cast<uint8_t>(t), static_cast<uint8_t>(p), value};
+        default: return {value, static_cast<uint8_t>(p), static_cast<uint8_t>(q)};
+    }
+}
+
+static CassetteTintColor cassette_view_normalize_dynamic_tint(
+    const CassetteTintColor &input, uint16_t *out_hue)
+{
+    uint16_t hue = 0U;
+    uint8_t saturation = 0U;
+    uint8_t value = 0U;
+    cassette_view_rgb_to_hsv(input, &hue, &saturation, &value);
+
+    // 黄绿色最容易出现“脏黄/荧光绿”。只轻推离 60° 中心，不做色板量化，
+    // 仍然保留连续 Hue 和丰富颜色。
+    if (hue >= 48U && hue < 60U) {
+        hue = static_cast<uint16_t>(hue > 10U ? hue - 10U : 0U);
+    } else if (hue >= 60U && hue <= 76U) {
+        hue = static_cast<uint16_t>(hue + 12U);
+    }
+
+    if (saturation < kCassetteTintMinSaturation) saturation = kCassetteTintMinSaturation;
+    if (saturation > kCassetteTintMaxSaturation) saturation = kCassetteTintMaxSaturation;
+    if (value < kCassetteTintMinValue) value = kCassetteTintMinValue;
+    if (value > kCassetteTintMaxValue) value = kCassetteTintMaxValue;
+
+    // 对偏棕/橙的低彩主色略补饱和，避免提亮后仍显灰。
+    if (hue >= 15U && hue <= 45U && saturation < 126U) saturation = 126U;
+
+    if (out_hue != nullptr) *out_hue = hue;
+    return cassette_view_hsv_to_rgb(hue, saturation, value);
+}
+
+static bool cassette_view_extract_cover_tint(
+    const CoverSurfaceLease &cover,
+    CassetteTintColor *out_color,
+    uint16_t *out_hue,
+    uint32_t *out_samples)
+{
+    if (out_color == nullptr || cover.normal_rgb565 == nullptr ||
+        cover.width == 0U || cover.height == 0U || cover.data_size < 2U) {
+        return false;
+    }
+
+    uint32_t weights[kCassetteTintHueBins] = {};
+    uint32_t red_sum[kCassetteTintHueBins] = {};
+    uint32_t green_sum[kCassetteTintHueBins] = {};
+    uint32_t blue_sum[kCassetteTintHueBins] = {};
+    uint32_t accepted = 0U;
+    uint32_t sampled = 0U;
+    uint32_t near_black_neutral = 0U;
+
+    const uint16_t x_begin = static_cast<uint16_t>(cover.width / 10U);
+    const uint16_t x_end = static_cast<uint16_t>(cover.width - cover.width / 10U);
+    const uint16_t y_begin = static_cast<uint16_t>(cover.height / 10U);
+    const uint16_t y_end = static_cast<uint16_t>(cover.height - cover.height / 10U);
+    const uint16_t step_x = cover.width >= 24U ? static_cast<uint16_t>(cover.width / 24U) : 1U;
+    const uint16_t step_y = cover.height >= 24U ? static_cast<uint16_t>(cover.height / 24U) : 1U;
+
+    for (uint16_t y = y_begin; y < y_end; y = static_cast<uint16_t>(y + step_y)) {
+        for (uint16_t x = x_begin; x < x_end; x = static_cast<uint16_t>(x + step_x)) {
+            const size_t pixel_index = static_cast<size_t>(y) * cover.width + x;
+            const size_t byte_index = pixel_index * 2U;
+            if (byte_index + 1U >= cover.data_size) continue;
+
+            const CassetteTintColor color = cassette_view_rgb565_to_rgb888(
+                cassette_view_load_rgb565(cover.normal_rgb565 + byte_index));
+            uint16_t hue = 0U;
+            uint8_t saturation = 0U;
+            uint8_t value = 0U;
+            cassette_view_rgb_to_hsv(color, &hue, &saturation, &value);
+            ++sampled;
+            if (value < 64U && saturation < 96U) ++near_black_neutral;
+
+            // 去掉近黑、近灰和接近白色的背景点，避免白边/黑底把主色拉灰。
+            if (value < 44U || saturation < 46U || (value > 244U && saturation < 90U)) {
+                continue;
+            }
+
+            const uint8_t bin = static_cast<uint8_t>(
+                (static_cast<uint32_t>(hue) * kCassetteTintHueBins) / 360U);
+            const uint32_t weight = 1U +
+                (static_cast<uint32_t>(saturation) * (128U + value)) / 384U;
+            weights[bin] += weight;
+            red_sum[bin] += static_cast<uint32_t>(color.r) * weight;
+            green_sum[bin] += static_cast<uint32_t>(color.g) * weight;
+            blue_sum[bin] += static_cast<uint32_t>(color.b) * weight;
+            ++accepted;
+        }
+    }
+
+    if (out_samples != nullptr) *out_samples = accepted;
+    // 大面积近黑/中性封面直接使用石墨灰壳体，避免少量彩色文字/Logo抢走主色。
+    if (sampled >= 24U && near_black_neutral * 100U >= sampled * 55U) return false;
+    if (accepted < 12U) return false;
+
+    uint8_t best_bin = 0U;
+    uint32_t best_score = 0U;
+    for (uint8_t bin = 0U; bin < kCassetteTintHueBins; ++bin) {
+        const uint8_t prev = bin == 0U ? kCassetteTintHueBins - 1U : bin - 1U;
+        const uint8_t next = static_cast<uint8_t>((bin + 1U) % kCassetteTintHueBins);
+        const uint32_t score = weights[bin] + (weights[prev] + weights[next]) / 2U;
+        if (score > best_score) {
+            best_score = score;
+            best_bin = bin;
+        }
+    }
+    if (best_score == 0U) return false;
+
+    const uint8_t prev = best_bin == 0U ? kCassetteTintHueBins - 1U : best_bin - 1U;
+    const uint8_t next = static_cast<uint8_t>((best_bin + 1U) % kCassetteTintHueBins);
+    const uint32_t total_weight =
+        weights[best_bin] + weights[prev] / 2U + weights[next] / 2U;
+    if (total_weight == 0U) return false;
+
+    CassetteTintColor dominant = {};
+    dominant.r = static_cast<uint8_t>((
+        red_sum[best_bin] + red_sum[prev] / 2U + red_sum[next] / 2U) / total_weight);
+    dominant.g = static_cast<uint8_t>((
+        green_sum[best_bin] + green_sum[prev] / 2U + green_sum[next] / 2U) / total_weight);
+    dominant.b = static_cast<uint8_t>((
+        blue_sum[best_bin] + blue_sum[prev] / 2U + blue_sum[next] / 2U) / total_weight);
+
+    *out_color = dominant;
+    if (out_hue != nullptr) {
+        cassette_view_rgb_to_hsv(*out_color, out_hue, nullptr, nullptr);
+    }
+    return true;
+}
+
+static bool cassette_view_shell_pixel_is_tintable(const CassetteTintColor &color, uint8_t alpha)
+{
+    if (alpha < 24U) return false;
+    const uint16_t luma = static_cast<uint16_t>(
+        (77U * color.r + 150U * color.g + 29U * color.b) >> 8U);
+    if (luma < 52U) return false;
+
+    // 原素材的塑料壳主体是粉/玫红色：R明显高于G，同时B也高于G。
+    // 白色高光、灰色金属、黑色文字/螺丝和棕色磁带细节自然落在Mask之外。
+    return color.r > static_cast<uint16_t>(color.g) + 12U &&
+        color.b > static_cast<uint16_t>(color.g) + 4U &&
+        static_cast<uint16_t>(color.r) + color.b >
+            static_cast<uint16_t>(color.g) * 2U + 32U;
+}
+
+static bool cassette_view_prepare_small_roller_tint_assets()
+{
+    if (g_small_roller_base_rgb565 != nullptr && g_small_roller_tint_luma != nullptr) {
+        return true;
+    }
+    if (g_small_roller_pixels == nullptr || g_small_roller_dsc.data == nullptr) return false;
+
+    const size_t width = static_cast<size_t>(kSmallRollerSize) * kSmallRollerFrameCount;
+    const size_t height = static_cast<size_t>(kSmallRollerSize);
+    const size_t pixel_count = width * height;
+    const size_t rgb_bytes = pixel_count * 2U;
+    if (g_small_roller_dsc.data_size < rgb_bytes + pixel_count) return false;
+
+    uint8_t *base_rgb565 = static_cast<uint8_t *>(heap_caps_malloc(
+        rgb_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (base_rgb565 == nullptr) return false;
+    uint8_t *tint_luma = static_cast<uint8_t *>(heap_caps_malloc(
+        pixel_count, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (tint_luma == nullptr) {
+        heap_caps_free(base_rgb565);
+        return false;
+    }
+
+    memcpy(base_rgb565, g_small_roller_pixels, rgb_bytes);
+    const uint8_t *alpha_plane = g_small_roller_pixels + rgb_bytes;
+    uint32_t tintable_pixels = 0U;
+    for (size_t index = 0U; index < pixel_count; ++index) {
+        const CassetteTintColor source = cassette_view_rgb565_to_rgb888(
+            cassette_view_load_rgb565(base_rgb565 + index * 2U));
+        if (cassette_view_shell_pixel_is_tintable(source, alpha_plane[index])) {
+            const uint8_t luma = static_cast<uint8_t>(
+                (77U * source.r + 150U * source.g + 29U * source.b) >> 8U);
+            tint_luma[index] = luma >= 254U ? 255U : static_cast<uint8_t>(luma + 1U);
+            ++tintable_pixels;
+        } else {
+            tint_luma[index] = 0U;
+        }
+    }
+
+    g_small_roller_base_rgb565 = base_rgb565;
+    g_small_roller_tint_luma = tint_luma;
+    g_small_roller_tintable_pixels = tintable_pixels;
+    ESP_LOGI(TAG, "小滚轮着色缓存已准备：Mask=%uB 原色=%uB tintable=%lu PSRAM",
+        static_cast<unsigned>(pixel_count),
+        static_cast<unsigned>(rgb_bytes),
+        static_cast<unsigned long>(g_small_roller_tintable_pixels));
+    return true;
+}
+
+static void cassette_view_restore_small_roller_default()
+{
+    if (g_small_roller_pixels == nullptr || g_small_roller_base_rgb565 == nullptr) return;
+    const size_t pixel_count =
+        static_cast<size_t>(kSmallRollerSize) * kSmallRollerFrameCount * kSmallRollerSize;
+    memcpy(g_small_roller_pixels, g_small_roller_base_rgb565, pixel_count * 2U);
+    for (lv_obj_t *image : g_small_roller_strip_images) {
+        if (image != nullptr) lv_obj_invalidate(image);
+    }
+}
+
+static void cassette_view_apply_small_roller_tint(const uint16_t tint_lut[256])
+{
+    if (tint_lut == nullptr || g_small_roller_pixels == nullptr ||
+        g_small_roller_base_rgb565 == nullptr || g_small_roller_tint_luma == nullptr) {
+        return;
+    }
+
+    const size_t pixel_count =
+        static_cast<size_t>(kSmallRollerSize) * kSmallRollerFrameCount * kSmallRollerSize;
+    for (size_t index = 0U; index < pixel_count; ++index) {
+        const uint8_t mapped_luma = g_small_roller_tint_luma[index];
+        uint8_t *display_pixel = g_small_roller_pixels + index * 2U;
+        if (mapped_luma == 0U) {
+            cassette_view_store_rgb565(
+                display_pixel, cassette_view_load_rgb565(g_small_roller_base_rgb565 + index * 2U));
+        } else {
+            cassette_view_store_rgb565(display_pixel, tint_lut[mapped_luma - 1U]);
+        }
+    }
+    for (lv_obj_t *image : g_small_roller_strip_images) {
+        if (image != nullptr) lv_obj_invalidate(image);
+    }
+}
+
+static void cassette_view_build_tint_lut(
+    const CassetteTintColor &target, uint16_t out_lut[256])
+{
+    const int32_t target_luma = static_cast<int32_t>(
+        (77U * target.r + 150U * target.g + 29U * target.b) >> 8U);
+    const int32_t delta_r = static_cast<int32_t>(target.r) - target_luma;
+    const int32_t delta_g = static_cast<int32_t>(target.g) - target_luma;
+    const int32_t delta_b = static_cast<int32_t>(target.b) - target_luma;
+
+    for (uint16_t luma = 0U; luma < 256U; ++luma) {
+        const uint16_t distance = luma <= 127U ? luma : static_cast<uint16_t>(255U - luma);
+        const uint16_t midtone = static_cast<uint16_t>(distance * 2U);
+        const int32_t strength = static_cast<int32_t>(
+            (static_cast<uint32_t>(kCassetteTintStrength) * midtone) / 255U);
+
+        // R17：继续沿用原壳体像素的 Luma 作为基准，只替换色彩偏移。
+        // 阴影、高光和塑料反光因此保持接近原装粉色素材的明暗质感。
+        const int32_t base_luma = static_cast<int32_t>(luma);
+        CassetteTintColor color = {};
+        color.r = cassette_view_clamp_u8(base_luma + delta_r * strength / 255);
+        color.g = cassette_view_clamp_u8(base_luma + delta_g * strength / 255);
+        color.b = cassette_view_clamp_u8(base_luma + delta_b * strength / 255);
+        out_lut[luma] = cassette_view_rgb888_to_rgb565(color);
+    }
+}
+
+static void cassette_view_restore_shell_default()
+{
+    if (g_shell_pixels == nullptr || g_shell_base_rgb565 == nullptr) return;
+    const size_t pixel_count = static_cast<size_t>(kCassetteWidth) * kCassetteHeight;
+    const size_t rgb_bytes = pixel_count * 2U;
+    memcpy(g_shell_pixels, g_shell_base_rgb565, rgb_bytes);
+    g_shell_tint_generation = 0U;
+    g_shell_tint_track = UINT32_MAX;
+    if (g_shell_image != nullptr) lv_obj_invalidate(g_shell_image);
+}
+
+static bool cassette_view_apply_shell_tint(
+    uint32_t generation, uint32_t track, const CoverSurfaceLease &cover)
+{
+    if (g_shell_pixels == nullptr || g_shell_base_rgb565 == nullptr ||
+        g_shell_tint_luma == nullptr) return false;
+    if (g_shell_tint_generation == generation && g_shell_tint_track == track) return true;
+    const int64_t tint_start_us = esp_timer_get_time();
+
+    CassetteTintColor extracted = {};
+    CassetteTintColor target = {};
+    uint16_t source_hue = 0U;
+    uint16_t target_hue = 0U;
+    uint32_t samples = 0U;
+    const bool chromatic = cassette_view_extract_cover_tint(
+        cover, &extracted, &source_hue, &samples);
+    const char *tint_mode = "中性灰";
+    if (chromatic) {
+        target = cassette_view_normalize_dynamic_tint(extracted, &target_hue);
+        tint_mode = "动态亮色";
+    } else {
+        target = kCassetteNeutralTint;
+    }
+
+    uint16_t tint_lut[256] = {};
+    cassette_view_build_tint_lut(target, tint_lut);
+
+    const size_t pixel_count = static_cast<size_t>(kCassetteWidth) * kCassetteHeight;
+    for (size_t index = 0U; index < pixel_count; ++index) {
+        const uint8_t *base_pixel = g_shell_base_rgb565 + index * 2U;
+        uint8_t *display_pixel = g_shell_pixels + index * 2U;
+        const uint8_t mapped_luma = g_shell_tint_luma[index];
+        if (mapped_luma == 0U) {
+            cassette_view_store_rgb565(display_pixel, cassette_view_load_rgb565(base_pixel));
+            continue;
+        }
+        cassette_view_store_rgb565(display_pixel, tint_lut[mapped_luma - 1U]);
+    }
+
+    cassette_view_apply_small_roller_tint(tint_lut);
+
+    g_shell_tint_generation = generation;
+    g_shell_tint_track = track;
+    if (g_shell_image != nullptr) lv_obj_invalidate(g_shell_image);
+    const int64_t tint_cost_us = esp_timer_get_time() - tint_start_us;
+    ESP_LOGI(TAG,
+        "磁带壳/小轮动态亮色：track=%lu mode=%s samples=%lu source_hue=%u target_hue=%u rgb=#%02X%02X%02X shell=%lu roller=%lu cost=%lldus",
+        static_cast<unsigned long>(track),
+        tint_mode,
+        static_cast<unsigned long>(samples),
+        static_cast<unsigned>(source_hue),
+        static_cast<unsigned>(target_hue),
+        static_cast<unsigned>(target.r),
+        static_cast<unsigned>(target.g),
+        static_cast<unsigned>(target.b),
+        static_cast<unsigned long>(g_shell_tintable_pixels),
+        static_cast<unsigned long>(g_small_roller_tintable_pixels),
+        static_cast<long long>(tint_cost_us));
+    return true;
+}
+
 static bool cassette_view_prepare_shell()
 {
     if (g_shell_pixels != nullptr) {
@@ -1244,6 +1697,26 @@ static bool cassette_view_prepare_shell()
         return false;
     }
 
+    uint8_t *base_rgb565 = static_cast<uint8_t *>(heap_caps_malloc(
+        rgb_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (base_rgb565 == nullptr) {
+        ESP_LOGE(TAG, "磁带壳原色 RGB565 PSRAM 不足：%uB", static_cast<unsigned>(rgb_bytes));
+        heap_caps_free(native);
+        heap_caps_free(rgba);
+        return false;
+    }
+
+    uint8_t *tint_luma = static_cast<uint8_t *>(heap_caps_malloc(
+        pixel_count, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (tint_luma == nullptr) {
+        ESP_LOGE(TAG, "磁带壳着色Mask PSRAM 不足：%uB", static_cast<unsigned>(pixel_count));
+        heap_caps_free(base_rgb565);
+        heap_caps_free(native);
+        heap_caps_free(rgba);
+        return false;
+    }
+
+    uint32_t tintable_pixels = 0U;
     for (size_t index = 0U; index < pixel_count; ++index) {
         const uint8_t r = rgba[index * 4U + 0U];
         const uint8_t g = rgba[index * 4U + 1U];
@@ -1256,10 +1729,26 @@ static bool cassette_view_prepare_shell()
         native[index * 2U + 0U] = static_cast<uint8_t>(rgb565 & 0xFFU);
         native[index * 2U + 1U] = static_cast<uint8_t>(rgb565 >> 8U);
         native[rgb_bytes + index] = a;
+
+        const CassetteTintColor source_color = {r, g, b};
+        if (cassette_view_shell_pixel_is_tintable(source_color, a)) {
+            const uint8_t luma = static_cast<uint8_t>(
+                (77U * r + 150U * g + 29U * b) >> 8U);
+            tint_luma[index] = luma >= 254U ? 255U : static_cast<uint8_t>(luma + 1U);
+            ++tintable_pixels;
+        } else {
+            tint_luma[index] = 0U;
+        }
     }
+    memcpy(base_rgb565, native, rgb_bytes);
     heap_caps_free(rgba);
 
     g_shell_pixels = native;
+    g_shell_base_rgb565 = base_rgb565;
+    g_shell_tint_luma = tint_luma;
+    g_shell_tintable_pixels = tintable_pixels;
+    g_shell_tint_generation = 0U;
+    g_shell_tint_track = UINT32_MAX;
     g_shell_dsc = {};
     g_shell_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
     g_shell_dsc.header.cf = LV_COLOR_FORMAT_RGB565A8;
@@ -1275,9 +1764,12 @@ static bool cassette_view_prepare_shell()
         lv_image_set_antialias(g_shell_image, false);
     }
 
-    ESP_LOGI(TAG, "磁带壳已准备：PNG=%uB RGB565A8(planar)=%uB stride=%u PSRAM",
+    ESP_LOGI(TAG, "磁带壳已准备：PNG=%uB RGB565A8=%uB 原色=%uB Mask=%uB tintable=%lu stride=%u PSRAM",
         static_cast<unsigned>(png_size),
         static_cast<unsigned>(native_bytes),
+        static_cast<unsigned>(rgb_bytes),
+        static_cast<unsigned>(pixel_count),
+        static_cast<unsigned long>(g_shell_tintable_pixels),
         static_cast<unsigned>(g_shell_dsc.header.stride));
     return true;
 }
@@ -1354,6 +1846,8 @@ static bool cassette_view_bind_current_cover()
     lv_image_set_antialias(g_cover_image, false);
     cassette_view_apply_cover_position();
     lv_obj_remove_flag(g_cover_image, LV_OBJ_FLAG_HIDDEN);
+    // 新封面 Surface 已 ready：只在切歌时分析一次主色并重着色静态壳体。
+    (void)cassette_view_apply_shell_tint(generation, track, g_cover_lease);
 
     ESP_LOGI(TAG, "磁带封面已绑定：track=%lu source=%ux%u label=%dx%d bleed=%upx scale=%u/256 y=%dpx safe=±%dpx",
         static_cast<unsigned long>(track),
