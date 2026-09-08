@@ -38,6 +38,7 @@ static DeviceSettingsSnapshot make_defaults()
     defaults.music_list_scope = DeviceMusicListScope::All;
     defaults.cassette_dynamic_tint_enabled = false;
     defaults.motion_controls_enabled = true;
+    defaults.nsf_gain_compensation_db = 3U;
     defaults.remember_volume = true;
     return defaults;
 }
@@ -80,6 +81,11 @@ static bool animation_mode_valid(uint8_t raw)
 static bool music_list_scope_valid(uint8_t raw)
 {
     return raw <= static_cast<uint8_t>(DeviceMusicListScope::Level2);
+}
+
+static bool nsf_gain_compensation_valid(uint8_t db)
+{
+    return db <= 6U;
 }
 
 static esp_err_t open_rw(nvs_handle_t *out_handle)
@@ -195,6 +201,9 @@ esp_err_t device_settings_init()
     if (nvs_get_u8(handle, "motion", &u8) == ESP_OK && u8 <= 1U) {
         g_settings.motion_controls_enabled = u8 != 0U;
     }
+    if (nvs_get_u8(handle, "nsfgain", &u8) == ESP_OK && nsf_gain_compensation_valid(u8)) {
+        g_settings.nsf_gain_compensation_db = u8;
+    }
     if (nvs_get_u8(handle, "memvol", &u8) == ESP_OK && u8 <= 1U) {
         g_settings.remember_volume = u8 != 0U;
     }
@@ -202,13 +211,14 @@ esp_err_t device_settings_init()
     nvs_close(handle);
     g_settings.ready = true;
     g_settings.loaded_from_nvs = true;
-    ESP_LOGI(TAG, "Settings V1加载完成：USB=%s audio=%s bright=%u aux=%s cassette=%s motion=%s",
+    ESP_LOGI(TAG, "Settings V1加载完成：USB=%s audio=%s bright=%u aux=%s cassette=%s motion=%s nsfgain=+%udB",
         device_settings_usb_mode_name(g_settings.usb_mode),
         device_settings_audio_output_mode_name(g_settings.audio_output_mode),
         static_cast<unsigned>(g_settings.brightness_level),
         device_settings_aux_key_mode_name(g_settings.aux_key_mode),
         g_settings.cassette_dynamic_tint_enabled ? "封面变色" : "原装粉色",
-        g_settings.motion_controls_enabled ? "开" : "关");
+        g_settings.motion_controls_enabled ? "开" : "关",
+        static_cast<unsigned>(g_settings.nsf_gain_compensation_db));
     return ESP_OK;
 }
 
@@ -366,6 +376,17 @@ esp_err_t device_settings_set_motion_controls_enabled(bool enabled)
     const esp_err_t ret = commit_u8("motion", enabled ? 1U : 0U);
     if (ret != ESP_OK) g_settings.motion_controls_enabled = old;
     log_commit_failure("motion", ret);
+    return ret;
+}
+
+esp_err_t device_settings_set_nsf_gain_compensation_db(uint8_t db)
+{
+    if (!nsf_gain_compensation_valid(db)) return ESP_ERR_INVALID_ARG;
+    const uint8_t old = g_settings.nsf_gain_compensation_db;
+    g_settings.nsf_gain_compensation_db = db;
+    const esp_err_t ret = commit_u8("nsfgain", db);
+    if (ret != ESP_OK) g_settings.nsf_gain_compensation_db = old;
+    log_commit_failure("nsfgain", ret);
     return ret;
 }
 

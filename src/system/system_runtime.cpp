@@ -115,6 +115,11 @@ void system_runtime_update()
                 ESP_LOGW(TAG, "恢复CS43131输出档失败：%s；继续使用普通耳机安全档",
                     device_settings_audio_output_mode_name(settings_snapshot.audio_output_mode));
             }
+            if (!audio_service_set_nsf_gain_compensation_db(
+                    settings_snapshot.nsf_gain_compensation_db)) {
+                ESP_LOGW(TAG, "恢复NSF数字衰减补偿失败：+%udB；继续使用默认+3dB",
+                    static_cast<unsigned>(settings_snapshot.nsf_gain_compensation_db));
+            }
         }
     }
 

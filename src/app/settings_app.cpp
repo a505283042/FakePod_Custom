@@ -72,6 +72,7 @@ enum class SettingsPage : uint8_t {
     Connection,
     Applications,
     MusicPlayer,
+    ElectronicFlow,
     System,
     About,
 };
@@ -135,7 +136,10 @@ static bool g_cassette_tint_dirty = false;
 static bool g_motion_controls_saved = true;
 static bool g_motion_controls_pending = true;
 static bool g_motion_controls_dirty = false;
-static int32_t g_detail_saved_scroll_y[6] = {};
+static uint8_t g_nsf_gain_saved_db = 3U;
+static uint8_t g_nsf_gain_pending_db = 3U;
+static bool g_nsf_gain_dirty = false;
+static int32_t g_detail_saved_scroll_y[7] = {};
 static int32_t g_detail_scroll_y = 0;
 static int32_t g_detail_scroll_max_y = 0;
 static int32_t g_detail_drag_start_scroll_y = 0;
@@ -148,6 +152,7 @@ static bool g_detail_inertia_active = false;
 
 static void music_list_commit_on_exit();
 static void music_player_commit_on_exit();
+static void electronic_flow_commit_on_exit();
 static void settings_update_vertical_adjust_channel();
 
 static void set_visible(lv_obj_t *obj, bool visible)
@@ -186,6 +191,7 @@ static const char *page_title(SettingsPage page)
         case SettingsPage::Connection: return "连接";
         case SettingsPage::Applications: return "应用";
         case SettingsPage::MusicPlayer: return "音乐播放器";
+        case SettingsPage::ElectronicFlow: return "电子音流";
         case SettingsPage::System: return "系统";
         case SettingsPage::About: return "关于";
         default: return "设置";
@@ -207,6 +213,7 @@ static SettingsPage parent_page(SettingsPage page)
 {
     switch (page) {
         case SettingsPage::MusicPlayer:
+        case SettingsPage::ElectronicFlow:
             return SettingsPage::Applications;
         case SettingsPage::Connection:
         case SettingsPage::Applications:
@@ -230,7 +237,7 @@ static void clear_detail_value_refs()
 static size_t settings_page_index(SettingsPage page)
 {
     const size_t index = static_cast<size_t>(page);
-    return index < 6U ? index : 0U;
+    return index < 7U ? index : 0U;
 }
 
 static lv_obj_t *detail_parent()
@@ -261,6 +268,7 @@ static uint16_t detail_row_count_for_page(SettingsPage page)
         case SettingsPage::Connection: return 4U;
         case SettingsPage::Applications: return 5U;
         case SettingsPage::MusicPlayer: return 3U;
+        case SettingsPage::ElectronicFlow: return 1U;
         case SettingsPage::System: return 5U;
         case SettingsPage::About: return 5U;
         case SettingsPage::Main:
@@ -1158,6 +1166,7 @@ static void usb_tf_runtime_enter_task(void *)
 
     // 软件热切换不会经过 Settings leave，因此显式提交本会话设置与播放器持久化状态。
     music_player_commit_on_exit();
+    electronic_flow_commit_on_exit();
     brightness_commit_on_exit();
     const esp_err_t persistent_ret = persistent_state_flush();
     if (persistent_ret != ESP_OK) {
@@ -1700,6 +1709,154 @@ static void music_player_commit_on_exit()
     }
 }
 
+static const char *nsf_gain_compensation_name(uint8_t db)
+{
+    switch (db) {
+        case 0U: return "0 dB";
+        case 1U: return "+1 dB";
+        case 2U: return "+2 dB";
+        case 3U: return "+3 dB";
+        case 4U: return "+4 dB";
+        case 5U: return "+5 dB";
+        case 6U: return "+6 dB";
+        default: return "+3 dB";
+    }
+}
+
+static const char *nsf_gain_compensation_value_text(uint8_t db)
+{
+    switch (db) {
+        case 0U: return "0";
+        case 1U: return "+1";
+        case 2U: return "+2";
+        case 3U: return "+3";
+        case 4U: return "+4";
+        case 5U: return "+5";
+        case 6U: return "+6";
+        default: return "+3";
+    }
+}
+
+static void electronic_flow_page_click_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event) || g_page != SettingsPage::Applications) return;
+    g_pending_page = SettingsPage::ElectronicFlow;
+    lv_async_call(show_page_async, nullptr);
+}
+
+static void nsf_gain_compensation_adjust_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event) || g_page != SettingsPage::ElectronicFlow) return;
+    const uintptr_t action = reinterpret_cast<uintptr_t>(lv_event_get_user_data(event));
+    if (action == 1U && g_nsf_gain_pending_db < 6U) {
+        ++g_nsf_gain_pending_db;
+    } else if (action == 2U && g_nsf_gain_pending_db > 0U) {
+        --g_nsf_gain_pending_db;
+    } else {
+        return;
+    }
+
+    g_nsf_gain_dirty = g_nsf_gain_pending_db != g_nsf_gain_saved_db;
+    if (g_detail_values[0] != nullptr) {
+        lv_label_set_text(g_detail_values[0], nsf_gain_compensation_value_text(g_nsf_gain_pending_db));
+        lv_obj_invalidate(g_detail_values[0]);
+    }
+    ESP_LOGI(TAG, "NSF增益补偿待保存：%s（退出设置时生效）",
+        nsf_gain_compensation_name(g_nsf_gain_pending_db));
+}
+
+static lv_obj_t *create_nsf_gain_adjust_button(
+    lv_obj_t *row, int16_t x, const char *symbol, uintptr_t action)
+{
+    if (row == nullptr || symbol == nullptr) return nullptr;
+    lv_obj_t *button = lv_button_create(row);
+    if (button == nullptr) return nullptr;
+    ui_common_lock_object(button);
+    lv_obj_set_pos(button, x, 12);
+    lv_obj_set_size(button, 42, 40);
+    lv_obj_set_style_radius(button, 9, 0);
+    lv_obj_set_style_border_width(button, 1, 0);
+    lv_obj_set_style_border_color(button, lv_color_hex(kAccentRgb), 0);
+    lv_obj_set_style_bg_color(button, lv_color_hex(kRowRgb), 0);
+    lv_obj_set_style_bg_opa(button, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(button, lv_color_hex(kRowBorderRgb), LV_STATE_PRESSED);
+    lv_obj_set_style_pad_all(button, 0, 0);
+    lv_obj_set_ext_click_area(button, 4);
+    lv_obj_remove_flag(button, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_event_cb(
+        button,
+        nsf_gain_compensation_adjust_cb,
+        LV_EVENT_CLICKED,
+        reinterpret_cast<void *>(action));
+
+    lv_obj_t *label = lv_label_create(button);
+    if (label != nullptr) {
+        ui_common_lock_object(label);
+        lv_label_set_text(label, symbol);
+        lv_obj_set_style_text_font(label, lv_font_default(), 0);
+        lv_obj_set_style_text_color(label, lv_color_hex(kAccentRgb), 0);
+        lv_obj_center(label);
+        lv_obj_remove_flag(label, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(label, LV_OBJ_FLAG_EVENT_BUBBLE);
+    }
+    return button;
+}
+
+static void electronic_flow_commit_on_exit()
+{
+    if (!g_nsf_gain_dirty) return;
+
+    const uint8_t requested = g_nsf_gain_pending_db;
+    const esp_err_t ret = device_settings_set_nsf_gain_compensation_db(requested);
+    if (ret == ESP_OK && audio_service_set_nsf_gain_compensation_db(requested)) {
+        g_nsf_gain_saved_db = requested;
+        g_nsf_gain_pending_db = requested;
+        ESP_LOGI(TAG, "退出设置保存NSF增益补偿：%s",
+            nsf_gain_compensation_name(requested));
+    } else {
+        ESP_LOGW(TAG, "退出设置保存NSF增益补偿失败：%s", esp_err_to_name(ret));
+        g_nsf_gain_pending_db = g_nsf_gain_saved_db;
+    }
+    g_nsf_gain_dirty = false;
+}
+
+static void create_electronic_flow_page(const DeviceSettingsSnapshot &settings)
+{
+    (void)settings;
+    lv_obj_t *value_label = create_row(
+        detail_parent(),
+        detail_row_y(0),
+        kDetailRowHeight,
+        "NSF增益补偿",
+        nsf_gain_compensation_value_text(g_nsf_gain_pending_db),
+        SettingsDetailIcon::Synth,
+        false,
+        nullptr,
+        nullptr);
+    if (value_label == nullptr) return;
+
+    g_detail_values[0] = value_label;
+    lv_obj_t *row = lv_obj_get_parent(value_label);
+
+    // 同一行三段式调节：↑ 增加、中间只显示数值、↓ 减少。
+    // 不再点击整行循环，避免从 +6 dB 一次跳回 0 dB。
+    lv_obj_set_size(value_label, 70, 40);
+    // create_row() initially places the value label with RIGHT_MID alignment.
+    // Re-align explicitly so the numeric box stays inside the row.
+    lv_obj_align(value_label, LV_ALIGN_TOP_LEFT, 292, 12);
+    lv_obj_set_style_radius(value_label, 9, 0);
+    lv_obj_set_style_border_width(value_label, 1, 0);
+    lv_obj_set_style_border_color(value_label, lv_color_hex(kRowBorderRgb), 0);
+    lv_obj_set_style_bg_color(value_label, lv_color_hex(kBgRgb), 0);
+    lv_obj_set_style_bg_opa(value_label, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(value_label, lv_color_hex(kValueRgb), 0);
+    lv_obj_set_style_text_align(value_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_pad_top(value_label, 8, 0);
+
+    (void)create_nsf_gain_adjust_button(row, 244, LV_SYMBOL_UP, 1U);
+    (void)create_nsf_gain_adjust_button(row, 368, LV_SYMBOL_DOWN, 2U);
+}
+
 static void create_applications_page(const DeviceSettingsSnapshot &settings)
 {
     (void)settings;
@@ -1712,7 +1869,12 @@ static void create_applications_page(const DeviceSettingsSnapshot &settings)
         music_player_page_click_cb);
     add_detail_row(2, "视频播放器", "待接入", SettingsDetailIcon::Video, false);
     add_detail_row(3, "文本阅读", "待接入", SettingsDetailIcon::Reader, false);
-    add_detail_row(4, "电子音流", "待接入", SettingsDetailIcon::Synth, false);
+    add_clickable_detail_row(
+        4,
+        "电子音流",
+        ">",
+        SettingsDetailIcon::Synth,
+        electronic_flow_page_click_cb);
 }
 
 static void create_music_player_page(const DeviceSettingsSnapshot &settings)
@@ -1806,6 +1968,7 @@ static void show_page(SettingsPage page)
         case SettingsPage::Connection: create_connection_page(settings); break;
         case SettingsPage::Applications: create_applications_page(settings); break;
         case SettingsPage::MusicPlayer: create_music_player_page(settings); break;
+        case SettingsPage::ElectronicFlow: create_electronic_flow_page(settings); break;
         case SettingsPage::System: create_system_page(settings); break;
         case SettingsPage::About: create_about_page(); break;
     }
@@ -2027,6 +2190,8 @@ static esp_err_t settings_enter()
         g_cassette_tint_pending = settings.cassette_dynamic_tint_enabled;
         g_motion_controls_saved = settings.motion_controls_enabled;
         g_motion_controls_pending = settings.motion_controls_enabled;
+        g_nsf_gain_saved_db = settings.nsf_gain_compensation_db;
+        g_nsf_gain_pending_db = settings.nsf_gain_compensation_db;
     } else {
         g_brightness_saved_level = screen_lock_simple_get_normal_brightness();
         g_brightness_pending_level = g_brightness_saved_level;
@@ -2035,6 +2200,7 @@ static esp_err_t settings_enter()
     g_music_scope_dirty = false;
     g_cassette_tint_dirty = false;
     g_motion_controls_dirty = false;
+    g_nsf_gain_dirty = false;
     show_page(SettingsPage::Main);
     lv_timer_reset(g_timer);
     lv_timer_resume(g_timer);
@@ -2054,6 +2220,7 @@ static esp_err_t settings_leave(AppRunState next_state)
     if (next_state != AppRunState::Stopped) return ESP_ERR_NOT_SUPPORTED;
     // 会话内只预览/滚选；真正离开Settings时才提交一次NVS并切换播放器范围。
     music_player_commit_on_exit();
+    electronic_flow_commit_on_exit();
     brightness_commit_on_exit();
     if (g_timer != nullptr) lv_timer_pause(g_timer);
     if (g_refresh_timer != nullptr) lv_timer_pause(g_refresh_timer);
@@ -2070,6 +2237,7 @@ static void settings_destroy()
 {
     // 防御性兜底：若生命周期异常直接destroy，也只在dirty时提交一次。
     music_player_commit_on_exit();
+    electronic_flow_commit_on_exit();
     brightness_commit_on_exit();
     gesture_router_set_control_capture(false);
     gesture_router_set_vertical_adjust_enabled(false);

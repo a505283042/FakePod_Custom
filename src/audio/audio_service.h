@@ -100,6 +100,10 @@ bool audio_service_nsf_set_track(uint8_t track, bool wait = true);
 // restore_music_hardware=false 用于同一 NSF 内切 Subsong，正常列表/退出路径应传 true。
 bool audio_service_nsf_stop(bool restore_music_hardware = true, bool wait = true);
 
+// NSF 专用数字衰减补偿。0~6dB，仅减少 CS43131 PCM 衰减并在 0dB 封顶；
+// 不改变 UI 的 0~100 音量，也不切换 OUT_FS 模拟输出档。
+bool audio_service_set_nsf_gain_compensation_db(uint8_t db);
+
 enum class AudioNsfDurationState : uint8_t
 {
     Unknown = 0U,

@@ -56,6 +56,7 @@ struct DeviceSettingsSnapshot {
     DeviceMusicListScope music_list_scope = DeviceMusicListScope::All;
     bool cassette_dynamic_tint_enabled = false;
     bool motion_controls_enabled = true;
+    uint8_t nsf_gain_compensation_db = 3U;  // 电子音流专用 CS43131 数字衰减补偿，0~6dB。
     bool remember_volume = true;
 };
 
@@ -74,6 +75,7 @@ esp_err_t device_settings_set_animation_mode(DeviceAnimationMode mode);
 esp_err_t device_settings_set_music_list_scope(DeviceMusicListScope scope);
 esp_err_t device_settings_set_cassette_dynamic_tint_enabled(bool enabled);
 esp_err_t device_settings_set_motion_controls_enabled(bool enabled);
+esp_err_t device_settings_set_nsf_gain_compensation_db(uint8_t db);
 
 // 播放列表目录选择与范围一起提交到同一个 NVS 事务。路径使用 Catalog 中的规范化完整目录路径，
 // 以 '/' 结尾；总列表可传空路径。这样切换一级/二级列表时不会出现 scope 已保存但目录未保存的半状态。

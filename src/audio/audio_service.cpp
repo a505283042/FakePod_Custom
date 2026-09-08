@@ -192,6 +192,7 @@ static uint32_t g_pcm_fade_in_total_frames = 0;
 static uint32_t g_pcm_fade_in_done_frames = 0;
 static bool g_pcm_fade_in_logged_done = true;
 static uint8_t g_task_volume_percent = 50U;
+static volatile uint8_t g_nsf_gain_compensation_db = 3U;
 static AudioOutputMode g_task_output_mode = AudioOutputMode::NormalHeadphones;
 static bool g_task_user_muted = false;
 static uint32_t g_flac_starve_grace_attempts = 0;
@@ -950,13 +951,31 @@ static Cs43131OutputProfile audio_output_mode_to_cs43131(AudioOutputMode mode)
     }
 }
 
-static esp_err_t audio_task_apply_user_volume()
+static uint8_t audio_task_effective_volume_half_db_steps(bool nsf_mode)
+{
+    const uint8_t base_steps = audio_volume_percent_to_half_db_steps(g_task_volume_percent);
+    // 0% 保持原来的 -100dB 语义，不因为 NSF 补偿而抬高近似静音底。
+    if (!nsf_mode || g_task_volume_percent == 0U) return base_steps;
+
+    const uint8_t compensation_steps = static_cast<uint8_t>(
+        (g_nsf_gain_compensation_db > 6U ? 6U : g_nsf_gain_compensation_db) * 2U);
+    return base_steps > compensation_steps
+        ? static_cast<uint8_t>(base_steps - compensation_steps)
+        : 0U;
+}
+
+static esp_err_t audio_task_apply_volume(bool nsf_mode)
 {
     if (!g_pipeline_headphone_enabled) {
         return ESP_OK;
     }
     return cs43131_set_pcm_volume_attenuation(
-        audio_volume_percent_to_half_db_steps(g_task_volume_percent));
+        audio_task_effective_volume_half_db_steps(nsf_mode));
+}
+
+static esp_err_t audio_task_apply_user_volume()
+{
+    return audio_task_apply_volume(g_nsf_active);
 }
 
 static esp_err_t audio_task_unmute_when_pcm_ready()
@@ -3275,8 +3294,19 @@ static void audio_task_handle_nsf_start(AudioRequest *request)
         nullptr,
         true,
         "nsf");
+    const bool nsf_output_started = ret == ESP_OK;
+    if (ret == ESP_OK) {
+        // start_output_hardware() 先按普通 Music 音量初始化；仍处于 mute/unmute_pending 窗口时
+        // 覆盖成 NSF 专用数字衰减，避免切换瞬间先响一拍普通音量。
+        ret = audio_task_apply_volume(true);
+    }
     if (ret != ESP_OK) {
         audio_task_cancel_nsf_analysis();
+        if (nsf_output_started) {
+            (void)audio_task_shutdown_output_hardware(
+                g_nsf_renderer.sample_rate_hz > 0U ? g_nsf_renderer.sample_rate_hz : 48000U,
+                "NSF-Gain-Failed");
+        }
         nsf_apu_renderer_close(&g_nsf_renderer);
         nsf_timeline_release_storage();
         if (g_nsf_restore_paused_music_hardware) {
@@ -3294,9 +3324,13 @@ static void audio_task_handle_nsf_start(AudioRequest *request)
     g_nsf_failed = false;
     audio_task_reset_nsf_end_policy();
     audio_task_publish_nsf_clock_snapshot();
-    ESP_LOGI(TAG, "NSF 2A03已启动：single6502 Sequencer + APU Event Renderer 48000Hz/16bit/2ch track=%u/%u 基础5通道",
+    ESP_LOGI(TAG, "NSF 2A03已启动：single6502 Sequencer + APU Event Renderer 48000Hz/16bit/2ch track=%u/%u 基础5通道 gain_cfg=+%udB volume=%u%% base_steps=%u effective_steps=%u",
         static_cast<unsigned>(g_nsf_renderer.track + 1U),
-        static_cast<unsigned>(g_nsf_renderer.track_count));
+        static_cast<unsigned>(g_nsf_renderer.track_count),
+        static_cast<unsigned>(g_nsf_gain_compensation_db),
+        static_cast<unsigned>(g_task_volume_percent),
+        static_cast<unsigned>(audio_volume_percent_to_half_db_steps(g_task_volume_percent)),
+        static_cast<unsigned>(audio_task_effective_volume_half_db_steps(true)));
     audio_request_complete(request, true, ESP_OK);
 }
 
@@ -4219,9 +4253,12 @@ static void audio_task_handle_set_volume(AudioRequest *request)
     }
 
     audio_task_publish_snapshot();
-    ESP_LOGI(TAG, "用户音量已更新：%u%%，衰减steps=%u",
+    ESP_LOGI(TAG, "用户音量已更新：%u%%，基础衰减steps=%u 实际衰减steps=%u NSF补偿=+%udB active=%u",
         static_cast<unsigned>(g_task_volume_percent),
-        static_cast<unsigned>(audio_volume_percent_to_half_db_steps(g_task_volume_percent)));
+        static_cast<unsigned>(audio_volume_percent_to_half_db_steps(g_task_volume_percent)),
+        static_cast<unsigned>(audio_task_effective_volume_half_db_steps(g_nsf_active)),
+        static_cast<unsigned>(g_nsf_gain_compensation_db),
+        static_cast<unsigned>(g_nsf_active));
     audio_request_complete(request, true, ESP_OK);
 }
 
@@ -4971,6 +5008,15 @@ bool audio_service_set_volume(uint8_t percent, bool wait)
     }
     request->volume_percent = percent > 100U ? 100U : percent;
     return audio_service_submit(request, wait);
+}
+
+bool audio_service_set_nsf_gain_compensation_db(uint8_t db)
+{
+    if (db > 6U) return false;
+    g_nsf_gain_compensation_db = db;
+    ESP_LOGI(TAG, "NSF数字衰减补偿配置：+%udB（0dB封顶，0%%音量不补偿）",
+        static_cast<unsigned>(db));
+    return true;
 }
 
 bool audio_service_set_output_mode(AudioOutputMode mode, bool wait)
