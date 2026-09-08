@@ -36,6 +36,7 @@ static DeviceSettingsSnapshot make_defaults()
     defaults.aod_enabled = true;
     defaults.animation_mode = DeviceAnimationMode::Auto;
     defaults.music_list_scope = DeviceMusicListScope::All;
+    defaults.cassette_dynamic_tint_enabled = false;
     defaults.motion_controls_enabled = true;
     defaults.remember_volume = true;
     return defaults;
@@ -188,6 +189,9 @@ esp_err_t device_settings_init()
     if (nvs_get_str(handle, "mul2", g_music_selection.level2_path, &path_bytes) != ESP_OK) {
         g_music_selection.level2_path[0] = '\0';
     }
+    if (nvs_get_u8(handle, "castint", &u8) == ESP_OK && u8 <= 1U) {
+        g_settings.cassette_dynamic_tint_enabled = u8 != 0U;
+    }
     if (nvs_get_u8(handle, "motion", &u8) == ESP_OK && u8 <= 1U) {
         g_settings.motion_controls_enabled = u8 != 0U;
     }
@@ -198,11 +202,12 @@ esp_err_t device_settings_init()
     nvs_close(handle);
     g_settings.ready = true;
     g_settings.loaded_from_nvs = true;
-    ESP_LOGI(TAG, "Settings V1加载完成：USB=%s audio=%s bright=%u aux=%s motion=%s",
+    ESP_LOGI(TAG, "Settings V1加载完成：USB=%s audio=%s bright=%u aux=%s cassette=%s motion=%s",
         device_settings_usb_mode_name(g_settings.usb_mode),
         device_settings_audio_output_mode_name(g_settings.audio_output_mode),
         static_cast<unsigned>(g_settings.brightness_level),
         device_settings_aux_key_mode_name(g_settings.aux_key_mode),
+        g_settings.cassette_dynamic_tint_enabled ? "封面变色" : "原装粉色",
         g_settings.motion_controls_enabled ? "开" : "关");
     return ESP_OK;
 }
@@ -342,6 +347,16 @@ esp_err_t device_settings_set_music_list_scope(DeviceMusicListScope scope)
         scope,
         g_music_selection.level1_path,
         g_music_selection.level2_path);
+}
+
+esp_err_t device_settings_set_cassette_dynamic_tint_enabled(bool enabled)
+{
+    const bool old = g_settings.cassette_dynamic_tint_enabled;
+    g_settings.cassette_dynamic_tint_enabled = enabled;
+    const esp_err_t ret = commit_u8("castint", enabled ? 1U : 0U);
+    if (ret != ESP_OK) g_settings.cassette_dynamic_tint_enabled = old;
+    log_commit_failure("castint", ret);
+    return ret;
 }
 
 esp_err_t device_settings_set_motion_controls_enabled(bool enabled)

@@ -71,6 +71,7 @@ enum class SettingsPage : uint8_t {
     Main = 0,
     Connection,
     Applications,
+    MusicPlayer,
     System,
     About,
 };
@@ -128,7 +129,13 @@ static bool g_brightness_dirty = false;
 static DeviceMusicListScope g_music_scope_saved = DeviceMusicListScope::All;
 static DeviceMusicListScope g_music_scope_pending = DeviceMusicListScope::All;
 static bool g_music_scope_dirty = false;
-static int32_t g_detail_saved_scroll_y[5] = {};
+static bool g_cassette_tint_saved = false;
+static bool g_cassette_tint_pending = false;
+static bool g_cassette_tint_dirty = false;
+static bool g_motion_controls_saved = true;
+static bool g_motion_controls_pending = true;
+static bool g_motion_controls_dirty = false;
+static int32_t g_detail_saved_scroll_y[6] = {};
 static int32_t g_detail_scroll_y = 0;
 static int32_t g_detail_scroll_max_y = 0;
 static int32_t g_detail_drag_start_scroll_y = 0;
@@ -140,6 +147,7 @@ static uint32_t g_detail_inertia_last_tick_ms = 0U;
 static bool g_detail_inertia_active = false;
 
 static void music_list_commit_on_exit();
+static void music_player_commit_on_exit();
 static void settings_update_vertical_adjust_channel();
 
 static void set_visible(lv_obj_t *obj, bool visible)
@@ -177,6 +185,7 @@ static const char *page_title(SettingsPage page)
         case SettingsPage::Main: return "设置";
         case SettingsPage::Connection: return "连接";
         case SettingsPage::Applications: return "应用";
+        case SettingsPage::MusicPlayer: return "音乐播放器";
         case SettingsPage::System: return "系统";
         case SettingsPage::About: return "关于";
         default: return "设置";
@@ -197,6 +206,8 @@ static SettingsPage page_for_category(SettingsCategory category)
 static SettingsPage parent_page(SettingsPage page)
 {
     switch (page) {
+        case SettingsPage::MusicPlayer:
+            return SettingsPage::Applications;
         case SettingsPage::Connection:
         case SettingsPage::Applications:
         case SettingsPage::System:
@@ -219,7 +230,7 @@ static void clear_detail_value_refs()
 static size_t settings_page_index(SettingsPage page)
 {
     const size_t index = static_cast<size_t>(page);
-    return index < 5U ? index : 0U;
+    return index < 6U ? index : 0U;
 }
 
 static lv_obj_t *detail_parent()
@@ -249,7 +260,8 @@ static uint16_t detail_row_count_for_page(SettingsPage page)
     switch (page) {
         case SettingsPage::Connection: return 4U;
         case SettingsPage::Applications: return 5U;
-        case SettingsPage::System: return 6U;
+        case SettingsPage::MusicPlayer: return 3U;
+        case SettingsPage::System: return 5U;
         case SettingsPage::About: return 5U;
         case SettingsPage::Main:
         default:
@@ -880,19 +892,15 @@ static void aux_key_mode_click_cb(lv_event_t *event)
 
 static void motion_controls_click_cb(lv_event_t *event)
 {
-    if (!click_is_valid(event) || g_page != SettingsPage::System) return;
-    DeviceSettingsSnapshot settings = {};
-    if (!device_settings_get_snapshot(&settings)) return;
-
-    const bool next = !settings.motion_controls_enabled;
-    const esp_err_t ret = device_settings_set_motion_controls_enabled(next);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "保存手势控歌开关失败：%s", esp_err_to_name(ret));
-        return;
+    if (!click_is_valid(event) || g_page != SettingsPage::MusicPlayer) return;
+    g_motion_controls_pending = !g_motion_controls_pending;
+    g_motion_controls_dirty = g_motion_controls_pending != g_motion_controls_saved;
+    if (g_detail_values[2] != nullptr) {
+        lv_label_set_text(g_detail_values[2], g_motion_controls_pending ? "开" : "关");
+        lv_obj_invalidate(g_detail_values[2]);
     }
-    ESP_LOGI(TAG, "手势控歌：%s（前翻/后翻/双击播放暂停统一门控）", next ? "开" : "关");
-    g_pending_page = SettingsPage::System;
-    lv_async_call(show_page_async, nullptr);
+    ESP_LOGI(TAG, "手势控歌待保存：%s（退出设置时生效）",
+        g_motion_controls_pending ? "开" : "关");
 }
 
 static void brightness_card_click_cb(lv_event_t *event)
@@ -1149,7 +1157,7 @@ static void usb_tf_runtime_enter_task(void *)
     bool storage_exclusive = false;
 
     // 软件热切换不会经过 Settings leave，因此显式提交本会话设置与播放器持久化状态。
-    music_list_commit_on_exit();
+    music_player_commit_on_exit();
     brightness_commit_on_exit();
     const esp_err_t persistent_ret = persistent_state_flush();
     if (persistent_ret != ESP_OK) {
@@ -1601,15 +1609,15 @@ static DeviceMusicListScope next_music_list_scope(DeviceMusicListScope scope)
 
 static void music_list_scope_cycle_click_cb(lv_event_t *event)
 {
-    if (!click_is_valid(event) || g_page != SettingsPage::Applications) return;
+    if (!click_is_valid(event) || g_page != SettingsPage::MusicPlayer) return;
     g_music_scope_pending = next_music_list_scope(g_music_scope_pending);
     g_music_scope_dirty = g_music_scope_pending != g_music_scope_saved;
 
-    if (g_detail_values[1] != nullptr) {
+    if (g_detail_values[0] != nullptr) {
         lv_label_set_text(
-            g_detail_values[1],
+            g_detail_values[0],
             device_settings_music_list_scope_name(g_music_scope_pending));
-        lv_obj_invalidate(g_detail_values[1]);
+        lv_obj_invalidate(g_detail_values[0]);
     }
     ESP_LOGI(TAG, "播放列表范围待保存：%s（退出设置时生效）",
         device_settings_music_list_scope_name(g_music_scope_pending));
@@ -1636,19 +1644,98 @@ static void music_list_commit_on_exit()
         device_settings_music_list_scope_name(requested));
 }
 
+static void music_player_page_click_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event) || g_page != SettingsPage::Applications) return;
+    g_pending_page = SettingsPage::MusicPlayer;
+    lv_async_call(show_page_async, nullptr);
+}
+
+static void cassette_tint_click_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event) || g_page != SettingsPage::MusicPlayer) return;
+    g_cassette_tint_pending = !g_cassette_tint_pending;
+    g_cassette_tint_dirty = g_cassette_tint_pending != g_cassette_tint_saved;
+    if (g_detail_values[1] != nullptr) {
+        lv_label_set_text(
+            g_detail_values[1],
+            g_cassette_tint_pending ? "封面变色" : "原装粉色");
+        lv_obj_invalidate(g_detail_values[1]);
+    }
+    ESP_LOGI(TAG, "磁带配色待保存：%s（退出设置时生效）",
+        g_cassette_tint_pending ? "封面变色" : "原装粉色");
+}
+
+static void music_player_commit_on_exit()
+{
+    music_list_commit_on_exit();
+
+    if (g_cassette_tint_dirty) {
+        const bool requested = g_cassette_tint_pending;
+        const esp_err_t ret = device_settings_set_cassette_dynamic_tint_enabled(requested);
+        if (ret == ESP_OK) {
+            g_cassette_tint_saved = requested;
+            g_cassette_tint_pending = requested;
+            ESP_LOGI(TAG, "退出设置保存磁带配色：%s",
+                requested ? "封面变色" : "原装粉色");
+        } else {
+            ESP_LOGW(TAG, "退出设置保存磁带配色失败：%s", esp_err_to_name(ret));
+            g_cassette_tint_pending = g_cassette_tint_saved;
+        }
+        g_cassette_tint_dirty = false;
+    }
+
+    if (g_motion_controls_dirty) {
+        const bool requested = g_motion_controls_pending;
+        const esp_err_t ret = device_settings_set_motion_controls_enabled(requested);
+        if (ret == ESP_OK) {
+            g_motion_controls_saved = requested;
+            g_motion_controls_pending = requested;
+            ESP_LOGI(TAG, "退出设置保存手势控歌：%s", requested ? "开" : "关");
+        } else {
+            ESP_LOGW(TAG, "退出设置保存手势控歌失败：%s", esp_err_to_name(ret));
+            g_motion_controls_pending = g_motion_controls_saved;
+        }
+        g_motion_controls_dirty = false;
+    }
+}
+
 static void create_applications_page(const DeviceSettingsSnapshot &settings)
 {
     (void)settings;
     add_detail_row(0, "自启动APP", "待接入", SettingsDetailIcon::Startup, false);
     add_clickable_detail_row(
         1,
+        "音乐播放器",
+        ">",
+        SettingsDetailIcon::Music,
+        music_player_page_click_cb);
+    add_detail_row(2, "视频播放器", "待接入", SettingsDetailIcon::Video, false);
+    add_detail_row(3, "文本阅读", "待接入", SettingsDetailIcon::Reader, false);
+    add_detail_row(4, "电子音流", "待接入", SettingsDetailIcon::Synth, false);
+}
+
+static void create_music_player_page(const DeviceSettingsSnapshot &settings)
+{
+    (void)settings;
+    add_clickable_detail_row(
+        0,
         "播放列表范围",
         device_settings_music_list_scope_name(g_music_scope_pending),
         SettingsDetailIcon::Music,
         music_list_scope_cycle_click_cb);
-    add_detail_row(2, "视频播放器", "待接入", SettingsDetailIcon::Video, false);
-    add_detail_row(3, "文本阅读", "待接入", SettingsDetailIcon::Reader, false);
-    add_detail_row(4, "电子音流", "待接入", SettingsDetailIcon::Synth, false);
+    add_clickable_detail_row(
+        1,
+        "磁带配色",
+        g_cassette_tint_pending ? "封面变色" : "原装粉色",
+        SettingsDetailIcon::Music,
+        cassette_tint_click_cb);
+    add_clickable_detail_row(
+        2,
+        "手势控歌",
+        g_motion_controls_pending ? "开" : "关",
+        SettingsDetailIcon::Music,
+        motion_controls_click_cb);
 }
 
 static void create_system_page(const DeviceSettingsSnapshot &settings)
@@ -1673,12 +1760,6 @@ static void create_system_page(const DeviceSettingsSnapshot &settings)
         device_settings_aux_key_mode_name(settings.aux_key_mode),
         SettingsDetailIcon::AuxKey,
         aux_key_mode_click_cb);
-    add_clickable_detail_row(
-        5,
-        "手势控歌",
-        settings.motion_controls_enabled ? "开" : "关",
-        SettingsDetailIcon::Music,
-        motion_controls_click_cb);
 }
 
 static void create_about_page()
@@ -1724,6 +1805,7 @@ static void show_page(SettingsPage page)
         case SettingsPage::Main: create_main_page(); break;
         case SettingsPage::Connection: create_connection_page(settings); break;
         case SettingsPage::Applications: create_applications_page(settings); break;
+        case SettingsPage::MusicPlayer: create_music_player_page(settings); break;
         case SettingsPage::System: create_system_page(settings); break;
         case SettingsPage::About: create_about_page(); break;
     }
@@ -1941,12 +2023,18 @@ static esp_err_t settings_enter()
         g_brightness_pending_level = settings.brightness_level;
         g_music_scope_saved = settings.music_list_scope;
         g_music_scope_pending = settings.music_list_scope;
+        g_cassette_tint_saved = settings.cassette_dynamic_tint_enabled;
+        g_cassette_tint_pending = settings.cassette_dynamic_tint_enabled;
+        g_motion_controls_saved = settings.motion_controls_enabled;
+        g_motion_controls_pending = settings.motion_controls_enabled;
     } else {
         g_brightness_saved_level = screen_lock_simple_get_normal_brightness();
         g_brightness_pending_level = g_brightness_saved_level;
     }
     g_brightness_dirty = false;
     g_music_scope_dirty = false;
+    g_cassette_tint_dirty = false;
+    g_motion_controls_dirty = false;
     show_page(SettingsPage::Main);
     lv_timer_reset(g_timer);
     lv_timer_resume(g_timer);
@@ -1965,7 +2053,7 @@ static esp_err_t settings_leave(AppRunState next_state)
 {
     if (next_state != AppRunState::Stopped) return ESP_ERR_NOT_SUPPORTED;
     // 会话内只预览/滚选；真正离开Settings时才提交一次NVS并切换播放器范围。
-    music_list_commit_on_exit();
+    music_player_commit_on_exit();
     brightness_commit_on_exit();
     if (g_timer != nullptr) lv_timer_pause(g_timer);
     if (g_refresh_timer != nullptr) lv_timer_pause(g_refresh_timer);
@@ -1981,7 +2069,7 @@ static esp_err_t settings_leave(AppRunState next_state)
 static void settings_destroy()
 {
     // 防御性兜底：若生命周期异常直接destroy，也只在dirty时提交一次。
-    music_list_commit_on_exit();
+    music_player_commit_on_exit();
     brightness_commit_on_exit();
     gesture_router_set_control_capture(false);
     gesture_router_set_vertical_adjust_enabled(false);

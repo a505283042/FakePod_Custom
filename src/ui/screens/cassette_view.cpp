@@ -17,6 +17,7 @@
 #include "media_catalog_v2.h"
 #include "media_library.h"
 #include "player_state.h"
+#include "system/device_settings.h"
 #include "system/screen_lock_simple.h"
 #include "lyrics/lyrics_service.h"
 #include "gesture/gesture_router.h"
@@ -192,6 +193,8 @@ static uint8_t *g_shell_tint_luma = nullptr;
 static uint32_t g_shell_tintable_pixels = 0U;
 static uint32_t g_shell_tint_generation = 0U;
 static uint32_t g_shell_tint_track = UINT32_MAX;
+static bool g_tint_setting_initialized = false;
+static bool g_tint_setting_dynamic = false;
 
 struct CassetteTintColor
 {
@@ -241,6 +244,7 @@ static void cassette_view_init_rgb565_dsc(
 static void cassette_view_restore_shell_default();
 static void cassette_view_restore_small_roller_default();
 static bool cassette_view_prepare_small_roller_tint_assets();
+static void cassette_view_sync_tint_setting();
 
 static uint16_t cassette_view_cover_source_width()
 {
@@ -1636,6 +1640,37 @@ static bool cassette_view_apply_shell_tint(
     return true;
 }
 
+static void cassette_view_sync_tint_setting()
+{
+    DeviceSettingsSnapshot settings = {};
+    const bool dynamic = device_settings_get_snapshot(&settings) &&
+        settings.cassette_dynamic_tint_enabled;
+    const bool mode_changed = !g_tint_setting_initialized ||
+        dynamic != g_tint_setting_dynamic;
+    g_tint_setting_initialized = true;
+    g_tint_setting_dynamic = dynamic;
+
+    if (!dynamic || g_cover_is_no_artwork_fallback) {
+        if (mode_changed || g_shell_tint_track != UINT32_MAX) {
+            cassette_view_restore_shell_default();
+            cassette_view_restore_small_roller_default();
+            ESP_LOGI(TAG, "磁带配色：原装粉色");
+        }
+        return;
+    }
+
+    if (g_cover_lease.slot_index == 0xFFU || g_cover_lease.normal_rgb565 == nullptr ||
+        g_cover_generation == 0U || g_cover_track == UINT32_MAX) {
+        return;
+    }
+
+    if (mode_changed || g_shell_tint_generation != g_cover_generation ||
+        g_shell_tint_track != g_cover_track) {
+        (void)cassette_view_apply_shell_tint(
+            g_cover_generation, g_cover_track, g_cover_lease);
+    }
+}
+
 static bool cassette_view_prepare_shell()
 {
     if (g_shell_pixels != nullptr) {
@@ -1846,8 +1881,8 @@ static bool cassette_view_bind_current_cover()
     lv_image_set_antialias(g_cover_image, false);
     cassette_view_apply_cover_position();
     lv_obj_remove_flag(g_cover_image, LV_OBJ_FLAG_HIDDEN);
-    // 新封面 Surface 已 ready：只在切歌时分析一次主色并重着色静态壳体。
-    (void)cassette_view_apply_shell_tint(generation, track, g_cover_lease);
+    // 新封面 Surface 已 ready：磁带配色由设置门控；原装粉色不做取色计算。
+    cassette_view_sync_tint_setting();
 
     ESP_LOGI(TAG, "磁带封面已绑定：track=%lu source=%ux%u label=%dx%d bleed=%upx scale=%u/256 y=%dpx safe=±%dpx",
         static_cast<unsigned long>(track),
@@ -2051,6 +2086,7 @@ bool cassette_view_set_active(bool active)
             lv_obj_remove_flag(g_shell_image, LV_OBJ_FLAG_HIDDEN);
         }
         (void)cassette_view_bind_current_cover();
+        cassette_view_sync_tint_setting();
         lv_obj_remove_flag(g_root, LV_OBJ_FLAG_HIDDEN);
         g_active = true;
         g_last_mechanics_frame_us = esp_timer_get_time();
@@ -2071,6 +2107,7 @@ bool cassette_view_set_active(bool active)
     }
 
     g_active = false;
+    g_tint_setting_initialized = false;
     if (g_mechanics_timer != nullptr) lv_timer_pause(g_mechanics_timer);
     cassette_view_set_mechanics_visible(false);
     lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
@@ -2086,6 +2123,7 @@ void cassette_view_update()
 {
     if (!g_active || g_root == nullptr) return;
     (void)cassette_view_bind_current_cover();
+    cassette_view_sync_tint_setting();
     cassette_view_update_track_text();
     cassette_view_update_mini_lyrics();
     cassette_view_update_mechanics();

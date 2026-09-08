@@ -54,6 +54,7 @@ struct DeviceSettingsSnapshot {
     bool aod_enabled = true;
     DeviceAnimationMode animation_mode = DeviceAnimationMode::Auto;
     DeviceMusicListScope music_list_scope = DeviceMusicListScope::All;
+    bool cassette_dynamic_tint_enabled = false;
     bool motion_controls_enabled = true;
     bool remember_volume = true;
 };
@@ -71,6 +72,7 @@ esp_err_t device_settings_set_auto_screen_off_seconds(uint16_t seconds);
 esp_err_t device_settings_set_aod_enabled(bool enabled);
 esp_err_t device_settings_set_animation_mode(DeviceAnimationMode mode);
 esp_err_t device_settings_set_music_list_scope(DeviceMusicListScope scope);
+esp_err_t device_settings_set_cassette_dynamic_tint_enabled(bool enabled);
 esp_err_t device_settings_set_motion_controls_enabled(bool enabled);
 
 // 播放列表目录选择与范围一起提交到同一个 NVS 事务。路径使用 Catalog 中的规范化完整目录路径，
