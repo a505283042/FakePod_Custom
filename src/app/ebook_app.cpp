@@ -43,7 +43,9 @@ static constexpr int32_t kHeaderHeight = 68;
 static constexpr int32_t kContentMargin = 12;
 static constexpr int32_t kRowHeight = 58;
 static constexpr int16_t kReaderTapMaxMovePx = 18;
-// 全屏沿用上一版“大面积轻点”思路，但从左右改为上下：顶部/底部各120px，中央呼出标签视图。
+static constexpr int16_t kReaderSwipeMinDistancePx = 56;
+static constexpr int16_t kReaderSwipeAxisDominancePx = 18;
+// 全屏短按保留上/下翻页，左右滑动也可翻页；返回带菜单视图改为长按屏幕。
 static constexpr int16_t kReaderEdgeTapHeightPx = 120;
 static constexpr int16_t kBrowserBackTouchExpandPx = 10;
 static constexpr int16_t kReaderTopTouchExpandPx = 5;
@@ -2023,6 +2025,15 @@ static void ebook_reader_pointer_cb(lv_event_t *event)
         g_press_tracking = true;
         return;
     }
+    if (code == LV_EVENT_LONG_PRESSED) {
+        if (g_reader_view_mode == ReaderViewMode::Fullscreen) {
+            // 长按触发后结束本次轻点跟踪，避免松手时再误触顶部/底部翻页。
+            g_press_tracking = false;
+            ebook_set_reader_overlay_visible(true);
+            ESP_LOGI(TAG, "Reader全屏长按 -> 返回带菜单视图");
+        }
+        return;
+    }
     if ((code != LV_EVENT_RELEASED && code != LV_EVENT_PRESS_LOST) || !g_press_tracking) return;
 
     lv_point_t end = {};
@@ -2031,20 +2042,33 @@ static void ebook_reader_pointer_cb(lv_event_t *event)
     const int32_t dx = static_cast<int32_t>(end.x) - g_press_start.x;
     const int32_t dy = static_cast<int32_t>(end.y) - g_press_start.y;
     if (abs(dx) <= kReaderTapMaxMovePx && abs(dy) <= kReaderTapMaxMovePx) {
-        // 全屏阅读从“左/中/右”改为“上/中/下”：
-        // 顶部120px上一页，中央区域呼出带标签视图，底部120px下一页。
-        // 不再提供任何左右点击或左右滑动翻页。
+        // 全屏短按只保留上下翻页：顶部120px上一页、底部120px下一页。
+        // 中央短按不再呼出菜单；返回带菜单视图必须长按屏幕。
         if (g_reader_view_mode != ReaderViewMode::Fullscreen) return;
         if (end.y < kReaderEdgeTapHeightPx) {
             if (g_current_page_ordinal > 0) ebook_reader_previous_page();
         } else if (end.y >= 460 - kReaderEdgeTapHeightPx) {
             if (!g_page_at_end && g_page_next > g_page_start) ebook_reader_next_page();
-        } else {
-            ebook_set_reader_overlay_visible(true);
         }
         return;
     }
-    // Reader不再响应左右滑动翻页；非轻点移动仅交还给触摸/手势系统。
+    if (g_reader_view_mode == ReaderViewMode::Fullscreen &&
+        abs(dx) >= kReaderSwipeMinDistancePx &&
+        abs(dx) >= abs(dy) + kReaderSwipeAxisDominancePx) {
+        if (dx < 0) {
+            if (!g_page_at_end && g_page_next > g_page_start) {
+                ebook_reader_next_page();
+                ESP_LOGI(TAG, "Reader全屏左滑 -> 下一页");
+            }
+        } else {
+            if (g_current_page_ordinal > 0) {
+                ebook_reader_previous_page();
+                ESP_LOGI(TAG, "Reader全屏右滑 -> 上一页");
+            }
+        }
+        return;
+    }
+    // 其它方向的移动不处理，避免斜滑误翻页。
 }
 
 static esp_err_t ebook_create()
@@ -2167,6 +2191,7 @@ static esp_err_t ebook_create()
         lv_obj_add_flag(g_reader_host, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(g_reader_host, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(g_reader_host, ebook_reader_pointer_cb, LV_EVENT_PRESSED, nullptr);
+        lv_obj_add_event_cb(g_reader_host, ebook_reader_pointer_cb, LV_EVENT_LONG_PRESSED, nullptr);
         lv_obj_add_event_cb(g_reader_host, ebook_reader_pointer_cb, LV_EVENT_RELEASED, nullptr);
         lv_obj_add_event_cb(g_reader_host, ebook_reader_pointer_cb, LV_EVENT_PRESS_LOST, nullptr);
 
@@ -2181,6 +2206,7 @@ static esp_err_t ebook_create()
             lv_obj_set_style_text_line_space(g_reader_text, kReaderLineSpace, 0);
             lv_obj_add_flag(g_reader_text, LV_OBJ_FLAG_CLICKABLE);
             lv_obj_add_event_cb(g_reader_text, ebook_reader_pointer_cb, LV_EVENT_PRESSED, nullptr);
+            lv_obj_add_event_cb(g_reader_text, ebook_reader_pointer_cb, LV_EVENT_LONG_PRESSED, nullptr);
             lv_obj_add_event_cb(g_reader_text, ebook_reader_pointer_cb, LV_EVENT_RELEASED, nullptr);
             lv_obj_add_event_cb(g_reader_text, ebook_reader_pointer_cb, LV_EVENT_PRESS_LOST, nullptr);
         }

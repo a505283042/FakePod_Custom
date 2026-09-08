@@ -132,7 +132,11 @@ static bool motion_controls_allowed()
     if (!device_settings_get_snapshot(&settings) || !settings.motion_controls_enabled) {
         return false;
     }
-    if (!app_manager_is_ready() || app_manager_foreground() != AppId::Music) {
+    if (!app_manager_is_ready()) {
+        return false;
+    }
+    const AppId foreground = app_manager_foreground();
+    if (foreground != AppId::Music && foreground != AppId::Ebook) {
         return false;
     }
 
@@ -243,7 +247,7 @@ static void motion_handle_double_tap(TickType_t now)
 
     if (!motion_controls_allowed()) {
 #if FAKEPOD_MOTION_DIAGNOSTIC_LOG
-        ESP_LOGI(TAG, "DoubleTap已识别：亮屏/解锁/Music门控未满足，忽略播放器动作");
+        ESP_LOGI(TAG, "DoubleTap已识别：亮屏/解锁/Music/Ebook门控未满足，忽略播放器动作");
 #endif
         return;
     }
@@ -411,7 +415,7 @@ static void motion_trigger_flip(int8_t direction, int32_t excursion_mdeg, TickTy
 
     if (!motion_controls_allowed()) {
 #if FAKEPOD_MOTION_DIAGNOSTIC_LOG
-        ESP_LOGI(TAG, "Flip已确认：亮屏/解锁/Music门控未满足，忽略播放器动作");
+        ESP_LOGI(TAG, "Flip已确认：亮屏/解锁/Music/Ebook门控未满足，忽略播放器动作");
 #endif
         return;
     }
@@ -773,9 +777,9 @@ esp_err_t motion_service_init()
 
     ESP_LOGI(
         TAG,
-        "Motion Controls V2.2就绪：INT1=GPIO%d ForwardFlip=下一首 BackwardFlip=上一首 DoubleTap=播放/暂停；设置-系统可关闭",
+        "Motion Controls V2.2就绪：INT1=GPIO%d ForwardFlip=下一首 BackwardFlip=上一首 DoubleTap=播放/暂停；设置-应用-音乐播放器可关闭",
         FAKEPOD_IMU_INT1);
-    ESP_LOGI(TAG, "Flip：到位后500ms内回位才生效；超时仅回位复位；动态零点Recenter；Pocket Guard=Normal+Unlocked+Music");
+    ESP_LOGI(TAG, "Flip：到位后500ms内回位才生效；超时仅回位复位；动态零点Recenter；Pocket Guard=Normal+Unlocked+Music/Ebook");
     return ESP_OK;
 }
 

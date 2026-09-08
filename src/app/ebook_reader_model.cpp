@@ -1030,11 +1030,15 @@ static esp_err_t paginate_loaded_page(
                 if (glyph_width_px == 0) glyph_width_px = codepoint < 0x80U ? 12U : 24U;
             }
 
+            // 分页器必须与 LVGL label 的实际换行边界一致。
+            // 之前允许中文闭合标点/句末标点/逗号在行尾“悬挂”越过 text_width_px，
+            // 但 LV_LABEL_LONG_WRAP 不会接受这个越界：LVGL 会把该字符挪到下一视觉行，
+            // 导致分页器认为本页仍只有 N 行，而屏幕实际出现第 N+1 行（常被底部裁成半行）。
+            // next_offset 又已经消费了那一行的源字节，翻页后就表现为“半行丢失”。
+            // 所以任何字形只要超出正文宽度，都先由分页器显式换行。
             const bool would_overflow = line_width_px > 0 &&
                 static_cast<uint32_t>(line_width_px) + glyph_width_px > layout.text_width_px;
-            const bool punctuation_can_hang = is_closing_punctuation(codepoint) ||
-                is_sentence_terminal(codepoint) || is_comma_like(codepoint);
-            if (would_overflow && !punctuation_can_hang) {
+            if (would_overflow) {
                 if (visual_line + 1U >= layout.max_lines) {
                     page_full = true;
                     break;

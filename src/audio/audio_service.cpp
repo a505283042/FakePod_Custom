@@ -4518,7 +4518,7 @@ static void audio_task_main(void *arg)
             g_video_mp3_active ||
             g_nsf_active ||
             g_task_state == AudioPlaybackState::Playing ||
-            g_task_state == AudioPlaybackState::Paused;
+            (g_task_state == AudioPlaybackState::Paused && g_pipeline_i2s_started);
         const TickType_t wait_ticks = stream_needs_service ? 0 : portMAX_DELAY;
 
         if (xQueueReceive(g_command_queue, &request, wait_ticks) == pdTRUE && request != nullptr) {

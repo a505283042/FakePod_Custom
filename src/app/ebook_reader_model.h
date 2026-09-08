@@ -13,7 +13,7 @@ static constexpr size_t kEntryNameBytes = 256;
 static constexpr size_t kPathBytes = 512;
 static constexpr size_t kPageReadBytes = 2048;
 // 持久 PageIndex cache 的分页算法世代。任何会改变 start/next 页界的 parser 规则都必须递增。
-static constexpr uint32_t kPaginationAlgorithmRevision = 1U;
+static constexpr uint32_t kPaginationAlgorithmRevision = 2U;
 
 enum DirectoryEntryFlags : uint32_t
 {

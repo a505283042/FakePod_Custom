@@ -312,9 +312,9 @@ static bool pause_music_for_nsf_exclusive()
     return true;
 }
 
-static bool stop_nsf_audio(bool restore_music, const char *reason)
+static bool stop_nsf_audio(bool restore_music, const char *reason, bool force_hardware_stop = false)
 {
-    if (g_nsf_audio_active || restore_music) {
+    if (g_nsf_audio_active || restore_music || force_hardware_stop) {
         if (!audio_service_nsf_stop(restore_music, true)) {
             ESP_LOGE(TAG, "NSF停止/恢复Music硬件失败：reason=%s",
                 reason != nullptr ? reason : "unknown");
@@ -758,7 +758,8 @@ static bool start_nsf_audio_from_image()
             g_nsf_image.prg_size,
             &config,
             true)) {
-        (void)stop_nsf_audio(true, "nsf_start_failed");
+        // 仍在电子音流 APP 内：强制清理可能已部分切换的 NSF 硬件，但不恢复普通 Music。
+        (void)stop_nsf_audio(false, "nsf_start_failed", true);
         g_nsf_failed = true;
         update_nsf_ready_ui();
         ESP_LOGE(TAG, "NSF 2A03启动失败：track=%u/%u",
@@ -789,8 +790,9 @@ static bool start_nsf_audio_from_image()
 static void begin_nsf_load()
 {
     if (g_selected_path == nullptr || g_selected_path[0] == '\0') return;
-    // 切换到新的 NSF 文件时先完整交还上一种临时音源；解析阶段允许原 Music 继续播放。
-    (void)stop_nsf_audio(true, "switch_nsf_file");
+    // 切换到新的 NSF 文件时只停止旧 NSF；普通 Music 始终保持进入 NSF 前的暂停状态。
+    // 只有真正离开电子音流 APP 时，visual_music_leave() 才恢复普通 Music。
+    (void)stop_nsf_audio(false, "switch_nsf_file");
     cancel_nsf_player();
     g_nsf_paused = true;
     g_nsf_eof = false;
@@ -854,7 +856,8 @@ static void nsf_result_tick()
 
 static bool select_nsf_subsong(int direction, bool allow_wrap)
 {
-    if (g_page != VisualMusicPage::NsfReady || g_nsf_image.track_count == 0U || direction == 0) {
+    // NSF 会话可以在文件列表页继续播放，内部 Track 切换不能依赖当前 UI 页面。
+    if (g_nsf_image.track_count == 0U || direction == 0) {
         return false;
     }
     int next = static_cast<int>(g_nsf_track) + (direction > 0 ? 1 : -1);
@@ -887,9 +890,17 @@ static bool select_nsf_subsong(int direction, bool allow_wrap)
     g_nsf_visual_window_count = 0U;
     g_last_nsf_visual_snapshot_tick = 0U;
     g_nsf_final_high_fps = false;
-    if (g_timer != nullptr) lv_timer_set_period(g_timer, kNsfAnalyzingTimerPeriodMs);
+    if (g_timer != nullptr) {
+        lv_timer_set_period(
+            g_timer,
+            g_page == VisualMusicPage::NsfReady
+                ? kNsfAnalyzingTimerPeriodMs
+                : kBrowserTimerPeriodMs);
+    }
     update_nsf_ready_ui();
-    if (g_waterfall_widget != nullptr) lv_obj_invalidate(g_waterfall_widget);
+    if (g_page == VisualMusicPage::NsfReady && g_waterfall_widget != nullptr) {
+        lv_obj_invalidate(g_waterfall_widget);
+    }
     ESP_LOGI(
         TAG,
         "NSF Subsong选择：track=%u/%u",
@@ -1238,8 +1249,11 @@ static void browser_load_tick()
 
 static void show_browser()
 {
-    (void)stop_nsf_audio(true, "back_to_list");
-    cancel_nsf_player();
+    // 播放页 -> 文件列表只切换 UI：NSF 继续播放，普通 Music 继续保持暂停。
+    // 若用户在“正在解析新 NSF”阶段返回列表，则仅取消尚未开始的解析。
+    if (g_page == VisualMusicPage::NsfLoading) {
+        cancel_nsf_player();
+    }
     g_page = VisualMusicPage::Browser;
     if (g_timer != nullptr) lv_timer_set_period(g_timer, kBrowserTimerPeriodMs);
     set_visible(g_browser_host, true);
@@ -1248,6 +1262,11 @@ static void show_browser()
     update_header();
     update_rows();
     gesture_router_reset();
+    ESP_LOGI(
+        TAG,
+        "电子音流返回文件列表：NSF=%s Music=%s；离开APP后才恢复Music",
+        g_nsf_audio_active ? "继续播放" : "未播放",
+        g_music_paused_for_nsf ? "保持暂停" : "保持原状态");
 }
 
 static void show_launcher()
@@ -1341,7 +1360,9 @@ static void timer_cb(lv_timer_t *timer)
 
     browser_load_tick();
     nsf_result_tick();
-    if (g_page == VisualMusicPage::NsfReady && g_nsf_audio_active) {
+    // NSF 音频会话与页面显示解耦：Browser 中仍持续消费 Clock/EOF/循环状态。
+    if (g_nsf_audio_active) {
+        const bool player_visible = g_page == VisualMusicPage::NsfReady;
         const uint32_t now_tick = static_cast<uint32_t>(lv_tick_get());
         AudioNsfClockSnapshot clock = {};
         if (audio_service_nsf_get_clock(&clock) && clock.active) {
@@ -1351,9 +1372,10 @@ static void timer_cb(lv_timer_t *timer)
             g_nsf_failed = clock.failed;
             if (clock.track < g_nsf_image.track_count) g_nsf_track = clock.track;
             if (clock.failed) {
-                (void)stop_nsf_audio(true, "nsf_runtime_failed");
+                // 运行失败也不越过 APP 生命周期恢复普通 Music。
+                (void)stop_nsf_audio(false, "nsf_runtime_failed");
                 g_nsf_failed = true;
-                update_nsf_ready_ui();
+                if (player_visible) update_nsf_ready_ui();
             } else if (clock.eof) {
                 // NSF v1 没有原生 Track 时长：AudioTask 只在 Final 结束计划真正到点后发布 EOF。
                 // UI 按 Track 实例 revision 只消费一次 EOF，并按当前循环模式切换 Subsong。
@@ -1372,7 +1394,9 @@ static void timer_cb(lv_timer_t *timer)
                             g_nsf_eof = false;
                             g_last_nsf_time_label_tick = 0U;
                             g_last_waterfall_draw_tick = 0U;
-                            if (g_waterfall_widget != nullptr) lv_obj_invalidate(g_waterfall_widget);
+                            if (player_visible && g_waterfall_widget != nullptr) {
+                                lv_obj_invalidate(g_waterfall_widget);
+                            }
                             ESP_LOGI(TAG, "NSF RepeatOne已重启：track=%u/%u",
                                 static_cast<unsigned>(g_nsf_track + 1U),
                                 static_cast<unsigned>(g_nsf_image.track_count));
@@ -1387,13 +1411,15 @@ static void timer_cb(lv_timer_t *timer)
                                    g_loop_mode == PlayerLoopMode::RepeatAll)) {
                         return;
                     }
-                    update_nsf_time_label();
-                    update_player_controls();
+                    if (player_visible) {
+                        update_nsf_time_label();
+                        update_player_controls();
+                    }
                 }
             } else {
                 if (paused_changed) {
-                    update_player_controls();
-                    if (clock.paused && g_waterfall_widget != nullptr) {
+                    if (player_visible) update_player_controls();
+                    if (player_visible && clock.paused && g_waterfall_widget != nullptr) {
                         // Pause 只在状态切换瞬间补一帧，之后不再持续刷新瀑布。
                         lv_obj_invalidate(g_waterfall_widget);
                     }
@@ -1405,21 +1431,24 @@ static void timer_cb(lv_timer_t *timer)
                     if (g_timer != nullptr) {
                         lv_timer_set_period(
                             g_timer,
-                            want_final_high_fps
-                                ? kNsfFinalTimerPeriodMs
-                                : kNsfAnalyzingTimerPeriodMs);
+                            player_visible
+                                ? (want_final_high_fps
+                                    ? kNsfFinalTimerPeriodMs
+                                    : kNsfAnalyzingTimerPeriodMs)
+                                : kBrowserTimerPeriodMs);
                     }
                     g_last_waterfall_draw_tick = 0U;
-                    if (want_final_high_fps) {
+                    if (player_visible && want_final_high_fps) {
                         ESP_LOGI(TAG, "NSF时长Final：瀑布切换20fps");
                     }
                 }
-                if (g_last_nsf_time_label_tick == 0U ||
-                    now_tick - g_last_nsf_time_label_tick >= kWaterfallTimeLabelPeriodMs) {
+                if (player_visible &&
+                    (g_last_nsf_time_label_tick == 0U ||
+                     now_tick - g_last_nsf_time_label_tick >= kWaterfallTimeLabelPeriodMs)) {
                     g_last_nsf_time_label_tick = now_tick;
                     update_nsf_time_label();
                 }
-                if (!clock.paused) {
+                if (player_visible && !clock.paused) {
                     const uint32_t waterfall_period_ms =
                         clock.duration_state == AudioNsfDurationState::Final
                             ? kNsfWaterfallFinalFramePeriodMs
@@ -1800,7 +1829,7 @@ static esp_err_t visual_music_leave(AppRunState next_state)
     app_launcher_overlay_hide();
     set_visible(g_root, false);
     g_page = VisualMusicPage::Browser;
-    ESP_LOGI(TAG, "电子音流离开Foreground：NSF音频与目录协作任务已停止，进入前Music状态已恢复");
+    ESP_LOGI(TAG, "电子音流离开Foreground：NSF音频与目录协作任务已停止；此时才恢复进入前Music状态");
     return ESP_OK;
 }
 
