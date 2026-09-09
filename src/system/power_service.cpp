@@ -11,6 +11,7 @@
 #include "player/player_control.h"
 #include "device_settings.h"
 #include "screen_lock_simple.h"
+#include "app/app_manager.h"
 
 static const char *TAG = "电源";
 
@@ -116,9 +117,16 @@ void power_service_update()
                     const bool track_mode = device_settings_get_snapshot(&settings) &&
                         settings.aux_key_mode == DeviceAuxKeyMode::Track;
                     if (track_mode) {
-                        ESP_LOGI(TAG, "电源键短按释放：hold=%lums → 上一曲",
-                            (unsigned long)held_ms);
-                        (void)player_control_previous();
+                        // 切歌仅在音乐或电子书前台时生效，避免在其它 APP 误切歌。
+                        const AppId foreground = app_manager_foreground();
+                        if (foreground == AppId::Music || foreground == AppId::Ebook) {
+                            ESP_LOGI(TAG, "电源键短按释放：hold=%lums → 上一曲",
+                                (unsigned long)held_ms);
+                            (void)player_control_previous();
+                        } else {
+                            ESP_LOGI(TAG, "电源键短按释放：hold=%lums → 非音乐/电子书前台，切歌不生效",
+                                (unsigned long)held_ms);
+                        }
                     } else {
                         ESP_LOGI(TAG, "电源键短按释放：hold=%lums → 音量+1",
                             (unsigned long)held_ms);

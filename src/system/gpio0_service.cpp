@@ -116,8 +116,15 @@ void gpio0_service_update()
                 const bool track_mode = device_settings_get_snapshot(&settings) &&
                     settings.aux_key_mode == DeviceAuxKeyMode::Track;
                 if (track_mode) {
-                    ESP_LOGI(TAG, "GPIO0 释放：短按 %lums → 下一曲", (unsigned long)held);
-                    (void)player_control_next();
+                    // 切歌仅在音乐或电子书前台时生效，避免在其它 APP 误切歌。
+                    const AppId foreground = app_manager_foreground();
+                    if (foreground == AppId::Music || foreground == AppId::Ebook) {
+                        ESP_LOGI(TAG, "GPIO0 释放：短按 %lums → 下一曲", (unsigned long)held);
+                        (void)player_control_next();
+                    } else {
+                        ESP_LOGI(TAG, "GPIO0 释放：短按 %lums → 非音乐/电子书前台，切歌不生效",
+                            (unsigned long)held);
+                    }
                 } else {
                     ESP_LOGI(TAG, "GPIO0 释放：短按 %lums → 音量-1", (unsigned long)held);
                     (void)player_control_volume_down(1U);
