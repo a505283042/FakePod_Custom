@@ -162,16 +162,15 @@ void gpio0_service_update()
 
     if (is_dark_or_locked) {
         // ① 暗态或锁定（Locked / AOD / 熄屏，任意组合）：
-        //    直接「一键解锁」= 亮回 Normal 并解除锁定
+        //    「一键唤醒+解锁」在同一次 LVGL 锁内原子完成，避免旧版 set_power + set_lock
+        //    两次独立锁获取之间出现「屏幕亮了但 AOD 还盖着」的半切换窗口。
         ESP_LOGI(TAG,
-            "GPIO0 长按 %lums [屏态=%s 锁=%s] → 一键 Normal + Unlocked",
+            "GPIO0 长按 %lums [屏态=%s 锁=%s] → 复合唤醒 Normal + Unlocked",
             (unsigned long)held,
             power == ScreenPowerNormal ? "NORMAL" :
             power == ScreenPowerAOD ? "AOD" : "OFF",
             lock == ScreenLockLocked ? "LOCKED" : "FREE");
-        // 先亮回来（Normal），再解锁
-        screen_lock_simple_set_power(ScreenPowerNormal);
-        screen_lock_simple_set_lock(ScreenLockUnlocked);
+        (void)screen_lock_simple_wake_and_unlock();
         // 同时关闭残留菜单（如果之前有打开过）
         screen_action_menu_close(false);
     } else {

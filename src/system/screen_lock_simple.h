@@ -64,6 +64,15 @@ void screen_lock_set_lock(ScreenLockState lock);             // 老别名
 void screen_lock_toggle_lock(void);
 void screen_lock_wake_if_needed(void);
 
+// ============================================================
+// 复合唤醒：把 power 切回 Normal + 解除锁定 在同一次 LVGL 锁内原子完成。
+//   GPIO0 长按从 AOD / 熄屏 / 锁定态唤醒时用它，避免 set_power() 与 set_lock()
+//   两次独立锁获取之间留下「屏幕亮了但 UI 还卡着」的脏窗口。
+//   硬件亮度切换独立于 LVGL 锁（先亮屏再等 UI），锁超时返回 false 时硬件已亮
+//   但 C++ 状态未变 —— 下次 GPIO0 长按可重试。
+// ============================================================
+bool screen_lock_simple_wake_and_unlock(void);
+
 // 正常显示亮度（esp_lcd_co5300 API 使用 0~100%，0 保留给真·熄屏）。
 // 设置页拖动时可实时预览；只有当前处于 Normal 才立即写硬件，AOD/Off 状态只更新目标值。
 esp_err_t screen_lock_simple_set_normal_brightness(uint8_t level);
