@@ -8,8 +8,41 @@ Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 function Find-Tool([string]$name) {
-    $cmd = Get-Command $name -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd.Source }
+
+    # ① 从当前 PowerShell 的 PATH 查找
+    try {
+        $cmd = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue
+        if ($cmd -and $cmd.Source) {
+            return $cmd.Source
+        }
+    } catch {}
+
+    # ② 使用 where.exe 再查一次
+    try {
+        $result = & where.exe $name 2>$null | Select-Object -First 1
+        if ($result -and (Test-Path -LiteralPath $result)) {
+            return $result
+        }
+    } catch {}
+
+    # ③ 检查常见 FFmpeg 安装位置
+    $candidates = @(
+        "$env:ProgramFiles\ffmpeg\bin\$name.exe",
+        "$env:ProgramFiles\FFmpeg\bin\$name.exe",
+        "${env:ProgramFiles(x86)}\ffmpeg\bin\$name.exe",
+        "${env:ProgramFiles(x86)}\FFmpeg\bin\$name.exe",
+        "C:\ffmpeg\bin\$name.exe",
+        "C:\FFmpeg\bin\$name.exe",
+        "$env:USERPROFILE\ffmpeg\bin\$name.exe",
+        "$env:LOCALAPPDATA\ffmpeg\bin\$name.exe"
+    )
+
+    foreach ($path in $candidates) {
+        if ($path -and (Test-Path -LiteralPath $path)) {
+            return (Resolve-Path -LiteralPath $path).Path
+        }
+    }
+
     return $null
 }
 
