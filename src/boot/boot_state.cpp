@@ -55,7 +55,9 @@ static void boot_library_scan_event(
     if (event == MediaLibraryScanEvent::InitialBuild) {
         (void)ui_manager_show_library_build_progress(current_count);
     } else if (event == MediaLibraryScanEvent::ChangesDetected) {
-        (void)ui_manager_show_library_update_progress();
+        (void)ui_manager_show_library_update_progress(0U);
+    } else if (event == MediaLibraryScanEvent::IncrementalAddedProgress) {
+        (void)ui_manager_show_library_update_progress(current_count);
     }
 }
 

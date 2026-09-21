@@ -21,11 +21,15 @@ enum class MediaLibraryScanEvent : uint8_t
 {
     InitialBuild = 0,
     ChangesDetected,
+    IncrementalAddedProgress,
 };
 
 using MediaLibraryScanEventCallback = void (*)(
     MediaLibraryScanEvent event,
-    uint32_t current_count,
+    // InitialBuild：当前已发现歌曲总数；
+    // IncrementalAddedProgress：本轮已确认新增歌曲数；
+    // ChangesDetected：仅表示检测到变化，value 当前不参与业务判断。
+    uint32_t value,
     void *context
 );
 

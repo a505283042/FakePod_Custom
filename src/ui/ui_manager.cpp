@@ -53,6 +53,9 @@ static lv_obj_t *g_boot_title = nullptr;
 static lv_obj_t *g_boot_status = nullptr;
 static bool g_bootstrap_ready = false;
 static bool g_boot_reveal_pending = false;
+static int64_t g_boot_reveal_retry_started_us = 0;
+static uint8_t g_boot_reveal_retry_count = 0U;
+static lv_timer_t *g_display_visibility_guard_timer = nullptr;
 static bool g_ready = false;
 
 // 首次建库进度由扫描任务只写入轻量计数，真正的 LVGL 文本更新由
@@ -63,6 +66,11 @@ static std::atomic<uint32_t> g_boot_library_progress_count{0U};
 static std::atomic<uint32_t> g_boot_library_progress_generation{0U};
 static uint32_t g_boot_library_progress_applied_generation = 0U;
 static std::atomic<bool> g_boot_library_progress_active{false};
+// 增量扫描和首次建库共用同一个 LVGL timer，但分别保存状态，避免扫描线程直接抢 LVGL 锁。
+static std::atomic<uint32_t> g_boot_library_update_added_count{0U};
+static std::atomic<uint32_t> g_boot_library_update_generation{0U};
+static uint32_t g_boot_library_update_applied_generation = 0U;
+static std::atomic<bool> g_boot_library_update_active{false};
 static esp_lv_decoder_handle_t g_image_decoder = nullptr;
 static int16_t g_touch_last_x = 0;
 static int16_t g_touch_last_y = 0;
@@ -81,6 +89,10 @@ static volatile uint32_t g_display_flush_done_sequence = 0U;
 static uint32_t g_display_flush_wait_timeout_count = 0U;
 static lv_area_t g_display_flush_last_area = {};
 static constexpr uint32_t kDisplayFlushWaitTimeoutMs = 250U;
+// 显示可见性保护只处理“理论上应该可见但状态机没有闭环”的异常。
+// 正常首帧/PresentHold 都远短于这些阈值，因此不会干扰正常页面切换。
+static constexpr uint32_t kBootRevealRetryIntervalMs = 300U;
+static constexpr uint32_t kPresentHoldRecoveryMs = 400U;
 
 // 大面积刷新才等待 TE。
 // 小型进度条/按钮局部更新继续立即刷新，避免所有 UI 交互都额外等待一帧。
@@ -279,6 +291,57 @@ static void ui_display_flush_wait_cb(lv_display_t *display)
     // 不能简单返回：wait_cb 返回后 LVGL 会继续复用 draw buffer；若底层 DMA 只是
     // 丢了完成闭环而仍在运行，会造成更严重的内存竞争。这里直接受控重启。
     esp_restart();
+}
+
+static void ui_display_visibility_guard_timer_cb(lv_timer_t *)
+{
+    const int64_t now_us = esp_timer_get_time();
+
+    // 首帧揭屏失败时不能把 pending 永久清掉。这里周期性制造一次新的整屏刷新，
+    // 让 REFR_READY 再次进入揭屏流程。只重试刷新，不绕过“首帧必须先完成”的约束。
+    if (g_boot_reveal_pending && g_display != nullptr &&
+        g_boot_reveal_retry_started_us > 0 &&
+        now_us - g_boot_reveal_retry_started_us >=
+            static_cast<int64_t>(kBootRevealRetryIntervalMs) * 1000LL) {
+        g_boot_reveal_retry_started_us = now_us;
+        ++g_boot_reveal_retry_count;
+        lv_obj_t *screen = lv_screen_active();
+        if (screen != nullptr) {
+            lv_obj_invalidate(screen);
+        }
+        if (g_boot_reveal_retry_count <= 5U || (g_boot_reveal_retry_count % 10U) == 0U) {
+            ESP_LOGW(TAG, "首帧揭屏仍未完成：retry=%u，重新请求整屏刷新",
+                static_cast<unsigned>(g_boot_reveal_retry_count));
+        }
+    }
+
+    // PresentHold 的目的只是隐藏一次全屏封面替换。若 REFR_READY 因异常没有闭环，
+    // 过去会让面板输出永久停在 OFF。超过保护窗口后优先恢复可见性，再让 LVGL
+    // 重绘当前屏幕；若用户已主动进入 AOD/熄屏，则绝不能把屏幕强行点亮。
+    if (g_present_hold_active && g_present_hold_started_us > 0 &&
+        now_us - g_present_hold_started_us >=
+            static_cast<int64_t>(kPresentHoldRecoveryMs) * 1000LL) {
+        const uint32_t held_ms = static_cast<uint32_t>(
+            (now_us - g_present_hold_started_us) / 1000LL);
+        const bool normal_power =
+            screen_lock_simple_get_power() == ScreenPowerNormal;
+        bool restored = true;
+        if (normal_power) {
+            restored = display_present_set_output(true);
+        }
+        g_present_hold_active = false;
+        g_present_hold_started_us = 0;
+
+        lv_obj_t *screen = lv_screen_active();
+        if (screen != nullptr && normal_power) {
+            lv_obj_invalidate(screen);
+        }
+        ESP_LOGW(TAG,
+            "PresentHold 超时自愈：held=%ums power=%s restored=%u",
+            static_cast<unsigned>(held_ms),
+            normal_power ? "Normal" : "NonNormal",
+            static_cast<unsigned>(restored));
+    }
 }
 
 static const char *ui_perf_context_name(UiPerfContext context)
@@ -816,11 +879,17 @@ static void ui_display_refresh_ready_cb(lv_event_t *event)
     }
 
     if (g_boot_reveal_pending) {
-        g_boot_reveal_pending = false;
         const esp_err_t reveal_ret = display_reveal_after_first_frame();
         if (reveal_ret != ESP_OK) {
-            ESP_LOGE(TAG, "启动页首帧揭屏失败：%s", esp_err_to_name(reveal_ret));
+            // 不清 pending。下一次刷新完成后继续尝试，避免一次瞬态面板命令失败
+            // 就把设备永久留在 brightness=0 / display OFF。
+            g_boot_reveal_retry_started_us = esp_timer_get_time();
+            ESP_LOGE(TAG, "启动页首帧揭屏失败：%s，将自动重试",
+                esp_err_to_name(reveal_ret));
         } else {
+            g_boot_reveal_pending = false;
+            g_boot_reveal_retry_started_us = 0;
+            g_boot_reveal_retry_count = 0U;
             ESP_LOGI(TAG, "启动页首帧已完成并揭屏");
         }
     }
@@ -1058,24 +1127,60 @@ static void ui_manager_apply_library_build_progress_locked(uint32_t scanned_coun
     lv_obj_invalidate(g_boot_root);
 }
 
+static void ui_manager_apply_library_update_progress_locked(uint32_t added_count)
+{
+    if (g_boot_status == nullptr || g_boot_root == nullptr) {
+        return;
+    }
+
+    char status[96] = {};
+    const int written = added_count == 0U
+        ? snprintf(status, sizeof(status), "正在更新音乐库...")
+        : snprintf(
+            status,
+            sizeof(status),
+            "正在更新音乐库...\n新增 %lu 首歌曲",
+            static_cast<unsigned long>(added_count));
+    if (written <= 0 || static_cast<size_t>(written) >= sizeof(status)) {
+        return;
+    }
+
+    lv_label_set_text(g_boot_status, status);
+    lv_obj_set_style_text_font(g_boot_status, usb_service_font_get(), 0);
+    lv_obj_set_style_text_color(g_boot_status, lv_color_hex(0xC7D5E8), 0);
+    lv_obj_set_style_text_align(g_boot_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_line_space(g_boot_status, 6, 0);
+    lv_obj_set_width(g_boot_status, 410);
+    lv_obj_align(g_boot_status, LV_ALIGN_CENTER, 0, 18);
+    lv_obj_invalidate(g_boot_root);
+}
+
 static void ui_manager_boot_library_progress_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
-    if (!g_boot_library_progress_active.load(std::memory_order_acquire) ||
-        g_boot_status == nullptr || g_boot_root == nullptr) {
+    if (g_boot_status == nullptr || g_boot_root == nullptr) {
         return;
     }
 
-    const uint32_t generation = g_boot_library_progress_generation.load(std::memory_order_acquire);
-    if (generation == g_boot_library_progress_applied_generation) {
-        return;
+    if (g_boot_library_progress_active.load(std::memory_order_acquire)) {
+        const uint32_t generation = g_boot_library_progress_generation.load(std::memory_order_acquire);
+        if (generation != g_boot_library_progress_applied_generation) {
+            // 先取最新计数再记录 generation。若扫描线程恰好在两次读取之间更新，
+            // 下一次 timer 仍会看到 generation 变化，不会永久丢掉一次进度。
+            const uint32_t count = g_boot_library_progress_count.load(std::memory_order_relaxed);
+            ui_manager_apply_library_build_progress_locked(count);
+            g_boot_library_progress_applied_generation = generation;
+        }
     }
 
-    // 先取最新计数再记录 generation。若扫描线程恰好在两次读取之间更新，
-    // 下一次 timer 仍会看到 generation 变化，不会永久丢掉一次进度。
-    const uint32_t count = g_boot_library_progress_count.load(std::memory_order_relaxed);
-    ui_manager_apply_library_build_progress_locked(count);
-    g_boot_library_progress_applied_generation = generation;
+    if (g_boot_library_update_active.load(std::memory_order_acquire)) {
+        const uint32_t generation = g_boot_library_update_generation.load(std::memory_order_acquire);
+        if (generation != g_boot_library_update_applied_generation) {
+            const uint32_t added_count = g_boot_library_update_added_count.load(std::memory_order_relaxed);
+            ui_manager_apply_library_update_progress_locked(added_count);
+            g_boot_library_update_applied_generation = generation;
+        }
+    }
 }
 
 esp_err_t ui_manager_bootstrap_init()
@@ -1251,14 +1356,28 @@ esp_err_t ui_manager_bootstrap_init()
     g_boot_library_progress_generation.store(0U, std::memory_order_relaxed);
     g_boot_library_progress_applied_generation = 0U;
     g_boot_library_progress_active.store(false, std::memory_order_release);
+    g_boot_library_update_added_count.store(0U, std::memory_order_relaxed);
+    g_boot_library_update_generation.store(0U, std::memory_order_relaxed);
+    g_boot_library_update_applied_generation = 0U;
+    g_boot_library_update_active.store(false, std::memory_order_release);
     g_boot_library_progress_timer = lv_timer_create(
         ui_manager_boot_library_progress_timer_cb, 100U, nullptr);
     if (g_boot_library_progress_timer == nullptr) {
         ESP_LOGW(TAG, "创建首次建库进度timer失败，将降级为仅显示静态启动状态");
     }
 
+    if (g_display_visibility_guard_timer == nullptr) {
+        g_display_visibility_guard_timer = lv_timer_create(
+            ui_display_visibility_guard_timer_cb, 100U, nullptr);
+        if (g_display_visibility_guard_timer == nullptr) {
+            ESP_LOGW(TAG, "创建显示可见性保护timer失败，揭屏/PresentHold将失去超时自愈");
+        }
+    }
+
     // 创建对象期间已经产生 invalidation；显式标记整屏，首轮 REFR_READY 才执行物理揭屏。
     g_boot_reveal_pending = true;
+    g_boot_reveal_retry_started_us = esp_timer_get_time();
+    g_boot_reveal_retry_count = 0U;
     lv_obj_invalidate(screen);
     lvgl_port_unlock();
 
@@ -1331,6 +1450,7 @@ esp_err_t ui_manager_init()
     }
 
     g_boot_library_progress_active.store(false, std::memory_order_release);
+    g_boot_library_update_active.store(false, std::memory_order_release);
     if (g_boot_library_progress_timer != nullptr) {
         lv_timer_delete(g_boot_library_progress_timer);
         g_boot_library_progress_timer = nullptr;
@@ -1454,27 +1574,18 @@ bool ui_manager_show_library_build_complete(uint32_t total_count)
     return true;
 }
 
-bool ui_manager_show_library_update_progress()
+bool ui_manager_show_library_update_progress(uint32_t added_count)
 {
     if (!g_bootstrap_ready || g_display == nullptr || g_boot_root == nullptr ||
         g_boot_status == nullptr) {
         return false;
     }
 
-    if (!lvgl_port_lock(1000)) {
-        ESP_LOGW(TAG, "曲库更新提示获取LVGL互斥锁超时");
-        return false;
-    }
-
-    lv_label_set_text(g_boot_status, "正在更新音乐库...");
-    lv_obj_set_style_text_font(g_boot_status, usb_service_font_get(), 0);
-    lv_obj_set_style_text_color(g_boot_status, lv_color_hex(0xC7D5E8), 0);
-    lv_obj_set_style_text_align(g_boot_status, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_line_space(g_boot_status, 6, 0);
-    lv_obj_set_width(g_boot_status, 410);
-    lv_obj_align(g_boot_status, LV_ALIGN_CENTER, 0, 18);
-    lv_obj_invalidate(g_boot_root);
-    lvgl_port_unlock();
+    // 增量扫描线程只发布新增数量，不直接进入 LVGL。
+    // 读卡器加歌后的开机扫描和 USB MSC 归还后的扫描都可以复用同一事件语义。
+    g_boot_library_update_added_count.store(added_count, std::memory_order_relaxed);
+    g_boot_library_update_active.store(true, std::memory_order_release);
+    g_boot_library_update_generation.fetch_add(1U, std::memory_order_release);
     return true;
 }
 
@@ -1487,6 +1598,8 @@ bool ui_manager_show_library_update_complete(
         g_boot_status == nullptr) {
         return false;
     }
+
+    g_boot_library_update_active.store(false, std::memory_order_release);
 
     char status[160] = {};
     size_t used = static_cast<size_t>(

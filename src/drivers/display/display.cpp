@@ -875,7 +875,7 @@ bool display_present_take_hold_request()
 }
 
 
-bool display_present_set_output(bool enabled)
+bool display_set_output_enabled(bool enabled)
 {
     if (!g_ready || g_panel == nullptr) {
         return false;
@@ -886,19 +886,24 @@ bool display_present_set_output(bool enabled)
 
     const esp_err_t ret = esp_lcd_panel_disp_on_off(g_panel, enabled);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "PresentHold：%s显示输出失败：%s",
-            enabled ? "恢复" : "暂停", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "切换显示输出失败：target=%s %s",
+            enabled ? "ON" : "OFF", esp_err_to_name(ret));
         return false;
     }
 
     g_present_output_enabled = enabled;
     ++g_present_output_toggle_count;
     if (g_present_output_toggle_count <= 8U || (g_present_output_toggle_count % 60U) == 0U) {
-        DISPLAY_TRANSPORT_LOGI("PresentHold：输出=%s toggle=%u",
+        DISPLAY_TRANSPORT_LOGI("显示输出：state=%s toggle=%u",
             enabled ? "ON" : "OFF",
             static_cast<unsigned>(g_present_output_toggle_count));
     }
     return true;
+}
+
+bool display_present_set_output(bool enabled)
+{
+    return display_set_output_enabled(enabled);
 }
 
 esp_lcd_panel_handle_t display_get_panel_handle(void)

@@ -141,11 +141,23 @@ static void artwork_ui_set_no_artwork_fallback_visible(bool visible)
 static void artwork_ui_show_waiting_without_placeholder()
 {
     artwork_ui_set_no_artwork_fallback_visible(false);
+
+    if (!g_has_surface_source && !g_has_compressed_source) {
+        // 冷启动时 Artwork/CoverSurface 后台服务要等系统 READY 后才启动。过去这里把
+        // 图片、图标和状态文字全部隐藏，只剩纯黑容器；服务若启动稍慢或发生一次抖动，
+        // 用户看到的就是“系统已经启动但屏幕黑了”。没有旧封面可保持时至少显示明确
+        // 的等待视觉；跨 Track 已有旧 source 时仍继续保持旧封面，不额外闪占位符。
+        if (g_image != nullptr) lv_obj_add_flag(g_image, LV_OBJ_FLAG_HIDDEN);
+        if (g_placeholder_icon != nullptr) lv_obj_remove_flag(g_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
+        if (g_status != nullptr) {
+            lv_label_set_text(g_status, "正在准备封面");
+            lv_obj_remove_flag(g_status, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+    }
+
     if (g_placeholder_icon != nullptr) lv_obj_add_flag(g_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
     if (g_status != nullptr) lv_obj_add_flag(g_status, LV_OBJ_FLAG_HIDDEN);
-    if (!g_has_surface_source && !g_has_compressed_source && g_image != nullptr) {
-        lv_obj_add_flag(g_image, LV_OBJ_FLAG_HIDDEN);
-    }
 }
 
 static void artwork_ui_show_no_artwork_fallback()

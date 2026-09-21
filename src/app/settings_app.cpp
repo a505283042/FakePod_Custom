@@ -1051,11 +1051,21 @@ static void usb_runtime_overlay_set_status(const char *text, uint32_t rgb)
 
 static void usb_library_scan_event(
     MediaLibraryScanEvent event,
-    uint32_t,
+    uint32_t value,
     void *)
 {
     if (event == MediaLibraryScanEvent::ChangesDetected) {
         usb_runtime_overlay_set_status("正在更新音乐库...", 0xC7D5E8);
+    } else if (event == MediaLibraryScanEvent::IncrementalAddedProgress) {
+        char status[96] = {};
+        const int written = snprintf(
+            status,
+            sizeof(status),
+            "正在更新音乐库...\n新增 %lu 首歌曲",
+            static_cast<unsigned long>(value));
+        if (written > 0 && static_cast<size_t>(written) < sizeof(status)) {
+            usb_runtime_overlay_set_status(status, 0xC7D5E8);
+        }
     }
 }
 

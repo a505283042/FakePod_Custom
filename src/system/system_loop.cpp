@@ -79,6 +79,14 @@ static constexpr TickType_t ARTWORK_RETRY_MAX_DELAY = pdMS_TO_TICKS(5000);
 static TickType_t g_artwork_retry_due_tick = 0;
 static uint8_t g_artwork_current_retry_count = 0U;
 
+// 当前曲压缩封面请求必须和 ArtworkTask 的 Snapshot 做 request_id 对齐。
+// 请求刚入队时 Task 可能还没来得及把 Snapshot 从 Idle 切到 Loading；如果这时立刻
+// 认为请求丢失并重试，新 request 会把正在读取的旧 request 标成 superseded，造成
+// “封面已经完整读完但结果被丢弃、UI 永远停在正在准备封面”的竞态。
+static uint32_t g_artwork_pending_request_id = 0U;
+static TickType_t g_artwork_pending_request_tick = 0;
+static constexpr TickType_t ARTWORK_REQUEST_DISPATCH_GRACE = pdMS_TO_TICKS(750);
+
 // 音频不断流优先：FLAC ring >=90% 后 ArtworkTask 才继续抢短 SD 窗口。
 // 不预热 next；所有可用窗口都只服务当前曲，避免后台预热竞争。
 static constexpr uint32_t ARTWORK_CURRENT_FLAC_RING_MIN_PERCENT = 90U;
@@ -135,6 +143,8 @@ static TickType_t system_artwork_retry_delay(uint8_t retry_count)
 
 static void system_artwork_schedule_retry(uint32_t track_index)
 {
+    g_artwork_pending_request_id = 0U;
+    g_artwork_pending_request_tick = 0;
     if (g_artwork_current_retry_count < UINT8_MAX) ++g_artwork_current_retry_count;
     const TickType_t delay = system_artwork_retry_delay(g_artwork_current_retry_count);
     g_artwork_retry_due_tick = xTaskGetTickCount() + delay;
@@ -143,6 +153,46 @@ static void system_artwork_schedule_retry(uint32_t track_index)
         static_cast<unsigned long>(track_index),
         static_cast<unsigned>(g_artwork_current_retry_count),
         static_cast<unsigned long>(delay * portTICK_PERIOD_MS));
+}
+
+static bool system_artwork_submit_compressed_request(uint32_t track_index)
+{
+    uint32_t request_id = 0U;
+    if (!artwork_loader_request_track(track_index, &request_id) || request_id == 0U) {
+        return false;
+    }
+    g_artwork_pending_request_id = request_id;
+    g_artwork_pending_request_tick = xTaskGetTickCount();
+    g_artwork_stage = ArtworkCurrentStage::WaitCompressed;
+    return true;
+}
+
+static bool system_artwork_pending_request_in_dispatch_grace(
+    uint32_t generation,
+    uint32_t track_index,
+    const ArtworkLoaderSnapshot *snapshot)
+{
+    if (g_artwork_pending_request_id == 0U || g_artwork_pending_request_tick == 0) return false;
+
+    // Snapshot 已经观察到当前 request 后，不再需要 dispatch grace；后续按真实 Loading/Ready/Failed 判断。
+    if (snapshot != nullptr &&
+        snapshot->request_id == g_artwork_pending_request_id &&
+        snapshot->catalog_generation == generation &&
+        snapshot->track_index == track_index) {
+        return false;
+    }
+
+    return xTaskGetTickCount() - g_artwork_pending_request_tick < ARTWORK_REQUEST_DISPATCH_GRACE;
+}
+
+static bool system_artwork_snapshot_is_current_request(
+    const ArtworkLoaderSnapshot &snapshot,
+    uint32_t generation,
+    uint32_t track_index)
+{
+    if (snapshot.catalog_generation != generation || snapshot.track_index != track_index) return false;
+    if (g_artwork_pending_request_id == 0U) return true;
+    return snapshot.request_id == g_artwork_pending_request_id;
 }
 
 static bool system_cover_surface_cached(uint32_t track_index)
@@ -204,6 +254,8 @@ static void system_artwork_begin_context(uint32_t generation, uint32_t current_t
     g_artwork_stage = ArtworkCurrentStage::Idle;
     g_artwork_retry_due_tick = 0;
     g_artwork_current_retry_count = 0U;
+    g_artwork_pending_request_id = 0U;
+    g_artwork_pending_request_tick = 0;
     g_artwork_storage_wait_last_log_tick = 0;
 
     const bool surface_ready = cover_surface_cache_is_ready();
@@ -238,9 +290,7 @@ static void system_artwork_begin_context(uint32_t generation, uint32_t current_t
         } else if (!system_artwork_storage_window_open(current_track)) {
             g_artwork_stage = ArtworkCurrentStage::RetryCompressed;
             g_artwork_retry_due_tick = 0;
-        } else if (artwork_loader_request_track(current_track, nullptr)) {
-            g_artwork_stage = ArtworkCurrentStage::WaitCompressed;
-        } else {
+        } else if (!system_artwork_submit_compressed_request(current_track)) {
             system_artwork_schedule_retry(current_track);
         }
     }
@@ -274,6 +324,8 @@ static void system_artwork_current_update()
         case ArtworkCurrentStage::WaitCompressed:
         {
             if (system_artwork_compressed_cached(current_track)) {
+                g_artwork_pending_request_id = 0U;
+                g_artwork_pending_request_tick = 0;
                 if (!cover_surface_cache_is_ready()) {
                     g_artwork_stage = ArtworkCurrentStage::Complete;
                 } else if (cover_surface_cache_request_track(current_track, nullptr)) {
@@ -283,12 +335,29 @@ static void system_artwork_current_update()
                 }
                 break;
             }
+
             ArtworkLoaderSnapshot snapshot = {};
-            if (!artwork_loader_get_snapshot(&snapshot) ||
-                snapshot.catalog_generation != generation || snapshot.track_index != current_track) {
-                // USB handoff may cancel a queued request before ArtworkTask starts it.
-                // Never leave the orchestrator stuck forever in WaitCompressed.
+            const bool have_snapshot = artwork_loader_get_snapshot(&snapshot);
+            if (system_artwork_pending_request_in_dispatch_grace(
+                    generation, current_track, have_snapshot ? &snapshot : nullptr)) {
+                // request 已经成功入队，但 ArtworkTask 还没发布 Loading。这个短窗口不能重试，
+                // 否则会用一个新 request_id 把刚开始读取的旧请求主动作废。
+                break;
+            }
+
+            if (!have_snapshot || !system_artwork_snapshot_is_current_request(
+                    snapshot, generation, current_track)) {
+                // grace 结束后仍看不到本次 request，才认为它真的丢失/被 USB handoff 取消。
                 system_artwork_schedule_retry(current_track);
+                break;
+            }
+
+            if (snapshot.state == ArtworkLoadState::Loading) {
+                // 正在读取当前 request：无论持续多久都必须等待，禁止周期性重发同一 Track。
+                break;
+            }
+            if (snapshot.state == ArtworkLoadState::Ready) {
+                // Ready 到 cache 可 acquire 之间理论上只有极短窗口；下一轮会直接命中 cache。
                 break;
             }
             if (snapshot.state == ArtworkLoadState::Idle) {
@@ -297,6 +366,8 @@ static void system_artwork_current_update()
                 system_artwork_schedule_retry(current_track);
             } else if (snapshot.state == ArtworkLoadState::NoArtwork ||
                        snapshot.state == ArtworkLoadState::Failed) {
+                g_artwork_pending_request_id = 0U;
+                g_artwork_pending_request_tick = 0;
                 g_artwork_stage = ArtworkCurrentStage::Complete;
             }
             break;
@@ -305,6 +376,8 @@ static void system_artwork_current_update()
         case ArtworkCurrentStage::RetryCompressed:
             if (!system_tick_due(xTaskGetTickCount(), g_artwork_retry_due_tick)) break;
             if (system_artwork_compressed_cached(current_track)) {
+                g_artwork_pending_request_id = 0U;
+                g_artwork_pending_request_tick = 0;
                 if (!cover_surface_cache_is_ready()) {
                     g_artwork_stage = ArtworkCurrentStage::Complete;
                 } else if (cover_surface_cache_request_track(current_track, nullptr)) {
@@ -312,12 +385,32 @@ static void system_artwork_current_update()
                 } else {
                     system_artwork_schedule_retry(current_track);
                 }
-            } else if (!system_artwork_storage_window_open(current_track)) {
+                break;
+            }
+
+            // 退避到期前，上一请求可能已经被 ArtworkTask 接走并进入 Loading。必须先识别
+            // 这个 in-flight 状态，不能因为“cache 还没完成”就再次提交同一 Track。
+            {
+                ArtworkLoaderSnapshot snapshot = {};
+                if (artwork_loader_get_snapshot(&snapshot) &&
+                    snapshot.catalog_generation == generation &&
+                    snapshot.track_index == current_track &&
+                    snapshot.state == ArtworkLoadState::Loading) {
+                    g_artwork_pending_request_id = snapshot.request_id;
+                    g_artwork_pending_request_tick = xTaskGetTickCount();
+                    g_artwork_stage = ArtworkCurrentStage::WaitCompressed;
+                    break;
+                }
+            }
+
+            if (!system_artwork_storage_window_open(current_track)) {
                 // 只等安全窗口，不累计 timeout/backoff。
-            } else if (artwork_loader_request_track(current_track, nullptr)) {
-                if (APP_DIAG_ARTWORK_UI) ESP_LOGI(TAG, "重试当前曲压缩封面：track=%lu",
-                    static_cast<unsigned long>(current_track));
-                g_artwork_stage = ArtworkCurrentStage::WaitCompressed;
+                break;
+            }
+            if (system_artwork_submit_compressed_request(current_track)) {
+                if (APP_DIAG_ARTWORK_UI) ESP_LOGI(TAG, "重试当前曲压缩封面：track=%lu request=%lu",
+                    static_cast<unsigned long>(current_track),
+                    static_cast<unsigned long>(g_artwork_pending_request_id));
             } else {
                 system_artwork_schedule_retry(current_track);
             }

@@ -166,15 +166,11 @@ static void display_panel_apply_brightness(uint8_t level)
 
 static void display_panel_apply_output(bool on)
 {
-    extern esp_lcd_panel_handle_t display_get_panel_handle(void);
-    esp_lcd_panel_handle_t panel = display_get_panel_handle();
-    if (panel == nullptr) {
-        ESP_LOGW(TAG, "display 未就绪，跳过显示开/关 on=%d", on);
-        return;
-    }
-    const esp_err_t ret = esp_lcd_panel_disp_on_off(panel, on);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "切换显示输出 on=%d 失败 %s", on, esp_err_to_name(ret));
+    // 显示输出必须经过 Display 模块统一入口。过去这里直接调用 panel API，
+    // 会让硬件真实 on/off 与 display.cpp 的缓存状态发生漂移，之后 PresentHold
+    // 可能误判“已经 ON”而跳过真正的唤醒命令。
+    if (!display_set_output_enabled(on)) {
+        ESP_LOGW(TAG, "切换显示输出 on=%d 失败", on);
     }
 }
 

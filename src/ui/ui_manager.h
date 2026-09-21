@@ -20,7 +20,9 @@ bool ui_manager_show_boot_fatal(const char *reason, esp_err_t error);
 // 首次建库时可传入当前已经发现的歌曲数；0 表示刚开始扫描。
 bool ui_manager_show_library_build_progress(uint32_t scanned_count = 0U);
 bool ui_manager_show_library_build_complete(uint32_t total_count);
-bool ui_manager_show_library_update_progress();
+// 已有曲库增量扫描：added_count=0 表示刚检测到变化；>0 时显示本轮新增歌曲数量。
+// 该接口只发布轻量状态，真正的 LVGL 文本更新由 taskLVGL 的进度 timer 完成。
+bool ui_manager_show_library_update_progress(uint32_t added_count = 0U);
 bool ui_manager_show_library_update_complete(
     uint32_t added_count,
     uint32_t removed_count,
