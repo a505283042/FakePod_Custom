@@ -1366,8 +1366,14 @@ static void usb_tf_runtime_return_task(void *)
         nullptr
     );
     if (reload_ret == ESP_OK) {
-        const bool player_rebound = player_state_rebind_after_catalog_reload(preferred_track_path, preferred_track_index);
-        // Player generation 已重绑，后台资产仍停用；现在才允许释放旧 Catalog 内存。
+        const uint32_t new_generation = media_catalog_v2_generation();
+        const bool catalog_replaced = new_generation != old_generation;
+        // 快速变更戳命中时 Catalog generation 没有变化，不必重建播放列表；
+        // 真正发生热替换时才按旧路径/索引重绑 Player。
+        const bool player_rebound = catalog_replaced
+            ? player_state_rebind_after_catalog_reload(preferred_track_path, preferred_track_index)
+            : true;
+        // 只有真正替换过 Catalog 时 retired_catalog 才持有旧 generation；空对象释放也是安全的。
         media_catalog_v2_release(&retired_catalog);
         ESP_LOGI(TAG,
             "USB归还曲库热刷新：generation=%lu->%lu tracks=%u->%u player=%s 新增=%lu 删除=%lu 更新=%lu",

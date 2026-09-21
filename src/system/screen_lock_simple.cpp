@@ -64,6 +64,12 @@ static constexpr uint32_t kC_TipText          = 0x8890A3;  // 底部提示
 static bool              g_ready         = false;
 static ScreenPowerState  g_power         = ScreenPowerNormal;
 static uint8_t           g_normal_brightness = kBrightnessNormalDefault;
+// 正常亮度恢复不能在任意业务任务里直接发送 CO5300 参数命令。
+// LVGL 正在进行 SPI polling/flush 时并发 set_brightness，可能让 loopTask 卡在
+// SPI 总线获取，进而阻断 Artwork/CoverSurface 等 READY 后台服务启动。
+// 这里只记录目标值，由 system_loop 的 idle_update 在取得 LVGL 锁后安全提交。
+static bool              g_normal_brightness_apply_pending = false;
+static TickType_t        g_normal_brightness_last_attempt_tick = 0;
 static ScreenLockState   g_lock          = ScreenLockUnlocked;
 static uint16_t          g_auto_screen_off_seconds = 0U;
 static bool              g_auto_screen_off_to_aod = true;
@@ -951,6 +957,8 @@ esp_err_t screen_lock_simple_create()
     g_lock  = ScreenLockUnlocked;
     g_last_jitter_tick = 0;
     g_last_user_activity_tick = xTaskGetTickCount();
+    g_normal_brightness_apply_pending = false;
+    g_normal_brightness_last_attempt_tick = 0;
     g_press_row        = -1;
     g_press_x = 0; g_press_y = 0;
 
@@ -1006,6 +1014,8 @@ void screen_lock_simple_destroy()
     g_auto_screen_off_seconds = 0U;
     g_auto_screen_off_to_aod = true;
     g_last_user_activity_tick = 0;
+    g_normal_brightness_apply_pending = false;
+    g_normal_brightness_last_attempt_tick = 0;
     lvgl_port_unlock();
     g_ready = false;
 }
@@ -1081,24 +1091,17 @@ esp_err_t screen_lock_simple_set_normal_brightness(uint8_t level)
         return ESP_ERR_INVALID_ARG;
     }
 
-    const uint8_t previous = g_normal_brightness;
     g_normal_brightness = level;
-    if (g_power != ScreenPowerNormal) {
-        return ESP_OK;
-    }
 
-    esp_lcd_panel_handle_t panel = display_get_panel_handle();
-    if (panel == nullptr) {
-        g_normal_brightness = previous;
-        return ESP_ERR_INVALID_STATE;
+    // 这里只发布目标值，不在调用者线程直接发送 panel 参数命令。
+    // system_runtime_update() 与 taskLVGL 并发时，直接 set_brightness 会与
+    // panel draw 的 polling transaction 抢同一个 SPI device；实测既可能立即返回
+    // acquire bus failed，也可能长期阻塞，导致后续 Artwork/CoverSurface 根本未启动。
+    if (g_power == ScreenPowerNormal) {
+        g_normal_brightness_apply_pending = true;
+        g_normal_brightness_last_attempt_tick = 0;
     }
-    const esp_err_t ret = esp_lcd_panel_co5300_set_brightness(panel, level);
-    if (ret != ESP_OK) {
-        g_normal_brightness = previous;
-        ESP_LOGW(TAG, "设置正常亮度失败 level=%u %s",
-            static_cast<unsigned>(level), esp_err_to_name(ret));
-    }
-    return ret;
+    return ESP_OK;
 }
 
 uint8_t screen_lock_simple_get_normal_brightness(void)
@@ -1124,6 +1127,35 @@ void screen_lock_simple_notify_user_activity(void)
 
 void screen_lock_simple_idle_update(void)
 {
+    // 正常亮度采用延迟提交：只有拿到 LVGL 互斥锁时才发送 CO5300 参数命令。
+    // esp_lvgl_port 在 lv_timer_handler/flush 期间持有该锁，因此这里成功取得锁时，
+    // 不会与 LVGL 的 CASET/RASET/RAMWR polling transaction 并发抢 SPI 总线。
+    if (g_ready && g_power == ScreenPowerNormal && g_normal_brightness_apply_pending) {
+        const TickType_t now = xTaskGetTickCount();
+        constexpr TickType_t kBrightnessRetryInterval = pdMS_TO_TICKS(50);
+        if (g_normal_brightness_last_attempt_tick == 0 ||
+            now - g_normal_brightness_last_attempt_tick >= kBrightnessRetryInterval) {
+            g_normal_brightness_last_attempt_tick = now;
+            if (lvgl_port_lock(0)) {
+                esp_lcd_panel_handle_t panel = display_get_panel_handle();
+                const esp_err_t ret = panel != nullptr
+                    ? esp_lcd_panel_co5300_set_brightness(panel, g_normal_brightness)
+                    : ESP_ERR_INVALID_STATE;
+                lvgl_port_unlock();
+
+                if (ret == ESP_OK) {
+                    g_normal_brightness_apply_pending = false;
+                    ESP_LOGI(TAG, "正常亮度已安全应用：%u%%",
+                        static_cast<unsigned>(g_normal_brightness));
+                } else if (ret != ESP_ERR_INVALID_STATE) {
+                    // 保留 pending，稍后继续重试；不能因为一次总线竞争永久丢失亮度恢复。
+                    ESP_LOGW(TAG, "正常亮度延迟应用失败：level=%u %s，稍后重试",
+                        static_cast<unsigned>(g_normal_brightness), esp_err_to_name(ret));
+                }
+            }
+        }
+    }
+
     if (!g_ready || g_power != ScreenPowerNormal || g_auto_screen_off_seconds == 0U) return;
     if (g_menu_open) return;
 

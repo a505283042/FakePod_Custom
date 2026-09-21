@@ -751,6 +751,108 @@ esp_err_t media_artwork_scan_file_v2(
     return ret;
 }
 
+esp_err_t media_artwork_catalog_reuse_unchanged_v2(
+    const MusicCatalogV2 *catalog,
+    uint32_t track_index,
+    const MediaArtworkBuildV2 *current_directory_fallback,
+    bool *out_unchanged
+)
+{
+    if (catalog == nullptr || out_unchanged == nullptr || track_index >= catalog->track_count) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_unchanged = false;
+    const TrackRowV2 &track = catalog->tracks[track_index];
+
+    if (track.artwork_ref_id != MEDIA_CATALOG_INVALID_ID_V2) {
+        if (track.artwork_ref_id >= catalog->artwork_ref_count || catalog->artwork_refs == nullptr) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        const ArtworkRefV2 &source = catalog->artwork_refs[track.artwork_ref_id];
+        if (source.source == MediaArtworkSourceV2::Mp3Apic ||
+            source.source == MediaArtworkSourceV2::FlacPicture) {
+            *out_unchanged = true;
+            return ESP_OK;
+        }
+    }
+
+    const bool have_current_external = current_directory_fallback != nullptr &&
+        current_directory_fallback->source == MediaArtworkSourceV2::ExternalFile &&
+        current_directory_fallback->external_path != nullptr &&
+        current_directory_fallback->external_path[0] != '\0';
+
+    const ArtworkRefV2 *old_ref = nullptr;
+    const char *old_external_path = nullptr;
+    if (track.artwork_ref_id != MEDIA_CATALOG_INVALID_ID_V2) {
+        old_ref = &catalog->artwork_refs[track.artwork_ref_id];
+        if (old_ref->source != MediaArtworkSourceV2::ExternalFile) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        old_external_path = media_catalog_v2_pool_str(catalog, old_ref->path_off);
+        if (old_external_path == nullptr || old_external_path[0] == '\0') {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+    }
+
+    if (!have_current_external) {
+        *out_unchanged = old_ref == nullptr;
+        return ESP_OK;
+    }
+
+    *out_unchanged = old_ref != nullptr &&
+        strcmp(old_external_path, current_directory_fallback->external_path) == 0 &&
+        old_ref->data_size == current_directory_fallback->data_size &&
+        old_ref->source_modified_time == current_directory_fallback->source_modified_time &&
+        old_ref->format == current_directory_fallback->format &&
+        old_ref->width == current_directory_fallback->width &&
+        old_ref->height == current_directory_fallback->height;
+    return ESP_OK;
+}
+
+esp_err_t media_artwork_clone_exact_from_catalog_v2(
+    const MusicCatalogV2 *catalog,
+    uint32_t track_index,
+    MediaArtworkBuildV2 *out_artwork
+)
+{
+    if (catalog == nullptr || out_artwork == nullptr || track_index >= catalog->track_count) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    media_artwork_build_release_v2(out_artwork);
+    const TrackRowV2 &track = catalog->tracks[track_index];
+    if (track.artwork_ref_id == MEDIA_CATALOG_INVALID_ID_V2) {
+        return ESP_OK;
+    }
+    if (track.artwork_ref_id >= catalog->artwork_ref_count || catalog->artwork_refs == nullptr) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    const ArtworkRefV2 &source = catalog->artwork_refs[track.artwork_ref_id];
+    out_artwork->data_offset = source.data_offset;
+    out_artwork->data_size = source.data_size;
+    out_artwork->source_modified_time = source.source_modified_time;
+    out_artwork->flags = source.flags;
+    out_artwork->width = source.width;
+    out_artwork->height = source.height;
+    out_artwork->source = source.source;
+    out_artwork->format = source.format;
+    out_artwork->picture_type = source.picture_type;
+
+    if (source.source == MediaArtworkSourceV2::ExternalFile) {
+        const char *path = media_catalog_v2_pool_str(catalog, source.path_off);
+        if (path == nullptr || path[0] == '\0') {
+            media_artwork_build_release_v2(out_artwork);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        out_artwork->external_path = artwork_psram_strdup(path);
+        if (out_artwork->external_path == nullptr) {
+            media_artwork_build_release_v2(out_artwork);
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    return ESP_OK;
+}
+
 esp_err_t media_artwork_clone_from_catalog_v2(
     const MusicCatalogV2 *catalog,
     uint32_t track_index,

@@ -21,4 +21,5 @@ static constexpr const char *kMusicIndexV2Backup = "/sdcard/System/library/music
 static constexpr const char *kMusicManifestV2 = "/sdcard/System/library/music_manifest_v2.bin";
 static constexpr const char *kMusicManifestV2Temp = "/sdcard/System/library/music_manifest_v2.bin.tmp";
 static constexpr const char *kMusicManifestV2Backup = "/sdcard/System/library/music_manifest_v2.bin.bak";
+static constexpr const char *kMusicQuickStamp = "/sdcard/System/library/music_quick_stamp_v1.bin";
 }

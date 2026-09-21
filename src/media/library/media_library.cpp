@@ -11,6 +11,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "sdcard.h"
@@ -22,6 +23,7 @@
 #include "media_metadata.h"
 #include "media_artwork.h"
 #include "app_diag_config.h"
+#include "system_paths.h"
 
 static const char *TAG = "音乐库";
 
@@ -41,6 +43,27 @@ static constexpr int64_t SLOW_SCAN_STAGE_WARN_US = 500000LL;
 // 首次建库是同步任务；每处理少量歌曲主动阻塞一个 tick，避免长时间占满启动核。
 static constexpr size_t SCAN_YIELD_INTERVAL_TRACKS = 8U;
 static constexpr TickType_t LIBRARY_SD_LOCK_TIMEOUT = pdMS_TO_TICKS(2000);
+
+// 正常开机的“新增歌曲快扫”先用一个极轻量的 TF 变更戳判断介质是否可能变化。
+// 命中时直接复用已经通过 CRC/semantic 校验的 V2 Catalog，不再枚举 /MUSIC 的千个长文件名。
+// 正常开机和 USB MSC 归还都先走这条快判定；只有变更戳不一致才进入完整增量扫描。
+static constexpr uint32_t LIBRARY_QUICK_STAMP_MAGIC = 0x46505331U; // "FPS1"
+static constexpr uint16_t LIBRARY_QUICK_STAMP_VERSION = 1U;
+
+struct MediaLibraryQuickStamp
+{
+    uint32_t magic = LIBRARY_QUICK_STAMP_MAGIC;
+    uint16_t version = LIBRARY_QUICK_STAMP_VERSION;
+    uint16_t struct_size = 0U;
+    uint32_t index_crc32 = 0U;
+    uint32_t track_count = 0U;
+    uint64_t total_bytes = 0U;
+    uint64_t free_bytes = 0U;
+    int64_t music_root_mtime = 0;
+    int64_t music_root_ctime = 0;
+    uint64_t music_root_size = 0U;
+    uint32_t checksum = 0U;
+};
 #if APP_DIAG_LIBRARY_ITEMS || APP_DIAG_LIBRARY_METADATA || APP_DIAG_LIBRARY_ARTWORK
 static constexpr size_t LOG_TRACK_LIMIT = 10;
 #endif
@@ -66,6 +89,166 @@ struct DirectoryLrcIndex
     size_t count = 0U;
     size_t capacity = 0U;
 };
+
+static esp_err_t media_library_query_quick_stamp_inputs(
+    uint64_t *out_total_bytes,
+    uint64_t *out_free_bytes,
+    int64_t *out_music_root_mtime,
+    int64_t *out_music_root_ctime,
+    uint64_t *out_music_root_size)
+{
+    if (out_total_bytes == nullptr || out_free_bytes == nullptr || out_music_root_mtime == nullptr ||
+        out_music_root_ctime == nullptr || out_music_root_size == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
+    if (!sd_lock.locked()) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    uint64_t total_bytes = 0U;
+    uint64_t free_bytes = 0U;
+    const esp_err_t info_ret = esp_vfs_fat_info("/sdcard", &total_bytes, &free_bytes);
+    if (info_ret != ESP_OK) {
+        return info_ret;
+    }
+
+    struct stat root_info = {};
+    if (stat(MUSIC_ROOT, &root_info) != 0 || !S_ISDIR(root_info.st_mode)) {
+        return ESP_FAIL;
+    }
+
+    *out_total_bytes = total_bytes;
+    *out_free_bytes = free_bytes;
+    *out_music_root_mtime = static_cast<int64_t>(root_info.st_mtime);
+    *out_music_root_ctime = static_cast<int64_t>(root_info.st_ctime);
+    *out_music_root_size = static_cast<uint64_t>(root_info.st_size);
+    return ESP_OK;
+}
+
+static uint32_t media_library_quick_stamp_checksum(const MediaLibraryQuickStamp *stamp)
+{
+    if (stamp == nullptr) return 0U;
+    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(stamp);
+    const size_t length = offsetof(MediaLibraryQuickStamp, checksum);
+    uint32_t hash = 2166136261U;
+    for (size_t i = 0U; i < length; ++i) {
+        hash ^= bytes[i];
+        hash *= 16777619U;
+    }
+    return hash;
+}
+
+static bool media_library_quick_stamp_matches(
+    const MediaCatalogSnapshotV2 *snapshot,
+    const char *source_label)
+{
+    if (snapshot == nullptr || snapshot->source != MediaCatalogLoadSourceV2::Final ||
+        snapshot->catalog.track_count == 0U) {
+        return false;
+    }
+
+    MediaLibraryQuickStamp stamp = {};
+    {
+        StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
+        if (!sd_lock.locked()) {
+            return false;
+        }
+        FILE *file = fopen(SystemPaths::kMusicQuickStamp, "rb");
+        if (file == nullptr) {
+            return false;
+        }
+        const size_t read_bytes = fread(&stamp, 1U, sizeof(stamp), file);
+        fclose(file);
+        if (read_bytes != sizeof(stamp)) {
+            return false;
+        }
+    }
+
+    if (stamp.magic != LIBRARY_QUICK_STAMP_MAGIC ||
+        stamp.version != LIBRARY_QUICK_STAMP_VERSION ||
+        stamp.struct_size != sizeof(MediaLibraryQuickStamp) ||
+        stamp.index_crc32 != snapshot->index_crc32 ||
+        stamp.track_count != snapshot->catalog.track_count ||
+        stamp.checksum != media_library_quick_stamp_checksum(&stamp)) {
+        return false;
+    }
+
+    const int64_t check_started_us = esp_timer_get_time();
+    uint64_t total_bytes = 0U;
+    uint64_t free_bytes = 0U;
+    int64_t music_root_mtime = 0;
+    int64_t music_root_ctime = 0;
+    uint64_t music_root_size = 0U;
+    if (media_library_query_quick_stamp_inputs(
+            &total_bytes, &free_bytes, &music_root_mtime,
+            &music_root_ctime, &music_root_size) != ESP_OK) {
+        return false;
+    }
+
+    const bool matches = stamp.total_bytes == total_bytes &&
+        stamp.free_bytes == free_bytes &&
+        stamp.music_root_mtime == music_root_mtime &&
+        stamp.music_root_ctime == music_root_ctime &&
+        stamp.music_root_size == music_root_size;
+    ESP_LOGI(TAG, "曲库快速变更戳：来源=%s 结果=%s 耗时=%u ms free=%llu",
+        source_label != nullptr ? source_label : "?",
+        matches ? "命中" : "变化",
+        static_cast<unsigned>((esp_timer_get_time() - check_started_us) / 1000LL),
+        static_cast<unsigned long long>(free_bytes));
+    return matches;
+}
+
+static esp_err_t media_library_write_quick_stamp(uint32_t index_crc32, uint32_t track_count)
+{
+    // 首次创建 stamp 文件本身可能分配一个 FAT cluster。先确保文件已经存在，
+    // 再查询 free_bytes，避免把“创建 stamp 消耗的空间”误判成下一次介质变化。
+    {
+        StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
+        if (!sd_lock.locked()) {
+            return ESP_ERR_TIMEOUT;
+        }
+        struct stat stamp_info = {};
+        if (stat(SystemPaths::kMusicQuickStamp, &stamp_info) != 0) {
+            FILE *seed = fopen(SystemPaths::kMusicQuickStamp, "wb");
+            if (seed == nullptr) {
+                return ESP_FAIL;
+            }
+            MediaLibraryQuickStamp empty_stamp = {};
+            empty_stamp.struct_size = static_cast<uint16_t>(sizeof(MediaLibraryQuickStamp));
+            const size_t written = fwrite(&empty_stamp, 1U, sizeof(empty_stamp), seed);
+            fclose(seed);
+            if (written != sizeof(empty_stamp)) {
+                return ESP_FAIL;
+            }
+        }
+    }
+
+    MediaLibraryQuickStamp stamp = {};
+    stamp.struct_size = static_cast<uint16_t>(sizeof(MediaLibraryQuickStamp));
+    stamp.index_crc32 = index_crc32;
+    stamp.track_count = track_count;
+    const esp_err_t query_ret = media_library_query_quick_stamp_inputs(
+        &stamp.total_bytes, &stamp.free_bytes, &stamp.music_root_mtime,
+        &stamp.music_root_ctime, &stamp.music_root_size);
+    if (query_ret != ESP_OK) {
+        return query_ret;
+    }
+    stamp.checksum = media_library_quick_stamp_checksum(&stamp);
+
+    StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
+    if (!sd_lock.locked()) {
+        return ESP_ERR_TIMEOUT;
+    }
+    FILE *file = fopen(SystemPaths::kMusicQuickStamp, "wb");
+    if (file == nullptr) {
+        return ESP_FAIL;
+    }
+    const size_t written = fwrite(&stamp, 1U, sizeof(stamp), file);
+    fclose(file);
+    return written == sizeof(stamp) ? ESP_OK : ESP_FAIL;
+}
 
 // Stage 12.0.1：扫描事务会嵌套 Catalog 写盘/回读校验。
 // 这些对象生命周期长、体积明显大于普通控制变量，不能继续压在 ESP-IDF main task 栈上。
@@ -553,6 +736,53 @@ static esp_err_t media_library_scan_with_scratch(
 
     const bool have_previous_v2 = media_catalog_store_v2_load(&previous_v2) == ESP_OK;
     const bool have_previous_v1 = !have_previous_v2 && media_index_store_load(&previous_v1) == ESP_OK;
+    // 正常开机的已有 V2 曲库以“新增/删除/改名发现”为主：目录项里已经确认旧路径仍存在时，
+    // 直接复用旧 Manifest 的 size/mtime，不再对上千首旧歌逐个 stat(full_path)。
+    // USB MSC 归还属于严格热刷新，仍逐首校验 size+mtime，从而保留同名覆盖/修改检测能力。
+    // 首次建库没有 previous_v2，因此完全不受这条快路径影响。
+    const bool fast_boot_incremental = have_previous_v2 && !replace_runtime_catalog;
+
+    // 已有正式 V2 Catalog 时，正常开机和 USB MSC 归还都先检查轻量变更戳。
+    // 命中时完全跳过 /MUSIC 千文件目录枚举：
+    // - 正常开机需要把磁盘 V2 Catalog 发布为运行时 Catalog；
+    // - USB 归还时旧运行时 Catalog 本来就有效，因此无需替换 generation，只返回“无变化”。
+    const bool quick_stamp_eligible =
+        have_previous_v2 && previous_v2.source == MediaCatalogLoadSourceV2::Final;
+    if (quick_stamp_eligible && media_library_quick_stamp_matches(
+            &previous_v2, replace_runtime_catalog ? "USB归还" : "启动")) {
+        const uint32_t final_track_count = previous_v2.catalog.track_count;
+        if (out_changes != nullptr) {
+            out_changes->previous_count = final_track_count;
+            out_changes->current_count = final_track_count;
+            out_changes->had_previous_catalog = true;
+            out_changes->changed = false;
+        }
+
+        if (!replace_runtime_catalog) {
+            next_catalog = previous_v2.catalog;
+            previous_v2.catalog = {};
+            const uint32_t source_crc = previous_v2.index_crc32;
+            const esp_err_t publish_ret = media_catalog_v2_publish(&next_catalog, source_crc);
+            if (publish_ret != ESP_OK) {
+                media_catalog_v2_release(&next_catalog);
+                media_catalog_store_v2_release(&previous_v2);
+                media_index_store_release(&previous_v1);
+                media_library_reset_build_state(replace_runtime_catalog);
+                return publish_ret;
+            }
+            g_ready = true;
+        }
+
+        media_catalog_store_v2_release(&previous_v2);
+        media_index_store_release(&previous_v1);
+        media_library_release_build_buffers();
+        const uint32_t elapsed_ms = static_cast<uint32_t>((esp_timer_get_time() - start_us) / 1000LL);
+        ESP_LOGI(TAG, "%s快速变更戳命中：跳过/MUSIC目录枚举，直接复用V2 Catalog tracks=%u 耗时=%u ms",
+            replace_runtime_catalog ? "USB归还" : "启动",
+            static_cast<unsigned>(final_track_count),
+            static_cast<unsigned>(elapsed_ms));
+        return ESP_OK;
+    }
     const size_t previous_track_count =
         have_previous_v2 ? static_cast<size_t>(previous_v2.catalog.track_count) : 0U;
     size_t existing_path_count = 0U;
@@ -602,6 +832,12 @@ static esp_err_t media_library_scan_with_scratch(
     size_t artwork_external_count = 0;
     size_t artwork_none_count = 0;
     size_t full_track_reused_count = 0;
+    size_t fast_stat_skipped_count = 0U;
+    size_t strict_stat_count = 0U;
+    size_t deferred_metadata_clone_count = 0U;
+    size_t deferred_artwork_clone_count = 0U;
+    size_t hydrated_metadata_clone_count = 0U;
+    size_t hydrated_artwork_clone_count = 0U;
     bool out_of_memory = false;
     bool storage_timeout = false;
     bool root_missing = false;
@@ -702,11 +938,12 @@ static esp_err_t media_library_scan_with_scratch(
         }
         directory_count++;
 
-        // 首次建库和正式 V2 增量扫描都建立目录级 .lrc 名字索引。
-        // 增量新增/变化歌曲随后会复用同一个已打开音频 FILE*；这里提前确认同名歌词，
-        // 避免每首新增歌曲再执行一次 stat("同名.lrc") 的大目录路径查找。V1 迁移保持旧路径。
+        // 目录级 .lrc 名字索引只用于首次建库。
+        // 已有 V2 的增量扫描通常只有少量新增/变化歌曲；如果为了它们先把千首大目录
+        // 完整 readdir 一遍建立歌词索引，反而会让“全量无变化”启动多出一次目录遍历。
+        // 因此 V2 增量沿用按需歌词探测，只对真正需要重扫 Metadata 的少量歌曲付出成本。
         directory_lrc_index_release(&directory_lrc_index);
-        if (!have_previous_v1) {
+        if (!have_previous_v2 && !have_previous_v1) {
             StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
             if (!sd_lock.locked()) {
                 storage_timeout = true;
@@ -776,14 +1013,57 @@ static esp_err_t media_library_scan_with_scratch(
                 out_of_memory = true;
                 break;
             }
+
+#if defined(DT_DIR)
+            // FatFs 已经明确告诉我们这是目录时，不需要为了确认 S_ISDIR 再做一次路径 stat。
+            // 目录深度规则仍保持 /MUSIC 下最多两级。
+            if (entry->d_type == DT_DIR) {
+                if (directory_item.depth < MAX_MUSIC_SUBDIR_DEPTH) {
+                    if (!directory_stack_push(&stack, full_path, static_cast<uint8_t>(directory_item.depth + 1U))) {
+                        out_of_memory = true;
+                    }
+                }
+                if (out_of_memory) {
+                    break;
+                }
+                continue;
+            }
+#endif
+
             info = {};
             bool stat_ok = false;
-            {
+
+            // 启动增量快扫：对于 readdir 已确认的普通媒体文件，先按路径查旧 V2 Manifest。
+            // 旧路径仍存在且格式一致时，说明它不是“新增/删除/改名”对象；直接沿用旧 size/mtime，
+            // 从而把 1000 首无变化曲库从“1000 次 FAT stat”降为“一次目录遍历 + 内存查找”。
+            // 这条快路径刻意不识别“同名原地覆盖文件”；USB MSC 归还的严格热刷新仍会逐首 stat。
+#if defined(DT_REG)
+            if (fast_boot_incremental && entry->d_type == DT_REG) {
+                MediaFormat fast_format = MediaFormat::Unknown;
+                if (media_library_detect_format(entry->d_name, &fast_format)) {
+                    const TrackRowV2 *fast_old_track = nullptr;
+                    const MediaManifestRecordV2 *fast_old_manifest = nullptr;
+                    const bool fast_old_found = media_catalog_store_v2_find(
+                        &previous_v2, full_path, &fast_old_track, &fast_old_manifest);
+                    if (fast_old_found && fast_old_track != nullptr && fast_old_manifest != nullptr &&
+                        fast_old_track->format == fast_format && fast_old_manifest->format == fast_format) {
+                        info.st_mode = S_IFREG;
+                        info.st_size = static_cast<off_t>(fast_old_manifest->file_size_bytes);
+                        info.st_mtime = static_cast<time_t>(fast_old_manifest->modified_time);
+                        stat_ok = true;
+                        fast_stat_skipped_count++;
+                    }
+                }
+            }
+#endif
+
+            if (!stat_ok) {
                 StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
                 if (!sd_lock.locked()) {
                     storage_timeout = true;
                     break;
                 }
+                strict_stat_count++;
                 stat_ok = stat(full_path, &info) == 0;
             }
             if (!stat_ok) {
@@ -835,55 +1115,108 @@ static esp_err_t media_library_scan_with_scratch(
                                 reused = true;
                                 reused_count++;
                             }
+                            const uint32_t old_track_index =
+                                static_cast<uint32_t>(old_v2_track - previous_v2.catalog.tracks);
+
+                            // 正常开机的 V2 增量快扫只需要证明“旧数据仍可复用”，
+                            // 不要为每首未变化歌曲立刻 clone title/artist/album/lyrics。
+                            // 无变化曲库最后会直接 move 旧 Catalog，这些临时对象创建后马上又会被释放。
+                            // 真正发现新增/更新时，再在 Catalog 重建前统一补齐。
                             if (deep_probe_format &&
                                 (old_v2_track->metadata_flags & MEDIA_TRACK_META_SCANNED_V2) != 0U) {
-                                metadata_build = static_cast<MediaMetadataBuildV2 *>(
-                                    heap_caps_calloc(1, sizeof(MediaMetadataBuildV2), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
-                                );
-                                if (metadata_build == nullptr) {
-                                    out_of_memory = true;
+                                if (fast_boot_incremental) {
+                                    metadata_reused = true;
+                                    metadata_reused_count++;
+                                    deferred_metadata_clone_count++;
                                 } else {
-                                    const uint32_t old_track_index = static_cast<uint32_t>(old_v2_track - previous_v2.catalog.tracks);
-                                    const esp_err_t clone_ret = media_metadata_clone_from_catalog_v2(
-                                        &previous_v2.catalog, old_track_index, metadata_build
+                                    metadata_build = static_cast<MediaMetadataBuildV2 *>(
+                                        heap_caps_calloc(1, sizeof(MediaMetadataBuildV2), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
                                     );
-                                    if (clone_ret == ESP_OK) {
-                                        metadata_reused = true;
-                                        metadata_reused_count++;
+                                    if (metadata_build == nullptr) {
+                                        out_of_memory = true;
                                     } else {
-                                        media_metadata_build_release(metadata_build);
-                                        heap_caps_free(metadata_build);
-                                        metadata_build = nullptr;
-                                        if (clone_ret == ESP_ERR_NO_MEM) {
-                                            out_of_memory = true;
+                                        const esp_err_t clone_ret = media_metadata_clone_from_catalog_v2(
+                                            &previous_v2.catalog, old_track_index, metadata_build
+                                        );
+                                        if (clone_ret == ESP_OK) {
+                                            metadata_reused = true;
+                                            metadata_reused_count++;
+                                        } else {
+                                            media_metadata_build_release(metadata_build);
+                                            heap_caps_free(metadata_build);
+                                            metadata_build = nullptr;
+                                            if (clone_ret == ESP_ERR_NO_MEM) {
+                                                out_of_memory = true;
+                                            }
                                         }
                                     }
                                 }
                             }
+
                             if (!out_of_memory) {
-                                artwork_build = static_cast<MediaArtworkBuildV2 *>(
-                                    heap_caps_calloc(1, sizeof(MediaArtworkBuildV2), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
-                                );
-                                if (artwork_build == nullptr) {
-                                    out_of_memory = true;
-                                } else {
-                                    const uint32_t old_track_index = static_cast<uint32_t>(old_v2_track - previous_v2.catalog.tracks);
-                                    const esp_err_t artwork_clone_ret = media_artwork_clone_from_catalog_v2(
-                                        &previous_v2.catalog, old_track_index, &directory_cover, artwork_build, &artwork_unchanged
+                                if (fast_boot_incremental) {
+                                    const esp_err_t artwork_check_ret = media_artwork_catalog_reuse_unchanged_v2(
+                                        &previous_v2.catalog, old_track_index, &directory_cover, &artwork_unchanged
                                     );
-                                    if (artwork_clone_ret == ESP_OK) {
+                                    if (artwork_check_ret == ESP_OK && artwork_unchanged) {
                                         artwork_reused = true;
-                                        if (artwork_unchanged) {
-                                            artwork_reused_count++;
-                                        } else {
-                                            artwork_refreshed_count++;
+                                        artwork_reused_count++;
+                                        if (old_v2_track->artwork_ref_id != MEDIA_CATALOG_INVALID_ID_V2) {
+                                            deferred_artwork_clone_count++;
                                         }
                                     } else {
-                                        media_artwork_build_release_v2(artwork_build);
-                                        heap_caps_free(artwork_build);
-                                        artwork_build = nullptr;
-                                        if (artwork_clone_ret == ESP_ERR_NO_MEM) {
+                                        // 目录 fallback 真正发生变化，或旧 locator 无法轻量校验时，
+                                        // 仍沿用原来的 clone 路径，保证变化检测语义不变。
+                                        artwork_build = static_cast<MediaArtworkBuildV2 *>(
+                                            heap_caps_calloc(1, sizeof(MediaArtworkBuildV2), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+                                        );
+                                        if (artwork_build == nullptr) {
                                             out_of_memory = true;
+                                        } else {
+                                            const esp_err_t artwork_clone_ret = media_artwork_clone_from_catalog_v2(
+                                                &previous_v2.catalog, old_track_index, &directory_cover, artwork_build, &artwork_unchanged
+                                            );
+                                            if (artwork_clone_ret == ESP_OK) {
+                                                artwork_reused = true;
+                                                if (artwork_unchanged) {
+                                                    artwork_reused_count++;
+                                                } else {
+                                                    artwork_refreshed_count++;
+                                                }
+                                            } else {
+                                                media_artwork_build_release_v2(artwork_build);
+                                                heap_caps_free(artwork_build);
+                                                artwork_build = nullptr;
+                                                if (artwork_clone_ret == ESP_ERR_NO_MEM) {
+                                                    out_of_memory = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    artwork_build = static_cast<MediaArtworkBuildV2 *>(
+                                        heap_caps_calloc(1, sizeof(MediaArtworkBuildV2), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+                                    );
+                                    if (artwork_build == nullptr) {
+                                        out_of_memory = true;
+                                    } else {
+                                        const esp_err_t artwork_clone_ret = media_artwork_clone_from_catalog_v2(
+                                            &previous_v2.catalog, old_track_index, &directory_cover, artwork_build, &artwork_unchanged
+                                        );
+                                        if (artwork_clone_ret == ESP_OK) {
+                                            artwork_reused = true;
+                                            if (artwork_unchanged) {
+                                                artwork_reused_count++;
+                                            } else {
+                                                artwork_refreshed_count++;
+                                            }
+                                        } else {
+                                            media_artwork_build_release_v2(artwork_build);
+                                            heap_caps_free(artwork_build);
+                                            artwork_build = nullptr;
+                                            if (artwork_clone_ret == ESP_ERR_NO_MEM) {
+                                                out_of_memory = true;
+                                            }
                                         }
                                     }
                                 }
@@ -982,7 +1315,7 @@ static esp_err_t media_library_scan_with_scratch(
                                     } else {
                                         esp_err_t metadata_ret = ESP_OK;
                                         const int64_t metadata_started_us = esp_timer_get_time();
-                                        if (!have_previous_v1) {
+                                        if (!have_previous_v2 && !have_previous_v1) {
                                             const char *lrc_name = directory_lrc_index_find_for_audio(
                                                 &directory_lrc_index, entry->d_name);
                                             char *resolved_lrc_path = lrc_name != nullptr
@@ -997,7 +1330,8 @@ static esp_err_t media_library_scan_with_scratch(
                                             }
                                             heap_caps_free(resolved_lrc_path);
                                         } else {
-                                            // V1 迁移没有目录级歌词索引，保持原有歌词探测语义。
+                                            // V2 增量只有新增/变化歌曲才走这里：按需探测同名歌词，
+                                            // 避免为了少量变化先额外遍历整个大目录。V1 迁移也保持原语义。
                                             metadata_ret = media_metadata_scan_open_file_v2(
                                                 shared_file, full_path, format,
                                                 static_cast<uint64_t>(info.st_size), metadata_build);
@@ -1329,6 +1663,11 @@ static esp_err_t media_library_scan_with_scratch(
         media_index_store_release(&previous_v1);
         media_library_release_build_buffers();
         g_ready = true;
+        const esp_err_t quick_stamp_ret = media_library_write_quick_stamp(source_crc, final_track_count);
+        if (quick_stamp_ret != ESP_OK) {
+            ESP_LOGW(TAG, "更新曲库快速变更戳失败，下次启动回退完整增量扫描：%s",
+                esp_err_to_name(quick_stamp_ret));
+        }
 
         const uint32_t elapsed_ms = static_cast<uint32_t>((esp_timer_get_time() - start_us) / 1000);
         if (have_previous_v2) {
@@ -1338,6 +1677,13 @@ static esp_err_t media_library_scan_with_scratch(
                 static_cast<unsigned>(added_count),
                 static_cast<unsigned>(updated_count),
                 static_cast<unsigned>(removed_count));
+            ESP_LOGI(TAG, "增量属性校验：模式=%s 跳过stat=%u 实际stat=%u",
+                fast_boot_incremental ? "启动新增快扫" : "严格校验",
+                static_cast<unsigned>(fast_stat_skipped_count),
+                static_cast<unsigned>(strict_stat_count));
+            ESP_LOGI(TAG, "增量延迟克隆：扫描期跳过Metadata=%u Artwork=%u，本轮无变化无需补齐",
+                static_cast<unsigned>(deferred_metadata_clone_count),
+                static_cast<unsigned>(deferred_artwork_clone_count));
             ESP_LOGI(TAG, "增量阶段耗时：目录扫描=%u ms Catalog重建=0 ms V2落盘=0 ms 总计=%u ms",
                 static_cast<unsigned>(walk_ms),
                 static_cast<unsigned>(elapsed_ms));
@@ -1380,6 +1726,106 @@ static esp_err_t media_library_scan_with_scratch(
             static_cast<unsigned long>(media_catalog_v2_generation()));
         publish_change_summary(final_track_count);
         return ESP_OK;
+    }
+
+    // 启动快扫如果最终发现了真实变化，才需要构建新 Catalog。
+    // 此时再一次性补齐前面被延迟的旧 Metadata/Artwork；无变化启动不会进入这里，
+    // 从而彻底避免“1000 首旧歌 clone 一遍，随后又全部释放”的无效 PSRAM 工作。
+    const int64_t deferred_hydrate_started_us = esp_timer_get_time();
+    if (fast_boot_incremental) {
+        for (size_t i = 0; i < g_entry_count; ++i) {
+            MediaEntry &entry = g_entries[i];
+            const char *path = g_path_pool + entry.path_offset;
+            const TrackRowV2 *old_track = nullptr;
+            const MediaManifestRecordV2 *old_manifest = nullptr;
+            if (!media_catalog_store_v2_find(&previous_v2, path, &old_track, &old_manifest) ||
+                old_track == nullptr || old_manifest == nullptr ||
+                old_track->format != entry.format || old_manifest->format != entry.format ||
+                old_manifest->file_size_bytes != entry.file_size_bytes ||
+                old_manifest->modified_time != entry.modified_time) {
+                continue;
+            }
+
+            const uint32_t old_track_index =
+                static_cast<uint32_t>(old_track - previous_v2.catalog.tracks);
+            const bool deep_probe_format =
+                entry.format == MediaFormat::FLAC || entry.format == MediaFormat::MP3;
+
+            if (deep_probe_format && entry.metadata_build == nullptr &&
+                (old_track->metadata_flags & MEDIA_TRACK_META_SCANNED_V2) != 0U) {
+                entry.metadata_build = static_cast<MediaMetadataBuildV2 *>(
+                    heap_caps_calloc(1, sizeof(MediaMetadataBuildV2), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+                );
+                if (entry.metadata_build == nullptr) {
+                    out_of_memory = true;
+                    break;
+                }
+                const esp_err_t clone_ret = media_metadata_clone_from_catalog_v2(
+                    &previous_v2.catalog, old_track_index, entry.metadata_build);
+                if (clone_ret != ESP_OK) {
+                    media_metadata_build_release(entry.metadata_build);
+                    heap_caps_free(entry.metadata_build);
+                    entry.metadata_build = nullptr;
+                    if (clone_ret == ESP_ERR_NO_MEM) {
+                        out_of_memory = true;
+                    } else {
+                        ESP_LOGE(TAG, "延迟补齐旧 Metadata 失败：%s ret=%s", path, esp_err_to_name(clone_ret));
+                        media_catalog_store_v2_release(&previous_v2);
+                        media_index_store_release(&previous_v1);
+                        media_library_reset_build_state(replace_runtime_catalog);
+                        return clone_ret;
+                    }
+                    break;
+                }
+                hydrated_metadata_clone_count++;
+            }
+
+            if (entry.artwork_build == nullptr &&
+                old_track->artwork_ref_id != MEDIA_CATALOG_INVALID_ID_V2) {
+                entry.artwork_build = static_cast<MediaArtworkBuildV2 *>(
+                    heap_caps_calloc(1, sizeof(MediaArtworkBuildV2), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+                );
+                if (entry.artwork_build == nullptr) {
+                    out_of_memory = true;
+                    break;
+                }
+                const esp_err_t clone_ret = media_artwork_clone_exact_from_catalog_v2(
+                    &previous_v2.catalog, old_track_index, entry.artwork_build);
+                if (clone_ret != ESP_OK) {
+                    media_artwork_build_release_v2(entry.artwork_build);
+                    heap_caps_free(entry.artwork_build);
+                    entry.artwork_build = nullptr;
+                    if (clone_ret == ESP_ERR_NO_MEM) {
+                        out_of_memory = true;
+                    } else {
+                        ESP_LOGE(TAG, "延迟补齐旧封面 locator 失败：%s ret=%s", path, esp_err_to_name(clone_ret));
+                        media_catalog_store_v2_release(&previous_v2);
+                        media_index_store_release(&previous_v1);
+                        media_library_reset_build_state(replace_runtime_catalog);
+                        return clone_ret;
+                    }
+                    break;
+                }
+                hydrated_artwork_clone_count++;
+            }
+        }
+    }
+    if (out_of_memory) {
+        ESP_LOGE(TAG, "增量变化后补齐旧 Catalog 中间对象时 PSRAM 不足");
+        media_catalog_store_v2_release(&previous_v2);
+        media_index_store_release(&previous_v1);
+        media_library_reset_build_state(replace_runtime_catalog);
+        return ESP_ERR_NO_MEM;
+    }
+    const uint32_t deferred_hydrate_ms =
+        static_cast<uint32_t>((esp_timer_get_time() - deferred_hydrate_started_us) / 1000LL);
+    if (fast_boot_incremental) {
+        ESP_LOGI(TAG, "增量延迟克隆：扫描期跳过Metadata=%u Artwork=%u，重建前补齐Metadata=%u Artwork=%u，耗时=%u ms",
+            static_cast<unsigned>(deferred_metadata_clone_count),
+            static_cast<unsigned>(deferred_artwork_clone_count),
+            static_cast<unsigned>(hydrated_metadata_clone_count),
+            static_cast<unsigned>(hydrated_artwork_clone_count),
+            static_cast<unsigned>(deferred_hydrate_ms));
     }
 
     // 扫描缓冲只负责构建。正式运行时使用精确尺寸的 MusicCatalogV2，
@@ -1434,6 +1880,13 @@ static esp_err_t media_library_scan_with_scratch(
     media_index_store_release(&previous_v1);
     media_library_release_build_buffers();
     g_ready = true;
+    if (index_ret == ESP_OK) {
+        const esp_err_t quick_stamp_ret = media_library_write_quick_stamp(catalog_crc, final_track_count);
+        if (quick_stamp_ret != ESP_OK) {
+            ESP_LOGW(TAG, "更新曲库快速变更戳失败，下次启动回退完整增量扫描：%s",
+                esp_err_to_name(quick_stamp_ret));
+        }
+    }
 
     const uint32_t elapsed_ms = static_cast<uint32_t>((esp_timer_get_time() - start_us) / 1000);
     if (have_previous_v2) {
@@ -1445,6 +1898,10 @@ static esp_err_t media_library_scan_with_scratch(
             static_cast<unsigned>(added_count),
             static_cast<unsigned>(updated_count),
             static_cast<unsigned>(removed_count));
+        ESP_LOGI(TAG, "增量属性校验：模式=%s 跳过stat=%u 实际stat=%u",
+            fast_boot_incremental ? "启动新增快扫" : "严格校验",
+            static_cast<unsigned>(fast_stat_skipped_count),
+            static_cast<unsigned>(strict_stat_count));
         ESP_LOGI(TAG, "增量阶段耗时：目录扫描=%u ms Catalog重建=%u ms V2落盘=%u ms 总计=%u ms",
             static_cast<unsigned>(walk_ms),
             static_cast<unsigned>(build_ms),

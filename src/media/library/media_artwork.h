@@ -59,6 +59,23 @@ esp_err_t media_artwork_scan_open_file_v2(
 // 增量扫描时从当前 Catalog 克隆 locator。
 // Embedded 在音频签名未变时直接复用；External/None 会与当前目录 fallback 比较并按需刷新。
 // out_unchanged=true 表示 locator 完全未变，可参与整库“全量命中”快速路径。
+// 启动增量快扫只需要判断旧 locator 是否仍与当前目录 fallback 一致，
+// 不创建扫描期临时对象，避免无变化曲库为每首歌重复申请/复制 artwork 数据。
+esp_err_t media_artwork_catalog_reuse_unchanged_v2(
+    const MusicCatalogV2 *catalog,
+    uint32_t track_index,
+    const MediaArtworkBuildV2 *current_directory_fallback,
+    bool *out_unchanged
+);
+
+// 只有确认本轮确实需要重建 Catalog 时，才把旧 locator 精确克隆到扫描期对象。
+// 这里不重新比较目录 fallback；调用方已经在扫描阶段完成一致性判断。
+esp_err_t media_artwork_clone_exact_from_catalog_v2(
+    const MusicCatalogV2 *catalog,
+    uint32_t track_index,
+    MediaArtworkBuildV2 *out_artwork
+);
+
 esp_err_t media_artwork_clone_from_catalog_v2(
     const MusicCatalogV2 *catalog,
     uint32_t track_index,
