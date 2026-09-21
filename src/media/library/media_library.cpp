@@ -11,6 +11,8 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "sdcard.h"
 #include "media_index_store.h"
 #include "media_catalog_v2.h"
@@ -32,33 +34,57 @@ static constexpr const char *MUSIC_ROOT = "/sdcard/MUSIC";
 static constexpr size_t INITIAL_ENTRY_CAPACITY = 128;
 static constexpr size_t INITIAL_PATH_CAPACITY = 16 * 1024;
 static constexpr size_t INITIAL_DIR_CAPACITY = 16;
+// /MUSIC 根目录为深度0，最多进入两级子目录：/MUSIC/A/B。
+static constexpr uint8_t MAX_MUSIC_SUBDIR_DEPTH = 2U;
+// 单个文件某一深度解析阶段超过这个时间就记录路径，方便定位坏标签/慢卡。
+static constexpr int64_t SLOW_SCAN_STAGE_WARN_US = 500000LL;
+// 首次建库是同步任务；每处理少量歌曲主动阻塞一个 tick，避免长时间占满启动核。
+static constexpr size_t SCAN_YIELD_INTERVAL_TRACKS = 8U;
+static constexpr TickType_t LIBRARY_SD_LOCK_TIMEOUT = pdMS_TO_TICKS(2000);
 #if APP_DIAG_LIBRARY_ITEMS || APP_DIAG_LIBRARY_METADATA || APP_DIAG_LIBRARY_ARTWORK
 static constexpr size_t LOG_TRACK_LIMIT = 10;
 #endif
 
 using MediaEntry = MediaIndexRecord;
 
+struct DirectoryStackItem
+{
+    char *path = nullptr;
+    uint8_t depth = 0U;
+};
+
 struct DirectoryStack
 {
-    char **items;
+    DirectoryStackItem *items;
     size_t count;
     size_t capacity;
+};
+
+struct DirectoryLrcIndex
+{
+    char **names = nullptr;
+    size_t count = 0U;
+    size_t capacity = 0U;
 };
 
 // Stage 12.0.1：扫描事务会嵌套 Catalog 写盘/回读校验。
 // 这些对象生命周期长、体积明显大于普通控制变量，不能继续压在 ESP-IDF main task 栈上。
 // 扫描仍然逐文件执行；这里只把事务状态/可复用 scratch 放到 PSRAM。
 static void directory_stack_destroy(DirectoryStack *stack);
+static void directory_lrc_index_release(DirectoryLrcIndex *index);
 
 struct MediaLibraryScanScratch
 {
     MediaCatalogSnapshotV2 previous_v2 = {};
     MediaIndexSnapshot previous_v1 = {};
     DirectoryStack directory_stack = {};
+    DirectoryLrcIndex directory_lrc_index = {};
     MediaArtworkBuildV2 directory_cover = {};
     struct stat file_info = {};
     MediaTechnicalInfo technical = {};
     MusicCatalogV2 next_catalog = {};
+    char *scan_path = nullptr;
+    size_t scan_path_capacity = 0U;
 };
 
 static void media_library_scan_scratch_release(MediaLibraryScanScratch *scratch)
@@ -68,9 +94,13 @@ static void media_library_scan_scratch_release(MediaLibraryScanScratch *scratch)
     }
     media_artwork_build_release_v2(&scratch->directory_cover);
     directory_stack_destroy(&scratch->directory_stack);
+    directory_lrc_index_release(&scratch->directory_lrc_index);
     media_catalog_store_v2_release(&scratch->previous_v2);
     media_index_store_release(&scratch->previous_v1);
     media_catalog_v2_release(&scratch->next_catalog);
+    heap_caps_free(scratch->scan_path);
+    scratch->scan_path = nullptr;
+    scratch->scan_path_capacity = 0U;
     heap_caps_free(scratch);
 }
 
@@ -208,34 +238,38 @@ static bool media_library_add_track(
     return true;
 }
 
-static bool directory_stack_push(DirectoryStack *stack, const char *path)
+static bool directory_stack_push(DirectoryStack *stack, const char *path, uint8_t depth)
 {
     if (stack == nullptr || path == nullptr) {
         return false;
     }
     if (stack->count == stack->capacity) {
         size_t next_capacity = stack->capacity == 0 ? INITIAL_DIR_CAPACITY : stack->capacity * 2;
-        void *next = media_psram_realloc(stack->items, next_capacity * sizeof(char *));
+        void *next = media_psram_realloc(stack->items, next_capacity * sizeof(DirectoryStackItem));
         if (next == nullptr) {
             return false;
         }
-        stack->items = static_cast<char **>(next);
+        stack->items = static_cast<DirectoryStackItem *>(next);
         stack->capacity = next_capacity;
     }
     char *copy = media_psram_strdup(path);
     if (copy == nullptr) {
         return false;
     }
-    stack->items[stack->count++] = copy;
+    DirectoryStackItem &item = stack->items[stack->count++];
+    item.path = copy;
+    item.depth = depth;
     return true;
 }
 
-static char *directory_stack_pop(DirectoryStack *stack)
+static DirectoryStackItem directory_stack_pop(DirectoryStack *stack)
 {
     if (stack == nullptr || stack->count == 0) {
-        return nullptr;
+        return {};
     }
-    return stack->items[--stack->count];
+    DirectoryStackItem item = stack->items[--stack->count];
+    stack->items[stack->count] = {};
+    return item;
 }
 
 static void directory_stack_destroy(DirectoryStack *stack)
@@ -244,10 +278,8 @@ static void directory_stack_destroy(DirectoryStack *stack)
         return;
     }
     while (stack->count > 0) {
-        char *path = directory_stack_pop(stack);
-        if (path != nullptr) {
-            heap_caps_free(path);
-        }
+        DirectoryStackItem item = directory_stack_pop(stack);
+        heap_caps_free(item.path);
     }
     if (stack->items != nullptr) {
         heap_caps_free(stack->items);
@@ -257,21 +289,153 @@ static void directory_stack_destroy(DirectoryStack *stack)
     stack->capacity = 0;
 }
 
-static char *media_library_join_path(const char *directory, const char *name)
+static void directory_lrc_index_release(DirectoryLrcIndex *index)
+{
+    if (index == nullptr) {
+        return;
+    }
+    for (size_t i = 0; i < index->count; ++i) {
+        heap_caps_free(index->names[i]);
+    }
+    heap_caps_free(index->names);
+    index->names = nullptr;
+    index->count = 0U;
+    index->capacity = 0U;
+}
+
+static bool directory_lrc_index_add(DirectoryLrcIndex *index, const char *name)
+{
+    if (index == nullptr || name == nullptr) {
+        return false;
+    }
+    if (index->count == index->capacity) {
+        const size_t next_capacity = index->capacity == 0U ? 16U : index->capacity * 2U;
+        void *next = media_psram_realloc(index->names, next_capacity * sizeof(char *));
+        if (next == nullptr) {
+            return false;
+        }
+        index->names = static_cast<char **>(next);
+        index->capacity = next_capacity;
+    }
+    char *copy = media_psram_strdup(name);
+    if (copy == nullptr) {
+        return false;
+    }
+    index->names[index->count++] = copy;
+    return true;
+}
+
+static bool media_library_name_has_extension(const char *name, const char *extension)
+{
+    if (name == nullptr || extension == nullptr) {
+        return false;
+    }
+    const char *dot = strrchr(name, '.');
+    return dot != nullptr && strcasecmp(dot, extension) == 0;
+}
+
+static esp_err_t directory_lrc_index_build(DIR *dir, DirectoryLrcIndex *index)
+{
+    if (dir == nullptr || index == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    directory_lrc_index_release(index);
+    rewinddir(dir);
+    while (true) {
+        struct dirent *entry = readdir(dir);
+        if (entry == nullptr) {
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        if (media_library_name_has_extension(entry->d_name, ".lrc") &&
+            !directory_lrc_index_add(index, entry->d_name)) {
+            directory_lrc_index_release(index);
+            rewinddir(dir);
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    rewinddir(dir);
+    return ESP_OK;
+}
+
+static const char *directory_lrc_index_find_for_audio(
+    const DirectoryLrcIndex *index,
+    const char *audio_name
+)
+{
+    if (index == nullptr || audio_name == nullptr) {
+        return nullptr;
+    }
+    const char *audio_dot = strrchr(audio_name, '.');
+    if (audio_dot == nullptr) {
+        return nullptr;
+    }
+    const size_t audio_stem_len = static_cast<size_t>(audio_dot - audio_name);
+    for (size_t i = 0; i < index->count; ++i) {
+        const char *lrc_name = index->names[i];
+        const char *lrc_dot = lrc_name != nullptr ? strrchr(lrc_name, '.') : nullptr;
+        if (lrc_dot == nullptr || strcasecmp(lrc_dot, ".lrc") != 0) {
+            continue;
+        }
+        const size_t lrc_stem_len = static_cast<size_t>(lrc_dot - lrc_name);
+        if (lrc_stem_len == audio_stem_len && strncasecmp(lrc_name, audio_name, audio_stem_len) == 0) {
+            return lrc_name;
+        }
+    }
+    return nullptr;
+}
+
+static char *media_library_alloc_join_path(const char *directory, const char *name)
 {
     if (directory == nullptr || name == nullptr) {
         return nullptr;
     }
     const size_t dir_length = strlen(directory);
     const size_t name_length = strlen(name);
-    const bool need_slash = dir_length > 0 && directory[dir_length - 1] != '/';
-    const size_t total = dir_length + (need_slash ? 1 : 0) + name_length + 1;
+    const bool need_slash = dir_length > 0U && directory[dir_length - 1U] != '/';
+    const size_t total = dir_length + (need_slash ? 1U : 0U) + name_length + 1U;
     char *path = static_cast<char *>(heap_caps_malloc(total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (path == nullptr) {
         return nullptr;
     }
     snprintf(path, total, "%s%s%s", directory, need_slash ? "/" : "", name);
     return path;
+}
+
+static char *media_library_build_scan_path(
+    MediaLibraryScanScratch *scratch,
+    const char *directory,
+    const char *name
+)
+{
+    if (scratch == nullptr || directory == nullptr || name == nullptr) {
+        return nullptr;
+    }
+    const size_t dir_length = strlen(directory);
+    const size_t name_length = strlen(name);
+    const bool need_slash = dir_length > 0 && directory[dir_length - 1] != '/';
+    const size_t required = dir_length + (need_slash ? 1U : 0U) + name_length + 1U;
+    if (required > scratch->scan_path_capacity) {
+        size_t next_capacity = scratch->scan_path_capacity == 0U ? 256U : scratch->scan_path_capacity;
+        while (next_capacity < required) {
+            next_capacity *= 2U;
+        }
+        void *next = media_psram_realloc(scratch->scan_path, next_capacity);
+        if (next == nullptr) {
+            return nullptr;
+        }
+        scratch->scan_path = static_cast<char *>(next);
+        scratch->scan_path_capacity = next_capacity;
+    }
+    memcpy(scratch->scan_path, directory, dir_length);
+    size_t cursor = dir_length;
+    if (need_slash) {
+        scratch->scan_path[cursor++] = '/';
+    }
+    memcpy(scratch->scan_path + cursor, name, name_length + 1U);
+    return scratch->scan_path;
 }
 
 static bool media_library_detect_format(const char *name, MediaFormat *format)
@@ -381,6 +545,7 @@ static esp_err_t media_library_scan_with_scratch(
     MediaCatalogSnapshotV2 &previous_v2 = scratch->previous_v2;
     MediaIndexSnapshot &previous_v1 = scratch->previous_v1;
     DirectoryStack &stack = scratch->directory_stack;
+    DirectoryLrcIndex &directory_lrc_index = scratch->directory_lrc_index;
     MediaArtworkBuildV2 &directory_cover = scratch->directory_cover;
     struct stat &info = scratch->file_info;
     MediaTechnicalInfo &technical = scratch->technical;
@@ -397,11 +562,14 @@ static esp_err_t media_library_scan_with_scratch(
     const auto notify_changes_detected = [&]() {
         if (!changes_notified && on_scan_event != nullptr) {
             changes_notified = true;
-            on_scan_event(MediaLibraryScanEvent::ChangesDetected, callback_context);
+            on_scan_event(
+                MediaLibraryScanEvent::ChangesDetected,
+                static_cast<uint32_t>(g_entry_count),
+                callback_context);
         }
     };
     if (!have_previous_v2 && on_scan_event != nullptr) {
-        on_scan_event(MediaLibraryScanEvent::InitialBuild, callback_context);
+        on_scan_event(MediaLibraryScanEvent::InitialBuild, 0U, callback_context);
     }
     if (have_previous_v1) {
         ESP_LOGI(TAG, "检测到旧 V1 索引，本次迁移复用技术信息并生成 V2 Catalog");
@@ -409,7 +577,7 @@ static esp_err_t media_library_scan_with_scratch(
         ESP_LOGI(TAG, "未找到可复用索引，本次将首次建立 MusicCatalogV2");
     }
 
-    if (!directory_stack_push(&stack, MUSIC_ROOT)) {
+    if (!directory_stack_push(&stack, MUSIC_ROOT, 0U)) {
         ESP_LOGE(TAG, "创建目录扫描栈失败");
         directory_stack_destroy(&stack);
         media_catalog_store_v2_release(&previous_v2);
@@ -435,16 +603,56 @@ static esp_err_t media_library_scan_with_scratch(
     size_t artwork_none_count = 0;
     size_t full_track_reused_count = 0;
     bool out_of_memory = false;
+    bool storage_timeout = false;
     bool root_missing = false;
 
-    while (stack.count > 0 && !out_of_memory) {
-        char *directory = directory_stack_pop(&stack);
+    // 首次建库时给启动页持续反馈“已经发现多少首音乐”。
+    // 不能每发现一首就抢一次 LVGL 锁，否则大曲库会把扫描本身拖慢；
+    // 这里按“至少 5 首”或“至少 250ms”节流，同时保证第 1 首立即可见。
+    size_t last_initial_progress_count = 0U;
+    int64_t last_initial_progress_us = start_us;
+    const auto notify_initial_build_progress = [&](bool force) {
+        if (have_previous_v2 || on_scan_event == nullptr || g_entry_count == 0U) {
+            return;
+        }
+
+        const int64_t now_us = esp_timer_get_time();
+        const bool first_track = last_initial_progress_count == 0U;
+        const bool count_due =
+            g_entry_count >= last_initial_progress_count + 5U;
+        const bool time_due =
+            now_us - last_initial_progress_us >= 250000LL;
+        if (!force && !first_track && !count_due && !time_due) {
+            return;
+        }
+
+        last_initial_progress_count = g_entry_count;
+        last_initial_progress_us = now_us;
+        on_scan_event(
+            MediaLibraryScanEvent::InitialBuild,
+            static_cast<uint32_t>(g_entry_count),
+            callback_context);
+    };
+
+    const auto log_slow_scan_stage = [&](const char *stage, const char *path, int64_t started_us) {
+        const int64_t elapsed_us = esp_timer_get_time() - started_us;
+        if (elapsed_us >= SLOW_SCAN_STAGE_WARN_US) {
+            ESP_LOGW(TAG, "建库单文件阶段耗时过长：stage=%s elapsed=%lldms path=%s",
+                stage != nullptr ? stage : "?",
+                static_cast<long long>(elapsed_us / 1000LL),
+                path != nullptr ? path : "");
+        }
+    };
+
+    while (stack.count > 0 && !out_of_memory && !storage_timeout) {
+        DirectoryStackItem directory_item = directory_stack_pop(&stack);
+        char *directory = directory_item.path;
         if (directory == nullptr) {
             break;
         }
         DIR *dir = nullptr;
         {
-            StorageSdLockGuard sd_lock;
+            StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
             if (!sd_lock.locked()) {
                 heap_caps_free(directory);
                 directory_stack_destroy(&stack);
@@ -465,14 +673,41 @@ static esp_err_t media_library_scan_with_scratch(
             continue;
         }
         directory_count++;
+
+        // 仅首次无索引建库需要 .lrc 内存索引；正常增量扫描继续走已有快速复用路径，
+        // 不额外增加一次目录枚举。
+        directory_lrc_index_release(&directory_lrc_index);
+        if (!have_previous_v2 && !have_previous_v1) {
+            StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
+            if (!sd_lock.locked()) {
+                storage_timeout = true;
+            } else {
+                const esp_err_t lrc_index_ret = directory_lrc_index_build(dir, &directory_lrc_index);
+                if (lrc_index_ret == ESP_ERR_NO_MEM) {
+                    out_of_memory = true;
+                }
+            }
+        }
+        if (storage_timeout || out_of_memory) {
+            StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
+            if (sd_lock.locked()) {
+                closedir(dir);
+            }
+            heap_caps_free(directory);
+            break;
+        }
+
         // 每个目录只探测一次 fallback，避免每首歌重复 stat/打开 cover.*。
         // directory_cover 使用 PSRAM scratch，避免把 locator 生命周期压在 main task 栈上。
         media_artwork_build_release_v2(&directory_cover);
         const esp_err_t directory_cover_ret = media_artwork_find_directory_fallback_v2(directory, &directory_cover);
-        if (directory_cover_ret == ESP_ERR_NO_MEM) {
+        if (directory_cover_ret == ESP_ERR_TIMEOUT) {
+            ESP_LOGW(TAG, "目录封面探测等待TF锁超时，本目录按无fallback继续：%s", directory);
+            media_artwork_build_release_v2(&directory_cover);
+        } else if (directory_cover_ret == ESP_ERR_NO_MEM) {
             out_of_memory = true;
             {
-                StorageSdLockGuard sd_lock;
+                StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
                 if (sd_lock.locked()) {
                     closedir(dir);
                 }
@@ -483,9 +718,9 @@ static esp_err_t media_library_scan_with_scratch(
         struct dirent *entry = nullptr;
         while (true) {
             {
-                StorageSdLockGuard sd_lock;
+                StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
                 if (!sd_lock.locked()) {
-                    out_of_memory = true;
+                    storage_timeout = true;
                     break;
                 }
                 entry = readdir(dir);
@@ -496,7 +731,18 @@ static esp_err_t media_library_scan_with_scratch(
             if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
                 continue;
             }
-            char *full_path = media_library_join_path(directory, entry->d_name);
+            // FatFs/VFS 已经在 dirent.d_type 标出普通文件时，先按扩展名快速过滤。
+            // 这样 .lrc、jpg、文本等非媒体文件不会再逐个 stat(full_path)，
+            // 对单目录上千文件的场景可以避免大量重复 FAT 名字查找；DT_UNKNOWN 时仍走后续 stat 兜底。
+#if defined(DT_REG)
+            if (entry->d_type == DT_REG) {
+                MediaFormat quick_format = MediaFormat::Unknown;
+                if (!media_library_detect_format(entry->d_name, &quick_format)) {
+                    continue;
+                }
+            }
+#endif
+            char *full_path = media_library_build_scan_path(scratch, directory, entry->d_name);
             if (full_path == nullptr) {
                 out_of_memory = true;
                 break;
@@ -504,24 +750,23 @@ static esp_err_t media_library_scan_with_scratch(
             info = {};
             bool stat_ok = false;
             {
-                StorageSdLockGuard sd_lock;
+                StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
                 if (!sd_lock.locked()) {
-                    heap_caps_free(full_path);
-                    out_of_memory = true;
+                    storage_timeout = true;
                     break;
                 }
                 stat_ok = stat(full_path, &info) == 0;
             }
             if (!stat_ok) {
                 ESP_LOGW(TAG, "无法读取文件属性，已跳过：%s", full_path);
-                heap_caps_free(full_path);
                 continue;
             }
             if (S_ISDIR(info.st_mode)) {
-                if (!directory_stack_push(&stack, full_path)) {
-                    out_of_memory = true;
+                if (directory_item.depth < MAX_MUSIC_SUBDIR_DEPTH) {
+                    if (!directory_stack_push(&stack, full_path, static_cast<uint8_t>(directory_item.depth + 1U))) {
+                        out_of_memory = true;
+                    }
                 }
-                heap_caps_free(full_path);
                 if (out_of_memory) {
                     break;
                 }
@@ -651,12 +896,138 @@ static esp_err_t media_library_scan_with_scratch(
                             heap_caps_free(artwork_build);
                             artwork_build = nullptr;
                         }
-                        heap_caps_free(full_path);
                         break;
                     }
 
-                    if (!reused && deep_probe_format) {
+                    // 首次无索引建库时，MP3/FLAC 三个深度阶段共享同一个已打开文件。
+                    // 大目录下 fopen(path) 本身会触发 FAT 目录名字查找；原实现每首至少打开三次，
+                    // 文件越靠后目录查找越慢。这里先消除重复打开，解析器内部仍可独立 fseek。
+                    bool initial_shared_scan_handled = false;
+                    if (!have_previous_v2 && !have_previous_v1 && deep_probe_format) {
+                        initial_shared_scan_handled = true;
+                        const int64_t open_started_us = esp_timer_get_time();
+                        StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
+                        if (!sd_lock.locked()) {
+                            storage_timeout = true;
+                        } else {
+                            FILE *shared_file = fopen(full_path, "rb");
+                            log_slow_scan_stage("文件打开", full_path, open_started_us);
+                            if (shared_file == nullptr) {
+                                ESP_LOGW(TAG, "首次建库无法打开音频文件，保留基础条目：%s", full_path);
+                                technical = {};
+                                probe_failed_count++;
+                                metadata_failed_count++;
+                                artwork_failed_count++;
+                            } else {
+                                const int64_t probe_started_us = esp_timer_get_time();
+                                const esp_err_t probe_ret = media_probe_open_file(
+                                    shared_file, format, static_cast<uint64_t>(info.st_size), &technical);
+                                log_slow_scan_stage("技术探测", full_path, probe_started_us);
+                                if (probe_ret == ESP_OK) {
+                                    probed_count++;
+                                } else {
+                                    technical = {};
+                                    probe_failed_count++;
+                                }
+
+                                metadata_build = static_cast<MediaMetadataBuildV2 *>(
+                                    heap_caps_calloc(1, sizeof(MediaMetadataBuildV2), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+                                if (metadata_build == nullptr) {
+                                    out_of_memory = true;
+                                } else {
+                                    const char *lrc_name = directory_lrc_index_find_for_audio(
+                                        &directory_lrc_index, entry->d_name);
+                                    char *resolved_lrc_path = lrc_name != nullptr
+                                        ? media_library_alloc_join_path(directory, lrc_name)
+                                        : nullptr;
+                                    if (lrc_name != nullptr && resolved_lrc_path == nullptr) {
+                                        out_of_memory = true;
+                                    }
+                                    const int64_t metadata_started_us = esp_timer_get_time();
+                                    const esp_err_t metadata_ret = out_of_memory
+                                        ? ESP_ERR_NO_MEM
+                                        : media_metadata_scan_open_file_indexed_v2(
+                                            shared_file, full_path, resolved_lrc_path, format,
+                                            static_cast<uint64_t>(info.st_size), metadata_build);
+                                    log_slow_scan_stage("Metadata", full_path, metadata_started_us);
+                                    heap_caps_free(resolved_lrc_path);
+                                    if (metadata_ret == ESP_OK) {
+                                        metadata_scanned_count++;
+                                    } else {
+                                        ESP_LOGW(TAG, "Metadata 解析失败，保留文件名 fallback：%s [%s] ret=%s",
+                                            full_path, media_format_name(format), esp_err_to_name(metadata_ret));
+                                        media_metadata_build_release(metadata_build);
+                                        heap_caps_free(metadata_build);
+                                        metadata_build = nullptr;
+                                        metadata_failed_count++;
+                                        if (metadata_ret == ESP_ERR_NO_MEM) {
+                                            out_of_memory = true;
+                                        }
+                                    }
+                                }
+
+                                if (!out_of_memory) {
+                                    artwork_build = static_cast<MediaArtworkBuildV2 *>(
+                                        heap_caps_calloc(1, sizeof(MediaArtworkBuildV2), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+                                    if (artwork_build == nullptr) {
+                                        out_of_memory = true;
+                                    } else {
+                                        const int64_t artwork_started_us = esp_timer_get_time();
+                                        const esp_err_t artwork_ret = media_artwork_scan_open_file_v2(
+                                            shared_file, full_path, format, static_cast<uint64_t>(info.st_size),
+                                            &directory_cover, artwork_build);
+                                        log_slow_scan_stage("封面索引", full_path, artwork_started_us);
+                                        if (artwork_ret == ESP_OK) {
+                                            artwork_scanned_count++;
+                                        } else {
+                                            ESP_LOGW(TAG, "封面 locator 解析失败，按无封面继续：%s [%s] ret=%s",
+                                                full_path, media_format_name(format), esp_err_to_name(artwork_ret));
+                                            media_artwork_build_release_v2(artwork_build);
+                                            heap_caps_free(artwork_build);
+                                            artwork_build = nullptr;
+                                            artwork_failed_count++;
+                                            if (artwork_ret == ESP_ERR_NO_MEM) {
+                                                out_of_memory = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                fclose(shared_file);
+                            }
+                        }
+                    }
+
+                    if (storage_timeout) {
+                        if (metadata_build != nullptr) {
+                            media_metadata_build_release(metadata_build);
+                            heap_caps_free(metadata_build);
+                            metadata_build = nullptr;
+                        }
+                        if (artwork_build != nullptr) {
+                            media_artwork_build_release_v2(artwork_build);
+                            heap_caps_free(artwork_build);
+                            artwork_build = nullptr;
+                        }
+                        break;
+                    }
+                    if (out_of_memory) {
+                        if (metadata_build != nullptr) {
+                            media_metadata_build_release(metadata_build);
+                            heap_caps_free(metadata_build);
+                            metadata_build = nullptr;
+                        }
+                        if (artwork_build != nullptr) {
+                            media_artwork_build_release_v2(artwork_build);
+                            heap_caps_free(artwork_build);
+                            artwork_build = nullptr;
+                        }
+                        break;
+                    }
+
+                    if (!initial_shared_scan_handled && !reused && deep_probe_format) {
+                        const int64_t probe_started_us = esp_timer_get_time();
                         const esp_err_t probe_ret = media_probe_file(full_path, format, &technical);
+                        log_slow_scan_stage("技术探测", full_path, probe_started_us);
                         if (probe_ret == ESP_OK) {
                             probed_count++;
                         } else {
@@ -666,7 +1037,7 @@ static esp_err_t media_library_scan_with_scratch(
                         }
                     }
 
-                    if (deep_probe_format && !metadata_reused) {
+                    if (!initial_shared_scan_handled && deep_probe_format && !metadata_reused) {
                         metadata_build = static_cast<MediaMetadataBuildV2 *>(
                             heap_caps_calloc(1, sizeof(MediaMetadataBuildV2), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
                         );
@@ -677,12 +1048,13 @@ static esp_err_t media_library_scan_with_scratch(
                                 heap_caps_free(artwork_build);
                                 artwork_build = nullptr;
                             }
-                            heap_caps_free(full_path);
                             break;
                         }
+                        const int64_t metadata_started_us = esp_timer_get_time();
                         const esp_err_t metadata_ret = media_metadata_scan_file_v2(
                             full_path, format, static_cast<uint64_t>(info.st_size), metadata_build
                         );
+                        log_slow_scan_stage("Metadata", full_path, metadata_started_us);
                         if (metadata_ret == ESP_OK) {
                             metadata_scanned_count++;
                         } else {
@@ -699,13 +1071,12 @@ static esp_err_t media_library_scan_with_scratch(
                                     heap_caps_free(artwork_build);
                                     artwork_build = nullptr;
                                 }
-                                heap_caps_free(full_path);
                                 break;
                             }
                         }
                     }
 
-                    if (!artwork_reused) {
+                    if (!initial_shared_scan_handled && !artwork_reused) {
                         artwork_build = static_cast<MediaArtworkBuildV2 *>(
                             heap_caps_calloc(1, sizeof(MediaArtworkBuildV2), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
                         );
@@ -716,12 +1087,13 @@ static esp_err_t media_library_scan_with_scratch(
                                 heap_caps_free(metadata_build);
                                 metadata_build = nullptr;
                             }
-                            heap_caps_free(full_path);
                             break;
                         }
+                        const int64_t artwork_started_us = esp_timer_get_time();
                         const esp_err_t artwork_ret = media_artwork_scan_file_v2(
                             full_path, format, static_cast<uint64_t>(info.st_size), &directory_cover, artwork_build
                         );
+                        log_slow_scan_stage("封面索引", full_path, artwork_started_us);
                         if (artwork_ret == ESP_OK) {
                             artwork_scanned_count++;
                         } else {
@@ -737,7 +1109,6 @@ static esp_err_t media_library_scan_with_scratch(
                                     media_metadata_build_release(metadata_build);
                                     heap_caps_free(metadata_build);
                                 }
-                                heap_caps_free(full_path);
                                 break;
                             }
                         }
@@ -781,10 +1152,13 @@ static esp_err_t media_library_scan_with_scratch(
                             heap_caps_free(artwork_build);
                         }
                         out_of_memory = true;
-                        heap_caps_free(full_path);
                         break;
                     }
+                    notify_initial_build_progress(false);
                     format_count[static_cast<size_t>(format)]++;
+                    if ((g_entry_count % SCAN_YIELD_INTERVAL_TRACKS) == 0U) {
+                        vTaskDelay(1);
+                    }
 #if APP_DIAG_LIBRARY_ITEMS
                     if (g_entry_count <= LOG_TRACK_LIMIT) {
                         const MediaMetadataBuildV2 *meta = g_entries[g_entry_count - 1].metadata_build;
@@ -835,20 +1209,28 @@ static esp_err_t media_library_scan_with_scratch(
 #endif
                 }
             }
-            heap_caps_free(full_path);
         }
         {
-            StorageSdLockGuard sd_lock;
+            StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
             if (sd_lock.locked()) {
                 closedir(dir);
             } else {
-                out_of_memory = true;
+                storage_timeout = true;
             }
         }
         media_artwork_build_release_v2(&directory_cover);
+        directory_lrc_index_release(&directory_lrc_index);
         heap_caps_free(directory);
     }
     directory_stack_destroy(&stack);
+
+    if (storage_timeout) {
+        ESP_LOGE(TAG, "扫描过程中等待TF访问锁超时，终止本次建库，避免永久卡住");
+        media_catalog_store_v2_release(&previous_v2);
+        media_index_store_release(&previous_v1);
+        media_library_reset_build_state(replace_runtime_catalog);
+        return ESP_ERR_TIMEOUT;
+    }
 
     if (out_of_memory) {
         ESP_LOGE(TAG, "扫描过程中 PSRAM 不足，音乐库未完成");
@@ -857,6 +1239,10 @@ static esp_err_t media_library_scan_with_scratch(
         media_library_reset_build_state(replace_runtime_catalog);
         return ESP_ERR_NO_MEM;
     }
+    // 若最后一批不足节流阈值，也要把最终已发现数量送到启动页；
+    // 后续还可能进行排序、Catalog 组装和落盘，因此用户不会在这段时间看到过期数字。
+    notify_initial_build_progress(true);
+
     if (root_missing) {
         ESP_LOGW(TAG, "音乐目录不存在：%s，音乐库保持为空", MUSIC_ROOT);
     }

@@ -1049,7 +1049,10 @@ static void usb_runtime_overlay_set_status(const char *text, uint32_t rgb)
     lvgl_port_unlock();
 }
 
-static void usb_library_scan_event(MediaLibraryScanEvent event, void *)
+static void usb_library_scan_event(
+    MediaLibraryScanEvent event,
+    uint32_t,
+    void *)
 {
     if (event == MediaLibraryScanEvent::ChangesDetected) {
         usb_runtime_overlay_set_status("正在更新音乐库...", 0xC7D5E8);

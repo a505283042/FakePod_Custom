@@ -86,8 +86,10 @@ esp_err_t sdcard_init()
         SDMMC_HOST_DEFAULT();
 
 
-    // 调试阶段先使用标准 20MHz。
-    // 后续稳定后再测试 40MHz。
+    // 稳定模式固定使用 20MHz。
+    // 实测 40MHz High Speed 在首次大曲库连续目录查找时可能出现单次文件访问长时间不返回，
+    // 即使卡片声明支持高速模式，也不能代表具体 PCB 走线、上拉和卡片组合在该频率下稳定。
+    // 建库性能继续通过减少重复路径查找和分阶段建库优化，不再用提高总线频率换取稳定性。
     host.max_freq_khz =
         SDMMC_FREQ_DEFAULT;
 
@@ -227,7 +229,15 @@ esp_err_t sdcard_init()
     SDCARD_BOOT_LOGI("总线宽度：4-bit");
 
 
-    SDCARD_BOOT_LOGI("当前速度：20 MHz");
+    // real_freq_khz 是 SDMMC Host 最终实际采用的时钟；不要根据请求值假定一定跑满 40MHz。
+    ESP_LOGI(
+        TAG,
+        "SDMMC运行参数：请求上限=%dkHz 卡支持上限=%lukHz 实际=%dkHz 总线=%u-bit",
+        host.max_freq_khz,
+        static_cast<unsigned long>(g_card->max_freq_khz),
+        g_card->real_freq_khz,
+        static_cast<unsigned>(1U << g_card->log_bus_width)
+    );
 
 
     return ESP_OK;

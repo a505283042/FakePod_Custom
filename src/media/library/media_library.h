@@ -23,7 +23,11 @@ enum class MediaLibraryScanEvent : uint8_t
     ChangesDetected,
 };
 
-using MediaLibraryScanEventCallback = void (*)(MediaLibraryScanEvent event, void *context);
+using MediaLibraryScanEventCallback = void (*)(
+    MediaLibraryScanEvent event,
+    uint32_t current_count,
+    void *context
+);
 
 // 启动期扫描 TF 卡音乐目录并建立运行时 MusicCatalogV2，同时维护 /sdcard/System/library 下的 V2 Index/Manifest。
 // 未变化文件通过 FAST(size+mtime) Manifest 复用旧技术信息；V1 仅作为首次升级迁移源。

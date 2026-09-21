@@ -11,6 +11,9 @@
 static const char *TAG = "媒体探针";
 static constexpr size_t MP3_SCAN_BUFFER_BYTES = 8192;
 static constexpr size_t MP3_MAX_LEADING_SCAN_BYTES = 256 * 1024;
+// FLAC 元数据 block 正常数量很少；异常文件不能让首次建库长期困在单首歌里。
+static constexpr uint32_t FLAC_MAX_METADATA_BLOCK_COUNT = 256U;
+static constexpr TickType_t LIBRARY_SD_LOCK_TIMEOUT = pdMS_TO_TICKS(2000);
 
 static uint32_t read_be24(const uint8_t *p)
 {
@@ -149,7 +152,11 @@ static esp_err_t probe_flac(FILE *file, MediaTechnicalInfo *info)
 
     bool have_streaminfo = false;
     bool last = false;
+    uint32_t block_count = 0U;
     while (!last) {
+        if (++block_count > FLAC_MAX_METADATA_BLOCK_COUNT) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
         uint8_t header[4] = {};
         if (fread(header, 1, sizeof(header), file) != sizeof(header)) {
             return ESP_ERR_INVALID_SIZE;
@@ -505,6 +512,30 @@ static esp_err_t probe_mp3(FILE *file, uint64_t file_size, MediaTechnicalInfo *i
     return ESP_OK;
 }
 
+esp_err_t media_probe_open_file(
+    FILE *file,
+    MediaFormat format,
+    uint64_t file_size,
+    MediaTechnicalInfo *out_info
+)
+{
+    if (file == nullptr || out_info == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *out_info = {};
+    if (format != MediaFormat::FLAC && format != MediaFormat::MP3) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    if (!seek_u64(file, 0U)) {
+        return ESP_FAIL;
+    }
+    return format == MediaFormat::FLAC
+        ? probe_flac(file, out_info)
+        : probe_mp3(file, file_size, out_info);
+}
+
 esp_err_t media_probe_file(
     const char *path,
     MediaFormat format,
@@ -514,13 +545,12 @@ esp_err_t media_probe_file(
     if (path == nullptr || out_info == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-
     *out_info = {};
     if (format != MediaFormat::FLAC && format != MediaFormat::MP3) {
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    StorageSdLockGuard sd_lock;
+    StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
     if (!sd_lock.locked()) {
         return ESP_ERR_TIMEOUT;
     }
@@ -537,15 +567,8 @@ esp_err_t media_probe_file(
             file_size = static_cast<uint64_t>(end);
         }
     }
-    rewind(file);
 
-    esp_err_t ret = ESP_FAIL;
-    if (format == MediaFormat::FLAC) {
-        ret = probe_flac(file, out_info);
-    } else {
-        ret = probe_mp3(file, file_size, out_info);
-    }
-
+    const esp_err_t ret = media_probe_open_file(file, format, file_size, out_info);
     fclose(file);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "技术信息解析失败：%s [%s] ret=%s",

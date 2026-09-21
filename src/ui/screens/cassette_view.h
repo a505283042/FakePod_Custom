@@ -8,6 +8,10 @@
 // Music 首页磁带视觉层。只消费已有 CoverSurface；不参与音频解码。
 esp_err_t cassette_view_create(lv_obj_t *parent);
 bool cassette_view_set_active(bool active);
+// 从封面视图切到磁带时先隐藏准备；ready 后再由 player_home 一次提交，避免粉色中间帧。
+bool cassette_view_prepare_deferred_active();
+bool cassette_view_try_present_deferred();
+bool cassette_view_is_present_ready();
 void cassette_view_update();
 // Music 原有播放控件 Overlay 显示时隐藏磁带专属曲目信息/Mini Lyrics。
 void cassette_view_set_controls_visible(bool visible);

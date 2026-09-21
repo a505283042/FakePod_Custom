@@ -1,6 +1,7 @@
 #include "ui_manager.h"
 #include "ui_common.h"
 
+#include <atomic>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -8,8 +9,11 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 #include "esp_lvgl_port.h"
 #include "esp_lv_decoder.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "lvgl.h"
 #include "app_diag_config.h"
 #include "board_pins.h"
@@ -50,11 +54,33 @@ static lv_obj_t *g_boot_status = nullptr;
 static bool g_bootstrap_ready = false;
 static bool g_boot_reveal_pending = false;
 static bool g_ready = false;
+
+// 首次建库进度由扫描任务只写入轻量计数，真正的 LVGL 文本更新由
+// taskLVGL 自己的 timer 完成。这样扫描线程不需要等待 LVGL 互斥锁，
+// 即使显示正处于 DMA flush，也不会把 TF 扫描主循环一起阻塞。
+static lv_timer_t *g_boot_library_progress_timer = nullptr;
+static std::atomic<uint32_t> g_boot_library_progress_count{0U};
+static std::atomic<uint32_t> g_boot_library_progress_generation{0U};
+static uint32_t g_boot_library_progress_applied_generation = 0U;
+static std::atomic<bool> g_boot_library_progress_active{false};
 static esp_lv_decoder_handle_t g_image_decoder = nullptr;
 static int16_t g_touch_last_x = 0;
 static int16_t g_touch_last_y = 0;
 static uint32_t g_touch_last_dispatch_sequence = 0U;
 static bool g_touch_dispatch_sequence_valid = false;
+
+// LVGL 9.2 在没有 flush_wait_cb 时会在 disp->flushing 上忙等。
+// 这里不接管 esp_lvgl_port 已注册的 Panel IO / flush 回调，只监听 LVGL 自己的
+// FLUSH_START / FLUSH_FINISH 事件来驱动信号量：既保留官方显示事务闭环，又让
+// taskLVGL 在等待 DMA 时阻塞让出 CPU，避免 IDLE1 因纯忙等触发 Task WDT。
+// 若 250ms 仍收不到 FLUSH_FINISH，说明官方显示事务没有正常闭环；此时受控重启，
+// 不能让 LVGL 继续复用可能仍被 DMA 持有的 draw buffer。
+static SemaphoreHandle_t g_display_flush_done = nullptr;
+static volatile uint32_t g_display_flush_submit_sequence = 0U;
+static volatile uint32_t g_display_flush_done_sequence = 0U;
+static uint32_t g_display_flush_wait_timeout_count = 0U;
+static lv_area_t g_display_flush_last_area = {};
+static constexpr uint32_t kDisplayFlushWaitTimeoutMs = 250U;
 
 // 大面积刷新才等待 TE。
 // 小型进度条/按钮局部更新继续立即刷新，避免所有 UI 交互都额外等待一帧。
@@ -194,6 +220,66 @@ static uint32_t g_te_animation_bypass_count = 0U;
 // LVGL RGB565 DMA 条带固定为 24 行，为 BoundedSPI 和音频留出更多内部 DMA headroom。
 // 双缓冲总像素 RAM = 460 * 24 * 2B * 2 = 44,160B，相比 40 行配置回收 29,440B。
 static constexpr uint32_t kLvglDmaBufferLines = 24U;
+
+static void ui_display_flush_sync_event_cb(lv_event_t *event)
+{
+    if (event == nullptr) return;
+
+    const lv_event_code_t code = lv_event_get_code(event);
+    if (code == LV_EVENT_FLUSH_START) {
+        // 新事务开始前清掉上一事务可能残留的 token。若 DMA 在 wait_cb 进入前已经
+        // 完成，本事务自己的 FLUSH_FINISH 会随后重新 give，因此不会漏掉快速完成。
+        if (g_display_flush_done != nullptr) {
+            while (xSemaphoreTake(g_display_flush_done, 0) == pdTRUE) {
+            }
+        }
+
+        ++g_display_flush_submit_sequence;
+        // LV_EVENT_FLUSH_START 的参数在不同 LVGL 小版本中并不保证暴露刷新区域；
+        // 这里不依赖私有 display 状态，超时诊断以事务序号为主。
+        g_display_flush_last_area = {};
+        return;
+    }
+
+    if (code != LV_EVENT_FLUSH_FINISH) return;
+
+    g_display_flush_done_sequence = g_display_flush_submit_sequence;
+    if (g_display_flush_done == nullptr) return;
+
+    // esp_lvgl_port 的颜色完成回调通常从 Panel IO ISR 进入 lv_display_flush_ready()。
+    // LVGL 的 FLUSH_FINISH 因此也可能运行在 ISR 上下文，必须选择对应的 FreeRTOS API。
+    if (xPortInIsrContext()) {
+        BaseType_t task_woken = pdFALSE;
+        xSemaphoreGiveFromISR(g_display_flush_done, &task_woken);
+        if (task_woken == pdTRUE) portYIELD_FROM_ISR();
+    } else {
+        xSemaphoreGive(g_display_flush_done);
+    }
+}
+
+static void ui_display_flush_wait_cb(lv_display_t *display)
+{
+    (void)display;
+
+    if (g_display_flush_done != nullptr &&
+        xSemaphoreTake(g_display_flush_done, pdMS_TO_TICKS(kDisplayFlushWaitTimeoutMs)) == pdTRUE) {
+        return;
+    }
+
+    ++g_display_flush_wait_timeout_count;
+    ESP_LOGE(TAG,
+        "LVGL刷屏完成等待超时：%ums submit=%u done=%u area=(%d,%d)-(%d,%d) timeout_count=%u，准备受控重启",
+        static_cast<unsigned>(kDisplayFlushWaitTimeoutMs),
+        static_cast<unsigned>(g_display_flush_submit_sequence),
+        static_cast<unsigned>(g_display_flush_done_sequence),
+        g_display_flush_last_area.x1, g_display_flush_last_area.y1,
+        g_display_flush_last_area.x2, g_display_flush_last_area.y2,
+        static_cast<unsigned>(g_display_flush_wait_timeout_count));
+
+    // 不能简单返回：wait_cb 返回后 LVGL 会继续复用 draw buffer；若底层 DMA 只是
+    // 丢了完成闭环而仍在运行，会造成更严重的内存竞争。这里直接受控重启。
+    esp_restart();
+}
 
 static const char *ui_perf_context_name(UiPerfContext context)
 {
@@ -944,6 +1030,54 @@ static void ui_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
         false, g_touch_last_x, g_touch_last_y, static_cast<uint32_t>(lv_tick_get()));
 }
 
+static void ui_manager_apply_library_build_progress_locked(uint32_t scanned_count)
+{
+    if (g_boot_status == nullptr || g_boot_root == nullptr) {
+        return;
+    }
+
+    char status[96] = {};
+    const int written = scanned_count == 0U
+        ? snprintf(status, sizeof(status), "正在建立音乐库...")
+        : snprintf(
+            status,
+            sizeof(status),
+            "正在建立音乐库...\n已扫描到 %lu 首音乐",
+            static_cast<unsigned long>(scanned_count));
+    if (written <= 0 || static_cast<size_t>(written) >= sizeof(status)) {
+        return;
+    }
+
+    lv_label_set_text(g_boot_status, status);
+    lv_obj_set_style_text_font(g_boot_status, usb_service_font_get(), 0);
+    lv_obj_set_style_text_color(g_boot_status, lv_color_hex(0xC7D5E8), 0);
+    lv_obj_set_style_text_align(g_boot_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_line_space(g_boot_status, 6, 0);
+    lv_obj_set_width(g_boot_status, 410);
+    lv_obj_align(g_boot_status, LV_ALIGN_CENTER, 0, 18);
+    lv_obj_invalidate(g_boot_root);
+}
+
+static void ui_manager_boot_library_progress_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (!g_boot_library_progress_active.load(std::memory_order_acquire) ||
+        g_boot_status == nullptr || g_boot_root == nullptr) {
+        return;
+    }
+
+    const uint32_t generation = g_boot_library_progress_generation.load(std::memory_order_acquire);
+    if (generation == g_boot_library_progress_applied_generation) {
+        return;
+    }
+
+    // 先取最新计数再记录 generation。若扫描线程恰好在两次读取之间更新，
+    // 下一次 timer 仍会看到 generation 变化，不会永久丢掉一次进度。
+    const uint32_t count = g_boot_library_progress_count.load(std::memory_order_relaxed);
+    ui_manager_apply_library_build_progress_locked(count);
+    g_boot_library_progress_applied_generation = generation;
+}
+
 esp_err_t ui_manager_bootstrap_init()
 {
     if (g_bootstrap_ready) {
@@ -973,6 +1107,14 @@ esp_err_t ui_manager_bootstrap_init()
         static_cast<unsigned>(lvgl_cfg.task_priority), static_cast<unsigned>(lvgl_cfg.task_stack));
     UI_BOOT_LOGI("Core1 priority：FlacPrefetch=P4 > LVGL=P3 > Artwork=P2 > Cover/Lyrics=P1");
 
+    if (g_display_flush_done == nullptr) {
+        g_display_flush_done = xSemaphoreCreateBinary();
+        if (g_display_flush_done == nullptr) {
+            ESP_LOGE(TAG, "创建 LVGL 刷屏完成信号量失败");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     UI_BOOT_LOGI("注册 CO5300 显示设备");
     lvgl_port_display_cfg_t disp_cfg = {};
     disp_cfg.io_handle = display_get_panel_io();
@@ -998,6 +1140,22 @@ esp_err_t ui_manager_bootstrap_init()
         ESP_LOGE(TAG, "注册 LVGL 显示设备失败");
         return ESP_FAIL;
     }
+
+    // 不覆盖 esp_lvgl_port 已经安装的 flush_cb / on_color_trans_done。
+    // 只给 LVGL 增加等待策略，并通过 FLUSH_START/FINISH 事件观察官方事务是否闭环。
+    if (!lvgl_port_lock(1000)) {
+        ESP_LOGE(TAG, "安装 LVGL 刷屏等待钩子时获取互斥锁超时");
+        return ESP_ERR_TIMEOUT;
+    }
+    lv_display_add_event_cb(
+        g_display, ui_display_flush_sync_event_cb, LV_EVENT_FLUSH_START, nullptr);
+    lv_display_add_event_cb(
+        g_display, ui_display_flush_sync_event_cb, LV_EVENT_FLUSH_FINISH, nullptr);
+    lv_display_set_flush_wait_cb(g_display, ui_display_flush_wait_cb);
+    lvgl_port_unlock();
+
+    UI_BOOT_LOGI("LVGL flush：保留esp_lvgl_port官方回调，启用信号量等待 + %ums超时保护",
+        static_cast<unsigned>(kDisplayFlushWaitTimeoutMs));
 
 #if APP_DIAG_BOOT_VERBOSE
     const size_t dma_free_after = heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
@@ -1089,6 +1247,16 @@ esp_err_t ui_manager_bootstrap_init()
     lv_obj_set_width(g_boot_status, 360);
     lv_obj_align(g_boot_status, LV_ALIGN_CENTER, 0, 18);
 
+    g_boot_library_progress_count.store(0U, std::memory_order_relaxed);
+    g_boot_library_progress_generation.store(0U, std::memory_order_relaxed);
+    g_boot_library_progress_applied_generation = 0U;
+    g_boot_library_progress_active.store(false, std::memory_order_release);
+    g_boot_library_progress_timer = lv_timer_create(
+        ui_manager_boot_library_progress_timer_cb, 100U, nullptr);
+    if (g_boot_library_progress_timer == nullptr) {
+        ESP_LOGW(TAG, "创建首次建库进度timer失败，将降级为仅显示静态启动状态");
+    }
+
     // 创建对象期间已经产生 invalidation；显式标记整屏，首轮 REFR_READY 才执行物理揭屏。
     g_boot_reveal_pending = true;
     lv_obj_invalidate(screen);
@@ -1162,6 +1330,11 @@ esp_err_t ui_manager_init()
         UI_BOOT_LOGI("TF 卡不可用，跳过中文字体加载并使用 LVGL 默认字体");
     }
 
+    g_boot_library_progress_active.store(false, std::memory_order_release);
+    if (g_boot_library_progress_timer != nullptr) {
+        lv_timer_delete(g_boot_library_progress_timer);
+        g_boot_library_progress_timer = nullptr;
+    }
     if (g_boot_root != nullptr) {
         lv_obj_delete(g_boot_root);
         g_boot_root = nullptr;
@@ -1228,27 +1401,18 @@ bool ui_manager_is_ready()
     return g_ready;
 }
 
-bool ui_manager_show_library_build_progress()
+bool ui_manager_show_library_build_progress(uint32_t scanned_count)
 {
     if (!g_bootstrap_ready || g_display == nullptr || g_boot_root == nullptr ||
         g_boot_status == nullptr) {
         return false;
     }
 
-    if (!lvgl_port_lock(1000)) {
-        ESP_LOGW(TAG, "曲库建立提示获取LVGL互斥锁超时");
-        return false;
-    }
-
-    lv_label_set_text(g_boot_status, "正在建立音乐库...");
-    lv_obj_set_style_text_font(g_boot_status, usb_service_font_get(), 0);
-    lv_obj_set_style_text_color(g_boot_status, lv_color_hex(0xC7D5E8), 0);
-    lv_obj_set_style_text_align(g_boot_status, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_line_space(g_boot_status, 6, 0);
-    lv_obj_set_width(g_boot_status, 410);
-    lv_obj_align(g_boot_status, LV_ALIGN_CENTER, 0, 18);
-    lv_obj_invalidate(g_boot_root);
-    lvgl_port_unlock();
+    // 这里只发布轻量状态，不从建库扫描线程进入 LVGL。
+    // 具体文本刷新由 taskLVGL 的 100ms timer 完成，避免扫描线程等待显示互斥锁。
+    g_boot_library_progress_count.store(scanned_count, std::memory_order_relaxed);
+    g_boot_library_progress_active.store(true, std::memory_order_release);
+    g_boot_library_progress_generation.fetch_add(1U, std::memory_order_release);
     return true;
 }
 
@@ -1258,6 +1422,10 @@ bool ui_manager_show_library_build_complete(uint32_t total_count)
         g_boot_status == nullptr) {
         return false;
     }
+
+    // 完成状态优先级高于异步进度，先停掉 timer 的进度提交，
+    // 防止最后一次“已扫描到 X 首”在完成文案之后又覆盖回来。
+    g_boot_library_progress_active.store(false, std::memory_order_release);
 
     char status[96] = {};
     const int written = snprintf(

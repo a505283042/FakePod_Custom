@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "esp_err.h"
 #include "media_catalog_v2.h"
@@ -52,6 +53,27 @@ void media_metadata_build_release(MediaMetadataBuildV2 *metadata);
 // 不读取歌词正文；内嵌歌词仅记录文件 offset/size/编码/语言。
 esp_err_t media_metadata_scan_file_v2(
     const char *path,
+    MediaFormat format,
+    uint64_t file_size,
+    MediaMetadataBuildV2 *out_metadata
+);
+
+// 复用上层已打开的音频文件，避免首次建库对同一路径重复 fopen。
+// 调用方负责 TF 锁与 FILE* 生命周期；外置 .lrc 仍按 audio_path 探测。
+esp_err_t media_metadata_scan_open_file_v2(
+    FILE *file,
+    const char *audio_path,
+    MediaFormat format,
+    uint64_t file_size,
+    MediaMetadataBuildV2 *out_metadata
+);
+
+// 首次建库已经按目录解析出同名歌词时使用。external_lrc_path=nullptr 表示已确认无外置歌词，
+// 因此不会再对每首歌执行 stat("同名.lrc")。
+esp_err_t media_metadata_scan_open_file_indexed_v2(
+    FILE *file,
+    const char *audio_path,
+    const char *external_lrc_path,
     MediaFormat format,
     uint64_t file_size,
     MediaMetadataBuildV2 *out_metadata

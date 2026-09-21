@@ -19,6 +19,10 @@ static const char *TAG = "封面索引";
 #endif
 static constexpr size_t IMAGE_HEADER_SCAN_BYTES = 16U * 1024U;
 static constexpr size_t ID3_APIC_PREFIX_SCAN_BYTES = 64U * 1024U;
+// 首次建库只需要找到一个可靠封面 locator；异常文件不能无限遍历标签结构。
+static constexpr uint32_t MAX_ARTWORK_ID3_FRAME_COUNT = 2048U;
+static constexpr uint32_t MAX_ARTWORK_FLAC_BLOCK_COUNT = 256U;
+static constexpr TickType_t LIBRARY_SD_LOCK_TIMEOUT = pdMS_TO_TICKS(2000);
 
 static uint32_t read_be24(const uint8_t *p)
 {
@@ -277,7 +281,11 @@ static esp_err_t scan_flac_embedded(FILE *file, uint64_t file_size, MediaArtwork
     }
 
     bool last = false;
+    uint32_t block_count = 0U;
     while (!last) {
+        if (++block_count > MAX_ARTWORK_FLAC_BLOCK_COUNT) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
         uint8_t header[4] = {};
         if (fread(header, 1, sizeof(header), file) != sizeof(header)) {
             return ESP_ERR_INVALID_SIZE;
@@ -493,7 +501,11 @@ static esp_err_t scan_mp3_embedded(FILE *file, uint64_t file_size, MediaArtworkB
         cursor += total_ext;
     }
 
+    uint32_t frame_count = 0U;
     while (cursor < tag_end) {
+        if (++frame_count > MAX_ARTWORK_ID3_FRAME_COUNT) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
         const size_t frame_header_size = version == 2U ? 6U : 10U;
         if (tag_end - cursor < frame_header_size || !seek_u64(file, cursor)) {
             break;
@@ -599,7 +611,7 @@ esp_err_t media_artwork_find_directory_fallback_v2(
     }
     media_artwork_build_release_v2(out_fallback);
 
-    StorageSdLockGuard sd_lock;
+    StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
     if (!sd_lock.locked()) {
         return ESP_ERR_TIMEOUT;
     }
@@ -645,7 +657,8 @@ esp_err_t media_artwork_find_directory_fallback_v2(
     return ESP_OK;
 }
 
-esp_err_t media_artwork_scan_file_v2(
+esp_err_t media_artwork_scan_open_file_v2(
+    FILE *file,
     const char *path,
     MediaFormat format,
     uint64_t file_size,
@@ -658,20 +671,13 @@ esp_err_t media_artwork_scan_file_v2(
     }
     media_artwork_build_release_v2(out_artwork);
 
-    StorageSdLockGuard sd_lock;
-    if (!sd_lock.locked()) {
-        return ESP_ERR_TIMEOUT;
-    }
-
     if (format == MediaFormat::MP3 || format == MediaFormat::FLAC) {
-        FILE *file = fopen(path, "rb");
         if (file == nullptr) {
-            return ESP_FAIL;
+            return ESP_ERR_INVALID_ARG;
         }
         const esp_err_t embedded_ret = format == MediaFormat::MP3
             ? scan_mp3_embedded(file, file_size, out_artwork)
             : scan_flac_embedded(file, file_size, out_artwork);
-        fclose(file);
         if (embedded_ret == ESP_ERR_NO_MEM) {
             return embedded_ret;
         }
@@ -711,6 +717,38 @@ esp_err_t media_artwork_scan_file_v2(
 #endif
     }
     return ESP_OK;
+}
+
+esp_err_t media_artwork_scan_file_v2(
+    const char *path,
+    MediaFormat format,
+    uint64_t file_size,
+    const MediaArtworkBuildV2 *directory_fallback,
+    MediaArtworkBuildV2 *out_artwork
+)
+{
+    if (path == nullptr || out_artwork == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
+    if (!sd_lock.locked()) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    if (format != MediaFormat::MP3 && format != MediaFormat::FLAC) {
+        return media_artwork_scan_open_file_v2(
+            nullptr, path, format, file_size, directory_fallback, out_artwork);
+    }
+
+    FILE *file = fopen(path, "rb");
+    if (file == nullptr) {
+        return ESP_FAIL;
+    }
+    const esp_err_t ret = media_artwork_scan_open_file_v2(
+        file, path, format, file_size, directory_fallback, out_artwork);
+    fclose(file);
+    return ret;
 }
 
 esp_err_t media_artwork_clone_from_catalog_v2(

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdio.h>
 
 #include "esp_err.h"
 #include "media_types.h"
@@ -37,6 +38,17 @@ esp_err_t media_artwork_find_directory_fallback_v2(
 // 2) 没有有效内嵌封面时使用 directory_fallback_path；
 // 3) 不读取整张图片，仅读取最小头部用于 JPEG/PNG magic 与尺寸识别。
 esp_err_t media_artwork_scan_file_v2(
+    const char *path,
+    MediaFormat format,
+    uint64_t file_size,
+    const MediaArtworkBuildV2 *directory_fallback,
+    MediaArtworkBuildV2 *out_artwork
+);
+
+// 复用上层已打开的音频文件，避免首次建库重复打开同一路径。
+// 调用方负责 TF 锁与 FILE* 生命周期；函数只读取嵌入封面并复制目录 fallback locator。
+esp_err_t media_artwork_scan_open_file_v2(
+    FILE *file,
     const char *path,
     MediaFormat format,
     uint64_t file_size,

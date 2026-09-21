@@ -192,6 +192,8 @@ enum class MusicVisualMode : uint8_t
 };
 
 static MusicVisualMode g_music_visual_mode = MusicVisualMode::Artwork;
+// 封面→磁带切换时，Artwork 继续保持显示，直到 Cassette 的封面+壳体整套视觉 ready。
+static bool g_cassette_visual_switch_pending = false;
 
 enum class PlaybackGestureScope : uint8_t
 {
@@ -352,6 +354,7 @@ static void player_home_cancel_progress_interaction();
 static void player_home_progress_sync(const AudioStateSnapshot &snapshot);
 static void player_home_apply_audio_snapshot(const AudioStateSnapshot &snapshot);
 static void player_home_overlay_hide();
+static bool player_home_finish_cassette_switch_if_ready();
 
 static void player_home_control_capture_cb(lv_event_t *event)
 {
@@ -3090,10 +3093,14 @@ static void player_home_update_background_timer_qos()
     // R.36：主页被完整覆盖时释放 Artwork UI lease，让交换槽可立即回收旧 Surface。
     // Launcher 若已用 BoundedSPI 恢复当前封面到 GRAM，则 resume 只同步 LVGL source/lease，
     // 不再额外触发整屏刷新；其它页面恢复仍走普通 invalidation。
-    const bool artwork_should_run =
-        should_run && g_music_visual_mode == MusicVisualMode::Artwork;
-    const bool cassette_should_run =
-        should_run && g_music_visual_mode == MusicVisualMode::Cassette;
+    if (!should_run && g_cassette_visual_switch_pending) {
+        // 页面被 Launcher/曲库等完整覆盖时取消尚未完成的首次切换，返回主页后仍保持 Artwork。
+        g_cassette_visual_switch_pending = false;
+    }
+    const bool artwork_should_run = should_run &&
+        (g_music_visual_mode == MusicVisualMode::Artwork || g_cassette_visual_switch_pending);
+    const bool cassette_should_run = should_run &&
+        (g_music_visual_mode == MusicVisualMode::Cassette || g_cassette_visual_switch_pending);
     const bool quiet_resume = artwork_should_run && g_artwork_resume_without_invalidation;
     now_playing_artwork_set_active(artwork_should_run, quiet_resume);
     (void)cassette_view_set_active(cassette_should_run);
@@ -3762,6 +3769,14 @@ static void player_home_artwork_timer_cb(lv_timer_t *timer)
     if (ui_touch_input_recent_activity(kInteractionYieldMs)) {
         return;
     }
+    if (g_cassette_visual_switch_pending) {
+        // 切换准备期间 Artwork 继续留在屏幕上；这里只推进隐藏的 Cassette 状态机。
+        cassette_view_update();
+        if (player_home_finish_cassette_switch_if_ready()) {
+            return;
+        }
+    }
+
     if (g_music_visual_mode == MusicVisualMode::Cassette) {
         cassette_view_update();
     } else {
@@ -3869,50 +3884,80 @@ static void player_home_refresh_visual_mode_button()
         g_music_visual_mode == MusicVisualMode::Cassette ? "切换到封面" : "切换到磁带");
 }
 
+static bool player_home_finish_cassette_switch_if_ready()
+{
+    if (!g_cassette_visual_switch_pending) return false;
+    if (!cassette_view_is_present_ready() || !cassette_view_try_present_deferred()) {
+        return false;
+    }
+
+    // Cassette root 到这里才真正显示；同一个 LVGL 回调内随后关闭 Artwork，屏幕不会经过粉色中间帧。
+    g_cassette_visual_switch_pending = false;
+    g_music_visual_mode = MusicVisualMode::Cassette;
+    now_playing_artwork_set_bounded_present_allowed(false);
+    (void)now_playing_artwork_set_dimmed(false);
+    now_playing_artwork_set_active(false);
+    g_artwork_resume_without_invalidation = false;
+
+    player_home_refresh_visual_mode_button();
+    player_home_overlay_apply_dim_path();
+    lv_obj_t *screen = lv_screen_active();
+    if (screen != nullptr) lv_obj_invalidate(screen);
+    ESP_LOGI(TAG, "Music视觉模式：磁带（封面+壳体已同步就绪）");
+    return true;
+}
+
 static bool player_home_set_visual_mode(MusicVisualMode mode)
 {
+    if (mode == MusicVisualMode::Artwork && g_cassette_visual_switch_pending) {
+        g_cassette_visual_switch_pending = false;
+        (void)cassette_view_set_active(false);
+    }
+
     if (mode == g_music_visual_mode) {
         player_home_refresh_visual_mode_button();
         return true;
     }
 
     if (mode == MusicVisualMode::Cassette) {
-        // 先让 Cassette acquire 当前 CoverSurface，再释放 Artwork lease，避免 pin=0 的交换窗口。
-        if (!cassette_view_set_active(true)) {
+        if (g_cassette_visual_switch_pending) return true;
+
+        // 不再先显示粉色 Cassette 再关闭 Artwork。磁带层保持隐藏，后台准备当前封面和壳体颜色；
+        // ready 后由 player_home_finish_cassette_switch_if_ready() 在同一帧完成视觉交接。
+        if (!cassette_view_prepare_deferred_active()) {
             ESP_LOGW(TAG, "切换磁带模式失败：磁带视觉层未就绪");
             return false;
         }
         cassette_view_set_controls_visible(g_overlay_visible);
-        g_music_visual_mode = MusicVisualMode::Cassette;
-        now_playing_artwork_set_bounded_present_allowed(false);
-        (void)now_playing_artwork_set_dimmed(false);
-        now_playing_artwork_set_active(false);
-        g_artwork_resume_without_invalidation = false;
-    } else {
-        g_music_visual_mode = MusicVisualMode::Artwork;
-        (void)cassette_view_set_active(false);
-        const bool should_run =
-            g_app_foreground &&
-            !library_view_is_visible() &&
-            !lyrics_view_is_visible() &&
-            !spectrum_view_is_visible() &&
-            !g_launcher_visible;
-        now_playing_artwork_set_bounded_present_allowed(should_run);
-        (void)now_playing_artwork_set_dimmed(g_overlay_visible);
-        now_playing_artwork_set_active(should_run);
-        if (should_run) {
-            now_playing_artwork_refresh_context();
-            now_playing_artwork_update();
-            player_home_repaint_controls_after_bounded_present();
+        g_cassette_visual_switch_pending = true;
+        if (!player_home_finish_cassette_switch_if_ready()) {
+            ESP_LOGI(TAG, "Music视觉模式：磁带准备中，继续保持当前封面");
         }
+        return true;
+    }
+
+    g_music_visual_mode = MusicVisualMode::Artwork;
+    (void)cassette_view_set_active(false);
+    const bool should_run =
+        g_app_foreground &&
+        !library_view_is_visible() &&
+        !lyrics_view_is_visible() &&
+        !spectrum_view_is_visible() &&
+        !g_launcher_visible;
+    now_playing_artwork_set_bounded_present_allowed(should_run);
+    (void)now_playing_artwork_set_dimmed(g_overlay_visible);
+    now_playing_artwork_set_active(should_run);
+    if (should_run) {
+        now_playing_artwork_refresh_context();
+        now_playing_artwork_update();
+        player_home_repaint_controls_after_bounded_present();
     }
 
     player_home_refresh_visual_mode_button();
     player_home_overlay_apply_dim_path();
     lv_obj_t *screen = lv_screen_active();
     if (screen != nullptr) lv_obj_invalidate(screen);
-    ESP_LOGI(TAG, "Music视觉模式：%s",
-        g_music_visual_mode == MusicVisualMode::Cassette ? "磁带" : "封面");
+    ESP_LOGI(TAG, "Music视觉模式：封面");
     return true;
 }
 
@@ -4147,6 +4192,7 @@ void player_home_create(lv_obj_t *screen)
     g_volume_adjust_armed = false;
     g_overlay_visible = false;
     g_music_visual_mode = MusicVisualMode::Artwork;
+    g_cassette_visual_switch_pending = false;
     g_visual_mode_button = nullptr;
     g_visual_mode_label = nullptr;
     g_last_loop_mode_valid = false;

@@ -16,6 +16,12 @@ static const char *TAG = "元数据扫描";
 static constexpr size_t MAX_TEXT_FRAME_BYTES = 64U * 1024U;
 static constexpr size_t MAX_TAG_TEXT_BYTES = 16U * 1024U;
 static constexpr size_t MAX_VORBIS_KEY_BYTES = 128U;
+// 损坏或恶意标签不能让首次建库在单个文件里遍历几十万次。
+// 这些上限远高于正常音乐文件的实际规模，超过时直接回退文件名/无标签。
+static constexpr uint32_t MAX_ID3_FRAME_COUNT = 2048U;
+static constexpr uint32_t MAX_FLAC_METADATA_BLOCK_COUNT = 256U;
+static constexpr uint32_t MAX_VORBIS_COMMENT_COUNT = 4096U;
+static constexpr TickType_t LIBRARY_SD_LOCK_TIMEOUT = pdMS_TO_TICKS(2000);
 
 static void *metadata_alloc(size_t bytes)
 {
@@ -603,6 +609,28 @@ static bool build_display_artist(MediaMetadataBuildV2 *metadata)
     return true;
 }
 
+static bool add_resolved_external_lrc(const char *lrc_path, MediaMetadataBuildV2 *metadata)
+{
+    if (metadata == nullptr) {
+        return false;
+    }
+    if (lrc_path == nullptr || lrc_path[0] == '\0') {
+        return true;
+    }
+    MediaMetadataLyricsBuildV2 lyrics = {};
+    lyrics.path = metadata_strdup(lrc_path);
+    lyrics.language = metadata_strdup("");
+    lyrics.source = MediaLyricsSourceV2::ExternalFile;
+    lyrics.kind = MediaLyricsKindV2::Synced;
+    lyrics.encoding = MediaLyricsEncodingV2::Unknown;
+    if (lyrics.path == nullptr || lyrics.language == nullptr || !add_lyrics_owned(metadata, &lyrics)) {
+        heap_caps_free(lyrics.path);
+        heap_caps_free(lyrics.language);
+        return false;
+    }
+    return true;
+}
+
 static bool add_external_lrc(const char *audio_path, MediaMetadataBuildV2 *metadata)
 {
     if (audio_path == nullptr || metadata == nullptr) {
@@ -825,7 +853,13 @@ static esp_err_t parse_id3(FILE *file, uint64_t file_size, MediaMetadataBuildV2 
         cursor += total_ext;
     }
 
+    uint32_t frame_count = 0U;
     while (cursor < tag_end) {
+        if (++frame_count > MAX_ID3_FRAME_COUNT) {
+            ESP_LOGW(TAG, "ID3 frame数量异常，停止解析并回退文件名：frames>%lu",
+                static_cast<unsigned long>(MAX_ID3_FRAME_COUNT));
+            return ESP_ERR_INVALID_RESPONSE;
+        }
         const size_t frame_header_size = version == 2U ? 6U : 10U;
         if (tag_end - cursor < frame_header_size || !seek_u64(file, cursor)) {
             break;
@@ -1134,7 +1168,13 @@ static esp_err_t parse_flac_vorbis(FILE *file, uint64_t file_size, MediaMetadata
     }
 
     bool last = false;
+    uint32_t block_count = 0U;
     while (!last) {
+        if (++block_count > MAX_FLAC_METADATA_BLOCK_COUNT) {
+            ESP_LOGW(TAG, "FLAC metadata block数量异常，停止解析：blocks>%lu",
+                static_cast<unsigned long>(MAX_FLAC_METADATA_BLOCK_COUNT));
+            return ESP_ERR_INVALID_RESPONSE;
+        }
         uint8_t block_header[4] = {};
         if (fread(block_header, 1, 4, file) != 4U) {
             return ESP_ERR_INVALID_SIZE;
@@ -1168,6 +1208,11 @@ static esp_err_t parse_flac_vorbis(FILE *file, uint64_t file_size, MediaMetadata
             return ESP_ERR_INVALID_SIZE;
         }
         const uint32_t comment_count = read_le32(u32);
+        if (comment_count > MAX_VORBIS_COMMENT_COUNT) {
+            ESP_LOGW(TAG, "Vorbis comment数量异常，停止解析：comments=%lu",
+                static_cast<unsigned long>(comment_count));
+            return ESP_ERR_INVALID_RESPONSE;
+        }
         for (uint32_t i = 0; i < comment_count; ++i) {
             const long len_pos = ftell(file);
             if (len_pos < 0 || static_cast<uint64_t>(len_pos) + 4U > block_end || fread(u32, 1, 4, file) != 4U) {
@@ -1194,6 +1239,78 @@ static esp_err_t parse_flac_vorbis(FILE *file, uint64_t file_size, MediaMetadata
     return ESP_OK;
 }
 
+static esp_err_t media_metadata_scan_open_file_common_v2(
+    FILE *file,
+    const char *audio_path,
+    const char *external_lrc_path,
+    bool external_lrc_resolved,
+    MediaFormat format,
+    uint64_t file_size,
+    MediaMetadataBuildV2 *out_metadata
+)
+{
+    if (audio_path == nullptr || out_metadata == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    media_metadata_build_release(out_metadata);
+
+    if (format != MediaFormat::FLAC && format != MediaFormat::MP3) {
+        out_metadata->metadata_flags |= MEDIA_TRACK_META_SCANNED_V2;
+        const bool lrc_ok = external_lrc_resolved
+            ? add_resolved_external_lrc(external_lrc_path, out_metadata)
+            : add_external_lrc(audio_path, out_metadata);
+        return lrc_ok ? ESP_OK : ESP_ERR_NO_MEM;
+    }
+    if (file == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t ret = format == MediaFormat::FLAC
+        ? parse_flac_vorbis(file, file_size, out_metadata)
+        : parse_id3(file, file_size, out_metadata);
+    if (ret == ESP_OK && format == MediaFormat::MP3) {
+        ret = parse_id3v1(file, file_size, out_metadata);
+    }
+    if (ret != ESP_OK) {
+        media_metadata_build_release(out_metadata);
+        return ret;
+    }
+    const bool lrc_ok = external_lrc_resolved
+        ? add_resolved_external_lrc(external_lrc_path, out_metadata)
+        : add_external_lrc(audio_path, out_metadata);
+    if (!build_display_artist(out_metadata) || !lrc_ok) {
+        media_metadata_build_release(out_metadata);
+        return ESP_ERR_NO_MEM;
+    }
+    out_metadata->metadata_flags |= MEDIA_TRACK_META_SCANNED_V2;
+    return ESP_OK;
+}
+
+esp_err_t media_metadata_scan_open_file_v2(
+    FILE *file,
+    const char *audio_path,
+    MediaFormat format,
+    uint64_t file_size,
+    MediaMetadataBuildV2 *out_metadata
+)
+{
+    return media_metadata_scan_open_file_common_v2(
+        file, audio_path, nullptr, false, format, file_size, out_metadata);
+}
+
+esp_err_t media_metadata_scan_open_file_indexed_v2(
+    FILE *file,
+    const char *audio_path,
+    const char *external_lrc_path,
+    MediaFormat format,
+    uint64_t file_size,
+    MediaMetadataBuildV2 *out_metadata
+)
+{
+    return media_metadata_scan_open_file_common_v2(
+        file, audio_path, external_lrc_path, true, format, file_size, out_metadata);
+}
+
 esp_err_t media_metadata_scan_file_v2(
     const char *path,
     MediaFormat format,
@@ -1204,39 +1321,23 @@ esp_err_t media_metadata_scan_file_v2(
     if (path == nullptr || out_metadata == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    media_metadata_build_release(out_metadata);
 
-    StorageSdLockGuard sd_lock;
+    StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
     if (!sd_lock.locked()) {
         return ESP_ERR_TIMEOUT;
     }
 
     if (format != MediaFormat::FLAC && format != MediaFormat::MP3) {
-        out_metadata->metadata_flags |= MEDIA_TRACK_META_SCANNED_V2;
-        return add_external_lrc(path, out_metadata) ? ESP_OK : ESP_ERR_NO_MEM;
+        return media_metadata_scan_open_file_v2(nullptr, path, format, file_size, out_metadata);
     }
 
     FILE *file = fopen(path, "rb");
     if (file == nullptr) {
         return ESP_ERR_NOT_FOUND;
     }
-    esp_err_t ret = format == MediaFormat::FLAC
-        ? parse_flac_vorbis(file, file_size, out_metadata)
-        : parse_id3(file, file_size, out_metadata);
-    if (ret == ESP_OK && format == MediaFormat::MP3) {
-        ret = parse_id3v1(file, file_size, out_metadata);
-    }
+    const esp_err_t ret = media_metadata_scan_open_file_v2(file, path, format, file_size, out_metadata);
     fclose(file);
-    if (ret != ESP_OK) {
-        media_metadata_build_release(out_metadata);
-        return ret;
-    }
-    if (!build_display_artist(out_metadata) || !add_external_lrc(path, out_metadata)) {
-        media_metadata_build_release(out_metadata);
-        return ESP_ERR_NO_MEM;
-    }
-    out_metadata->metadata_flags |= MEDIA_TRACK_META_SCANNED_V2;
-    return ESP_OK;
+    return ret;
 }
 
 static bool clone_string_from_pool(const MusicCatalogV2 *catalog, uint32_t offset, char **out)

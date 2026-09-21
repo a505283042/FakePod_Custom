@@ -47,10 +47,13 @@ static void boot_state_update();
 static bool boot_state_is_degraded();
 static bool boot_state_has_error();
 
-static void boot_library_scan_event(MediaLibraryScanEvent event, void *)
+static void boot_library_scan_event(
+    MediaLibraryScanEvent event,
+    uint32_t current_count,
+    void *)
 {
     if (event == MediaLibraryScanEvent::InitialBuild) {
-        (void)ui_manager_show_library_build_progress();
+        (void)ui_manager_show_library_build_progress(current_count);
     } else if (event == MediaLibraryScanEvent::ChangesDetected) {
         (void)ui_manager_show_library_update_progress();
     }

@@ -17,7 +17,8 @@ bool ui_manager_is_ready();
 bool ui_manager_show_boot_fatal(const char *reason, esp_err_t error);
 
 // 启动期复用启动页显示首次建库或增量更新状态；已有曲库且无变化时不会额外提示。
-bool ui_manager_show_library_build_progress();
+// 首次建库时可传入当前已经发现的歌曲数；0 表示刚开始扫描。
+bool ui_manager_show_library_build_progress(uint32_t scanned_count = 0U);
 bool ui_manager_show_library_build_complete(uint32_t total_count);
 bool ui_manager_show_library_update_progress();
 bool ui_manager_show_library_update_complete(
