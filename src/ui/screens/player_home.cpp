@@ -2841,6 +2841,9 @@ static void player_home_overlay_apply_dim_path()
     bool fast_dim = false;
     if (g_music_visual_mode == MusicVisualMode::Artwork) {
         fast_dim = now_playing_artwork_set_dimmed(g_overlay_visible);
+    } else if (g_music_visual_mode == MusicVisualMode::Cassette) {
+        // Round 22：磁带命中预暗 PSRAM RGB565 时，不再叠实时 Alpha 黑层。
+        fast_dim = cassette_view_controls_cache_active();
     }
     const lv_opa_t backdrop_opa =
         (g_overlay_visible && !fast_dim)
@@ -3047,6 +3050,10 @@ static void player_home_artwork_fast_rebind(const char *reason)
     const int64_t started_us = esp_timer_get_time();
     if (g_music_visual_mode == MusicVisualMode::Cassette) {
         cassette_view_update();
+        // Overlay 保持打开并切歌时，缓存会先失效再重建；同步切换兜底/快路径。
+        if (g_overlay_visible) {
+            player_home_overlay_apply_dim_path();
+        }
     } else {
         now_playing_artwork_refresh_context();
         now_playing_artwork_update();
@@ -3779,6 +3786,10 @@ static void player_home_artwork_timer_cb(lv_timer_t *timer)
 
     if (g_music_visual_mode == MusicVisualMode::Cassette) {
         cassette_view_update();
+        if (g_overlay_visible) {
+            // 新歌缓存可能在本次后台刷新刚刚准备完成，立即撤掉实时 Alpha Backdrop。
+            player_home_overlay_apply_dim_path();
+        }
     } else {
         now_playing_artwork_update();
         player_home_repaint_controls_after_bounded_present();

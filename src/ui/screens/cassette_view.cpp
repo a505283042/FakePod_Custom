@@ -114,6 +114,14 @@ static constexpr uint8_t kCassetteTintMaxSaturation = 190U;
 static constexpr uint8_t kCassetteTintMinValue = 200U;
 static constexpr uint8_t kCassetteTintMaxValue = 224U;
 
+// Round 22：Controls 模式不再让整套磁带对象树实时参与 Alpha 混合。
+// 当前歌曲视觉稳定后，提前快照成 RGB565 并离线压暗；点击时只显隐一张 PSRAM 图。
+static constexpr uint8_t kControlsCacheDimOpacity = 150U;
+static constexpr uint16_t kControlsCacheWidth = FAKEPOD_LCD_WIDTH;
+static constexpr uint16_t kControlsCacheHeight = FAKEPOD_LCD_HEIGHT;
+static constexpr size_t kControlsCacheBytes =
+    static_cast<size_t>(kControlsCacheWidth) * kControlsCacheHeight * sizeof(uint16_t);
+
 // C2.4.1 固定几何（均为 460x296 磁带局部坐标）。
 // 大轮：左轮用左侧圆周切点，右轮用右侧圆周切点；磁带量增加时只沿X向外最多5px。
 static constexpr int16_t kTapeBigLeftBaseX = 107;
@@ -175,6 +183,15 @@ static lv_obj_t *g_current_lyric_label = nullptr;
 static lv_obj_t *g_next_lyric_label = nullptr;
 static bool g_active = false;
 static bool g_controls_visible = false;
+
+// 只缓存当前歌曲一张 Controls 背景。像素在第一次需要时申请 PSRAM，之后反复复用。
+static lv_obj_t *g_controls_cache_image = nullptr;
+static uint8_t *g_controls_cache_pixels = nullptr;
+static lv_image_dsc_t g_controls_cache_dsc = {};
+static bool g_controls_cache_ready = false;
+static bool g_controls_cache_dirty = true;
+static uint32_t g_controls_cache_generation = 0U;
+static uint32_t g_controls_cache_track = UINT32_MAX;
 // C2.4.10：进度条拖动和Audio Seek提交期间冻结所有磁带机械刷新。
 static bool g_seek_frozen = false;
 // C2.4.13：Launcher 显示期间冻结 Cassette 机械层。高速 Launcher 会进一步隐藏整个
@@ -286,6 +303,8 @@ static void cassette_view_sync_tint_setting();
 static void cassette_view_release_pending_cover();
 static bool cassette_view_commit_pending_cover(uint32_t generation, uint32_t track);
 static bool cassette_view_current_visual_ready();
+static void cassette_view_mark_controls_cache_dirty();
+static bool cassette_view_rebuild_controls_cache_if_needed();
 
 static uint16_t cassette_view_cover_source_width()
 {
@@ -382,6 +401,7 @@ static void cassette_view_cover_adjust_cb(lv_event_t *event)
 
     g_cover_y_offset_px = static_cast<int16_t>(limited);
     cassette_view_apply_cover_position();
+    cassette_view_mark_controls_cache_dirty();
     ESP_LOGI(TAG, "磁带封面%s：%dpx（安全范围±%dpx）",
         action,
         static_cast<int>(g_cover_y_offset_px),
@@ -582,6 +602,126 @@ static void cassette_view_release_pending_cover()
     g_pending_cover_valid = false;
 }
 
+static void cassette_view_mark_controls_cache_dirty()
+{
+    g_controls_cache_dirty = true;
+    g_controls_cache_ready = false;
+    g_controls_cache_generation = 0U;
+    g_controls_cache_track = UINT32_MAX;
+    if (g_controls_cache_image != nullptr) {
+        lv_obj_add_flag(g_controls_cache_image, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static bool cassette_view_controls_cache_matches_current()
+{
+    if (!g_controls_cache_ready || g_controls_cache_dirty ||
+        !player_state_is_ready() || media_library_get_count() == 0U) {
+        return false;
+    }
+    return g_controls_cache_generation == media_catalog_v2_generation() &&
+        g_controls_cache_track == static_cast<uint32_t>(player_state_get_index());
+}
+
+static void cassette_view_dim_controls_cache_rgb565()
+{
+    if (g_controls_cache_pixels == nullptr) return;
+    const uint32_t keep = 255U - kControlsCacheDimOpacity;
+    uint16_t *pixels = reinterpret_cast<uint16_t *>(g_controls_cache_pixels);
+    const size_t pixel_count =
+        static_cast<size_t>(kControlsCacheWidth) * kControlsCacheHeight;
+    for (size_t index = 0U; index < pixel_count; ++index) {
+        const uint16_t color = pixels[index];
+        const uint32_t r = (color >> 11U) & 0x1FU;
+        const uint32_t g = (color >> 5U) & 0x3FU;
+        const uint32_t b = color & 0x1FU;
+        const uint16_t dr = static_cast<uint16_t>((r * keep + 127U) / 255U);
+        const uint16_t dg = static_cast<uint16_t>((g * keep + 127U) / 255U);
+        const uint16_t db = static_cast<uint16_t>((b * keep + 127U) / 255U);
+        pixels[index] = static_cast<uint16_t>((dr << 11U) | (dg << 5U) | db);
+    }
+}
+
+static bool cassette_view_rebuild_controls_cache_if_needed()
+{
+    if (!g_active || g_root == nullptr || g_controls_cache_image == nullptr ||
+        g_present_deferred || lv_obj_has_flag(g_root, LV_OBJ_FLAG_HIDDEN) ||
+        !cassette_view_current_visual_ready()) {
+        return false;
+    }
+
+    const uint32_t generation = media_catalog_v2_generation();
+    const uint32_t track = static_cast<uint32_t>(player_state_get_index());
+    if (!g_controls_cache_dirty && g_controls_cache_ready &&
+        g_controls_cache_generation == generation && g_controls_cache_track == track) {
+        return true;
+    }
+
+    if (g_controls_cache_pixels == nullptr) {
+        g_controls_cache_pixels = static_cast<uint8_t *>(heap_caps_malloc(
+            kControlsCacheBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (g_controls_cache_pixels == nullptr) {
+            ESP_LOGW(TAG, "磁带控件PSRAM缓存申请失败：%uB，继续使用实时半透明Backdrop",
+                static_cast<unsigned>(kControlsCacheBytes));
+            return false;
+        }
+    }
+
+    // Snapshot 不能把缓存图自己拍进去。Controls 原本就隐藏曲目信息/Mini Lyrics，
+    // 因此预生成时临时隐藏四个文字对象，回调结束前恢复，屏幕不会看到中间状态。
+    lv_obj_add_flag(g_controls_cache_image, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_t *labels[] = {g_title_label, g_artist_label, g_current_lyric_label, g_next_lyric_label};
+    bool label_was_hidden[4] = {};
+    for (size_t index = 0U; index < 4U; ++index) {
+        if (labels[index] == nullptr) continue;
+        label_was_hidden[index] = lv_obj_has_flag(labels[index], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(labels[index], LV_OBJ_FLAG_HIDDEN);
+    }
+
+    const int64_t started_us = esp_timer_get_time();
+    lv_image_dsc_t snapshot_dsc = {};
+    const lv_result_t result = lv_snapshot_take_to_buf(
+        g_root, LV_COLOR_FORMAT_RGB565, &snapshot_dsc,
+        g_controls_cache_pixels, static_cast<uint32_t>(kControlsCacheBytes));
+
+    for (size_t index = 0U; index < 4U; ++index) {
+        if (labels[index] != nullptr && !label_was_hidden[index]) {
+            lv_obj_remove_flag(labels[index], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    if (result != LV_RESULT_OK || snapshot_dsc.data != g_controls_cache_pixels ||
+        snapshot_dsc.header.w != kControlsCacheWidth ||
+        snapshot_dsc.header.h != kControlsCacheHeight) {
+        g_controls_cache_ready = false;
+        ESP_LOGW(TAG, "磁带控件快照失败：result=%d size=%ux%u，继续使用实时半透明Backdrop",
+            static_cast<int>(result),
+            static_cast<unsigned>(snapshot_dsc.header.w),
+            static_cast<unsigned>(snapshot_dsc.header.h));
+        return false;
+    }
+
+    g_controls_cache_dsc = snapshot_dsc;
+    cassette_view_dim_controls_cache_rgb565();
+    lv_image_set_src(g_controls_cache_image, &g_controls_cache_dsc);
+    lv_image_set_antialias(g_controls_cache_image, false);
+    g_controls_cache_generation = generation;
+    g_controls_cache_track = track;
+    g_controls_cache_dirty = false;
+    g_controls_cache_ready = true;
+
+    if (g_controls_visible) {
+        lv_obj_remove_flag(g_controls_cache_image, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(g_controls_cache_image);
+    }
+
+    ESP_LOGI(TAG, "磁带控件PSRAM缓存就绪：track=%lu bytes=%u snapshot+dim=%lldus",
+        static_cast<unsigned long>(track),
+        static_cast<unsigned>(kControlsCacheBytes),
+        static_cast<long long>(esp_timer_get_time() - started_us));
+    return true;
+}
+
 static uint32_t cassette_view_cover_scale_for_size(uint16_t width, uint16_t height)
 {
     if (width == 0U || height == 0U) return kLvImageScaleNone;
@@ -639,6 +779,7 @@ static bool cassette_view_commit_pending_cover(uint32_t generation, uint32_t tra
         fallback_cover_image_release(&old_fallback);
         fallback_cover_image_discard_unpinned();
     }
+    cassette_view_mark_controls_cache_dirty();
     return true;
 }
 
@@ -707,6 +848,7 @@ static bool cassette_view_bind_no_artwork_label(uint32_t generation, uint32_t tr
         fallback_cover_image_release(&old_fallback);
     }
     fallback_cover_image_discard_unpinned();
+    cassette_view_mark_controls_cache_dirty();
     return true;
 }
 
@@ -1717,6 +1859,7 @@ static void cassette_view_restore_shell_default()
     memcpy(g_shell_pixels, g_shell_base_rgb565, rgb_bytes);
     g_shell_tint_generation = 0U;
     g_shell_tint_track = UINT32_MAX;
+    cassette_view_mark_controls_cache_dirty();
     if (g_shell_image != nullptr) lv_obj_invalidate(g_shell_image);
 }
 
@@ -1777,6 +1920,7 @@ static void cassette_view_tick_shell_tint_chunk()
     cassette_view_apply_small_roller_tint(g_shell_tint_job.tint_lut);
     g_shell_tint_generation = completed_generation;
     g_shell_tint_track = completed_track;
+    cassette_view_mark_controls_cache_dirty();
     const bool cover_committed = cassette_view_commit_pending_cover(
         completed_generation, completed_track);
     cassette_view_cancel_shell_tint_job();
@@ -2340,6 +2484,14 @@ esp_err_t cassette_view_create(lv_obj_t *parent)
         return ESP_ERR_NO_MEM;
     }
 
+    g_controls_cache_image = lv_image_create(g_root);
+    if (g_controls_cache_image == nullptr) return ESP_ERR_NO_MEM;
+    ui_common_lock_object(g_controls_cache_image);
+    lv_obj_set_pos(g_controls_cache_image, 0, 0);
+    lv_obj_add_flag(g_controls_cache_image, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(g_controls_cache_image, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(g_controls_cache_image, LV_OBJ_FLAG_SCROLLABLE);
+
     g_mechanics_timer = lv_timer_create(
         cassette_view_mechanics_timer_cb, kMechanicsTimerPeriodMs, nullptr);
     if (g_mechanics_timer == nullptr) return ESP_ERR_NO_MEM;
@@ -2402,6 +2554,9 @@ bool cassette_view_set_active(bool active)
 
     g_active = false;
     g_present_deferred = false;
+    if (g_controls_cache_image != nullptr) {
+        lv_obj_add_flag(g_controls_cache_image, LV_OBJ_FLAG_HIDDEN);
+    }
     g_tint_setting_initialized = false;
     cassette_view_cancel_shell_tint_job();
     if (g_mechanics_timer != nullptr) lv_timer_pause(g_mechanics_timer);
@@ -2451,6 +2606,7 @@ bool cassette_view_try_present_deferred()
     cassette_view_apply_aux_visibility();
     cassette_view_update_mini_lyrics();
     cassette_view_update_mechanics();
+    // 控件缓存延后到后续 100ms 背景刷新再生成，不能拖慢首次切入磁带的视觉提交。
     lv_obj_invalidate(g_root);
     return true;
 }
@@ -2467,6 +2623,7 @@ void cassette_view_update()
     cassette_view_sync_tint_setting();
     cassette_view_update_track_text();
     cassette_view_update_mini_lyrics();
+    (void)cassette_view_rebuild_controls_cache_if_needed();
     // 机械层由独立 50ms timer 驱动；这里是封面/文字刷新路径，不重复进入机械更新。
 }
 
@@ -2484,8 +2641,19 @@ void cassette_view_set_controls_visible(bool visible)
         return;
     }
 
-    // C2.4.12：打开播放控件时保留半透明Backdrop，但冻结所有磁带机械刷新。
-    // 只暂停timer并重置时间基准，不隐藏/重建机械对象，因此画面保持最后一帧。
+    if (visible) {
+        // 点击路径只消费已经准备好的缓存，绝不在用户点击时现场 Snapshot。
+        // 缓存尚未准备好时直接走原实时 Backdrop 兜底。
+        if (cassette_view_controls_cache_matches_current() && g_controls_cache_image != nullptr) {
+            lv_obj_remove_flag(g_controls_cache_image, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(g_controls_cache_image);
+        }
+    } else if (g_controls_cache_image != nullptr) {
+        lv_obj_add_flag(g_controls_cache_image, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // Controls 打开时仍冻结真实机械层。缓存命中时屏幕只重绘预暗 RGB565；
+    // 缓存未就绪则保留原来的实时半透明 Backdrop 作为兼容兜底。
     const int64_t now_us = esp_timer_get_time();
     g_last_mechanics_frame_us = now_us;
     g_last_tape_glint_us = now_us;
@@ -2508,7 +2676,17 @@ void cassette_view_set_controls_visible(bool visible)
         lv_timer_resume(g_mechanics_timer);
     }
 
-    ESP_LOGI(TAG, "控件机械动画：%s", visible ? "冻结" : "恢复");
+    ESP_LOGI(TAG, "控件机械动画：%s cache=%s",
+        visible ? "冻结" : "恢复",
+        visible && cassette_view_controls_cache_matches_current() ? "PSRAM" : "live");
+}
+
+bool cassette_view_controls_cache_active()
+{
+    return g_active && g_controls_visible &&
+        cassette_view_controls_cache_matches_current() &&
+        g_controls_cache_image != nullptr &&
+        !lv_obj_has_flag(g_controls_cache_image, LV_OBJ_FLAG_HIDDEN);
 }
 
 void cassette_view_set_launcher_suspended(bool suspended)
