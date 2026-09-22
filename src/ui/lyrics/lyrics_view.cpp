@@ -16,6 +16,7 @@
 #include "player_control.h"
 #include "player_state.h"
 #include "system/screen_lock_simple.h"
+#include "screens/cassette_view.h"
 #include "ui_common.h"
 
 namespace {
@@ -691,7 +692,11 @@ static void lyrics_view_overlay_mode_cb(lv_event_t *event)
         return;
     }
 
+    const PlayerLoopMode previous_mode = player_control_get_loop_mode();
     const PlayerLoopMode mode = player_control_cycle_loop_mode();
+    if (mode != previous_mode) {
+        cassette_view_on_playback_mode_changed();
+    }
     if (g_overlay_mode_button != nullptr) {
         lv_obj_invalidate(g_overlay_mode_button);
     }

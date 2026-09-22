@@ -17,6 +17,7 @@
 #include "media_library.h"
 #include "player_control.h"
 #include "player_home.h"
+#include "cassette_view.h"
 #include "player_playlist.h"
 #include "player_state.h"
 #include "search/search_key_builder.h"
@@ -647,6 +648,8 @@ static bool library_view_persist_folder_selection(
     const esp_err_t ret = device_settings_set_music_list_selection(
         setting_scope, level1_path, level2_path);
     if (ret == ESP_OK) {
+        // 一/二级文件夹改变后立即使旧 next-prefetch 失效；曲库覆盖期间不启动新的磁带后台预取。
+        cassette_view_on_playback_queue_changed();
         return true;
     }
 

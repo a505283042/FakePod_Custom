@@ -31,6 +31,7 @@
 #include "media_library.h"
 #include "screen_lock_simple.h"
 #include "settings_menu_icons.h"
+#include "ui/screens/cassette_view.h"
 #include "ui_common.h"
 
 static const char *TAG = "设置APP";
@@ -1619,6 +1620,7 @@ static bool music_list_apply_scope(DeviceMusicListScope scope)
         return false;
     }
 
+    cassette_view_on_playback_queue_changed();
     ESP_LOGI(TAG, "播放列表范围已切换：%s；文件夹在主页下拉列表左滑切换",
         device_settings_music_list_scope_name(scope));
     return true;

@@ -3881,7 +3881,11 @@ static void player_home_loop_cb(lv_event_t *event)
     }
     player_home_overlay_show();
     HOME_INTERACTION_LOGI("控件命中：播放模式");
-    player_control_cycle_loop_mode();
+    const PlayerLoopMode previous_mode = player_control_get_loop_mode();
+    const PlayerLoopMode mode = player_control_cycle_loop_mode();
+    if (mode != previous_mode) {
+        cassette_view_on_playback_mode_changed();
+    }
     AudioStateSnapshot snapshot = {};
     audio_service_get_snapshot(&snapshot);
     player_home_refresh_transport_controls(&snapshot);

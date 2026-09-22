@@ -828,6 +828,13 @@ static bool cassette_view_commit_pending_cover(uint32_t generation, uint32_t tra
         return false;
     }
 
+    // Launcher 临时隐藏只会释放当前 Surface lease，不代表磁带视觉发生变化。
+    // 若恢复的仍是同一首、现有 Controls 缓存也仍匹配，就只重新绑定封面，
+    // 不把 Controls 误标为 dirty，否则会无谓取消已经准备好的 next 预缓存。
+    const bool keep_controls_cache =
+        g_cover_generation == generation && g_cover_track == track &&
+        cassette_view_controls_cache_matches_visible_visual();
+
     CoverSurfaceLease old_cover = g_cover_lease;
     FallbackCoverImageLease old_fallback = g_fallback_cover_lease;
 
@@ -864,7 +871,9 @@ static bool cassette_view_commit_pending_cover(uint32_t generation, uint32_t tra
         fallback_cover_image_release(&old_fallback);
         fallback_cover_image_discard_unpinned();
     }
-    cassette_view_mark_controls_cache_dirty();
+    if (!keep_controls_cache) {
+        cassette_view_mark_controls_cache_dirty();
+    }
     return true;
 }
 
@@ -3625,6 +3634,46 @@ void cassette_view_update()
     cassette_view_service_cache_pipeline();
     // 机械层由独立 50ms timer 驱动；Controls/next 缓存由 Core1 低优先级任务离屏生成，
     // 这里仅消费结果和推进预取状态，不再同步 Snapshot 阻塞机械 timer。
+}
+
+static void cassette_view_revalidate_next_prefetch(const char *cancel_reason)
+{
+    if (!player_state_is_ready() || media_library_get_count() == 0U) {
+        return;
+    }
+
+    uint32_t next_track = UINT32_MAX;
+    // 播放模式/目录队列变化与手动切歌共用 PlayerControl 串行锁；锁忙时不破坏旧缓存，
+    // 后续 cassette_view_update() 会再次复核。
+    if (!player_control_peek_next_track(&next_track)) {
+        return;
+    }
+
+    const uint32_t current_track = static_cast<uint32_t>(player_state_get_index());
+    const uint32_t generation = media_catalog_v2_generation();
+    const bool next_available = next_track != UINT32_MAX && next_track != current_track;
+
+    if (g_next_prefetch.state != CassetteNextPrefetchState::Idle &&
+        (!next_available || g_next_prefetch.track != next_track ||
+         g_next_prefetch.generation != generation)) {
+        cassette_view_cancel_next_prefetch(cancel_reason);
+    }
+
+    // 曲库/设置等全屏页覆盖主页时，磁带层不启动新的后台预取；
+    // 但旧 next 会在队列变化当下立即失效，返回磁带后再按新 next 启动预缓存。
+    if (g_active && next_available) {
+        cassette_view_service_next_prefetch();
+    }
+}
+
+void cassette_view_on_playback_mode_changed()
+{
+    cassette_view_revalidate_next_prefetch("播放模式下一首变化");
+}
+
+void cassette_view_on_playback_queue_changed()
+{
+    cassette_view_revalidate_next_prefetch("目录队列下一首变化");
 }
 
 void cassette_view_set_controls_visible(bool visible)

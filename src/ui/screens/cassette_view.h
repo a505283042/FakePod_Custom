@@ -18,6 +18,10 @@ bool cassette_view_prepare_deferred_active();
 bool cassette_view_try_present_deferred();
 bool cassette_view_is_present_ready();
 void cassette_view_update();
+// 播放模式变化后立即复核下一首预缓存；目标相同则保留，变化时才取消并按新模式重建。
+void cassette_view_on_playback_mode_changed();
+// 总列表/一级/二级目录队列变化后立即复核 next；全屏页覆盖时只失效旧目标，返回磁带后再启动新预取。
+void cassette_view_on_playback_queue_changed();
 // Music 原有播放控件 Overlay 显示时隐藏磁带专属曲目信息/Mini Lyrics。
 void cassette_view_set_controls_visible(bool visible);
 // true 表示 Controls 当前已有一张稳定的 PSRAM 预暗背景正在显示；即使目标曲已变化也先保持旧图，Home 不需要实时 Alpha Backdrop。
