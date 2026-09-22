@@ -25,6 +25,11 @@ bool player_transport_play_current(const char *reason = nullptr);
 bool player_transport_previous();
 bool player_transport_next();
 
+// 只读预取提示：返回“如果现在进入下一首，最可能播放的全局 Track”。
+// 随机模式会提前保留一个随机候选，后续真正的下一曲会消费同一个候选，
+// 这样 UI/封面/磁带可以安全预热而不会出现“预热B、实际却播放C”。
+bool player_transport_peek_next_track(uint32_t *out_track_index);
+
 // 对当前 Playlist 选中的 Track 发起 Seek；不会改变列表 position。
 bool player_transport_seek_ms(uint64_t target_ms);
 

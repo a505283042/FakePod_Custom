@@ -254,6 +254,17 @@ bool player_control_next()
     return ok;
 }
 
+bool player_control_peek_next_track(uint32_t *out_track_index)
+{
+    if (out_track_index == nullptr) return false;
+    *out_track_index = UINT32_MAX;
+    // 预热只是后台机会任务，绝不能为了拿下一首提示阻塞 LVGL。
+    if (!player_control_lock(0)) return false;
+    (void)player_transport_peek_next_track(out_track_index);
+    player_control_unlock();
+    return true;
+}
+
 PlayerLoopMode player_control_get_loop_mode()
 {
     return player_transport_get_loop_mode();

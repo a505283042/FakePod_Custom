@@ -25,6 +25,10 @@ bool player_control_toggle_play_pause();
 bool player_control_previous();
 bool player_control_next();
 
+// 非阻塞读取下一首预热提示。返回 true 表示本次成功取得 transport 串行锁；
+// out_track_index==UINT32_MAX 表示当前模式/列表没有可预热的下一首。
+bool player_control_peek_next_track(uint32_t *out_track_index);
+
 // 播放模式：顺序/列表循环/单曲循环沿用 EOF 策略；随机模式同时接管
 // 自然 EOF 和手动下一曲，并在当前 Playlist Context 内随机。
 PlayerLoopMode player_control_get_loop_mode();

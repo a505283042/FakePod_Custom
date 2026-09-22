@@ -34,6 +34,40 @@ struct ShuffleHistory
 
 static ShuffleHistory g_shuffle_history = {};
 
+// Round 23：随机模式允许资源预热提前“看见”下一首。
+// Reservation 只保存队列 position，不改变 PlayerState；真正执行下一曲时再消费。
+struct ShuffleNextReservation
+{
+    bool valid = false;
+    uint32_t catalog_generation = 0U;
+    uint32_t context_id = 0U;
+    uint32_t track_count = 0U;
+    uint32_t current_position = 0U;
+    uint32_t current_track = UINT32_MAX;
+    bool current_in_queue = false;
+    uint32_t next_position = 0U;
+};
+
+static ShuffleNextReservation g_shuffle_next_reservation = {};
+
+static void player_transport_shuffle_clear_reservation()
+{
+    g_shuffle_next_reservation = {};
+}
+
+static bool player_transport_shuffle_reservation_matches(
+    const PlayerFolderQueueSnapshot &list)
+{
+    return g_shuffle_next_reservation.valid &&
+        g_shuffle_next_reservation.catalog_generation == list.catalog_generation &&
+        g_shuffle_next_reservation.context_id == list.context_id &&
+        g_shuffle_next_reservation.track_count == list.track_count &&
+        g_shuffle_next_reservation.current_position == list.position &&
+        g_shuffle_next_reservation.current_track == list.track_index &&
+        g_shuffle_next_reservation.current_in_queue == list.current_in_queue &&
+        g_shuffle_next_reservation.next_position < list.track_count;
+}
+
 static bool player_transport_shuffle_context_matches(const PlayerFolderQueueSnapshot &list)
 {
     return g_shuffle_history.valid &&
@@ -47,6 +81,7 @@ static bool player_transport_shuffle_context_matches(const PlayerFolderQueueSnap
 static void player_transport_shuffle_reset(const PlayerFolderQueueSnapshot *list = nullptr)
 {
     g_shuffle_history = {};
+    player_transport_shuffle_clear_reservation();
     if (list == nullptr || !list->ready) {
         return;
     }
@@ -135,6 +170,25 @@ static uint32_t player_transport_shuffle_choose_position(const PlayerFolderQueue
 
     // 理论上只在极端随机碰撞时走到这里；保证不会立即重复当前首。
     return (list.position + 1U + (esp_random() % (list.track_count - 1U))) % list.track_count;
+}
+
+static uint32_t player_transport_shuffle_reserve_position(
+    const PlayerFolderQueueSnapshot &list)
+{
+    if (player_transport_shuffle_reservation_matches(list)) {
+        return g_shuffle_next_reservation.next_position;
+    }
+
+    const uint32_t next_position = player_transport_shuffle_choose_position(list);
+    g_shuffle_next_reservation.valid = true;
+    g_shuffle_next_reservation.catalog_generation = list.catalog_generation;
+    g_shuffle_next_reservation.context_id = list.context_id;
+    g_shuffle_next_reservation.track_count = list.track_count;
+    g_shuffle_next_reservation.current_position = list.position;
+    g_shuffle_next_reservation.current_track = list.track_index;
+    g_shuffle_next_reservation.current_in_queue = list.current_in_queue;
+    g_shuffle_next_reservation.next_position = next_position;
+    return next_position;
 }
 
 const char *player_transport_loop_mode_name(PlayerLoopMode mode)
@@ -250,7 +304,8 @@ static bool player_transport_shuffle_next(const char *reason)
         return player_transport_play_current(reason != nullptr ? reason : "随机单曲重播");
     }
 
-    const uint32_t next_position = player_transport_shuffle_choose_position(list);
+    const uint32_t next_position = player_transport_shuffle_reserve_position(list);
+    player_transport_shuffle_clear_reservation();
     if (list.current_in_queue) {
         player_transport_shuffle_push(list.position);
     }
@@ -281,6 +336,9 @@ bool player_transport_previous()
 #endif
         return player_transport_seek_ms(0);
     }
+
+    // 只有真正要切换曲目时才作废下一首预留；>3秒 Seek(0) 不改变队列。
+    player_transport_shuffle_clear_reservation();
 
     if (player_transport_get_loop_mode() == PlayerLoopMode::Shuffle) {
         PlayerFolderQueueSnapshot list = {};
@@ -321,6 +379,46 @@ bool player_transport_next()
     return player_transport_play_current("手动下一曲");
 }
 
+
+bool player_transport_peek_next_track(uint32_t *out_track_index)
+{
+    if (out_track_index == nullptr || !player_state_is_ready()) {
+        return false;
+    }
+    *out_track_index = UINT32_MAX;
+
+    PlayerFolderQueueSnapshot list = {};
+    if (!player_state_get_folder_queue_snapshot(&list) || !list.ready || list.track_count == 0U) {
+        return false;
+    }
+
+    const PlayerLoopMode mode = player_transport_get_loop_mode();
+    uint32_t next_position = 0U;
+
+    if (mode == PlayerLoopMode::SingleRepeat) {
+        if (!list.current_in_queue) return false;
+        next_position = list.position;
+    } else if (mode == PlayerLoopMode::Shuffle) {
+        player_transport_shuffle_ensure_context(list);
+        next_position = player_transport_shuffle_reserve_position(list);
+    } else if (!list.current_in_queue) {
+        next_position = 0U;
+    } else if (list.position + 1U < list.track_count) {
+        next_position = list.position + 1U;
+    } else if (mode == PlayerLoopMode::ListRepeat) {
+        next_position = 0U;
+    } else {
+        // 顺序播放自然 EOF 在列表末尾停止，因此不做无意义的下一首预热。
+        return false;
+    }
+
+    size_t track_index = 0U;
+    if (!player_playlist_get_folder_queue_track_index_at_position(next_position, &track_index)) {
+        return false;
+    }
+    *out_track_index = static_cast<uint32_t>(track_index);
+    return true;
+}
 
 bool player_transport_seek_ms(uint64_t target_ms)
 {

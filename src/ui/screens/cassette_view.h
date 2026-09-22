@@ -15,7 +15,7 @@ bool cassette_view_is_present_ready();
 void cassette_view_update();
 // Music 原有播放控件 Overlay 显示时隐藏磁带专属曲目信息/Mini Lyrics。
 void cassette_view_set_controls_visible(bool visible);
-// true 表示 Controls 已切到当前歌曲的 PSRAM 预暗 RGB565 缓存，Home 不需要实时 Alpha Backdrop。
+// true 表示 Controls 当前已有一张稳定的 PSRAM 预暗背景正在显示；即使目标曲已变化也先保持旧图，Home 不需要实时 Alpha Backdrop。
 bool cassette_view_controls_cache_active();
 // Launcher 菜单显示期间冻结磁带机械层；高速 Launcher 可同时隐藏整个 Cassette root。
 void cassette_view_set_launcher_suspended(bool suspended);

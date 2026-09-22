@@ -182,12 +182,8 @@ target_compile_definitions(
         LV_MEM_SIZE=131072U
         LV_MEM_POOL_INCLUDE=\"fakepod_lvgl_pool.h\"
         LV_MEM_POOL_ALLOC=fakepod_lvgl_psram_pool_alloc
-        LV_USE_SNAPSHOT=1
 )
 
-# Round 22：磁带控件背景使用 LVGL Snapshot 写入应用自管 PSRAM RGB565 缓存。
-# LVGL 组件和本组件必须看到同一个 LV_USE_SNAPSHOT，避免头文件声明与库实现不一致。
-target_compile_definitions(${COMPONENT_LIB} PRIVATE LV_USE_SNAPSHOT=1)
 
 # 128KB LVGL pool 由 fakepod_lvgl_pool.h 使用 heap_caps_malloc(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) 分配。
 target_link_libraries(__idf_lvgl__lvgl PRIVATE idf::heap)
