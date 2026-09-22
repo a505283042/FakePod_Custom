@@ -8,6 +8,8 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_partition.h"
+#include "esp_timer.h"
 #include "sdcard.h"
 #include "app_diag_config.h"
 
@@ -50,9 +52,29 @@ static constexpr size_t FONT_HEADER_SIZE = 12;
 static constexpr size_t GLYPH_HEADER_SIZE = 6;
 static constexpr uint32_t EXPECTED_BPP = 2;
 
+// 中文字体 Flash 缓存。
+// 分区只负责缓存 TF 上的字体；缓存损坏或分区不存在时自动回退 TF -> PSRAM。
+static constexpr const char *FONT_CACHE_PARTITION_LABEL = "fontcache";
+static constexpr uint32_t FONT_CACHE_MAGIC = 0x31435446U;  // "FTC1"
+static constexpr uint32_t FONT_CACHE_VERSION = 1U;
+static constexpr size_t FONT_CACHE_DATA_OFFSET = 256U * 1024U;
+static constexpr size_t FONT_CACHE_COPY_CHUNK = 16U * 1024U;
+
+struct FontCacheHeader
+{
+    uint32_t magic;
+    uint32_t version;
+    uint32_t font_size;
+    uint32_t reserved0;
+    int64_t source_mtime;
+    uint32_t line_height;
+    uint32_t base_line;
+    uint32_t reserved[8];
+};
+
 struct OriginalFontContext
 {
-    uint8_t *data;
+    const uint8_t *data;
     size_t size;
     uint16_t lower_exclusive;
     uint16_t upper_inclusive;
@@ -66,6 +88,12 @@ struct OriginalFontContext
 static OriginalFontContext g_context = {};
 static lv_font_t g_ui_font = {};
 static bool g_ready = false;
+static uint8_t *g_psram_font_data = nullptr;
+static const esp_partition_t *g_font_cache_partition = nullptr;
+static esp_partition_mmap_handle_t g_font_cache_mmap_handle = 0;
+static FontCacheHeader g_font_cache_header = {};
+static bool g_font_cache_mapped = false;
+static bool g_font_cache_metrics_valid = false;
 
 static uint16_t font_manager_read_le16(const uint8_t *data)
 {
@@ -336,31 +364,193 @@ static esp_err_t font_manager_validate_format()
     return ESP_OK;
 }
 
-esp_err_t font_manager_init()
+static bool font_manager_cache_header_matches(const FontCacheHeader &header, const struct stat &source_info)
 {
-    if (g_ready) {
-        return ESP_OK;
+    if (header.magic != FONT_CACHE_MAGIC ||
+        header.version != FONT_CACHE_VERSION ||
+        header.font_size == 0U ||
+        header.font_size != static_cast<uint32_t>(source_info.st_size) ||
+        header.source_mtime != static_cast<int64_t>(source_info.st_mtime)) {
+        return false;
     }
 
-    if (!sdcard_is_mounted()) {
-        ESP_LOGE(TAG, "TF 卡未挂载，无法加载中文字体");
-        return ESP_ERR_INVALID_STATE;
+    return true;
+}
+
+static bool font_manager_cache_metrics_sane(const FontCacheHeader &header)
+{
+    return header.line_height >= 8U &&
+        header.line_height <= 128U &&
+        header.base_line < header.line_height;
+}
+
+static esp_err_t font_manager_try_map_flash_cache(const struct stat &source_info)
+{
+    const int64_t started_us = esp_timer_get_time();
+    const esp_partition_t *partition = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA,
+        ESP_PARTITION_SUBTYPE_ANY,
+        FONT_CACHE_PARTITION_LABEL);
+    if (partition == nullptr) {
+        FONT_BOOT_LOGI("字体Flash缓存分区不存在，回退TF读取");
+        return ESP_ERR_NOT_FOUND;
     }
 
-    struct stat info = {};
+    FontCacheHeader header = {};
+    esp_err_t ret = esp_partition_read(partition, 0U, &header, sizeof(header));
+    if (ret != ESP_OK || !font_manager_cache_header_matches(header, source_info)) {
+        FONT_BOOT_LOGI("字体Flash缓存未命中：header=%s",
+            ret == ESP_OK ? "STALE" : esp_err_to_name(ret));
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    if (FONT_CACHE_DATA_OFFSET + static_cast<size_t>(header.font_size) > partition->size) {
+        ESP_LOGW(TAG, "字体Flash缓存尺寸越界：font=%u partition=%u",
+            static_cast<unsigned>(header.font_size),
+            static_cast<unsigned>(partition->size));
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    const void *mapped = nullptr;
+    esp_partition_mmap_handle_t mmap_handle = 0;
+    ret = esp_partition_mmap(
+        partition,
+        FONT_CACHE_DATA_OFFSET,
+        header.font_size,
+        ESP_PARTITION_MMAP_DATA,
+        &mapped,
+        &mmap_handle);
+    if (ret != ESP_OK || mapped == nullptr) {
+        ESP_LOGW(TAG, "字体Flash缓存mmap失败：%s", esp_err_to_name(ret));
+        return ret != ESP_OK ? ret : ESP_FAIL;
+    }
+
+    g_font_cache_partition = partition;
+    g_font_cache_mmap_handle = mmap_handle;
+    g_font_cache_header = header;
+    g_font_cache_mapped = true;
+    g_font_cache_metrics_valid = font_manager_cache_metrics_sane(header);
+    g_context.data = static_cast<const uint8_t *>(mapped);
+    g_context.size = static_cast<size_t>(header.font_size);
+
+    ESP_LOGI(TAG, "中文字体Flash缓存命中：%u KB mmap=%u ms metrics=%s",
+        static_cast<unsigned>(g_context.size / 1024U),
+        static_cast<unsigned>((esp_timer_get_time() - started_us) / 1000),
+        g_font_cache_metrics_valid ? "CACHED" : "RECALC");
+    return ESP_OK;
+}
+
+static esp_err_t font_manager_build_flash_cache(const struct stat &source_info)
+{
+    const esp_partition_t *partition = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA,
+        ESP_PARTITION_SUBTYPE_ANY,
+        FONT_CACHE_PARTITION_LABEL);
+    if (partition == nullptr) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    if (partition->erase_size > FONT_CACHE_DATA_OFFSET) {
+        ESP_LOGW(TAG, "字体Flash缓存擦除粒度过大：erase=%u offset=%u，回退PSRAM字体",
+            static_cast<unsigned>(partition->erase_size),
+            static_cast<unsigned>(FONT_CACHE_DATA_OFFSET));
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    const size_t font_size = static_cast<size_t>(source_info.st_size);
+    const size_t required = FONT_CACHE_DATA_OFFSET + font_size;
+    if (required > partition->size) {
+        ESP_LOGW(TAG, "字体Flash缓存分区过小：需要=%u KB 分区=%u KB",
+            static_cast<unsigned>((required + 1023U) / 1024U),
+            static_cast<unsigned>(partition->size / 1024U));
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    uint8_t *copy_buffer = static_cast<uint8_t *>(
+        heap_caps_malloc(FONT_CACHE_COPY_CHUNK, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (copy_buffer == nullptr) {
+        ESP_LOGW(TAG, "字体Flash缓存复制缓冲申请失败，回退PSRAM字体");
+        return ESP_ERR_NO_MEM;
+    }
+
+    const size_t erase_size = partition->erase_size;
+    const size_t erase_length = ((required + erase_size - 1U) / erase_size) * erase_size;
+    const int64_t started_us = esp_timer_get_time();
+    esp_err_t ret = esp_partition_erase_range(partition, 0U, erase_length);
+    if (ret != ESP_OK) {
+        heap_caps_free(copy_buffer);
+        ESP_LOGW(TAG, "擦除字体Flash缓存失败：%s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    size_t copied = 0U;
     {
         StorageSdLockGuard sd_lock;
         if (!sd_lock.locked()) {
+            heap_caps_free(copy_buffer);
             return ESP_ERR_TIMEOUT;
         }
-        if (stat(FONT_PATH, &info) != 0 || info.st_size <= 0) {
-            ESP_LOGE(TAG, "中文字体不存在：%s", FONT_PATH);
-            return ESP_ERR_NOT_FOUND;
+
+        FILE *file = fopen(FONT_PATH, "rb");
+        if (file == nullptr) {
+            heap_caps_free(copy_buffer);
+            return ESP_FAIL;
         }
+
+        while (copied < font_size) {
+            const size_t wanted =
+                (font_size - copied) < FONT_CACHE_COPY_CHUNK
+                ? (font_size - copied)
+                : FONT_CACHE_COPY_CHUNK;
+            const size_t got = fread(copy_buffer, 1U, wanted, file);
+            if (got != wanted) {
+                ret = ESP_FAIL;
+                break;
+            }
+
+            ret = esp_partition_write(
+                partition,
+                FONT_CACHE_DATA_OFFSET + copied,
+                copy_buffer,
+                got);
+            if (ret != ESP_OK) {
+                break;
+            }
+            copied += got;
+        }
+        fclose(file);
     }
 
-    const size_t font_size = static_cast<size_t>(info.st_size);
-    const size_t psram_before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    heap_caps_free(copy_buffer);
+    if (ret != ESP_OK || copied != font_size) {
+        ESP_LOGW(TAG, "建立字体Flash缓存失败：copied=%u/%u err=%s",
+            static_cast<unsigned>(copied),
+            static_cast<unsigned>(font_size),
+            esp_err_to_name(ret));
+        return ret != ESP_OK ? ret : ESP_FAIL;
+    }
+
+    FontCacheHeader header = {};
+    header.magic = FONT_CACHE_MAGIC;
+    header.version = FONT_CACHE_VERSION;
+    header.font_size = static_cast<uint32_t>(font_size);
+    header.source_mtime = static_cast<int64_t>(source_info.st_mtime);
+    ret = esp_partition_write(partition, 0U, &header, sizeof(header));
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "写入字体Flash缓存头失败：%s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "中文字体Flash缓存已建立：%u KB 耗时=%u ms（仅首次/字体变化执行）",
+        static_cast<unsigned>(font_size / 1024U),
+        static_cast<unsigned>((esp_timer_get_time() - started_us) / 1000));
+    return ESP_OK;
+}
+
+static esp_err_t font_manager_load_psram_fallback(const struct stat &source_info)
+{
+    const size_t font_size = static_cast<size_t>(source_info.st_size);
+    const int64_t started_us = esp_timer_get_time();
     uint8_t *font_data = static_cast<uint8_t *>(
         heap_caps_malloc(font_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (font_data == nullptr) {
@@ -383,9 +573,10 @@ esp_err_t font_manager_init()
         }
 
         FONT_BOOT_LOGI("正在将中文字体载入 PSRAM：%s", FONT_PATH);
-        read_count = fread(font_data, 1, font_size, file);
+        read_count = fread(font_data, 1U, font_size, file);
         fclose(file);
     }
+
     if (read_count != font_size) {
         heap_caps_free(font_data);
         ESP_LOGE(TAG, "读取中文字体不完整：期望=%u，实际=%u",
@@ -394,21 +585,122 @@ esp_err_t font_manager_init()
         return ESP_FAIL;
     }
 
+    g_psram_font_data = font_data;
     g_context.data = font_data;
     g_context.size = font_size;
+    ESP_LOGI(TAG, "中文字体回退TF->PSRAM：%u KB 耗时=%u ms",
+        static_cast<unsigned>(font_size / 1024U),
+        static_cast<unsigned>((esp_timer_get_time() - started_us) / 1000));
+    return ESP_OK;
+}
+
+static void font_manager_store_cached_metrics()
+{
+    if (!g_font_cache_mapped || g_font_cache_partition == nullptr ||
+        g_font_cache_metrics_valid || g_context.line_height <= 0 || g_context.base_line < 0) {
+        return;
+    }
+
+    FontCacheHeader updated = g_font_cache_header;
+    updated.line_height = static_cast<uint32_t>(g_context.line_height);
+    updated.base_line = static_cast<uint32_t>(g_context.base_line);
+
+    const size_t erase_size = g_font_cache_partition->erase_size;
+    if (erase_size > FONT_CACHE_DATA_OFFSET) {
+        ESP_LOGW(TAG, "字体度量缓存跳过：erase=%u 大于缓存头保留区=%u",
+            static_cast<unsigned>(erase_size),
+            static_cast<unsigned>(FONT_CACHE_DATA_OFFSET));
+        return;
+    }
+    esp_err_t ret = esp_partition_erase_range(g_font_cache_partition, 0U, erase_size);
+    if (ret == ESP_OK) {
+        ret = esp_partition_write(g_font_cache_partition, 0U, &updated, sizeof(updated));
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "保存字体度量缓存失败：%s；不影响本次字体使用", esp_err_to_name(ret));
+        return;
+    }
+
+    g_font_cache_header = updated;
+    g_font_cache_metrics_valid = true;
+}
+
+esp_err_t font_manager_init()
+{
+    if (g_ready) {
+        return ESP_OK;
+    }
+
+    if (!sdcard_is_mounted()) {
+        ESP_LOGE(TAG, "TF 卡未挂载，无法加载中文字体");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const int64_t total_started_us = esp_timer_get_time();
+    struct stat info = {};
+    {
+        StorageSdLockGuard sd_lock;
+        if (!sd_lock.locked()) {
+            return ESP_ERR_TIMEOUT;
+        }
+        if (stat(FONT_PATH, &info) != 0 || info.st_size <= 0) {
+            ESP_LOGE(TAG, "中文字体不存在：%s", FONT_PATH);
+            return ESP_ERR_NOT_FOUND;
+        }
+    }
+
+    const size_t psram_before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    esp_err_t load_ret = font_manager_try_map_flash_cache(info);
+    if (load_ret != ESP_OK) {
+        const esp_err_t cache_ret = font_manager_build_flash_cache(info);
+        if (cache_ret == ESP_OK) {
+            load_ret = font_manager_try_map_flash_cache(info);
+        }
+    }
+
+    if (load_ret != ESP_OK) {
+        load_ret = font_manager_load_psram_fallback(info);
+    }
+    if (load_ret != ESP_OK) {
+        return load_ret;
+    }
+
     esp_err_t ret = font_manager_validate_format();
     if (ret != ESP_OK) {
-        heap_caps_free(g_context.data);
+        if (g_psram_font_data != nullptr) {
+            heap_caps_free(g_psram_font_data);
+            g_psram_font_data = nullptr;
+        }
+        if (g_font_cache_mapped) {
+            esp_partition_munmap(g_font_cache_mmap_handle);
+            g_font_cache_mapped = false;
+        }
         g_context = {};
         return ret;
     }
 
-    ret = font_manager_analyze_metrics();
-    if (ret != ESP_OK) {
-        heap_caps_free(g_context.data);
-        g_context = {};
-        return ret;
+    const int64_t metrics_started_us = esp_timer_get_time();
+    if (g_font_cache_metrics_valid) {
+        g_context.line_height = static_cast<int32_t>(g_font_cache_header.line_height);
+        g_context.base_line = static_cast<int32_t>(g_font_cache_header.base_line);
+        g_context.baseline_y = g_context.line_height - g_context.base_line;
+    } else {
+        ret = font_manager_analyze_metrics();
+        if (ret != ESP_OK) {
+            if (g_psram_font_data != nullptr) {
+                heap_caps_free(g_psram_font_data);
+                g_psram_font_data = nullptr;
+            }
+            if (g_font_cache_mapped) {
+                esp_partition_munmap(g_font_cache_mmap_handle);
+                g_font_cache_mapped = false;
+            }
+            g_context = {};
+            return ret;
+        }
+        font_manager_store_cached_metrics();
     }
+    const uint32_t metrics_ms = static_cast<uint32_t>((esp_timer_get_time() - metrics_started_us) / 1000);
 
     g_ui_font = {};
     g_ui_font.get_glyph_dsc = font_manager_get_glyph_dsc_cb;
@@ -428,13 +720,16 @@ esp_err_t font_manager_init()
 
     g_ready = true;
     const size_t psram_after = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    ESP_LOGI(TAG, "中文字体初始化成功：文件=%u KB，行高=%ld，基线=%ld",
-        static_cast<unsigned>(font_size / 1024),
+    ESP_LOGI(TAG, "中文字体初始化成功：文件=%u KB，行高=%ld，基线=%ld，来源=%s，总耗时=%u ms，度量=%u ms",
+        static_cast<unsigned>(g_context.size / 1024U),
         static_cast<long>(g_context.line_height),
-        static_cast<long>(g_context.base_line));
+        static_cast<long>(g_context.base_line),
+        g_font_cache_mapped ? "Flash mmap" : "TF->PSRAM",
+        static_cast<unsigned>((esp_timer_get_time() - total_started_us) / 1000),
+        static_cast<unsigned>(metrics_ms));
     FONT_BOOT_LOGI("字体占用 PSRAM：%u KB，剩余=%u KB",
-        static_cast<unsigned>((psram_before - psram_after) / 1024),
-        static_cast<unsigned>(psram_after / 1024));
+        static_cast<unsigned>((psram_before - psram_after) / 1024U),
+        static_cast<unsigned>(psram_after / 1024U));
 
     return ESP_OK;
 }

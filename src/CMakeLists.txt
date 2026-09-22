@@ -151,6 +151,7 @@ idf_component_register(
         libpng
         esp_psram
         esp_timer
+        esp_partition
         nvs_flash
         fatfs
 

@@ -1389,6 +1389,12 @@ esp_err_t ui_manager_bootstrap_init()
 
 esp_err_t ui_manager_init()
 {
+    const int64_t ui_init_started_us = esp_timer_get_time();
+    uint32_t ui_touch_ms = 0U;
+    uint32_t ui_decoder_ms = 0U;
+    uint32_t ui_font_ms = 0U;
+    uint32_t ui_pages_ms = 0U;
+
     if (g_ready) {
         return ESP_OK;
     }
@@ -1398,12 +1404,26 @@ esp_err_t ui_manager_init()
         return ESP_ERR_INVALID_STATE;
     }
 
-    // 完整 UI 只补齐触摸、图片解码器、TF 字体和业务页面，不重新初始化 LVGL/Display。
+    // 字体加载只访问 TF / Flash 缓存和字体结构，不需要持有 LVGL 锁。
+    // 尤其首次建立 Flash 缓存可能包含擦除/写入，放在锁外可避免启动页冻结和显示任务饥饿。
+    const int64_t font_started_us = esp_timer_get_time();
+    if (sdcard_is_mounted()) {
+        const esp_err_t font_ret = font_manager_init();
+        if (font_ret != ESP_OK) {
+            ESP_LOGW(TAG, "原厂中文字体初始化失败，将使用 LVGL 默认字体：%s", esp_err_to_name(font_ret));
+        }
+    } else {
+        UI_BOOT_LOGI("TF 卡不可用，跳过中文字体加载并使用 LVGL 默认字体");
+    }
+    ui_font_ms = static_cast<uint32_t>((esp_timer_get_time() - font_started_us) / 1000);
+
+    // 完整 UI 只补齐触摸、图片解码器和业务页面，不重新初始化 LVGL/Display。
     if (!lvgl_port_lock(1000)) {
         ESP_LOGE(TAG, "获取完整 UI 初始化互斥锁超时");
         return ESP_ERR_TIMEOUT;
     }
 
+    const int64_t touch_started_us = esp_timer_get_time();
     gesture_router_reset();
     if (cst820_is_ready()) {
         UI_BOOT_LOGI("注册CST820触摸输入");
@@ -1430,7 +1450,9 @@ esp_err_t ui_manager_init()
         g_touch_error = ESP_ERR_INVALID_STATE;
         UI_BOOT_LOGI("CST820 不可用，完整 UI 继续以无触摸模式运行");
     }
+    ui_touch_ms = static_cast<uint32_t>((esp_timer_get_time() - touch_started_us) / 1000);
 
+    const int64_t decoder_started_us = esp_timer_get_time();
     // ArtworkLoader 已把压缩图放入 PSRAM，LVGL 只消费内存变量，不再访问 SD。
     const esp_err_t decoder_ret = esp_lv_decoder_init(&g_image_decoder);
     if (decoder_ret != ESP_OK) {
@@ -1439,16 +1461,9 @@ esp_err_t ui_manager_init()
     } else {
         lv_image_cache_resize(512U * 1024U, true);
     }
+    ui_decoder_ms = static_cast<uint32_t>((esp_timer_get_time() - decoder_started_us) / 1000);
 
-    if (sdcard_is_mounted()) {
-        const esp_err_t font_ret = font_manager_init();
-        if (font_ret != ESP_OK) {
-            ESP_LOGW(TAG, "原厂中文字体初始化失败，将使用 LVGL 默认字体：%s", esp_err_to_name(font_ret));
-        }
-    } else {
-        UI_BOOT_LOGI("TF 卡不可用，跳过中文字体加载并使用 LVGL 默认字体");
-    }
-
+    const int64_t pages_started_us = esp_timer_get_time();
     g_boot_library_progress_active.store(false, std::memory_order_release);
     g_boot_library_update_active.store(false, std::memory_order_release);
     if (g_boot_library_progress_timer != nullptr) {
@@ -1494,6 +1509,8 @@ esp_err_t ui_manager_init()
         }
     }
 
+    ui_pages_ms = static_cast<uint32_t>((esp_timer_get_time() - pages_started_us) / 1000);
+
     if (APP_DIAG_UI_PERFORMANCE) {
         g_perf_audit_timer = lv_timer_create(ui_perf_audit_timer_cb, kPerfAuditWindowMs, nullptr);
         if (g_perf_audit_timer == nullptr) {
@@ -1506,6 +1523,12 @@ esp_err_t ui_manager_init()
     lvgl_port_unlock();
 
     g_ready = true;
+    ESP_LOGI(TAG, "完整UI初始化耗时：总计=%u ms Touch=%u Decoder=%u Font=%u Pages=%u",
+        static_cast<unsigned>((esp_timer_get_time() - ui_init_started_us) / 1000),
+        static_cast<unsigned>(ui_touch_ms),
+        static_cast<unsigned>(ui_decoder_ms),
+        static_cast<unsigned>(ui_font_ms),
+        static_cast<unsigned>(ui_pages_ms));
     ESP_LOGI(
         TAG,
         "UI ready：启动核心复用，Touch=%s Storage=%s Library=%s；后台服务等待系统 READY",
