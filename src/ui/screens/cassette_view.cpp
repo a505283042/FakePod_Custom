@@ -357,6 +357,10 @@ static uint32_t g_cover_scale_q8 = kLvImageScaleNone;
 static int16_t g_cover_y_offset_px = 0;
 static bool g_cover_is_no_artwork_fallback = false;
 
+// 曲库会在列表停留期间停用磁带并释放常驻 lease。用户真正点歌前再短暂 pin 当前封面，
+// 防止新歌 CoverTask 启动后把旧 Surface 当成未使用缓存提前回收。
+static CoverSurfaceLease g_transition_hold_lease = {};
+
 // 变色模式下，新封面先只 pin 在 pending lease 中，不立刻绑定到 LVGL。
 // 等离屏壳体 TintJob 完整结束后，再在同一个 LVGL 回调内一次提交封面、壳体和小滚轮。
 static CoverSurfaceLease g_pending_cover_lease = {};
@@ -625,8 +629,8 @@ static void cassette_view_update_track_text()
 
 static void cassette_view_update_mini_lyrics()
 {
-    if (g_controls_visible || !lyrics_service_is_ready() ||
-        !player_state_is_ready() || media_library_get_count() == 0U) {
+    if (!lyrics_service_is_ready() || !player_state_is_ready() ||
+        media_library_get_count() == 0U) {
         return;
     }
 
@@ -647,6 +651,12 @@ static void cassette_view_update_mini_lyrics()
         g_lyrics_requested_track = track;
     }
 
+    // Controls 显示期间只提前加载当前曲歌词，不更新隐藏中的歌词标签。
+    // 这样 LRC 可以与控件展示时间重叠，控件关闭后若已 Ready 就能直接显示。
+    if (g_controls_visible) {
+        return;
+    }
+
     if (window.track_index != track || window.state != LyricsLoadState::Ready) {
         if (g_last_lyrics_revision != window.revision || g_last_lyrics_line != UINT32_MAX) {
             cassette_view_clear_lyrics();
@@ -665,9 +675,13 @@ static void cassette_view_update_mini_lyrics()
 
     const LyricsWindowLine &current = window.lines[2];
     const LyricsWindowLine &next = window.lines[3];
+    const bool before_first_line = window.current_line_index == UINT32_MAX;
+
+    // 歌曲开头尚未到第一句时间戳时，磁带页先预显示第一句，避免刚进入视图时首行空白。
+    // 到达第一句时间戳后仍按歌词服务的 current 标记正常同步，不改变全局歌词时序。
     cassette_view_set_text_if_changed(
         g_current_lyric_label,
-        current.valid && current.current ? current.text : "");
+        current.valid && (current.current || before_first_line) ? current.text : "");
     cassette_view_set_text_if_changed(
         g_next_lyric_label,
         next.valid ? next.text : "");
@@ -683,6 +697,17 @@ static void cassette_view_release_pending_cover()
     g_pending_cover_track = UINT32_MAX;
     g_pending_cover_y_offset_px = 0;
     g_pending_cover_valid = false;
+}
+
+static void cassette_view_release_transition_hold()
+{
+    if (g_transition_hold_lease.slot_index != 0xFFU) {
+        ESP_LOGI(TAG, "磁带曲库交接释放：track=%lu revision=%lu",
+            static_cast<unsigned long>(g_transition_hold_lease.track_index),
+            static_cast<unsigned long>(g_transition_hold_lease.slot_revision));
+        cover_surface_cache_release(&g_transition_hold_lease);
+    }
+    g_transition_hold_lease = {};
 }
 
 static void cassette_view_mark_controls_cache_dirty()
@@ -757,6 +782,42 @@ static uint32_t cassette_view_cover_scale_for_size(uint16_t width, uint16_t heig
         (static_cast<uint64_t>(min_cover_height) * kLvImageScaleNone + height - 1U) / height);
     const uint32_t scale = width_scale > height_scale ? width_scale : height_scale;
     return scale == 0U ? 1U : scale;
+}
+
+static bool cassette_view_apply_transition_hold()
+{
+    if (g_transition_hold_lease.slot_index == 0xFFU || g_cover_image == nullptr ||
+        g_transition_hold_lease.normal_rgb565 == nullptr ||
+        g_transition_hold_lease.width == 0U || g_transition_hold_lease.height == 0U ||
+        g_transition_hold_lease.data_size == 0U ||
+        g_cover_lease.slot_index != 0xFFU || g_fallback_cover_lease.slot_index != 0xFFU) {
+        return false;
+    }
+
+    g_cover_lease = g_transition_hold_lease;
+    g_transition_hold_lease = {};
+    g_cover_generation = g_cover_lease.catalog_generation;
+    g_cover_track = g_cover_lease.track_index;
+    g_cover_is_no_artwork_fallback = false;
+
+    cassette_view_init_rgb565_dsc(
+        &g_cover_dsc,
+        g_cover_lease.normal_rgb565,
+        g_cover_lease.width,
+        g_cover_lease.height,
+        g_cover_lease.data_size);
+    g_cover_scale_q8 = cassette_view_cover_scale_for_size(
+        g_cover_lease.width, g_cover_lease.height);
+    lv_image_set_src(g_cover_image, &g_cover_dsc);
+    lv_image_set_scale(g_cover_image, g_cover_scale_q8);
+    lv_image_set_antialias(g_cover_image, false);
+    cassette_view_apply_cover_position();
+    lv_obj_remove_flag(g_cover_image, LV_OBJ_FLAG_HIDDEN);
+
+    ESP_LOGI(TAG, "磁带曲库交接恢复旧封面：track=%lu revision=%lu",
+        static_cast<unsigned long>(g_cover_track),
+        static_cast<unsigned long>(g_cover_lease.slot_revision));
+    return true;
 }
 
 static bool cassette_view_commit_pending_cover(uint32_t generation, uint32_t track)
@@ -2468,6 +2529,26 @@ static bool cassette_view_schedule_next_build(bool no_artwork)
     return true;
 }
 
+static bool cassette_view_current_lyrics_settled()
+{
+    if (!lyrics_service_is_ready() || !player_state_is_ready() || media_library_get_count() == 0U) {
+        return true;
+    }
+
+    const uint32_t track = static_cast<uint32_t>(player_state_get_index());
+    LyricsWindowSnapshot window = {};
+    if (!lyrics_service_get_window(track, 0U, &window)) {
+        return true;
+    }
+
+    // 下一首封面只是后台优化。当前曲歌词尚未完成读取/解析时先让出 TF 与 Core 1，
+    // 等歌词进入终态后再启动下一首预缓存；当前曲封面加载不受这里限制。
+    if (window.track_index != track) {
+        return false;
+    }
+    return window.state != LyricsLoadState::Idle && window.state != LyricsLoadState::Loading;
+}
+
 static void cassette_view_service_next_prefetch()
 {
     if (!g_active || !g_controls_cache_ready || g_cache_build_busy ||
@@ -2494,6 +2575,9 @@ static void cassette_view_service_next_prefetch()
     }
 
     if (g_next_prefetch.state == CassetteNextPrefetchState::Idle) {
+        if (!cassette_view_current_lyrics_settled()) {
+            return;
+        }
         g_next_prefetch.generation = generation;
         g_next_prefetch.track = next_track;
         MediaArtworkViewV2 artwork = {};
@@ -3362,6 +3446,11 @@ bool cassette_view_set_active(bool active)
         // 先消费后台 current/next 合成结果；若当前曲正好命中预热 next，
         // 本轮 bind 就能直接提升完整视觉，不先误启动一轮普通 TintJob。
         cassette_view_handle_cache_result();
+        if (g_cover_lease.slot_index == 0xFFU && g_fallback_cover_lease.slot_index == 0xFFU) {
+            (void)cassette_view_apply_transition_hold();
+        } else {
+            cassette_view_release_transition_hold();
+        }
         (void)cassette_view_bind_current_cover();
         cassette_view_sync_tint_setting();
         g_active = true;
@@ -3407,11 +3496,45 @@ bool cassette_view_set_active(bool active)
     cassette_view_set_mechanics_visible(false);
     lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
     cassette_view_release_cover();
+    cassette_view_release_transition_hold();
     g_text_track = UINT32_MAX;
     g_lyrics_requested_track = UINT32_MAX;
     cassette_view_clear_lyrics();
     cassette_view_apply_aux_visibility();
     return true;
+}
+
+bool cassette_view_prepare_track_transition_hold()
+{
+    cassette_view_release_transition_hold();
+    if (!player_state_is_ready() || media_library_get_count() == 0U ||
+        !cover_surface_cache_is_ready()) {
+        return false;
+    }
+
+    const uint32_t track = static_cast<uint32_t>(player_state_get_index());
+    CoverSurfaceLease lease = {};
+    if (!cover_surface_cache_acquire(track, &lease)) {
+        ESP_LOGI(TAG, "磁带曲库交接未命中旧Surface：track=%lu",
+            static_cast<unsigned long>(track));
+        return false;
+    }
+    if (lease.normal_rgb565 == nullptr || lease.width == 0U || lease.height == 0U ||
+        lease.data_size == 0U) {
+        cover_surface_cache_release(&lease);
+        return false;
+    }
+
+    g_transition_hold_lease = lease;
+    ESP_LOGI(TAG, "磁带曲库交接pin旧封面：track=%lu revision=%lu",
+        static_cast<unsigned long>(track),
+        static_cast<unsigned long>(lease.slot_revision));
+    return true;
+}
+
+void cassette_view_cancel_track_transition_hold()
+{
+    cassette_view_release_transition_hold();
 }
 
 bool cassette_view_prepare_deferred_active()

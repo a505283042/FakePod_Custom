@@ -4041,14 +4041,16 @@ static void player_home_refresh()
 bool player_home_prepare_track_transition_hold()
 {
     if (g_music_visual_mode == MusicVisualMode::Cassette) {
-        return true;
+        return cassette_view_prepare_track_transition_hold();
     }
     return now_playing_artwork_prepare_track_transition_hold();
 }
 
 void player_home_cancel_track_transition_hold()
 {
-    if (g_music_visual_mode == MusicVisualMode::Artwork) {
+    if (g_music_visual_mode == MusicVisualMode::Cassette) {
+        cassette_view_cancel_track_transition_hold();
+    } else {
         now_playing_artwork_cancel_track_transition_hold();
     }
 }

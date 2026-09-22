@@ -8,6 +8,9 @@
 // Music 首页磁带视觉层。只消费已有 CoverSurface；不参与音频解码。
 esp_err_t cassette_view_create(lv_obj_t *parent);
 bool cassette_view_set_active(bool active);
+// 曲库点歌前短暂 pin 当前磁带封面；返回主页时若新歌 Surface 未就绪，继续显示旧封面。
+bool cassette_view_prepare_track_transition_hold();
+void cassette_view_cancel_track_transition_hold();
 // 从封面视图切到磁带时先隐藏准备；ready 后再由 player_home 一次提交，避免粉色中间帧。
 bool cassette_view_prepare_deferred_active();
 bool cassette_view_try_present_deferred();
