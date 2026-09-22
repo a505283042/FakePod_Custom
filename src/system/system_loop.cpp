@@ -277,13 +277,11 @@ static void system_artwork_begin_context(uint32_t generation, uint32_t current_t
         if (same_inflight && loader.state == ArtworkLoadState::Loading) {
             g_artwork_stage = ArtworkCurrentStage::WaitCompressed;
         } else if (same_inflight && loader.state == ArtworkLoadState::Ready) {
-            if (!surface_ready) {
-                g_artwork_stage = ArtworkCurrentStage::Complete;
-            } else if (cover_surface_cache_request_track(current_track, nullptr)) {
-                g_artwork_stage = ArtworkCurrentStage::WaitSurface;
-            } else {
-                system_artwork_schedule_retry(current_track);
-            }
+            // Snapshot 的 Ready 只表示该请求曾经完成，不保证压缩缓存仍驻留。
+            // 例如磁带 next 预取退出后会释放未 pin 原图；先回 RetryCompressed 再核验缓存，
+            // 缓存确实已淘汰时重新读取当前曲，不能拿历史 Ready 直接请求 Surface。
+            g_artwork_stage = ArtworkCurrentStage::RetryCompressed;
+            g_artwork_retry_due_tick = 0;
         } else if (same_inflight &&
                    (loader.state == ArtworkLoadState::NoArtwork || loader.state == ArtworkLoadState::Failed)) {
             g_artwork_stage = ArtworkCurrentStage::Complete;
@@ -357,7 +355,12 @@ static void system_artwork_current_update()
                 break;
             }
             if (snapshot.state == ArtworkLoadState::Ready) {
-                // Ready 到 cache 可 acquire 之间理论上只有极短窗口；下一轮会直接命中 cache。
+                // Ready 快照可能在压缩缓存被淘汰后继续保留。这里已经确认当前 cache 不可 acquire，
+                // 回到 RetryCompressed 再核验一次；若确实不存在就重新提交当前曲读取请求。
+                g_artwork_pending_request_id = 0U;
+                g_artwork_pending_request_tick = 0;
+                g_artwork_stage = ArtworkCurrentStage::RetryCompressed;
+                g_artwork_retry_due_tick = 0;
                 break;
             }
             if (snapshot.state == ArtworkLoadState::Idle) {
