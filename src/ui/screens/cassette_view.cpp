@@ -937,7 +937,7 @@ static bool cassette_view_bind_no_artwork_label(uint32_t generation, uint32_t tr
     return true;
 }
 
-static void cassette_view_release_cover()
+static void cassette_view_release_cover(bool preserve_visual_identity)
 {
     cassette_view_cancel_shell_tint_job();
     cassette_view_release_pending_cover();
@@ -950,8 +950,13 @@ static void cassette_view_release_cover()
     g_cover_lease = {};
     g_fallback_cover_lease = {};
     g_cover_dsc = {};
-    g_cover_generation = 0U;
-    g_cover_track = UINT32_MAX;
+    // Launcher 只是临时接管屏幕。释放 Surface lease 时保留上一套已提交视觉的身份，
+    // 恢复同一首歌时不能误判成“目标已切换”并取消仍有效的 next 预缓存。
+    // 真正离开磁带视图时仍清空身份，后续重新进入按正常绑定流程处理。
+    if (!preserve_visual_identity) {
+        g_cover_generation = 0U;
+        g_cover_track = UINT32_MAX;
+    }
     g_cover_scale_q8 = kLvImageScaleNone;
     g_cover_is_no_artwork_fallback = false;
     if (g_cover_image != nullptr) {
@@ -3429,7 +3434,7 @@ esp_err_t cassette_view_create(lv_obj_t *parent)
     return ESP_OK;
 }
 
-bool cassette_view_set_active(bool active)
+static bool cassette_view_set_active_internal(bool active, bool preserve_next_prefetch)
 {
     if (g_root == nullptr) return false;
     if (active) {
@@ -3482,26 +3487,42 @@ bool cassette_view_set_active(bool active)
 
     g_active = false;
     g_present_deferred = false;
-    // 退出磁带视图后不长期 pin 下一首 CoverSurface，避免占用双槽封面缓存影响 Artwork 模式。
-    // current 合成任务若恰好在跑可以自然结束；next 任务/结果通过 serial 自动失效。
-    if (g_next_prefetch.state != CassetteNextPrefetchState::Idle) {
+    // 真正退出磁带视图时不长期 pin 下一首 CoverSurface，避免占用双槽封面缓存影响 Artwork 模式。
+    // Launcher 仅临时隐藏场景时保留 next；关闭菜单后继续消费，不重复读盘/合成。
+    if (!preserve_next_prefetch && g_next_prefetch.state != CassetteNextPrefetchState::Idle) {
         cassette_view_cancel_next_prefetch("磁带视图退出");
     }
     if (g_controls_cache_image != nullptr) {
         lv_obj_add_flag(g_controls_cache_image, LV_OBJ_FLAG_HIDDEN);
     }
-    g_tint_setting_initialized = false;
+    // Launcher 临时隐藏不代表配色设置发生了变化；保留已确认状态，
+    // 否则恢复时 sync_tint_setting() 会把重新初始化误判为设置变化，再次取消 next。
+    if (!preserve_next_prefetch) {
+        g_tint_setting_initialized = false;
+    }
     cassette_view_cancel_shell_tint_job();
     if (g_mechanics_timer != nullptr) lv_timer_pause(g_mechanics_timer);
     cassette_view_set_mechanics_visible(false);
     lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
-    cassette_view_release_cover();
+    cassette_view_release_cover(preserve_next_prefetch);
     cassette_view_release_transition_hold();
     g_text_track = UINT32_MAX;
     g_lyrics_requested_track = UINT32_MAX;
     cassette_view_clear_lyrics();
     cassette_view_apply_aux_visibility();
     return true;
+}
+
+bool cassette_view_set_active(bool active)
+{
+    return cassette_view_set_active_internal(active, false);
+}
+
+bool cassette_view_set_launcher_scene_hidden(bool hidden)
+{
+    // Launcher 只是临时接管屏幕：隐藏磁带场景时保留已经准备好的下一首预缓存。
+    // 真正离开 Music/磁带模式仍走 cassette_view_set_active(false)，按原逻辑释放预缓存。
+    return cassette_view_set_active_internal(!hidden, true);
 }
 
 bool cassette_view_prepare_track_transition_hold()

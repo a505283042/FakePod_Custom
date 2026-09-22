@@ -2447,7 +2447,7 @@ static void player_home_launcher_leave_done(lv_anim_t *anim)
         // fallback 可能临时恢复了 Artwork；回到 Cassette 前明确关掉。
         now_playing_artwork_set_active(false);
         if (g_launcher_cassette_scene_hidden) {
-            (void)cassette_view_set_active(true);
+            (void)cassette_view_set_launcher_scene_hidden(false);
         }
         cassette_view_set_launcher_suspended(false);
         g_launcher_cassette_scene_hidden = false;
@@ -2575,7 +2575,7 @@ static void player_home_launcher_show()
             const bool invalidation_was_enabled =
                 display != nullptr && lv_display_is_invalidation_enabled(display);
             if (invalidation_was_enabled) lv_display_enable_invalidation(display, false);
-            g_launcher_cassette_scene_hidden = cassette_view_set_active(false);
+            g_launcher_cassette_scene_hidden = cassette_view_set_launcher_scene_hidden(true);
             if (invalidation_was_enabled) lv_display_enable_invalidation(display, true);
         }
 
