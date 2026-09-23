@@ -298,6 +298,8 @@ static lv_timer_t *g_artwork_timer = nullptr;
 static lv_timer_t *g_gesture_timer = nullptr;
 static bool g_background_timers_running = true;
 static bool g_app_foreground = true;
+// 设置页只覆盖 Music，不需要牺牲已经完成的磁带 next 预读；电子书/视频/NSF 才主动释放。
+static bool g_keep_cassette_prefetch_in_background = false;
 static bool g_launcher_open_after_foreground = false;
 // BoundedSPI 退出已把当前封面恢复到 GRAM 时，下一次 Artwork resume 只同步 lease/source，
 // 不再产生一笔 460x460 LVGL invalidation。
@@ -2447,7 +2449,7 @@ static void player_home_launcher_leave_done(lv_anim_t *anim)
         // fallback 可能临时恢复了 Artwork；回到 Cassette 前明确关掉。
         now_playing_artwork_set_active(false);
         if (g_launcher_cassette_scene_hidden) {
-            (void)cassette_view_set_launcher_scene_hidden(false);
+            (void)cassette_view_set_temporary_hidden(false);
         }
         cassette_view_set_launcher_suspended(false);
         g_launcher_cassette_scene_hidden = false;
@@ -2575,7 +2577,7 @@ static void player_home_launcher_show()
             const bool invalidation_was_enabled =
                 display != nullptr && lv_display_is_invalidation_enabled(display);
             if (invalidation_was_enabled) lv_display_enable_invalidation(display, false);
-            g_launcher_cassette_scene_hidden = cassette_view_set_launcher_scene_hidden(true);
+            g_launcher_cassette_scene_hidden = cassette_view_set_temporary_hidden(true);
             if (invalidation_was_enabled) lv_display_enable_invalidation(display, true);
         }
 
@@ -2687,7 +2689,9 @@ static void player_home_launcher_activate_index(
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Launcher进入APP失败：name=%s ret=%s",
             app_manager_name(target), esp_err_to_name(ret));
+        return;
     }
+    player_home_apply_background_prefetch_policy(target);
 }
 
 static void player_home_launcher_panel_click_cb(lv_event_t *event)
@@ -3085,11 +3089,11 @@ static void player_home_update_background_timer_qos()
 {
     // 主页被歌词/频谱/曲库完整覆盖时，不让主页自己的 100ms Audio/Artwork timer
     // 继续在 LVGL P3 后台醒来。Music APP 真正转入 Background 时，Gesture timer 也由 Adapter 单独暂停。
+    const bool music_child_view_visible =
+        library_view_is_visible() || lyrics_view_is_visible() || spectrum_view_is_visible();
     const bool should_run =
         g_app_foreground &&
-        !library_view_is_visible() &&
-        !lyrics_view_is_visible() &&
-        !spectrum_view_is_visible() &&
+        !music_child_view_visible &&
         !g_launcher_visible;
     if (should_run == g_background_timers_running) {
         return;
@@ -3110,7 +3114,21 @@ static void player_home_update_background_timer_qos()
         (g_music_visual_mode == MusicVisualMode::Cassette || g_cassette_visual_switch_pending);
     const bool quiet_resume = artwork_should_run && g_artwork_resume_without_invalidation;
     now_playing_artwork_set_active(artwork_should_run, quiet_resume);
-    (void)cassette_view_set_active(cassette_should_run);
+    if (cassette_should_run) {
+        (void)cassette_view_set_active(true);
+    } else {
+        // 歌词/频谱/曲库、Launcher 与设置页都只是临时覆盖 Music：暂停机械层并释放当前显示 lease，
+        // 但保留已经完成或正在进行的 next 预读。电子书/视频/NSF 则继续走真正退出路径释放预读。
+        const bool preserve_next_prefetch =
+            g_music_visual_mode == MusicVisualMode::Cassette &&
+            ((g_app_foreground && (music_child_view_visible || g_launcher_visible)) ||
+             (!g_app_foreground && g_keep_cassette_prefetch_in_background));
+        if (preserve_next_prefetch) {
+            (void)cassette_view_set_temporary_hidden(true);
+        } else {
+            (void)cassette_view_set_active(false);
+        }
+    }
     if (should_run) {
         g_artwork_resume_without_invalidation = false;
     }
@@ -4076,7 +4094,7 @@ void player_home_resume_from_fullscreen_view(const char *reason)
         g_overlay_visible ? 1U : 0U);
 }
 
-static void player_home_launcher_abort_for_app_switch()
+static void player_home_launcher_abort_for_app_switch(bool preserve_cassette_prefetch)
 {
     if (g_launcher_panel != nullptr) {
         lv_anim_delete(g_launcher_panel, player_home_launcher_progress_anim_exec);
@@ -4089,8 +4107,13 @@ static void player_home_launcher_abort_for_app_switch()
     g_launcher_frame_cache_active = false;
     g_launcher_frame_index = kLauncherFrameInvalid;
     if (g_music_visual_mode == MusicVisualMode::Cassette) {
-        // 直接切换到其他 APP 时不要恢复一帧磁带动画；先保持 Cassette inactive，再清冻结标记。
-        (void)cassette_view_set_active(false);
+        // 直接切换 APP 时不要恢复一帧磁带动画。设置页属于轻量覆盖，保留 next 预读；
+        // 电子书/视频/NSF 会占用更多媒体资源，继续按真正退出处理并释放预读。
+        if (preserve_cassette_prefetch) {
+            (void)cassette_view_set_temporary_hidden(true);
+        } else {
+            (void)cassette_view_set_active(false);
+        }
         cassette_view_set_launcher_suspended(false);
     }
     g_launcher_cassette_scene_hidden = false;
@@ -4110,12 +4133,18 @@ esp_err_t player_home_app_leave_background()
         return ESP_OK;
     }
 
+    // Launcher 在发起切换前已经发布目标。只有高占用媒体 APP 才需要牺牲磁带 next 预读；
+    // 设置页保持缓存，返回 Music 时直接继续使用。当前已注册的其它目标只有这四类。
+    const AppId target = app_manager_launcher_target();
+    g_keep_cassette_prefetch_in_background =
+        target != AppId::Nsf && target != AppId::Video && target != AppId::Ebook;
+
     // Music 的子页面必须先静默收口，不能调用 HomeResume；否则会在 Manager 已准备切 APP 时
     // 重新 acquire Artwork lease / 恢复 timer。
     library_view_suspend_for_app_switch();
     lyrics_view_close();
     spectrum_view_close();
-    player_home_launcher_abort_for_app_switch();
+    player_home_launcher_abort_for_app_switch(g_keep_cassette_prefetch_in_background);
     player_home_overlay_hide();
     player_home_cancel_progress_interaction();
     g_volume_dragging = false;
@@ -4147,6 +4176,7 @@ esp_err_t player_home_app_enter_foreground()
     }
 
     g_app_foreground = true;
+    g_keep_cassette_prefetch_in_background = false;
     now_playing_artwork_set_bounded_present_allowed(
         g_music_visual_mode == MusicVisualMode::Artwork);
     if (g_gesture_timer != nullptr) {
@@ -4175,6 +4205,23 @@ esp_err_t player_home_app_enter_foreground()
 bool player_home_app_is_foreground()
 {
     return g_app_foreground;
+}
+
+void player_home_apply_background_prefetch_policy(AppId foreground_app)
+{
+    const bool keep_prefetch =
+        foreground_app != AppId::Nsf &&
+        foreground_app != AppId::Video &&
+        foreground_app != AppId::Ebook;
+    const bool was_keeping_prefetch = g_keep_cassette_prefetch_in_background;
+    g_keep_cassette_prefetch_in_background = keep_prefetch;
+
+    // Music 已在后台时仍可能从设置页继续切到视频/电子书/NSF。此时不会再次触发 Music leave，
+    // 所以只有从“保留”切到“释放”时补一次真正退出，避免重复清理已经空掉的缓存。
+    if (was_keeping_prefetch && !keep_prefetch && !g_app_foreground &&
+        g_music_visual_mode == MusicVisualMode::Cassette) {
+        (void)cassette_view_set_active(false);
+    }
 }
 
 esp_err_t player_home_request_launcher_foreground()
@@ -4249,6 +4296,7 @@ void player_home_create(lv_obj_t *screen)
     g_gesture_timer = nullptr;
     g_background_timers_running = true;
     g_app_foreground = true;
+    g_keep_cassette_prefetch_in_background = false;
     g_launcher_open_after_foreground = false;
     g_artwork_resume_without_invalidation = false;
     g_last_artwork_bound_track = UINT32_MAX;

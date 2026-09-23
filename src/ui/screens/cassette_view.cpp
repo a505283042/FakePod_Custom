@@ -3527,10 +3527,10 @@ bool cassette_view_set_active(bool active)
     return cassette_view_set_active_internal(active, false);
 }
 
-bool cassette_view_set_launcher_scene_hidden(bool hidden)
+bool cassette_view_set_temporary_hidden(bool hidden)
 {
-    // Launcher 只是临时接管屏幕：隐藏磁带场景时保留已经准备好的下一首预缓存。
-    // 真正离开 Music/磁带模式仍走 cassette_view_set_active(false)，按原逻辑释放预缓存。
+    // Music 内部全屏页、Launcher 或轻量 APP 只是临时接管屏幕：隐藏磁带场景时保留下一首预缓存。
+    // 真正进入高占用媒体 APP 或离开磁带模式仍走 cassette_view_set_active(false)，按原逻辑释放。
     return cassette_view_set_active_internal(!hidden, true);
 }
 

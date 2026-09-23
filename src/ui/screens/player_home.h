@@ -21,6 +21,8 @@ void player_home_resume_from_fullscreen_view(const char *reason);
 esp_err_t player_home_app_leave_background();
 esp_err_t player_home_app_enter_foreground();
 bool player_home_app_is_foreground();
+// 前台 APP 切换完成后同步磁带预读保留策略：设置页保留，电子书/视频/NSF 释放。
+void player_home_apply_background_prefetch_policy(AppId foreground_app);
 
 // R.39.5.4：其他 APP 请求系统 Launcher 时不再复制一套径向 UI。
 // 若 Music 在后台，则先由 AppManager 恢复 Music Foreground，再自动展开原生 Launcher；

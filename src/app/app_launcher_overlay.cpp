@@ -124,7 +124,10 @@ static void switch_app_async(void *user_data)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "共享圆环进入APP失败：name=%s ret=%s",
             app_manager_name(target), esp_err_to_name(ret));
+        return;
     }
+    // Music 可能早已在设置页背后处于 Background；切入重媒体 APP 时仍需释放磁带 next 预读。
+    player_home_apply_background_prefetch_policy(target);
 }
 
 static void activate_index(uint8_t index, int32_t x, int32_t y)

@@ -8,8 +8,8 @@
 // Music 首页磁带视觉层。只消费已有 CoverSurface；不参与音频解码。
 esp_err_t cassette_view_create(lv_obj_t *parent);
 bool cassette_view_set_active(bool active);
-// Launcher 高速菜单只临时隐藏磁带场景，保留下一首预缓存；真正退出仍使用 set_active(false)。
-bool cassette_view_set_launcher_scene_hidden(bool hidden);
+// Music 内部全屏覆盖或轻量 APP 只临时隐藏磁带场景，保留下一首预缓存；真正退出仍使用 set_active(false)。
+bool cassette_view_set_temporary_hidden(bool hidden);
 // 曲库点歌前短暂 pin 当前磁带封面；返回主页时若新歌 Surface 未就绪，继续显示旧封面。
 bool cassette_view_prepare_track_transition_hold();
 void cassette_view_cancel_track_transition_hold();
