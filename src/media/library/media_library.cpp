@@ -1368,6 +1368,7 @@ static esp_err_t media_library_scan_with_scratch(
                                     if (probe_ret == ESP_OK) {
                                         probed_count++;
                                         if (format == MediaFormat::MP3 &&
+                                            technical.sample_rate_hz != 32000U &&
                                             technical.sample_rate_hz != 44100U && technical.sample_rate_hz != 48000U) {
                                             char reason[96] = {};
                                             snprintf(reason, sizeof(reason), "MP3 %lu Hz 当前不可播放，歌曲仍保留在曲库",

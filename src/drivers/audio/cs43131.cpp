@@ -383,7 +383,7 @@ esp_err_t cs43131_prepare_pcm_playback_32bit(uint32_t sample_rate_hz)
         uint8_t value;
     };
 
-    // 44.1~192kHz Rate Profile 都使用板载 24.576MHz XTAL 作为内部 MCLK。
+    // 32~192kHz Rate Profile 都使用板载 24.576MHz XTAL 作为内部 MCLK。
     // 数据手册明确说明除 384kHz Master Mode 外，其余采样率可使用 22.5792 或 24.576MHz MCLK_INT。
     // CS43131 保持 Slave，BCLK/LRCK 由 ESP32-S3 产生。
     const uint8_t sample_rate_reg = rate_profile.cs43131_asp_sprate;

@@ -679,9 +679,9 @@ static esp_err_t mp3_verify_runtime_info(Mp3Decoder *decoder)
         static_cast<unsigned long>(info.bitrate));
 #endif
 
-    if ((info.sample_rate != 44100U && info.sample_rate != 48000U) ||
+    if ((info.sample_rate != 32000U && info.sample_rate != 44100U && info.sample_rate != 48000U) ||
         !audio_rate_profile_get(info.sample_rate, nullptr)) {
-        ESP_LOGE(TAG, "暂不支持该 MP3 采样率：%luHz（当前仅44.1/48kHz）",
+        ESP_LOGE(TAG, "暂不支持该 MP3 采样率：%luHz（当前仅32/44.1/48kHz）",
             static_cast<unsigned long>(info.sample_rate));
         return ESP_ERR_NOT_SUPPORTED;
     }

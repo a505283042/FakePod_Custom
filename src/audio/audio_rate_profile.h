@@ -24,6 +24,14 @@ static inline bool audio_rate_profile_get(uint32_t sample_rate_hz, AudioRateProf
     profile.i2s_dma_desc_num = 0U;
     profile.flac_stage_enabled = false;
     switch (sample_rate_hz) {
+        case 32000U:
+            profile.sample_rate_hz = 32000U;
+            profile.cs43131_asp_sprate = 0x00U;
+            // 32kHz 仅用于 MP3 原生播放；DMA 配置沿用 44.1/48kHz 已有档位。
+            // 本轮不扩大 FLAC 支持范围，因此 flac_stage_enabled 保持 false。
+            profile.i2s_dma_desc_num = 16U;
+            profile.flac_stage_enabled = false;
+            break;
         case 44100U:
             profile.sample_rate_hz = 44100U;
             profile.cs43131_asp_sprate = 0x01U;
