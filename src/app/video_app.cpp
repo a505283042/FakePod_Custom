@@ -1306,6 +1306,30 @@ static void go_back()
         lv_obj_invalidate(g_root);
         return;
     }
+
+    // 规格预检状态仍属于视频列表的一次临时操作；返回时先取消预检并恢复列表，
+    // 不能按根目录返回处理，否则会误弹出 APP 圆环菜单。
+    if (g_profile_probe_pending) {
+        VideoProbe::cancel();
+        g_profile_probe_pending = false;
+        benchmark_restore_music_after_exclusive("profile_back");
+        show_browser();
+        lv_obj_invalidate(g_root);
+        ESP_LOGI(TAG, "用户取消视频规格预检；返回视频列表");
+        return;
+    }
+
+    // Profile Probe 失败/格式不支持会复用 Browser 页面显示错误状态，并临时隐藏列表。
+    // 只要原目录快照仍有效，第一次返回应关闭错误状态并恢复列表。
+    if (g_browser_status != nullptr &&
+        !lv_obj_has_flag(g_browser_status, LV_OBJ_FLAG_HIDDEN) &&
+        g_directory.entries != nullptr && g_directory.count != 0U) {
+        show_browser();
+        lv_obj_invalidate(g_root);
+        ESP_LOGI(TAG, "用户关闭视频状态页；返回视频列表");
+        return;
+    }
+
     if (g_current_dir == nullptr || strcmp(g_current_dir, VideoBrowser::kRootDirectory) == 0) {
         show_launcher();
         return;
