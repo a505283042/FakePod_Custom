@@ -3,6 +3,8 @@
 #include <stdbool.h>
 #include "esp_err.h"
 
+struct MediaLibraryChangeSummary;
+
 // 仅建立 LVGL 显示核心与黑色启动页；不依赖触摸、TF 卡或中文字体。
 esp_err_t ui_manager_bootstrap_init();
 
@@ -19,15 +21,11 @@ bool ui_manager_show_boot_fatal(const char *reason, esp_err_t error);
 // 启动期复用启动页显示首次建库或增量更新状态；已有曲库且无变化时不会额外提示。
 // 首次建库时可传入当前已经发现的歌曲数；0 表示刚开始扫描。
 bool ui_manager_show_library_build_progress(uint32_t scanned_count = 0U);
-bool ui_manager_show_library_build_complete(uint32_t total_count);
+bool ui_manager_show_library_build_complete(const MediaLibraryChangeSummary &changes);
 // 已有曲库增量扫描：added_count=0 表示刚检测到变化；>0 时显示本轮新增歌曲数量。
 // 该接口只发布轻量状态，真正的 LVGL 文本更新由 taskLVGL 的进度 timer 完成。
 bool ui_manager_show_library_update_progress(uint32_t added_count = 0U);
-bool ui_manager_show_library_update_complete(
-    uint32_t added_count,
-    uint32_t removed_count,
-    uint32_t updated_count
-);
+bool ui_manager_show_library_update_complete(const MediaLibraryChangeSummary &changes);
 
 // 一次性 TF 卡 USB MSC 服务模式复用启动页，不建立完整 Music/Settings UI。
 // 返回 false 仅表示提示页不可用，不影响 USB 服务本身。

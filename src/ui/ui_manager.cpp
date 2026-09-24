@@ -1559,7 +1559,7 @@ bool ui_manager_show_library_build_progress(uint32_t scanned_count)
     return true;
 }
 
-bool ui_manager_show_library_build_complete(uint32_t total_count)
+bool ui_manager_show_library_build_complete(const MediaLibraryChangeSummary &changes)
 {
     if (!g_bootstrap_ready || g_display == nullptr || g_boot_root == nullptr ||
         g_boot_status == nullptr) {
@@ -1570,12 +1570,22 @@ bool ui_manager_show_library_build_complete(uint32_t total_count)
     // 防止最后一次“已扫描到 X 首”在完成文案之后又覆盖回来。
     g_boot_library_progress_active.store(false, std::memory_order_release);
 
-    char status[96] = {};
-    const int written = snprintf(
-        status,
-        sizeof(status),
-        "音乐库建立完成\n共 %lu 首歌曲",
-        static_cast<unsigned long>(total_count));
+    char status[384] = {};
+    const int written = changes.issue_count == 0U
+        ? snprintf(
+            status,
+            sizeof(status),
+            "音乐库建立完成\n共 %lu 首歌曲",
+            static_cast<unsigned long>(changes.current_count))
+        : snprintf(
+            status,
+            sizeof(status),
+            "音乐库建立完成\n共 %lu 首歌曲 · %lu 个问题%s\n%s\n%s",
+            static_cast<unsigned long>(changes.current_count),
+            static_cast<unsigned long>(changes.issue_count),
+            changes.skipped_count > 0U ? "（含跳过歌曲）" : "",
+            changes.first_issue_file[0] != '\0' ? changes.first_issue_file : "未知文件",
+            changes.first_issue_reason[0] != '\0' ? changes.first_issue_reason : "已自动降级处理");
     if (written <= 0 || static_cast<size_t>(written) >= sizeof(status)) {
         return false;
     }
@@ -1612,10 +1622,7 @@ bool ui_manager_show_library_update_progress(uint32_t added_count)
     return true;
 }
 
-bool ui_manager_show_library_update_complete(
-    uint32_t added_count,
-    uint32_t removed_count,
-    uint32_t updated_count)
+bool ui_manager_show_library_update_complete(const MediaLibraryChangeSummary &changes)
 {
     if (!g_bootstrap_ready || g_display == nullptr || g_boot_root == nullptr ||
         g_boot_status == nullptr) {
@@ -1624,7 +1631,7 @@ bool ui_manager_show_library_update_complete(
 
     g_boot_library_update_active.store(false, std::memory_order_release);
 
-    char status[160] = {};
+    char status[384] = {};
     size_t used = static_cast<size_t>(
         snprintf(status, sizeof(status), "音乐库已更新"));
     const auto append_count = [&](const char *label, uint32_t count) {
@@ -1652,9 +1659,22 @@ bool ui_manager_show_library_update_complete(
         used += line_len;
         status[used] = '\0';
     };
-    append_count("新增", added_count);
-    append_count("删除", removed_count);
-    append_count("更新", updated_count);
+    append_count("新增", changes.added_count);
+    append_count("删除", changes.removed_count);
+    append_count("更新", changes.updated_count);
+    if (changes.issue_count > 0U && used < sizeof(status) - 1U) {
+        const int issue_written = snprintf(
+            status + used,
+            sizeof(status) - used,
+            "\n发现 %lu 个问题%s\n%s\n%s",
+            static_cast<unsigned long>(changes.issue_count),
+            changes.skipped_count > 0U ? "（含跳过歌曲）" : "",
+            changes.first_issue_file[0] != '\0' ? changes.first_issue_file : "未知文件",
+            changes.first_issue_reason[0] != '\0' ? changes.first_issue_reason : "已自动降级处理");
+        if (issue_written > 0 && static_cast<size_t>(issue_written) < sizeof(status) - used) {
+            used += static_cast<size_t>(issue_written);
+        }
+    }
 
     if (!lvgl_port_lock(1000)) {
         ESP_LOGW(TAG, "曲库更新完成提示获取LVGL互斥锁超时");

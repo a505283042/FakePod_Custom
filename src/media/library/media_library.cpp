@@ -421,6 +421,55 @@ static bool media_library_add_track(
     return true;
 }
 
+static void media_library_drop_metadata(MediaEntry *entry)
+{
+    if (entry == nullptr || entry->metadata_build == nullptr) {
+        return;
+    }
+    media_metadata_build_release(entry->metadata_build);
+    heap_caps_free(entry->metadata_build);
+    entry->metadata_build = nullptr;
+}
+
+static void media_library_drop_artwork(MediaEntry *entry)
+{
+    if (entry == nullptr || entry->artwork_build == nullptr) {
+        return;
+    }
+    media_artwork_build_release_v2(entry->artwork_build);
+    heap_caps_free(entry->artwork_build);
+    entry->artwork_build = nullptr;
+}
+
+static void media_library_drop_lyrics(MediaMetadataBuildV2 *metadata)
+{
+    if (metadata == nullptr || metadata->lyrics == nullptr) {
+        return;
+    }
+    for (uint16_t i = 0; i < metadata->lyrics_count; ++i) {
+        heap_caps_free(metadata->lyrics[i].path);
+        heap_caps_free(metadata->lyrics[i].language);
+    }
+    heap_caps_free(metadata->lyrics);
+    metadata->lyrics = nullptr;
+    metadata->lyrics_count = 0U;
+    metadata->lyrics_capacity = 0U;
+}
+
+static bool media_library_is_track_catalog_error(esp_err_t error)
+{
+    return error == ESP_ERR_INVALID_RESPONSE || error == ESP_ERR_INVALID_SIZE;
+}
+
+static esp_err_t media_library_validate_single_track(size_t index)
+{
+    MusicCatalogV2 single = {};
+    const esp_err_t ret = media_catalog_v2_build_from_index_records(
+        &g_entries[index], 1U, g_path_pool, g_path_size, &single);
+    media_catalog_v2_release(&single);
+    return ret;
+}
+
 static bool directory_stack_push(DirectoryStack *stack, const char *path, uint8_t depth)
 {
     if (stack == nullptr || path == nullptr) {
@@ -788,6 +837,22 @@ static esp_err_t media_library_scan_with_scratch(
     size_t existing_path_count = 0U;
     size_t added_count = 0U;
     size_t updated_count = 0U;
+    size_t issue_count = 0U;
+    size_t skipped_track_count = 0U;
+    char first_issue_file[96] = {};
+    char first_issue_reason[96] = {};
+    const auto record_scan_issue = [&](const char *path, const char *reason) {
+        issue_count++;
+        if (first_issue_file[0] == '\0') {
+            const char *name = path != nullptr ? strrchr(path, '/') : nullptr;
+            snprintf(first_issue_file, sizeof(first_issue_file), "%s",
+                name != nullptr ? name + 1 : (path != nullptr ? path : "未知文件"));
+            snprintf(first_issue_reason, sizeof(first_issue_reason), "%s",
+                reason != nullptr ? reason : "媒体文件异常，已自动降级处理");
+        }
+        ESP_LOGW(TAG, "曲库单曲异常：%s，%s",
+            path != nullptr ? path : "<unknown>", reason != nullptr ? reason : "未知原因");
+    };
     bool changes_notified = false;
     const auto notify_changes_detected = [&]() {
         if (!changes_notified && on_scan_event != nullptr) {
@@ -1283,6 +1348,7 @@ static esp_err_t media_library_scan_with_scratch(
                             log_slow_scan_stage("文件打开", full_path, open_started_us);
                             if (shared_file == nullptr) {
                                 ESP_LOGW(TAG, "建库无法打开音频文件，保留可复用信息/基础条目：%s", full_path);
+                                record_scan_issue(full_path, "音频文件无法打开，已保留基础条目");
                                 if (need_probe_scan) {
                                     technical = {};
                                     probe_failed_count++;
@@ -1301,13 +1367,31 @@ static esp_err_t media_library_scan_with_scratch(
                                     log_slow_scan_stage("技术探测", full_path, probe_started_us);
                                     if (probe_ret == ESP_OK) {
                                         probed_count++;
+                                        if (format == MediaFormat::MP3 &&
+                                            technical.sample_rate_hz != 44100U && technical.sample_rate_hz != 48000U) {
+                                            char reason[96] = {};
+                                            snprintf(reason, sizeof(reason), "MP3 %lu Hz 当前不可播放，歌曲仍保留在曲库",
+                                                static_cast<unsigned long>(technical.sample_rate_hz));
+                                            record_scan_issue(full_path, reason);
+                                        }
                                     } else {
                                         technical = {};
                                         probe_failed_count++;
+                                        if (probe_ret == ESP_ERR_NO_MEM) {
+                                            out_of_memory = true;
+                                        } else if (probe_ret == ESP_ERR_NOT_FOUND) {
+                                            record_scan_issue(full_path, "未找到连续有效 MPEG Header，已保留基础条目");
+                                        } else if (probe_ret == ESP_ERR_INVALID_SIZE) {
+                                            record_scan_issue(full_path, "ID3 Size 或文件长度异常，已保留基础条目");
+                                        } else if (probe_ret == ESP_ERR_INVALID_RESPONSE) {
+                                            record_scan_issue(full_path, "ID3/MPEG Header 结构异常，已保留基础条目");
+                                        } else {
+                                            record_scan_issue(full_path, "音频技术探测失败，已保留基础条目");
+                                        }
                                     }
                                 }
 
-                                if (need_metadata_scan) {
+                                if (!out_of_memory && need_metadata_scan) {
                                     metadata_build = static_cast<MediaMetadataBuildV2 *>(
                                         heap_caps_calloc(1, sizeof(MediaMetadataBuildV2), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
                                     if (metadata_build == nullptr) {
@@ -1348,8 +1432,35 @@ static esp_err_t media_library_scan_with_scratch(
                                             metadata_failed_count++;
                                             if (metadata_ret == ESP_ERR_NO_MEM) {
                                                 out_of_memory = true;
+                                            } else if (metadata_ret == ESP_ERR_INVALID_SIZE) {
+                                                record_scan_issue(full_path, "ID3 Size/Frame 范围异常，已回退文件名");
+                                            } else if (metadata_ret == ESP_ERR_INVALID_RESPONSE) {
+                                                record_scan_issue(full_path, "ID3v2 结构异常，已回退文件名");
+                                            } else {
+                                                record_scan_issue(full_path, "Metadata 解析失败，已回退文件名");
                                             }
                                         }
+                                    }
+                                }
+
+                                if (metadata_build != nullptr) {
+                                    const uint32_t track_pair = MEDIA_TRACK_META_HAS_TRACK_NUMBER_V2 | MEDIA_TRACK_META_HAS_TRACK_TOTAL_V2;
+                                    if ((metadata_build->metadata_flags & track_pair) == track_pair &&
+                                        metadata_build->track_number > metadata_build->track_total) {
+                                        metadata_build->track_total = 0U;
+                                        metadata_build->metadata_flags &= ~MEDIA_TRACK_META_HAS_TRACK_TOTAL_V2;
+                                        record_scan_issue(full_path, format == MediaFormat::MP3
+                                            ? "ID3 TRCK 曲目号/总数异常，已忽略总数"
+                                            : "曲目号/总数异常，已忽略总数");
+                                    }
+                                    const uint32_t disc_pair = MEDIA_TRACK_META_HAS_DISC_NUMBER_V2 | MEDIA_TRACK_META_HAS_DISC_TOTAL_V2;
+                                    if ((metadata_build->metadata_flags & disc_pair) == disc_pair &&
+                                        metadata_build->disc_number > metadata_build->disc_total) {
+                                        metadata_build->disc_total = 0U;
+                                        metadata_build->metadata_flags &= ~MEDIA_TRACK_META_HAS_DISC_TOTAL_V2;
+                                        record_scan_issue(full_path, format == MediaFormat::MP3
+                                            ? "ID3 TPOS 碟号/总数异常，已忽略总数"
+                                            : "碟号/总数异常，已忽略总数");
                                     }
                                 }
 
@@ -1375,6 +1486,8 @@ static esp_err_t media_library_scan_with_scratch(
                                             artwork_failed_count++;
                                             if (artwork_ret == ESP_ERR_NO_MEM) {
                                                 out_of_memory = true;
+                                            } else {
+                                                record_scan_issue(full_path, "APIC/PICTURE 封面解析失败，已按无封面处理");
                                             }
                                         }
                                     }
@@ -1448,6 +1561,7 @@ static esp_err_t media_library_scan_with_scratch(
                                 }
                                 break;
                             }
+                            record_scan_issue(full_path, "APIC/PICTURE 封面解析失败，已按无封面处理");
                         }
                     }
 
@@ -1587,7 +1701,7 @@ static esp_err_t media_library_scan_with_scratch(
     }
     media_library_sort_entries();
 
-    const size_t removed_count =
+    size_t removed_count =
         have_previous_v2 && previous_track_count > existing_path_count
         ? previous_track_count - existing_path_count
         : 0U;
@@ -1605,6 +1719,10 @@ static esp_err_t media_library_scan_with_scratch(
         out_changes->added_count = static_cast<uint32_t>(added_count);
         out_changes->removed_count = static_cast<uint32_t>(removed_count);
         out_changes->updated_count = static_cast<uint32_t>(updated_count);
+        out_changes->issue_count = static_cast<uint32_t>(issue_count);
+        out_changes->skipped_count = static_cast<uint32_t>(skipped_track_count);
+        snprintf(out_changes->first_issue_file, sizeof(out_changes->first_issue_file), "%s", first_issue_file);
+        snprintf(out_changes->first_issue_reason, sizeof(out_changes->first_issue_reason), "%s", first_issue_reason);
         out_changes->changed =
             have_previous_v2 &&
             (added_count > 0U || removed_count > 0U || updated_count > 0U);
@@ -1835,6 +1953,131 @@ static esp_err_t media_library_scan_with_scratch(
     esp_err_t catalog_ret = media_catalog_v2_build_from_index_records(
         g_entries, g_entry_count, g_path_pool, g_path_size, &next_catalog
     );
+
+    // 正常路径不增加额外 Catalog 构建。只有整库语义校验失败时才逐首定位，
+    // 并通过临时剥离可选数据判断是封面、歌词、Metadata 还是 technical 导致失败。
+    if (media_library_is_track_catalog_error(catalog_ret)) {
+        bool recovered_any_track = false;
+        size_t i = 0U;
+        while (i < g_entry_count) {
+            esp_err_t single_ret = media_library_validate_single_track(i);
+            if (single_ret == ESP_OK) {
+                i++;
+                continue;
+            }
+            if (!media_library_is_track_catalog_error(single_ret)) {
+                catalog_ret = single_ret;
+                break;
+            }
+
+            MediaEntry &entry = g_entries[i];
+            const char *path = g_path_pool + entry.path_offset;
+            bool repaired = false;
+
+            if (entry.artwork_build != nullptr) {
+                MediaArtworkBuildV2 *saved = entry.artwork_build;
+                entry.artwork_build = nullptr;
+                single_ret = media_library_validate_single_track(i);
+                entry.artwork_build = saved;
+                if (single_ret == ESP_OK) {
+                    media_library_drop_artwork(&entry);
+                    record_scan_issue(path, "Catalog 封面数据异常，已按无封面处理");
+                    repaired = true;
+                } else if (!media_library_is_track_catalog_error(single_ret)) {
+                    catalog_ret = single_ret;
+                    break;
+                }
+            }
+
+            if (!repaired && entry.metadata_build != nullptr && entry.metadata_build->lyrics_count > 0U) {
+                const uint16_t saved_count = entry.metadata_build->lyrics_count;
+                entry.metadata_build->lyrics_count = 0U;
+                single_ret = media_library_validate_single_track(i);
+                entry.metadata_build->lyrics_count = saved_count;
+                if (single_ret == ESP_OK) {
+                    media_library_drop_lyrics(entry.metadata_build);
+                    record_scan_issue(path, "Catalog USLT/SYLT 歌词数据异常，已忽略歌词");
+                    repaired = true;
+                } else if (!media_library_is_track_catalog_error(single_ret)) {
+                    catalog_ret = single_ret;
+                    break;
+                }
+            }
+
+            if (!repaired && entry.metadata_build != nullptr) {
+                MediaMetadataBuildV2 *saved = entry.metadata_build;
+                entry.metadata_build = nullptr;
+                single_ret = media_library_validate_single_track(i);
+                entry.metadata_build = saved;
+                if (single_ret == ESP_OK) {
+                    media_library_drop_metadata(&entry);
+                    record_scan_issue(path, "Catalog Metadata 异常，已回退文件名");
+                    repaired = true;
+                } else if (!media_library_is_track_catalog_error(single_ret)) {
+                    catalog_ret = single_ret;
+                    break;
+                }
+            }
+
+            if (!repaired) {
+                const MediaTechnicalInfo saved = entry.technical;
+                entry.technical = {};
+                single_ret = media_library_validate_single_track(i);
+                if (single_ret == ESP_OK) {
+                    record_scan_issue(path, "Catalog technical 数据异常，已清除技术信息");
+                    repaired = true;
+                } else {
+                    entry.technical = saved;
+                    if (!media_library_is_track_catalog_error(single_ret)) {
+                        catalog_ret = single_ret;
+                        break;
+                    }
+                }
+            }
+
+            if (repaired) {
+                recovered_any_track = true;
+                i++;
+                continue;
+            }
+
+            // 清空全部可选数据仍无效，说明这首记录本身无法进入 Catalog；只跳过该曲。
+            record_scan_issue(path, "单曲 Catalog 仍无效，本次已跳过");
+            skipped_track_count++;
+            recovered_any_track = true;
+            if (have_previous_v2) {
+                const TrackRowV2 *old_track = nullptr;
+                const MediaManifestRecordV2 *old_manifest = nullptr;
+                if (media_catalog_store_v2_find(&previous_v2, path, &old_track, &old_manifest) && old_track != nullptr) {
+                    const bool was_updated = old_manifest != nullptr &&
+                        (old_track->format != entry.format || old_manifest->format != entry.format ||
+                         old_manifest->file_size_bytes != entry.file_size_bytes ||
+                         old_manifest->modified_time != entry.modified_time);
+                    if (was_updated && updated_count > 0U) {
+                        updated_count--;
+                    }
+                    removed_count++;
+                    notify_changes_detected();
+                } else if (added_count > 0U) {
+                    added_count--;
+                }
+            }
+            media_library_drop_metadata(&entry);
+            media_library_drop_artwork(&entry);
+            if (i + 1U < g_entry_count) {
+                memmove(&g_entries[i], &g_entries[i + 1U],
+                    (g_entry_count - i - 1U) * sizeof(MediaEntry));
+            }
+            g_entry_count--;
+            g_entries[g_entry_count] = {};
+        }
+
+        if (media_library_is_track_catalog_error(catalog_ret) && recovered_any_track) {
+            media_catalog_v2_release(&next_catalog);
+            catalog_ret = media_catalog_v2_build_from_index_records(
+                g_entries, g_entry_count, g_path_pool, g_path_size, &next_catalog);
+        }
+    }
     const int64_t catalog_build_finished_us = esp_timer_get_time();
     if (catalog_ret != ESP_OK) {
         ESP_LOGE(TAG, "构建 MusicCatalogV2 失败：%s", esp_err_to_name(catalog_ret));

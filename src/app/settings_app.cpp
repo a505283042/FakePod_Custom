@@ -1072,7 +1072,7 @@ static void usb_library_scan_event(
 
 static void usb_runtime_overlay_show_library_summary(const MediaLibraryChangeSummary &changes)
 {
-    char status[160] = {};
+    char status[384] = {};
     size_t used = static_cast<size_t>(snprintf(status, sizeof(status), "音乐库已更新"));
     const auto append_count = [&](const char *label, uint32_t count) {
         if (count == 0U || used >= sizeof(status) - 1U) {
@@ -1102,6 +1102,19 @@ static void usb_runtime_overlay_show_library_summary(const MediaLibraryChangeSum
     append_count("新增", changes.added_count);
     append_count("删除", changes.removed_count);
     append_count("更新", changes.updated_count);
+    if (changes.issue_count > 0U && used < sizeof(status) - 1U) {
+        const int written = snprintf(
+            status + used,
+            sizeof(status) - used,
+            "\n发现 %lu 个问题%s\n%s\n%s",
+            static_cast<unsigned long>(changes.issue_count),
+            changes.skipped_count > 0U ? "（含跳过歌曲）" : "",
+            changes.first_issue_file[0] != '\0' ? changes.first_issue_file : "未知文件",
+            changes.first_issue_reason[0] != '\0' ? changes.first_issue_reason : "已自动降级处理");
+        if (written > 0 && static_cast<size_t>(written) < sizeof(status) - used) {
+            used += static_cast<size_t>(written);
+        }
+    }
     usb_runtime_overlay_set_status(status, 0xA9D6B4);
 }
 
@@ -1386,7 +1399,7 @@ static void usb_tf_runtime_return_task(void *)
             static_cast<unsigned long>(library_changes.added_count),
             static_cast<unsigned long>(library_changes.removed_count),
             static_cast<unsigned long>(library_changes.updated_count));
-        if (library_changes.changed) {
+        if (library_changes.changed || library_changes.issue_count > 0U) {
             usb_runtime_overlay_show_library_summary(library_changes);
             vTaskDelay(pdMS_TO_TICKS(800));
         }

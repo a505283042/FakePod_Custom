@@ -511,23 +511,22 @@ static void boot_state_update()
                     "首次建立音乐库完成：tracks=%lu",
                     static_cast<unsigned long>(changes.current_count)
                 );
-                if (ui_manager_show_library_build_complete(changes.current_count)) {
+                if (ui_manager_show_library_build_complete(changes)) {
                     vTaskDelay(pdMS_TO_TICKS(900));
                 }
-            } else if (changes.changed) {
+            } else if (changes.changed || changes.issue_count > 0U) {
                 ESP_LOGI(
                     TAG,
-                    "启动曲库增量更新：tracks=%lu->%lu 新增=%lu 删除=%lu 更新=%lu",
+                    "启动曲库增量更新：tracks=%lu->%lu 新增=%lu 删除=%lu 更新=%lu 问题=%lu 跳过=%lu",
                     static_cast<unsigned long>(changes.previous_count),
                     static_cast<unsigned long>(changes.current_count),
                     static_cast<unsigned long>(changes.added_count),
                     static_cast<unsigned long>(changes.removed_count),
-                    static_cast<unsigned long>(changes.updated_count)
+                    static_cast<unsigned long>(changes.updated_count),
+                    static_cast<unsigned long>(changes.issue_count),
+                    static_cast<unsigned long>(changes.skipped_count)
                 );
-                if (ui_manager_show_library_update_complete(
-                        changes.added_count,
-                        changes.removed_count,
-                        changes.updated_count)) {
+                if (ui_manager_show_library_update_complete(changes)) {
                     // LVGL 刷新任务独立运行；只在真实曲库变化时短暂保留结果提示。
                     vTaskDelay(pdMS_TO_TICKS(900));
                 }

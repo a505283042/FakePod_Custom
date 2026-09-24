@@ -13,6 +13,11 @@ struct MediaLibraryChangeSummary
     uint32_t added_count = 0U;
     uint32_t removed_count = 0U;
     uint32_t updated_count = 0U;
+    uint32_t issue_count = 0U;
+    uint32_t skipped_count = 0U;
+    // 只保留首个问题用于启动页提示；完整路径与后续问题仍写入串口日志。
+    char first_issue_file[96] = {};
+    char first_issue_reason[96] = {};
     bool had_previous_catalog = false;
     bool changed = false;
 };
