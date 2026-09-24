@@ -270,7 +270,7 @@ static uint16_t detail_row_count_for_page(SettingsPage page)
         case SettingsPage::Applications: return 5U;
         case SettingsPage::MusicPlayer: return 3U;
         case SettingsPage::ElectronicFlow: return 1U;
-        case SettingsPage::System: return 5U;
+        case SettingsPage::System: return 6U;
         case SettingsPage::About: return 5U;
         case SettingsPage::Main:
         default:
@@ -895,6 +895,35 @@ static void aux_key_mode_click_cb(lv_event_t *event)
         return;
     }
     ESP_LOGI(TAG, "辅助键模式切换：%s", device_settings_aux_key_mode_name(next));
+    g_pending_page = SettingsPage::System;
+    lv_async_call(show_page_async, nullptr);
+}
+
+static DeviceUiFont next_ui_font(DeviceUiFont current)
+{
+    switch (current) {
+        case DeviceUiFont::CustomExt24: return DeviceUiFont::SyhtExt24;
+        case DeviceUiFont::SyhtExt24: return DeviceUiFont::SyhtBoldExt24;
+        case DeviceUiFont::SyhtBoldExt24: return DeviceUiFont::SystBoldExt24;
+        case DeviceUiFont::SystBoldExt24:
+        default:
+            return DeviceUiFont::CustomExt24;
+    }
+}
+
+static void ui_font_click_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event) || g_page != SettingsPage::System) return;
+    DeviceSettingsSnapshot settings = {};
+    if (!device_settings_get_snapshot(&settings)) return;
+
+    const DeviceUiFont next = next_ui_font(settings.ui_font);
+    const esp_err_t ret = device_settings_set_ui_font(next);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "保存界面字体失败：%s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "界面字体已选择：%s；重启后生效", device_settings_ui_font_name(next));
     g_pending_page = SettingsPage::System;
     lv_async_call(show_page_async, nullptr);
 }
@@ -1956,6 +1985,12 @@ static void create_system_page(const DeviceSettingsSnapshot &settings)
         device_settings_aux_key_mode_name(settings.aux_key_mode),
         SettingsDetailIcon::AuxKey,
         aux_key_mode_click_cb);
+    add_clickable_detail_row(
+        5,
+        "界面字体(重启)",
+        device_settings_ui_font_name(settings.ui_font),
+        SettingsDetailIcon::None,
+        ui_font_click_cb);
 }
 
 static void create_about_page()

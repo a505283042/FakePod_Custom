@@ -1155,6 +1155,25 @@ static void ui_manager_apply_library_update_progress_locked(uint32_t added_count
     lv_obj_invalidate(g_boot_root);
 }
 
+static void ui_manager_font_cache_write_started()
+{
+    if (!lvgl_port_lock(1000)) {
+        return;
+    }
+    if (g_boot_status != nullptr && g_boot_root != nullptr) {
+        lv_label_set_text(g_boot_status, "Caching UI font...\nDo not power off");
+        // 主字体此时尚未就绪，使用固件内置服务字体；英文字符由其 LVGL fallback 显示。
+        lv_obj_set_style_text_font(g_boot_status, usb_service_font_get(), 0);
+        lv_obj_set_style_text_color(g_boot_status, lv_color_hex(0xC7D5E8), 0);
+        lv_obj_set_style_text_align(g_boot_status, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_line_space(g_boot_status, 6, 0);
+        lv_obj_set_width(g_boot_status, 410);
+        lv_obj_align(g_boot_status, LV_ALIGN_CENTER, 0, 18);
+        lv_obj_invalidate(g_boot_root);
+    }
+    lvgl_port_unlock();
+}
+
 static void ui_manager_boot_library_progress_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
@@ -1408,12 +1427,12 @@ esp_err_t ui_manager_init()
     // 尤其首次建立 Flash 缓存可能包含擦除/写入，放在锁外可避免启动页冻结和显示任务饥饿。
     const int64_t font_started_us = esp_timer_get_time();
     if (sdcard_is_mounted()) {
-        const esp_err_t font_ret = font_manager_init();
+        const esp_err_t font_ret = font_manager_init(ui_manager_font_cache_write_started);
         if (font_ret != ESP_OK) {
-            ESP_LOGW(TAG, "原厂中文字体初始化失败，将使用 LVGL 默认字体：%s", esp_err_to_name(font_ret));
+            ESP_LOGW(TAG, "界面字体初始化失败，将使用 LVGL 默认字体：%s", esp_err_to_name(font_ret));
         }
     } else {
-        UI_BOOT_LOGI("TF 卡不可用，跳过中文字体加载并使用 LVGL 默认字体");
+        UI_BOOT_LOGI("TF 卡不可用，跳过界面字体加载并使用 LVGL 默认字体");
     }
     ui_font_ms = static_cast<uint32_t>((esp_timer_get_time() - font_started_us) / 1000);
 

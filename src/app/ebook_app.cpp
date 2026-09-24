@@ -126,6 +126,7 @@ static EbookPage g_page = EbookPage::Browser;
 static char *g_current_dir = nullptr; // PSRAM
 static char *g_scratch_path = nullptr; // PSRAM
 static char *g_book_path = nullptr; // PSRAM
+static TextEncoding::Encoding g_book_encoding = TextEncoding::Encoding::Utf8;
 static EbookReader::DirectorySnapshot g_directory = {};
 
 enum class BrowserLoadPhase : uint8_t
@@ -635,6 +636,7 @@ static void ebook_reset_reader_session()
     g_bookmark_offset = 0;
     g_reader_overlay_visible = false;
     g_reader_view_mode = ReaderViewMode::Labeled;
+    g_book_encoding = TextEncoding::Encoding::Utf8;
     if (g_book_path != nullptr) g_book_path[0] = '\0';
 }
 
@@ -871,7 +873,7 @@ static esp_err_t ebook_load_page_for_mode(
         return ESP_ERR_INVALID_STATE;
     }
     const EbookReader::PageLayout layout = ebook_reader_page_layout_for_mode(mode);
-    return EbookReader::load_text_page(g_book_path, offset, layout, out_page);
+    return EbookReader::load_text_page(g_book_path, offset, g_book_encoding, layout, out_page);
 }
 
 static bool ebook_find_anchor_in_known_index(
@@ -1066,7 +1068,7 @@ static void ebook_page_index_shadow_tick()
         }
 
         EbookReader::PageScanSession scan = {};
-        const esp_err_t begin_ret = EbookReader::begin_page_scan(g_book_path, &scan);
+        const esp_err_t begin_ret = EbookReader::begin_page_scan(g_book_path, g_book_encoding, &scan);
         if (begin_ret != ESP_OK) {
             ebook_shadow_warmup_fail(begin_ret);
             return;
@@ -1334,7 +1336,7 @@ static esp_err_t ebook_start_page_index_builder(
     }
 
     EbookReader::PageScanSession scan = {};
-    const esp_err_t ret = EbookReader::begin_page_scan(g_book_path, &scan);
+    const esp_err_t ret = EbookReader::begin_page_scan(g_book_path, g_book_encoding, &scan);
     if (ret != ESP_OK) return ret;
 
     g_page_index_builder = {};
@@ -1442,9 +1444,9 @@ static const char *ebook_error_message(esp_err_t err)
         case ESP_ERR_NO_MEM:
             return "内存不足\n无法打开Reader";
         case ESP_ERR_NOT_SUPPORTED:
-            return "暂不支持该TXT编码\nV1仅支持UTF-8";
+            return "暂不支持该TXT编码\n支持 UTF-8 / UTF-16(BOM) / GBK";
         case ESP_ERR_INVALID_RESPONSE:
-            return "TXT不是有效UTF-8文本";
+            return "TXT编码内容损坏";
         case ESP_ERR_INVALID_SIZE:
             return "TXT为空或大小异常";
         default:
@@ -1492,6 +1494,22 @@ static void ebook_row_clicked_cb(lv_event_t *event)
 
     ebook_reset_reader_session();
     snprintf(g_book_path, EbookReader::kPathBytes, "%s", g_scratch_path);
+    g_book_size = entry->size_bytes;
+
+    const esp_err_t encoding_ret = EbookReader::detect_text_encoding(g_book_path, &g_book_encoding);
+    if (encoding_ret != ESP_OK) {
+        ESP_LOGW(TAG, "TXT编码识别失败：path=%s ret=%s",
+            g_book_path, esp_err_to_name(encoding_ret));
+        if (g_reader_text != nullptr) lv_label_set_text(g_reader_text, ebook_error_message(encoding_ret));
+        g_page_start = 0;
+        g_page_next = 0;
+        g_page_at_end = true;
+        ebook_show_reader();
+        ebook_update_reader_controls();
+        return;
+    }
+    ESP_LOGI(TAG, "TXT编码识别：%s encoding=%s", entry_name,
+        TextEncoding::encoding_name(g_book_encoding));
 
     uint64_t initial_offset = 0;
     bool bookmark_found = false;
@@ -1505,7 +1523,6 @@ static void ebook_row_clicked_cb(lv_event_t *event)
     g_bookmark_valid = bookmark_found;
     g_bookmark_offset = bookmark_found ? initial_offset : 0;
 
-    g_book_size = entry->size_bytes;
     // 前台只同步恢复默认 Labeled cache；Fullscreen cache 由 Shadow Index 在用户空闲后恢复，
     // 避免打开 TXT 的关键路径同步读取两套索引，同时让第一次切全屏也尽量命中预热结果。
     ebook_restore_page_index_cache(ReaderViewMode::Labeled);
@@ -1890,7 +1907,7 @@ static void ebook_browser_load_tick()
         if (g_directory.count == 0) {
             g_browser_load = {};
             ebook_browser_show_status(
-                "这里还没有TXT文件\n支持子文件夹和 UTF-8 .txt",
+                "这里还没有TXT文件\n支持 UTF-8 / UTF-16(BOM) / GBK .txt",
                 0x8490A0);
             ebook_update_header();
             ESP_LOGI(TAG,

@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "text_encoding.h"
 
 namespace EbookReader
 {
@@ -81,8 +82,11 @@ struct PageScanSession
 {
     void *file = nullptr; // implementation-owned FILE*
     uint8_t *raw = nullptr; // PSRAM, kPageReadBytes
+    uint8_t *decoded = nullptr; // 非 UTF-8 时使用，PSRAM UTF-8 window
+    uint16_t *source_map = nullptr; // 非 UTF-8 时使用，UTF-8 byte boundary -> 源文件相对 offset
     char *page_text = nullptr; // PSRAM, parser scratch
     uint64_t file_size = 0;
+    TextEncoding::Encoding encoding = TextEncoding::Encoding::Utf8;
 };
 
 struct PageScanResult
@@ -115,13 +119,17 @@ bool directory_entry_is_directory(const DirectoryEntryIndex *entry);
 // 从稳定文件字节偏移读取单页。每页只读一个小窗口，并按实际字体像素宽度/可见行数切页。
 // 小说重排采用保守策略：短对白/诗句/效果字保留原换行，高置信度网页机械折行软合并，明确网站广告仅隐藏显示。
 // 连续多个物理空行折叠为最多一行空行；所有显示变换仍精确消费原 TXT 字节，next_offset 永远保持源文件 offset。
-// offset=0 时识别 UTF-8 BOM，UTF-16/非法 UTF-8 拒绝。
+// Reader 始终输出 UTF-8；分页 offset 保持为原始 TXT 文件字节 offset。
+// 支持 UTF-8/UTF-8 BOM、带 BOM 的 UTF-16LE/BE 与 GBK/CP936。
+esp_err_t detect_text_encoding(const char *path, TextEncoding::Encoding *out_encoding);
 esp_err_t load_text_page(
-    const char *path, uint64_t offset, const PageLayout &layout, TextPage *out_page);
+    const char *path, uint64_t offset, TextEncoding::Encoding encoding,
+    const PageLayout &layout, TextPage *out_page);
 
 // 长书索引扫描专用：一次打开文件并复用 PSRAM scratch。scan_page 每次仍按 1KB 分块
 // 获取 StorageSdLockGuard，并与 load_text_page 共享完全相同的分页 parser。
-esp_err_t begin_page_scan(const char *path, PageScanSession *session);
+esp_err_t begin_page_scan(
+    const char *path, TextEncoding::Encoding encoding, PageScanSession *session);
 esp_err_t scan_page(
     PageScanSession *session, uint64_t offset, const PageLayout &layout, PageScanResult *out_result);
 void end_page_scan(PageScanSession *session);

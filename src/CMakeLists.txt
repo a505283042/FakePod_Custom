@@ -32,6 +32,8 @@ idf_component_register(
         "system/gpio0_service.cpp"
         "system/screen_lock_simple.cpp"
 
+        "text/text_encoding.cpp"
+
         "drivers/i2c/i2c_bus.cpp"
 
         "drivers/touch/cst820.cpp"
@@ -109,6 +111,8 @@ idf_component_register(
         "app"
 
         "system"
+
+        "text"
 
         "drivers/i2c"
 

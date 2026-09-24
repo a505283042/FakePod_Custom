@@ -17,6 +17,7 @@
 #include "flac_decoder.h"
 #include "media_catalog_v2.h"
 #include "storage_io.h"
+#include "text_encoding.h"
 
 namespace {
 
@@ -209,49 +210,6 @@ static bool lyrics_copy_external_lrc_path(uint32_t track_index, uint32_t generat
         return true;
     }
     return false;
-}
-
-static bool lyrics_utf8_validate(const uint8_t *data, size_t size)
-{
-    if (data == nullptr) {
-        return false;
-    }
-    size_t i = 0U;
-    while (i < size) {
-        const uint8_t c = data[i];
-        if (c < 0x80U) {
-            ++i;
-            continue;
-        }
-        size_t need = 0U;
-        uint32_t minimum = 0U;
-        uint32_t codepoint = 0U;
-        if ((c & 0xE0U) == 0xC0U) {
-            need = 1U; minimum = 0x80U; codepoint = c & 0x1FU;
-        } else if ((c & 0xF0U) == 0xE0U) {
-            need = 2U; minimum = 0x800U; codepoint = c & 0x0FU;
-        } else if ((c & 0xF8U) == 0xF0U) {
-            need = 3U; minimum = 0x10000U; codepoint = c & 0x07U;
-        } else {
-            return false;
-        }
-        if (i + need >= size) {
-            return false;
-        }
-        for (size_t n = 0U; n < need; ++n) {
-            const uint8_t next = data[i + n + 1U];
-            if ((next & 0xC0U) != 0x80U) {
-                return false;
-            }
-            codepoint = (codepoint << 6U) | (next & 0x3FU);
-        }
-        if (codepoint < minimum || codepoint > 0x10FFFFU ||
-            (codepoint >= 0xD800U && codepoint <= 0xDFFFU)) {
-            return false;
-        }
-        i += need + 1U;
-    }
-    return true;
 }
 
 static esp_err_t lyrics_read_file(
@@ -523,31 +481,143 @@ static int lyrics_line_compare(const void *left, const void *right)
     return 0;
 }
 
-static esp_err_t lyrics_parse_lrc(char *data, size_t size, LyricsDocument *out_document)
+static bool lyrics_decode_html_entity(
+    const char *begin, const char *end, uint32_t *out_codepoint, size_t *out_source_bytes)
+{
+    if (begin == nullptr || end == nullptr || begin >= end || *begin != '&' ||
+        out_codepoint == nullptr || out_source_bytes == nullptr) {
+        return false;
+    }
+
+    const size_t available = static_cast<size_t>(end - begin);
+    struct NamedEntity { const char *text; size_t size; uint32_t codepoint; };
+    static constexpr NamedEntity kNamed[] = {
+        {"&amp;", 5U, '&'}, {"&lt;", 4U, '<'}, {"&gt;", 4U, '>'},
+        {"&quot;", 6U, '"'}, {"&apos;", 6U, '\''}, {"&nbsp;", 6U, 0x00A0U},
+    };
+    for (const NamedEntity &entity : kNamed) {
+        if (available >= entity.size && memcmp(begin, entity.text, entity.size) == 0) {
+            *out_codepoint = entity.codepoint;
+            *out_source_bytes = entity.size;
+            return true;
+        }
+    }
+
+    if (available < 4U || begin[1] != '#') {
+        return false;
+    }
+    size_t index = 2U;
+    uint32_t base = 10U;
+    if (index < available && (begin[index] == 'x' || begin[index] == 'X')) {
+        base = 16U;
+        ++index;
+    }
+    const size_t digit_begin = index;
+    uint32_t codepoint = 0U;
+    for (; index < available && index < 12U; ++index) {
+        const unsigned char ch = static_cast<unsigned char>(begin[index]);
+        if (ch == ';') {
+            if (index == digit_begin || codepoint == 0U || codepoint > 0x10FFFFU ||
+                (codepoint >= 0xD800U && codepoint <= 0xDFFFU)) {
+                return false;
+            }
+            *out_codepoint = codepoint;
+            *out_source_bytes = index + 1U;
+            return true;
+        }
+        uint32_t digit = UINT32_MAX;
+        if (ch >= '0' && ch <= '9') digit = static_cast<uint32_t>(ch - '0');
+        else if (base == 16U && ch >= 'a' && ch <= 'f') digit = static_cast<uint32_t>(ch - 'a') + 10U;
+        else if (base == 16U && ch >= 'A' && ch <= 'F') digit = static_cast<uint32_t>(ch - 'A') + 10U;
+        if (digit == UINT32_MAX || codepoint > (0x10FFFFU - digit) / base) {
+            return false;
+        }
+        codepoint = codepoint * base + digit;
+    }
+    return false;
+}
+
+static esp_err_t lyrics_append_normalized_text(
+    const char *begin,
+    const char *end,
+    char *text_pool,
+    size_t text_capacity,
+    uint32_t *io_text_used,
+    uint32_t *out_text_off)
+{
+    if (begin == nullptr || end == nullptr || begin > end || text_pool == nullptr ||
+        io_text_used == nullptr || out_text_off == nullptr || *io_text_used >= text_capacity) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const uint32_t text_off = *io_text_used;
+    size_t write = text_off;
+    size_t cursor = 0U;
+    const size_t size = static_cast<size_t>(end - begin);
+    bool has_text = false;
+
+    while (cursor < size) {
+        uint32_t codepoint = 0U;
+        size_t source_bytes = 0U;
+        if (!lyrics_decode_html_entity(
+                begin + cursor, end, &codepoint, &source_bytes)) {
+            const TextEncoding::DecodeResult decoded = TextEncoding::decode_one(
+                TextEncoding::Encoding::Utf8,
+                reinterpret_cast<const uint8_t *>(begin),
+                size,
+                cursor,
+                &codepoint,
+                &source_bytes);
+            if (decoded != TextEncoding::DecodeResult::Ok || source_bytes == 0U) {
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+        }
+        cursor += source_bytes;
+
+        codepoint = TextEncoding::normalize_plain_text_codepoint(codepoint);
+        if (codepoint == 0U) {
+            continue;
+        }
+        if (!has_text && (codepoint == ' ' || codepoint == '\t')) {
+            continue;
+        }
+
+        char utf8[4] = {};
+        const size_t utf8_bytes = TextEncoding::encode_utf8(codepoint, utf8);
+        if (utf8_bytes == 0U || write + utf8_bytes + 1U > text_capacity) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        memcpy(text_pool + write, utf8, utf8_bytes);
+        write += utf8_bytes;
+        if (codepoint != ' ' && codepoint != '\t') {
+            has_text = true;
+        }
+    }
+
+    while (write > text_off && (text_pool[write - 1U] == ' ' || text_pool[write - 1U] == '\t')) {
+        --write;
+    }
+    text_pool[write] = '\0';
+    *out_text_off = text_off;
+    *io_text_used = static_cast<uint32_t>(write + 1U);
+    return ESP_OK;
+}
+
+static esp_err_t lyrics_parse_utf8_lrc(
+    const char *data, size_t size, LyricsDocument *out_document)
 {
     if (data == nullptr || size == 0U || out_document == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(data);
-    size_t utf8_offset = 0U;
-    if (size >= 3U && bytes[0] == 0xEFU && bytes[1] == 0xBBU && bytes[2] == 0xBFU) {
-        utf8_offset = 3U;
-    } else if (size >= 2U && ((bytes[0] == 0xFFU && bytes[1] == 0xFEU) ||
-                              (bytes[0] == 0xFEU && bytes[1] == 0xFFU))) {
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-    if (!lyrics_utf8_validate(bytes + utf8_offset, size - utf8_offset)) {
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-
     int32_t global_offset_ms = 0;
-    const size_t timestamp_count = lyrics_count_timestamps(data + utf8_offset, size - utf8_offset, &global_offset_ms);
+    const size_t timestamp_count = lyrics_count_timestamps(data, size, &global_offset_ms);
     if (timestamp_count == 0U || timestamp_count > UINT32_MAX) {
         return ESP_ERR_NOT_FOUND;
     }
 
-    LyricsLineRow *rows = static_cast<LyricsLineRow *>(lyrics_psram_alloc(timestamp_count * sizeof(LyricsLineRow)));
+    LyricsLineRow *rows = static_cast<LyricsLineRow *>(lyrics_psram_alloc(
+        timestamp_count * sizeof(LyricsLineRow)));
     char *text_pool = static_cast<char *>(lyrics_psram_alloc(size + 4U));
     if (rows == nullptr || text_pool == nullptr) {
         heap_caps_free(rows);
@@ -559,7 +629,7 @@ static esp_err_t lyrics_parse_lrc(char *data, size_t size, LyricsDocument *out_d
     uint32_t text_used = 1U;
     uint32_t row_used = 0U;
 
-    const char *p = data + utf8_offset;
+    const char *p = data;
     const char *end = data + size;
     while (p < end && row_used < timestamp_count) {
         const char *line_end = lyrics_line_end(p, end);
@@ -568,7 +638,8 @@ static esp_err_t lyrics_parse_lrc(char *data, size_t size, LyricsDocument *out_d
         size_t timestamp_used = 0U;
 
         while (cursor < line_end && *cursor == '[') {
-            const char *close = static_cast<const char *>(memchr(cursor + 1, ']', static_cast<size_t>(line_end - cursor - 1)));
+            const char *close = static_cast<const char *>(memchr(
+                cursor + 1, ']', static_cast<size_t>(line_end - cursor - 1)));
             if (close == nullptr) {
                 break;
             }
@@ -589,23 +660,23 @@ static esp_err_t lyrics_parse_lrc(char *data, size_t size, LyricsDocument *out_d
             while (text_end > cursor && (text_end[-1] == ' ' || text_end[-1] == '\t')) {
                 --text_end;
             }
-            const size_t text_len = static_cast<size_t>(text_end - cursor);
-            if (text_used + text_len + 1U <= size + 4U) {
-                const uint32_t text_off = text_used;
-                if (text_len > 0U) {
-                    memcpy(text_pool + text_used, cursor, text_len);
-                }
-                text_pool[text_used + text_len] = '\0';
-                text_used += static_cast<uint32_t>(text_len + 1U);
 
-                for (size_t i = 0U; i < timestamp_used && row_used < timestamp_count; ++i) {
-                    int64_t adjusted = static_cast<int64_t>(timestamps[i]) + global_offset_ms;
-                    if (adjusted < 0) adjusted = 0;
-                    if (adjusted > UINT32_MAX) adjusted = UINT32_MAX;
-                    rows[row_used].time_ms = static_cast<uint32_t>(adjusted);
-                    rows[row_used].text_off = text_off;
-                    ++row_used;
-                }
+            uint32_t text_off = 0U;
+            const esp_err_t normalize_ret = lyrics_append_normalized_text(
+                cursor, text_end, text_pool, size + 4U, &text_used, &text_off);
+            if (normalize_ret != ESP_OK) {
+                heap_caps_free(rows);
+                heap_caps_free(text_pool);
+                return normalize_ret;
+            }
+
+            for (size_t i = 0U; i < timestamp_used && row_used < timestamp_count; ++i) {
+                int64_t adjusted = static_cast<int64_t>(timestamps[i]) + global_offset_ms;
+                if (adjusted < 0) adjusted = 0;
+                if (adjusted > UINT32_MAX) adjusted = UINT32_MAX;
+                rows[row_used].time_ms = static_cast<uint32_t>(adjusted);
+                rows[row_used].text_off = text_off;
+                ++row_used;
             }
         }
         p = lyrics_next_line(line_end, end);
@@ -634,6 +705,40 @@ static esp_err_t lyrics_parse_lrc(char *data, size_t size, LyricsDocument *out_d
     out_document->text_pool = text_pool;
     out_document->text_pool_size = text_used;
     return ESP_OK;
+}
+
+static esp_err_t lyrics_parse_lrc(char *data, size_t size, LyricsDocument *out_document)
+{
+    if (data == nullptr || size == 0U || out_document == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    TextEncoding::Detection detected = {};
+    esp_err_t ret = TextEncoding::detect(
+        reinterpret_cast<const uint8_t *>(data), size, &detected);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    if (detected.encoding == TextEncoding::Encoding::Utf8) {
+        return lyrics_parse_utf8_lrc(
+            data + detected.bom_bytes, size - detected.bom_bytes, out_document);
+    }
+
+    char *utf8 = nullptr;
+    size_t utf8_size = 0U;
+    ret = TextEncoding::convert_to_utf8(
+        reinterpret_cast<const uint8_t *>(data), size, &utf8, &utf8_size, nullptr);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "LRC编码转换：%s -> UTF-8，source=%uB utf8=%uB",
+        TextEncoding::encoding_name(detected.encoding),
+        static_cast<unsigned>(size), static_cast<unsigned>(utf8_size));
+    ret = lyrics_parse_utf8_lrc(utf8, utf8_size, out_document);
+    heap_caps_free(utf8);
+    return ret;
 }
 
 static const char *lyrics_document_text(const LyricsDocument &document, uint32_t offset)
@@ -683,7 +788,7 @@ static void lyrics_task(void *arg)
         ret = lyrics_parse_lrc(file_data, file_size, &parsed);
         heap_caps_free(file_data);
         if (ret == ESP_ERR_NOT_SUPPORTED) {
-            ESP_LOGW(TAG, "LRC 编码暂不支持：track=%lu；仅支持 UTF-8/UTF-8 BOM",
+            ESP_LOGW(TAG, "LRC 编码暂不支持：track=%lu；支持 UTF-8/UTF-16(BOM)/GBK",
                 static_cast<unsigned long>(request.track_index));
             lyrics_publish_state(request, LyricsLoadState::Unsupported, ret, nullptr);
             continue;
@@ -757,7 +862,7 @@ esp_err_t lyrics_service_start()
     g_ready = true;
 #if APP_DIAG_BOOT_VERBOSE
     ESP_LOGI(TAG,
-        "LyricsTask 已启动：core=%d priority=%u stack=%uB chunk=%uB FLAC安全水位=%u%%，格式=External UTF-8 LRC",
+        "LyricsTask 已启动：core=%d priority=%u stack=%uB chunk=%uB FLAC安全水位=%u%%，External LRC=UTF-8/UTF-16(BOM)/GBK",
         static_cast<int>(LYRICS_TASK_CORE),
         static_cast<unsigned>(LYRICS_TASK_PRIORITY),
         static_cast<unsigned>(LYRICS_TASK_STACK),
@@ -890,9 +995,6 @@ bool lyrics_service_get_window(uint32_t track_index, uint64_t position_ms, Lyric
         dest.current = line_index == current;
         dest.time_ms = source.time_ms;
         const char *text = lyrics_document_text(g_document, source.text_off);
-        if (text[0] == '\0') {
-            text = "♪";
-        }
         snprintf(dest.text, sizeof(dest.text), "%s", text);
     }
 

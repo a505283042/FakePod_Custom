@@ -20,6 +20,9 @@ namespace
 
 static constexpr TickType_t kStorageLockTimeout = pdMS_TO_TICKS(30);
 static constexpr size_t kReadChunkBytes = 1024;
+static constexpr size_t kEncodingProbeBytes = 16U * 1024U;
+static constexpr size_t kDecodedPageBytes = kPageReadBytes * 3U / 2U + 8U;
+static constexpr size_t kDecodedSourceMapEntries = kDecodedPageBytes + 1U;
 
 static bool name_is_hidden(const char *name)
 {
@@ -415,7 +418,8 @@ static LineMetrics line_metrics(const uint8_t *data, const PhysicalLine &line)
             return metrics;
         }
         cursor += bytes;
-        if (cp == '\t' || cp == ' ' || cp == 0x3000U) continue;
+        cp = TextEncoding::normalize_plain_text_codepoint(cp);
+        if (cp == 0U || cp == '\t' || cp == ' ') continue;
         if (metrics.first == 0) metrics.first = cp;
         ++metrics.codepoints;
         if (semantic_count < 4) {
@@ -824,29 +828,54 @@ static esp_err_t read_page_window(
     FILE *file,
     uint64_t file_size,
     uint64_t offset,
+    TextEncoding::Encoding encoding,
     uint8_t *raw,
     size_t *out_loaded,
-    uint8_t *out_previous_source_byte,
-    bool *out_have_previous_source_byte)
+    bool *out_line_started_midway)
 {
     if (file == nullptr || raw == nullptr || out_loaded == nullptr ||
-        out_previous_source_byte == nullptr || out_have_previous_source_byte == nullptr ||
-        offset >= file_size || offset > static_cast<uint64_t>(LONG_MAX)) {
+        out_line_started_midway == nullptr || offset >= file_size ||
+        offset > static_cast<uint64_t>(LONG_MAX)) {
         return ESP_ERR_INVALID_ARG;
+    }
+    if ((encoding == TextEncoding::Encoding::Utf16Le ||
+            encoding == TextEncoding::Encoding::Utf16Be) &&
+        (offset & 1ULL) != 0ULL) {
+        return ESP_ERR_INVALID_RESPONSE;
     }
 
     *out_loaded = 0;
-    *out_previous_source_byte = 0;
-    *out_have_previous_source_byte = false;
+    *out_line_started_midway = offset > 0;
 
     {
         StorageSdLockGuard guard(kStorageLockTimeout);
         if (!guard) return ESP_ERR_TIMEOUT;
         clearerr(file);
+
         if (offset > 0) {
-            if (fseek(file, static_cast<long>(offset - 1U), SEEK_SET) == 0 &&
-                fread(out_previous_source_byte, 1, 1, file) == 1) {
-                *out_have_previous_source_byte = true;
+            if (encoding == TextEncoding::Encoding::Utf16Le ||
+                encoding == TextEncoding::Encoding::Utf16Be) {
+                if (offset >= 2U && offset - 2U <= static_cast<uint64_t>(LONG_MAX) &&
+                    fseek(file, static_cast<long>(offset - 2U), SEEK_SET) == 0) {
+                    uint8_t previous[2] = {};
+                    if (fread(previous, 1U, sizeof(previous), file) == sizeof(previous)) {
+                        const bool little = encoding == TextEncoding::Encoding::Utf16Le;
+                        const uint16_t value = little
+                            ? static_cast<uint16_t>(previous[0] |
+                                (static_cast<uint16_t>(previous[1]) << 8U))
+                            : static_cast<uint16_t>(
+                                (static_cast<uint16_t>(previous[0]) << 8U) | previous[1]);
+                        *out_line_started_midway = value != '\r' && value != '\n';
+                    }
+                }
+            } else {
+                if (fseek(file, static_cast<long>(offset - 1U), SEEK_SET) == 0) {
+                    uint8_t previous = 0U;
+                    if (fread(&previous, 1U, 1U, file) == 1U) {
+                        // UTF-8 与 GBK 的换行都是单字节 ASCII；GBK trail 不会落到 CR/LF。
+                        *out_line_started_midway = previous != '\r' && previous != '\n';
+                    }
+                }
             }
             clearerr(file);
         }
@@ -877,14 +906,85 @@ static esp_err_t read_page_window(
     return *out_loaded > 0 ? ESP_OK : ESP_FAIL;
 }
 
+static esp_err_t transcode_page_window(
+    const uint8_t *raw,
+    size_t loaded,
+    uint64_t offset,
+    uint64_t file_size,
+    TextEncoding::Encoding encoding,
+    uint8_t *decoded,
+    size_t decoded_capacity,
+    uint16_t *source_map,
+    size_t source_map_entries,
+    size_t *out_decoded_size)
+{
+    if (raw == nullptr || loaded == 0U || decoded == nullptr || source_map == nullptr ||
+        out_decoded_size == nullptr || decoded_capacity == 0U || source_map_entries == 0U ||
+        encoding == TextEncoding::Encoding::Utf8) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t source = 0U;
+    if (offset == 0U &&
+        (encoding == TextEncoding::Encoding::Utf16Le ||
+         encoding == TextEncoding::Encoding::Utf16Be)) {
+        if (loaded < 2U) return ESP_ERR_INVALID_SIZE;
+        const bool expected_bom = encoding == TextEncoding::Encoding::Utf16Le
+            ? (raw[0] == 0xFFU && raw[1] == 0xFEU)
+            : (raw[0] == 0xFEU && raw[1] == 0xFFU);
+        if (!expected_bom) return ESP_ERR_INVALID_RESPONSE;
+        source = 2U;
+    }
+
+    size_t write = 0U;
+    source_map[0] = static_cast<uint16_t>(source);
+    while (source < loaded) {
+        uint32_t codepoint = 0U;
+        size_t source_bytes = 0U;
+        const TextEncoding::DecodeResult decode = TextEncoding::decode_one(
+            encoding, raw, loaded, source, &codepoint, &source_bytes);
+        if (decode == TextEncoding::DecodeResult::Incomplete) {
+            if (offset + loaded >= file_size) {
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+            break;
+        }
+        if (decode != TextEncoding::DecodeResult::Ok || source_bytes == 0U) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+
+        char utf8[4] = {};
+        const size_t utf8_bytes = TextEncoding::encode_utf8(codepoint, utf8);
+        if (utf8_bytes == 0U || write + utf8_bytes > decoded_capacity ||
+            write + utf8_bytes + 1U > source_map_entries) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+
+        const uint16_t source_before = static_cast<uint16_t>(source);
+        source += source_bytes;
+        for (size_t i = 0U; i < utf8_bytes; ++i) {
+            decoded[write + i] = static_cast<uint8_t>(utf8[i]);
+            source_map[write + i] = source_before;
+        }
+        write += utf8_bytes;
+        source_map[write] = static_cast<uint16_t>(source);
+    }
+
+    if (write == 0U) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    *out_decoded_size = write;
+    return ESP_OK;
+}
+
 static esp_err_t paginate_loaded_page(
     const uint8_t *raw,
     size_t loaded,
     char *page_text,
     uint64_t offset,
     uint64_t file_size,
-    uint8_t previous_source_byte,
-    bool have_previous_source_byte,
+    bool line_started_midway,
+    const uint16_t *source_map,
     const PageLayout &layout,
     TextPage *out_page)
 {
@@ -895,27 +995,29 @@ static esp_err_t paginate_loaded_page(
     *out_page = {};
 
     size_t source = 0;
-    bool line_started_midway = offset > 0 &&
-        (!have_previous_source_byte ||
-            (previous_source_byte != '\r' && previous_source_byte != '\n'));
-    if (offset == 0) {
-        line_started_midway = false;
-        if (loaded >= 2 && raw[0] == 0xFFU && raw[1] == 0xFEU) {
-            return ESP_ERR_NOT_SUPPORTED;
+    size_t valid_size = loaded;
+    if (source_map == nullptr) {
+        if (offset == 0) {
+            line_started_midway = false;
+            if (loaded >= 2 && ((raw[0] == 0xFFU && raw[1] == 0xFEU) ||
+                                (raw[0] == 0xFEU && raw[1] == 0xFFU))) {
+                return ESP_ERR_NOT_SUPPORTED;
+            }
+            if (loaded >= 3 && raw[0] == 0xEFU && raw[1] == 0xBBU && raw[2] == 0xBFU) {
+                source = 3;
+            }
         }
-        if (loaded >= 2 && raw[0] == 0xFEU && raw[1] == 0xFFU) {
-            return ESP_ERR_NOT_SUPPORTED;
-        }
-        if (loaded >= 3 && raw[0] == 0xEFU && raw[1] == 0xBBU && raw[2] == 0xBFU) {
-            source = 3;
-        }
+        valid_size = source + trim_incomplete_utf8_tail(raw + source, loaded - source);
     }
-
-    const size_t valid_size = source + trim_incomplete_utf8_tail(raw + source, loaded - source);
     if (valid_size <= source) {
         return ESP_ERR_INVALID_RESPONSE;
     }
 
+    const auto source_file_offset = [offset, source_map](size_t decoded_offset) -> uint64_t {
+        return offset + (source_map != nullptr
+            ? static_cast<uint64_t>(source_map[decoded_offset])
+            : static_cast<uint64_t>(decoded_offset));
+    };
     const size_t page_source_start = source;
     size_t write = 0;
     uint8_t visual_line = 0;
@@ -1006,7 +1108,9 @@ static esp_err_t paginate_loaded_page(
                 return ESP_ERR_INVALID_RESPONSE;
             }
 
-            if (codepoint < 0x20U && codepoint != '\t') {
+            const uint32_t source_codepoint = codepoint;
+            codepoint = TextEncoding::normalize_plain_text_codepoint(codepoint);
+            if (codepoint == 0U || (codepoint < 0x20U && codepoint != '\t')) {
                 cursor += codepoint_bytes;
                 source = cursor;
                 continue;
@@ -1018,6 +1122,8 @@ static esp_err_t paginate_loaded_page(
                 if (decode_utf8_one(raw, physical.end, cursor + codepoint_bytes,
                         &next_codepoint, &next_bytes) != Utf8DecodeResult::Ok) {
                     next_codepoint = 0;
+                } else {
+                    next_codepoint = TextEncoding::normalize_plain_text_codepoint(next_codepoint);
                 }
             }
 
@@ -1053,6 +1159,9 @@ static esp_err_t paginate_loaded_page(
 
             if (codepoint == '\t') {
                 for (uint8_t n = 0; n < 4U; ++n) page_text[write++] = ' ';
+            } else if (codepoint != source_codepoint) {
+                // U+00A0/U+3000 统一显示为普通空格，避免字体缺字显示方框。
+                page_text[write++] = ' ';
             } else {
                 memcpy(page_text + write, raw + cursor, codepoint_bytes);
                 write += codepoint_bytes;
@@ -1097,7 +1206,7 @@ static esp_err_t paginate_loaded_page(
 
     // 若本页之后直到 EOF 只剩明确网站广告/重复抓取头，则直接把源 offset 吃到文件尾，
     // 避免用户再翻到一张“只有被过滤内容”的空白末页。
-    if (source < valid_size && offset + valid_size >= file_size &&
+    if (source < valid_size && source_file_offset(valid_size) >= file_size &&
         remaining_is_noise_only(raw, valid_size, source)) {
         source = valid_size;
     }
@@ -1106,16 +1215,95 @@ static esp_err_t paginate_loaded_page(
     out_page->text = page_text;
     out_page->size = write;
     out_page->start_offset = offset;
-    out_page->next_offset = offset + source;
+    out_page->next_offset = source_file_offset(source);
     out_page->file_size = file_size;
     out_page->at_start = offset == 0;
     out_page->at_end = out_page->next_offset >= file_size;
     return ESP_OK;
 }
 
+static size_t page_text_capacity(TextEncoding::Encoding encoding)
+{
+    const size_t input_bytes = encoding == TextEncoding::Encoding::Utf8
+        ? kPageReadBytes
+        : kDecodedPageBytes;
+    return input_bytes * 2U + 64U;
+}
+
+esp_err_t detect_text_encoding(const char *path, TextEncoding::Encoding *out_encoding)
+{
+    if (path == nullptr || out_encoding == nullptr || !path_is_inside_root(path) || !is_txt_name(path)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    struct stat info = {};
+    FILE *file = nullptr;
+    {
+        StorageSdLockGuard guard(kStorageLockTimeout);
+        if (!guard) return ESP_ERR_TIMEOUT;
+        if (stat(path, &info) != 0 || !S_ISREG(info.st_mode)) return ESP_ERR_NOT_FOUND;
+        if (info.st_size <= 0) return ESP_ERR_INVALID_SIZE;
+        file = fopen(path, "rb");
+    }
+    if (file == nullptr) return ESP_ERR_NOT_FOUND;
+
+    const size_t probe_size = static_cast<uint64_t>(info.st_size) > kEncodingProbeBytes
+        ? kEncodingProbeBytes
+        : static_cast<size_t>(info.st_size);
+    uint8_t *probe = static_cast<uint8_t *>(heap_caps_malloc(
+        probe_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (probe == nullptr) {
+        StorageSdLockGuard guard(portMAX_DELAY);
+        if (guard) fclose(file);
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t loaded = 0U;
+    esp_err_t result = ESP_OK;
+    while (loaded < probe_size) {
+        const size_t wanted = (probe_size - loaded) > kReadChunkBytes
+            ? kReadChunkBytes
+            : (probe_size - loaded);
+        size_t got = 0U;
+        {
+            StorageSdLockGuard guard(kStorageLockTimeout);
+            if (!guard) {
+                result = ESP_ERR_TIMEOUT;
+                break;
+            }
+            got = fread(probe + loaded, 1U, wanted, file);
+        }
+        if (got == 0U) {
+            result = feof(file) ? ESP_OK : ESP_FAIL;
+            break;
+        }
+        loaded += got;
+        taskYIELD();
+    }
+    {
+        StorageSdLockGuard guard(portMAX_DELAY);
+        if (guard) fclose(file);
+    }
+
+    if (result == ESP_OK && loaded > 0U) {
+        TextEncoding::Detection detected = {};
+        const bool probe_is_prefix = static_cast<uint64_t>(loaded) <
+            static_cast<uint64_t>(info.st_size);
+        result = TextEncoding::detect(probe, loaded, &detected, probe_is_prefix);
+        if (result == ESP_OK) {
+            *out_encoding = detected.encoding;
+        }
+    } else if (result == ESP_OK) {
+        result = ESP_ERR_INVALID_SIZE;
+    }
+    heap_caps_free(probe);
+    return result;
+}
+
 static esp_err_t load_text_page_internal(
     const char *path,
     uint64_t offset,
+    TextEncoding::Encoding encoding,
     const PageLayout &layout,
     TextPage *out_page)
 {
@@ -1148,32 +1336,55 @@ static esp_err_t load_text_page_internal(
 
     uint8_t *raw = static_cast<uint8_t *>(heap_caps_malloc(
         kPageReadBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    uint8_t *decoded = nullptr;
+    uint16_t *source_map = nullptr;
+    if (encoding != TextEncoding::Encoding::Utf8) {
+        decoded = static_cast<uint8_t *>(heap_caps_malloc(
+            kDecodedPageBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        source_map = static_cast<uint16_t *>(heap_caps_malloc(
+            kDecodedSourceMapEntries * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    }
     char *page_text = static_cast<char *>(heap_caps_malloc(
-        kPageReadBytes * 2U + 64U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (raw == nullptr || page_text == nullptr) {
-        if (raw != nullptr) heap_caps_free(raw);
-        if (page_text != nullptr) heap_caps_free(page_text);
+        page_text_capacity(encoding), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (raw == nullptr || page_text == nullptr ||
+        (encoding != TextEncoding::Encoding::Utf8 && (decoded == nullptr || source_map == nullptr))) {
+        heap_caps_free(raw);
+        heap_caps_free(decoded);
+        heap_caps_free(source_map);
+        heap_caps_free(page_text);
         StorageSdLockGuard guard(portMAX_DELAY);
         if (guard) fclose(file);
         return ESP_ERR_NO_MEM;
     }
 
-    size_t loaded = 0;
-    uint8_t previous_source_byte = 0;
-    bool have_previous_source_byte = false;
+    size_t loaded = 0U;
+    bool line_started_midway = false;
     esp_err_t result = read_page_window(
-        file, file_size, offset, raw, &loaded,
-        &previous_source_byte, &have_previous_source_byte);
+        file, file_size, offset, encoding, raw, &loaded, &line_started_midway);
     {
         StorageSdLockGuard guard(portMAX_DELAY);
         if (guard) fclose(file);
     }
-    if (result == ESP_OK) {
+
+    if (result == ESP_OK && encoding == TextEncoding::Encoding::Utf8) {
         result = paginate_loaded_page(
             raw, loaded, page_text, offset, file_size,
-            previous_source_byte, have_previous_source_byte, layout, out_page);
+            line_started_midway, nullptr, layout, out_page);
+    } else if (result == ESP_OK) {
+        size_t decoded_size = 0U;
+        result = transcode_page_window(
+            raw, loaded, offset, file_size, encoding,
+            decoded, kDecodedPageBytes, source_map, kDecodedSourceMapEntries, &decoded_size);
+        if (result == ESP_OK) {
+            result = paginate_loaded_page(
+                decoded, decoded_size, page_text, offset, file_size,
+                line_started_midway, source_map, layout, out_page);
+        }
     }
+
     heap_caps_free(raw);
+    heap_caps_free(decoded);
+    heap_caps_free(source_map);
     if (result != ESP_OK) {
         heap_caps_free(page_text);
         *out_page = {};
@@ -1182,12 +1393,19 @@ static esp_err_t load_text_page_internal(
 }
 
 esp_err_t load_text_page(
-    const char *path, uint64_t offset, const PageLayout &layout, TextPage *out_page)
+    const char *path,
+    uint64_t offset,
+    TextEncoding::Encoding encoding,
+    const PageLayout &layout,
+    TextPage *out_page)
 {
-    return load_text_page_internal(path, offset, layout, out_page);
+    return load_text_page_internal(path, offset, encoding, layout, out_page);
 }
 
-esp_err_t begin_page_scan(const char *path, PageScanSession *session)
+esp_err_t begin_page_scan(
+    const char *path,
+    TextEncoding::Encoding encoding,
+    PageScanSession *session)
 {
     if (path == nullptr || session == nullptr || !path_is_inside_root(path) || !is_txt_name(path)) {
         return ESP_ERR_INVALID_ARG;
@@ -1212,11 +1430,22 @@ esp_err_t begin_page_scan(const char *path, PageScanSession *session)
 
     uint8_t *raw = static_cast<uint8_t *>(heap_caps_malloc(
         kPageReadBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    uint8_t *decoded = nullptr;
+    uint16_t *source_map = nullptr;
+    if (encoding != TextEncoding::Encoding::Utf8) {
+        decoded = static_cast<uint8_t *>(heap_caps_malloc(
+            kDecodedPageBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        source_map = static_cast<uint16_t *>(heap_caps_malloc(
+            kDecodedSourceMapEntries * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    }
     char *page_text = static_cast<char *>(heap_caps_malloc(
-        kPageReadBytes * 2U + 64U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (raw == nullptr || page_text == nullptr) {
-        if (raw != nullptr) heap_caps_free(raw);
-        if (page_text != nullptr) heap_caps_free(page_text);
+        page_text_capacity(encoding), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (raw == nullptr || page_text == nullptr ||
+        (encoding != TextEncoding::Encoding::Utf8 && (decoded == nullptr || source_map == nullptr))) {
+        heap_caps_free(raw);
+        heap_caps_free(decoded);
+        heap_caps_free(source_map);
+        heap_caps_free(page_text);
         StorageSdLockGuard guard(portMAX_DELAY);
         if (guard) fclose(file);
         return ESP_ERR_NO_MEM;
@@ -1224,8 +1453,11 @@ esp_err_t begin_page_scan(const char *path, PageScanSession *session)
 
     session->file = file;
     session->raw = raw;
+    session->decoded = decoded;
+    session->source_map = source_map;
     session->page_text = page_text;
     session->file_size = static_cast<uint64_t>(info.st_size);
+    session->encoding = encoding;
     return ESP_OK;
 }
 
@@ -1237,20 +1469,36 @@ esp_err_t scan_page(
         offset >= session->file_size) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (session->encoding != TextEncoding::Encoding::Utf8 &&
+        (session->decoded == nullptr || session->source_map == nullptr)) {
+        return ESP_ERR_INVALID_STATE;
+    }
     *out_result = {};
 
-    size_t loaded = 0;
-    uint8_t previous_source_byte = 0;
-    bool have_previous_source_byte = false;
+    size_t loaded = 0U;
+    bool line_started_midway = false;
     esp_err_t ret = read_page_window(
-        static_cast<FILE *>(session->file), session->file_size, offset, session->raw, &loaded,
-        &previous_source_byte, &have_previous_source_byte);
+        static_cast<FILE *>(session->file), session->file_size, offset,
+        session->encoding, session->raw, &loaded, &line_started_midway);
     if (ret != ESP_OK) return ret;
+
+    const uint8_t *page_source = session->raw;
+    size_t page_source_size = loaded;
+    const uint16_t *source_map = nullptr;
+    if (session->encoding != TextEncoding::Encoding::Utf8) {
+        ret = transcode_page_window(
+            session->raw, loaded, offset, session->file_size, session->encoding,
+            session->decoded, kDecodedPageBytes,
+            session->source_map, kDecodedSourceMapEntries, &page_source_size);
+        if (ret != ESP_OK) return ret;
+        page_source = session->decoded;
+        source_map = session->source_map;
+    }
 
     TextPage page = {};
     ret = paginate_loaded_page(
-        session->raw, loaded, session->page_text, offset, session->file_size,
-        previous_source_byte, have_previous_source_byte, layout, &page);
+        page_source, page_source_size, session->page_text, offset, session->file_size,
+        line_started_midway, source_map, layout, &page);
     if (ret != ESP_OK) return ret;
 
     out_result->start_offset = page.start_offset;
@@ -1267,8 +1515,10 @@ void end_page_scan(PageScanSession *session)
         StorageSdLockGuard guard(portMAX_DELAY);
         if (guard) fclose(file);
     }
-    if (session->raw != nullptr) heap_caps_free(session->raw);
-    if (session->page_text != nullptr) heap_caps_free(session->page_text);
+    heap_caps_free(session->raw);
+    heap_caps_free(session->decoded);
+    heap_caps_free(session->source_map);
+    heap_caps_free(session->page_text);
     *session = {};
 }
 

@@ -1026,7 +1026,7 @@ static void lyrics_view_apply_window_state(
             lv_label_set_text(g_status, "暂无同步歌词");
             break;
         case LyricsLoadState::Unsupported:
-            lv_label_set_text(g_status, "歌词编码暂不支持\n请使用 UTF-8 LRC");
+            lv_label_set_text(g_status, "歌词编码暂不支持\n支持 UTF-8 / UTF-16(BOM) / GBK");
             break;
         case LyricsLoadState::Failed:
             lv_label_set_text(g_status, "歌词读取失败");

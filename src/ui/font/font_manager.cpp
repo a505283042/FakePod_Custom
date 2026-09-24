@@ -1,5 +1,6 @@
 #include "font_manager.h"
 #include "storage_io.h"
+#include "device_settings.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -47,16 +48,19 @@ static const char *TAG = "字体";
 // 2bpp 位图每行单独按字节对齐，每字节从高位到低位存 4 个像素。
 // ============================================================
 
-static constexpr const char *FONT_PATH = "/sdcard/FONTS/SYHT_BOLD_24.bin";
+static constexpr const char *FONT_PATH_CUSTOM_EXT_24 = "/sdcard/FONTS/CUSTOM_EXT_24.bin";
+static constexpr const char *FONT_PATH_SYHT_EXT_24 = "/sdcard/FONTS/SYHT_EXT_24.bin";
+static constexpr const char *FONT_PATH_SYHT_BOLD_EXT_24 = "/sdcard/FONTS/SYHT_BOLD_EXT_24.bin";
+static constexpr const char *FONT_PATH_SYST_BOLD_EXT_24 = "/sdcard/FONTS/SYST_BOLD_EXT_24.bin";
 static constexpr size_t FONT_HEADER_SIZE = 12;
 static constexpr size_t GLYPH_HEADER_SIZE = 6;
 static constexpr uint32_t EXPECTED_BPP = 2;
 
-// 中文字体 Flash 缓存。
+// 界面字体 Flash 缓存。
 // 分区只负责缓存 TF 上的字体；缓存损坏或分区不存在时自动回退 TF -> PSRAM。
 static constexpr const char *FONT_CACHE_PARTITION_LABEL = "fontcache";
 static constexpr uint32_t FONT_CACHE_MAGIC = 0x31435446U;  // "FTC1"
-static constexpr uint32_t FONT_CACHE_VERSION = 1U;
+static constexpr uint32_t FONT_CACHE_VERSION = 2U;
 static constexpr size_t FONT_CACHE_DATA_OFFSET = 256U * 1024U;
 static constexpr size_t FONT_CACHE_COPY_CHUNK = 16U * 1024U;
 
@@ -65,7 +69,7 @@ struct FontCacheHeader
     uint32_t magic;
     uint32_t version;
     uint32_t font_size;
-    uint32_t reserved0;
+    uint32_t font_id;
     int64_t source_mtime;
     uint32_t line_height;
     uint32_t base_line;
@@ -94,6 +98,20 @@ static esp_partition_mmap_handle_t g_font_cache_mmap_handle = 0;
 static FontCacheHeader g_font_cache_header = {};
 static bool g_font_cache_mapped = false;
 static bool g_font_cache_metrics_valid = false;
+static DeviceUiFont g_selected_font = DeviceUiFont::CustomExt24;
+static const char *g_font_path = FONT_PATH_CUSTOM_EXT_24;
+
+static const char *font_manager_path_for(DeviceUiFont font)
+{
+    switch (font) {
+        case DeviceUiFont::SyhtExt24: return FONT_PATH_SYHT_EXT_24;
+        case DeviceUiFont::SyhtBoldExt24: return FONT_PATH_SYHT_BOLD_EXT_24;
+        case DeviceUiFont::SystBoldExt24: return FONT_PATH_SYST_BOLD_EXT_24;
+        case DeviceUiFont::CustomExt24:
+        default:
+            return FONT_PATH_CUSTOM_EXT_24;
+    }
+}
 
 static uint16_t font_manager_read_le16(const uint8_t *data)
 {
@@ -368,6 +386,7 @@ static bool font_manager_cache_header_matches(const FontCacheHeader &header, con
 {
     if (header.magic != FONT_CACHE_MAGIC ||
         header.version != FONT_CACHE_VERSION ||
+        header.font_id != static_cast<uint32_t>(g_selected_font) ||
         header.font_size == 0U ||
         header.font_size != static_cast<uint32_t>(source_info.st_size) ||
         header.source_mtime != static_cast<int64_t>(source_info.st_mtime)) {
@@ -433,14 +452,17 @@ static esp_err_t font_manager_try_map_flash_cache(const struct stat &source_info
     g_context.data = static_cast<const uint8_t *>(mapped);
     g_context.size = static_cast<size_t>(header.font_size);
 
-    ESP_LOGI(TAG, "中文字体Flash缓存命中：%u KB mmap=%u ms metrics=%s",
+    ESP_LOGI(TAG, "界面字体Flash缓存命中：%s %u KB mmap=%u ms metrics=%s",
+        device_settings_ui_font_name(g_selected_font),
         static_cast<unsigned>(g_context.size / 1024U),
         static_cast<unsigned>((esp_timer_get_time() - started_us) / 1000),
         g_font_cache_metrics_valid ? "CACHED" : "RECALC");
     return ESP_OK;
 }
 
-static esp_err_t font_manager_build_flash_cache(const struct stat &source_info)
+static esp_err_t font_manager_build_flash_cache(
+    const struct stat &source_info,
+    FontManagerCacheWriteCallback cache_write_callback)
 {
     const esp_partition_t *partition = esp_partition_find_first(
         ESP_PARTITION_TYPE_DATA,
@@ -476,6 +498,9 @@ static esp_err_t font_manager_build_flash_cache(const struct stat &source_info)
     const size_t erase_size = partition->erase_size;
     const size_t erase_length = ((required + erase_size - 1U) / erase_size) * erase_size;
     const int64_t started_us = esp_timer_get_time();
+    if (cache_write_callback != nullptr) {
+        cache_write_callback();
+    }
     esp_err_t ret = esp_partition_erase_range(partition, 0U, erase_length);
     if (ret != ESP_OK) {
         heap_caps_free(copy_buffer);
@@ -491,9 +516,10 @@ static esp_err_t font_manager_build_flash_cache(const struct stat &source_info)
             return ESP_ERR_TIMEOUT;
         }
 
-        FILE *file = fopen(FONT_PATH, "rb");
+        FILE *file = fopen(g_font_path, "rb");
         if (file == nullptr) {
             heap_caps_free(copy_buffer);
+            ESP_LOGE(TAG, "打开界面字体失败：%s", g_font_path);
             return ESP_FAIL;
         }
 
@@ -534,6 +560,7 @@ static esp_err_t font_manager_build_flash_cache(const struct stat &source_info)
     header.magic = FONT_CACHE_MAGIC;
     header.version = FONT_CACHE_VERSION;
     header.font_size = static_cast<uint32_t>(font_size);
+    header.font_id = static_cast<uint32_t>(g_selected_font);
     header.source_mtime = static_cast<int64_t>(source_info.st_mtime);
     ret = esp_partition_write(partition, 0U, &header, sizeof(header));
     if (ret != ESP_OK) {
@@ -541,7 +568,7 @@ static esp_err_t font_manager_build_flash_cache(const struct stat &source_info)
         return ret;
     }
 
-    ESP_LOGI(TAG, "中文字体Flash缓存已建立：%u KB 耗时=%u ms（仅首次/字体变化执行）",
+    ESP_LOGI(TAG, "界面字体Flash缓存已建立：%u KB 耗时=%u ms（仅首次/字体变化执行）",
         static_cast<unsigned>(font_size / 1024U),
         static_cast<unsigned>((esp_timer_get_time() - started_us) / 1000));
     return ESP_OK;
@@ -565,21 +592,21 @@ static esp_err_t font_manager_load_psram_fallback(const struct stat &source_info
             heap_caps_free(font_data);
             return ESP_ERR_TIMEOUT;
         }
-        FILE *file = fopen(FONT_PATH, "rb");
+        FILE *file = fopen(g_font_path, "rb");
         if (file == nullptr) {
             heap_caps_free(font_data);
-            ESP_LOGE(TAG, "打开中文字体失败：%s", FONT_PATH);
+            ESP_LOGE(TAG, "打开界面字体失败：%s", g_font_path);
             return ESP_FAIL;
         }
 
-        FONT_BOOT_LOGI("正在将中文字体载入 PSRAM：%s", FONT_PATH);
+        FONT_BOOT_LOGI("正在将界面字体载入 PSRAM：%s", g_font_path);
         read_count = fread(font_data, 1U, font_size, file);
         fclose(file);
     }
 
     if (read_count != font_size) {
         heap_caps_free(font_data);
-        ESP_LOGE(TAG, "读取中文字体不完整：期望=%u，实际=%u",
+        ESP_LOGE(TAG, "读取界面字体不完整：期望=%u，实际=%u",
             static_cast<unsigned>(font_size),
             static_cast<unsigned>(read_count));
         return ESP_FAIL;
@@ -588,7 +615,7 @@ static esp_err_t font_manager_load_psram_fallback(const struct stat &source_info
     g_psram_font_data = font_data;
     g_context.data = font_data;
     g_context.size = font_size;
-    ESP_LOGI(TAG, "中文字体回退TF->PSRAM：%u KB 耗时=%u ms",
+    ESP_LOGI(TAG, "界面字体回退TF->PSRAM：%u KB 耗时=%u ms",
         static_cast<unsigned>(font_size / 1024U),
         static_cast<unsigned>((esp_timer_get_time() - started_us) / 1000));
     return ESP_OK;
@@ -625,16 +652,22 @@ static void font_manager_store_cached_metrics()
     g_font_cache_metrics_valid = true;
 }
 
-esp_err_t font_manager_init()
+esp_err_t font_manager_init(FontManagerCacheWriteCallback cache_write_callback)
 {
     if (g_ready) {
         return ESP_OK;
     }
 
     if (!sdcard_is_mounted()) {
-        ESP_LOGE(TAG, "TF 卡未挂载，无法加载中文字体");
+        ESP_LOGE(TAG, "TF 卡未挂载，无法加载界面字体");
         return ESP_ERR_INVALID_STATE;
     }
+
+    DeviceSettingsSnapshot settings = {};
+    if (device_settings_get_snapshot(&settings)) {
+        g_selected_font = settings.ui_font;
+    }
+    g_font_path = font_manager_path_for(g_selected_font);
 
     const int64_t total_started_us = esp_timer_get_time();
     struct stat info = {};
@@ -643,8 +676,8 @@ esp_err_t font_manager_init()
         if (!sd_lock.locked()) {
             return ESP_ERR_TIMEOUT;
         }
-        if (stat(FONT_PATH, &info) != 0 || info.st_size <= 0) {
-            ESP_LOGE(TAG, "中文字体不存在：%s", FONT_PATH);
+        if (stat(g_font_path, &info) != 0 || info.st_size <= 0) {
+            ESP_LOGE(TAG, "界面字体不存在：%s", g_font_path);
             return ESP_ERR_NOT_FOUND;
         }
     }
@@ -652,7 +685,7 @@ esp_err_t font_manager_init()
     const size_t psram_before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     esp_err_t load_ret = font_manager_try_map_flash_cache(info);
     if (load_ret != ESP_OK) {
-        const esp_err_t cache_ret = font_manager_build_flash_cache(info);
+        const esp_err_t cache_ret = font_manager_build_flash_cache(info, cache_write_callback);
         if (cache_ret == ESP_OK) {
             load_ret = font_manager_try_map_flash_cache(info);
         }
@@ -713,14 +746,15 @@ esp_err_t font_manager_init()
     g_ui_font.underline_position = -2;
     g_ui_font.underline_thickness = 1;
     g_ui_font.dsc = &g_context;
-    // 所有正文/菜单只使用原厂中文字体；Symbol 图标由页面显式使用 lv_font_default()。
+    // 所有正文/菜单只使用当前界面字体；Symbol 图标由页面显式使用 lv_font_default()。
     // 不再让正文缺字时偷偷切换成 LVGL 西文字体。
     g_ui_font.fallback = nullptr;
     g_ui_font.user_data = nullptr;
 
     g_ready = true;
     const size_t psram_after = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    ESP_LOGI(TAG, "中文字体初始化成功：文件=%u KB，行高=%ld，基线=%ld，来源=%s，总耗时=%u ms，度量=%u ms",
+    ESP_LOGI(TAG, "界面字体初始化成功：字体=%s，文件=%u KB，行高=%ld，基线=%ld，来源=%s，总耗时=%u ms，度量=%u ms",
+        device_settings_ui_font_name(g_selected_font),
         static_cast<unsigned>(g_context.size / 1024U),
         static_cast<long>(g_context.line_height),
         static_cast<long>(g_context.base_line),

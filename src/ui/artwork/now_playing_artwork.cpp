@@ -140,6 +140,16 @@ static void artwork_ui_set_no_artwork_fallback_visible(bool visible)
 
 static void artwork_ui_show_waiting_without_placeholder()
 {
+    // 从无封面歌曲切到有封面歌曲时，缺省封面也是可继续保持的旧视觉。
+    // 新 Surface/压缩封面真正绑定成功后再释放它，避免中间闪出“正在准备封面”。
+    if (g_no_artwork_fallback != nullptr &&
+        g_no_artwork_lease.slot_index != 0xFFU &&
+        !lv_obj_has_flag(g_no_artwork_fallback, LV_OBJ_FLAG_HIDDEN)) {
+        if (g_placeholder_icon != nullptr) lv_obj_add_flag(g_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
+        if (g_status != nullptr) lv_obj_add_flag(g_status, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+
     artwork_ui_set_no_artwork_fallback_visible(false);
 
     if (!g_has_surface_source && !g_has_compressed_source) {

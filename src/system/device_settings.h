@@ -35,6 +35,13 @@ enum class DeviceMusicListScope : uint8_t {
     Level2,
 };
 
+enum class DeviceUiFont : uint8_t {
+    CustomExt24 = 0,
+    SyhtExt24 = 1,
+    SyhtBoldExt24 = 2,
+    SystBoldExt24 = 3,
+};
+
 static constexpr size_t DEVICE_MUSIC_FOLDER_PATH_MAX = 384U;
 
 struct DeviceMusicListSelection {
@@ -58,6 +65,7 @@ struct DeviceSettingsSnapshot {
     bool motion_controls_enabled = true;
     uint8_t nsf_gain_compensation_db = 3U;  // 电子音流专用 CS43131 数字衰减补偿，0~6dB。
     bool remember_volume = true;
+    DeviceUiFont ui_font = DeviceUiFont::CustomExt24;
 };
 
 // NVS namespace: device_cfg。初始化只加载设置，不主动应用硬件状态。
@@ -76,6 +84,7 @@ esp_err_t device_settings_set_music_list_scope(DeviceMusicListScope scope);
 esp_err_t device_settings_set_cassette_dynamic_tint_enabled(bool enabled);
 esp_err_t device_settings_set_motion_controls_enabled(bool enabled);
 esp_err_t device_settings_set_nsf_gain_compensation_db(uint8_t db);
+esp_err_t device_settings_set_ui_font(DeviceUiFont font);
 
 // 播放列表目录选择与范围一起提交到同一个 NVS 事务。路径使用 Catalog 中的规范化完整目录路径，
 // 以 '/' 结尾；总列表可传空路径。这样切换一级/二级列表时不会出现 scope 已保存但目录未保存的半状态。
@@ -95,3 +104,4 @@ const char *device_settings_audio_output_level_name(DeviceAudioOutputMode mode);
 const char *device_settings_aux_key_mode_name(DeviceAuxKeyMode mode);
 const char *device_settings_animation_mode_name(DeviceAnimationMode mode);
 const char *device_settings_music_list_scope_name(DeviceMusicListScope scope);
+const char *device_settings_ui_font_name(DeviceUiFont font);
