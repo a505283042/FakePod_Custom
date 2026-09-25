@@ -580,7 +580,7 @@ static bool inspect_external_file(
     }
     struct stat info = {};
     if (stat(path, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size <= 1 ||
-        static_cast<uint64_t>(info.st_size) > UINT32_MAX) {
+        static_cast<uint64_t>(info.st_size) > MEDIA_ARTWORK_MAX_COMPRESSED_BYTES_V2) {
         return false;
     }
     FILE *file = fopen(path, "rb");

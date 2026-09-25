@@ -21,8 +21,8 @@ static const char *TAG = "曲库索引V2";
 #else
 #define CATALOG_STORE_BOOT_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
 #endif
-// R25：新增 OpusPicture locator；旧 version=4 自动失效并重建，确保既有 .opus 重新扫描内嵌封面。
-static constexpr uint16_t CATALOG_VERSION_V2 = 5;
+// R29：封面 2 MiB 规则已统一到内嵌/目录扫描；旧 version=5 自动失效并重建，清理旧超限 locator。
+static constexpr uint16_t CATALOG_VERSION_V2 = 6;
 static constexpr uint16_t MANIFEST_VERSION_V2 = 2;
 static constexpr uint32_t SIGNATURE_MODE_FAST_V2 = 1;
 static constexpr uint32_t MAX_TRACKS_V2 = 100000;

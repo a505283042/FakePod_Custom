@@ -476,102 +476,18 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
     return true;
 }
 
-static bool artwork_ui_read_png_dimensions(
-    const uint8_t *data,
-    size_t size,
-    uint32_t *out_width,
-    uint32_t *out_height)
-{
-    if (data == nullptr || size < 24U || out_width == nullptr || out_height == nullptr ||
-        memcmp(data, "\x89PNG\x0D\x0A\x1A\x0A", 8U) != 0) return false;
-    const uint32_t width =
-        (static_cast<uint32_t>(data[16]) << 24U) |
-        (static_cast<uint32_t>(data[17]) << 16U) |
-        (static_cast<uint32_t>(data[18]) << 8U) |
-        static_cast<uint32_t>(data[19]);
-    const uint32_t height =
-        (static_cast<uint32_t>(data[20]) << 24U) |
-        (static_cast<uint32_t>(data[21]) << 16U) |
-        (static_cast<uint32_t>(data[22]) << 8U) |
-        static_cast<uint32_t>(data[23]);
-    if (width == 0U || height == 0U) return false;
-    *out_width = width;
-    *out_height = height;
-    return true;
-}
-
-static bool artwork_ui_is_jpeg_sof_marker(uint8_t marker)
-{
-    switch (marker) {
-        case 0xC0: case 0xC1: case 0xC2: case 0xC3:
-        case 0xC5: case 0xC6: case 0xC7:
-        case 0xC9: case 0xCA: case 0xCB:
-        case 0xCD: case 0xCE: case 0xCF:
-            return true;
-        default:
-            return false;
-    }
-}
-
-static bool artwork_ui_read_jpeg_dimensions(
-    const uint8_t *data,
-    size_t size,
-    uint32_t *out_width,
-    uint32_t *out_height)
-{
-    if (data == nullptr || size < 4U || out_width == nullptr || out_height == nullptr ||
-        data[0] != 0xFFU || data[1] != 0xD8U) return false;
-
-    size_t pos = 2U;
-    while (pos + 3U < size) {
-        while (pos < size && data[pos] != 0xFFU) ++pos;
-        while (pos < size && data[pos] == 0xFFU) ++pos;
-        if (pos >= size) break;
-        const uint8_t marker = data[pos++];
-        if (marker == 0xD8U || marker == 0xD9U || marker == 0x01U ||
-            (marker >= 0xD0U && marker <= 0xD7U)) continue;
-        if (pos + 2U > size) break;
-        const uint16_t segment_length =
-            (static_cast<uint16_t>(data[pos]) << 8U) |
-            static_cast<uint16_t>(data[pos + 1U]);
-        if (segment_length < 2U || pos + static_cast<size_t>(segment_length) > size) break;
-        if (artwork_ui_is_jpeg_sof_marker(marker) && segment_length >= 7U) {
-            const uint32_t height =
-                (static_cast<uint32_t>(data[pos + 3U]) << 8U) |
-                static_cast<uint32_t>(data[pos + 4U]);
-            const uint32_t width =
-                (static_cast<uint32_t>(data[pos + 5U]) << 8U) |
-                static_cast<uint32_t>(data[pos + 6U]);
-            if (width > 0U && height > 0U) {
-                *out_width = width;
-                *out_height = height;
-                return true;
-            }
-        }
-        if (marker == 0xDAU) break;
-        pos += static_cast<size_t>(segment_length);
-    }
-    return false;
-}
-
 static bool artwork_ui_resolve_dimensions(
     const ArtworkCacheLease &lease,
     uint32_t *out_width,
     uint32_t *out_height)
 {
-    if (out_width == nullptr || out_height == nullptr) return false;
-    if (lease.width > 0U && lease.height > 0U) {
-        *out_width = lease.width;
-        *out_height = lease.height;
-        return true;
+    if (out_width == nullptr || out_height == nullptr ||
+        lease.width == 0U || lease.height == 0U) {
+        return false;
     }
-    if (lease.format == MediaArtworkFormatV2::Png) {
-        return artwork_ui_read_png_dimensions(lease.data, lease.size, out_width, out_height);
-    }
-    if (lease.format == MediaArtworkFormatV2::Jpeg) {
-        return artwork_ui_read_jpeg_dimensions(lease.data, lease.size, out_width, out_height);
-    }
-    return false;
+    *out_width = lease.width;
+    *out_height = lease.height;
+    return true;
 }
 
 static bool artwork_ui_decode_budget_ok(

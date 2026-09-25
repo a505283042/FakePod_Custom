@@ -481,18 +481,92 @@ static bool cache_insert(
     return true;
 }
 
-static MediaArtworkFormatV2 artwork_detect_format(const uint8_t *data, size_t size)
+static bool artwork_is_jpeg_sof_marker(uint8_t marker)
 {
-    if (data == nullptr) {
-        return MediaArtworkFormatV2::Unknown;
+    switch (marker) {
+        case 0xC0: case 0xC1: case 0xC2: case 0xC3:
+        case 0xC5: case 0xC6: case 0xC7:
+        case 0xC9: case 0xCA: case 0xCB:
+        case 0xCD: case 0xCE: case 0xCF:
+            return true;
+        default:
+            return false;
     }
-    if (size >= 8U && memcmp(data, "\x89PNG\x0D\x0A\x1A\x0A", 8U) == 0) {
-        return MediaArtworkFormatV2::Png;
+}
+
+static bool artwork_detect_image(
+    const uint8_t *data,
+    size_t size,
+    MediaArtworkFormatV2 *out_format,
+    uint16_t *out_width,
+    uint16_t *out_height)
+{
+    if (out_format != nullptr) *out_format = MediaArtworkFormatV2::Unknown;
+    if (out_width != nullptr) *out_width = 0U;
+    if (out_height != nullptr) *out_height = 0U;
+    if (data == nullptr || out_format == nullptr || out_width == nullptr || out_height == nullptr) {
+        return false;
     }
-    if (size >= 2U && data[0] == 0xFFU && data[1] == 0xD8U) {
-        return MediaArtworkFormatV2::Jpeg;
+
+    if (size >= 24U &&
+        memcmp(data, "\x89PNG\x0D\x0A\x1A\x0A", 8U) == 0 &&
+        memcmp(data + 12U, "IHDR", 4U) == 0) {
+        const uint32_t width =
+            (static_cast<uint32_t>(data[16]) << 24U) |
+            (static_cast<uint32_t>(data[17]) << 16U) |
+            (static_cast<uint32_t>(data[18]) << 8U) |
+            static_cast<uint32_t>(data[19]);
+        const uint32_t height =
+            (static_cast<uint32_t>(data[20]) << 24U) |
+            (static_cast<uint32_t>(data[21]) << 16U) |
+            (static_cast<uint32_t>(data[22]) << 8U) |
+            static_cast<uint32_t>(data[23]);
+        if (width == 0U || height == 0U || width > UINT16_MAX || height > UINT16_MAX) {
+            return false;
+        }
+        *out_format = MediaArtworkFormatV2::Png;
+        *out_width = static_cast<uint16_t>(width);
+        *out_height = static_cast<uint16_t>(height);
+        return true;
     }
-    return MediaArtworkFormatV2::Unknown;
+
+    if (size < 4U || data[0] != 0xFFU || data[1] != 0xD8U) {
+        return false;
+    }
+    size_t pos = 2U;
+    while (pos + 3U < size) {
+        while (pos < size && data[pos] != 0xFFU) ++pos;
+        while (pos < size && data[pos] == 0xFFU) ++pos;
+        if (pos >= size) break;
+        const uint8_t marker = data[pos++];
+        if (marker == 0xD8U || marker == 0xD9U || marker == 0x01U ||
+            (marker >= 0xD0U && marker <= 0xD7U)) {
+            continue;
+        }
+        if (pos + 2U > size) break;
+        const uint16_t segment_length =
+            (static_cast<uint16_t>(data[pos]) << 8U) |
+            static_cast<uint16_t>(data[pos + 1U]);
+        if (segment_length < 2U || pos + static_cast<size_t>(segment_length) > size) break;
+        if (artwork_is_jpeg_sof_marker(marker) && segment_length >= 7U) {
+            const uint16_t height =
+                (static_cast<uint16_t>(data[pos + 3U]) << 8U) |
+                static_cast<uint16_t>(data[pos + 4U]);
+            const uint16_t width =
+                (static_cast<uint16_t>(data[pos + 5U]) << 8U) |
+                static_cast<uint16_t>(data[pos + 6U]);
+            if (width == 0U || height == 0U) {
+                return false;
+            }
+            *out_format = MediaArtworkFormatV2::Jpeg;
+            *out_width = width;
+            *out_height = height;
+            return true;
+        }
+        if (marker == 0xDAU) break;
+        pos += static_cast<size_t>(segment_length);
+    }
+    return false;
 }
 
 // ID3v2.4 unsynchronisation 的逆变换。只删除由 unsync 规则插入的 0x00，避免误删 JPEG 自身的 FF 00 stuffing。
@@ -609,15 +683,20 @@ static __attribute__((noinline)) esp_err_t artwork_read_blob(
     const ArtworkLoadRequest *request,
     uint8_t **out_data,
     size_t *out_size,
-    MediaArtworkFormatV2 *out_format
+    MediaArtworkFormatV2 *out_format,
+    uint16_t *out_width,
+    uint16_t *out_height
 )
 {
-    if (request == nullptr || out_data == nullptr || out_size == nullptr || out_format == nullptr) {
+    if (request == nullptr || out_data == nullptr || out_size == nullptr || out_format == nullptr ||
+        out_width == nullptr || out_height == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
     *out_data = nullptr;
     *out_size = 0U;
     *out_format = MediaArtworkFormatV2::Unknown;
+    *out_width = 0U;
+    *out_height = 0U;
 
     if (request->ref.data_size == 0U || request->ref.data_size > MEDIA_ARTWORK_MAX_COMPRESSED_BYTES_V2) {
         return ESP_ERR_INVALID_SIZE;
@@ -665,8 +744,11 @@ static __attribute__((noinline)) esp_err_t artwork_read_blob(
             heap_caps_free(data);
             return read_ret != ESP_OK ? read_ret : ESP_ERR_INVALID_SIZE;
         }
-        const MediaArtworkFormatV2 actual_format = artwork_detect_format(data, picture.data_size);
-        if (actual_format == MediaArtworkFormatV2::Unknown) {
+        MediaArtworkFormatV2 actual_format = MediaArtworkFormatV2::Unknown;
+        uint16_t actual_width = 0U;
+        uint16_t actual_height = 0U;
+        if (!artwork_detect_image(
+                data, picture.data_size, &actual_format, &actual_width, &actual_height)) {
             heap_caps_free(data);
             return ESP_ERR_INVALID_RESPONSE;
         }
@@ -679,6 +761,8 @@ static __attribute__((noinline)) esp_err_t artwork_read_blob(
         *out_data = data;
         *out_size = picture.data_size;
         *out_format = actual_format;
+        *out_width = actual_width;
+        *out_height = actual_height;
         return ESP_OK;
     }
 
@@ -782,8 +866,10 @@ static __attribute__((noinline)) esp_err_t artwork_read_blob(
     if ((request->ref.flags & MEDIA_ARTWORK_REF_NEEDS_ID3_UNSYNC_V2) != 0U) {
         logical_size = artwork_deunsynchronise_in_place(data, loaded);
     }
-    const MediaArtworkFormatV2 actual_format = artwork_detect_format(data, logical_size);
-    if (actual_format == MediaArtworkFormatV2::Unknown) {
+    MediaArtworkFormatV2 actual_format = MediaArtworkFormatV2::Unknown;
+    uint16_t actual_width = 0U;
+    uint16_t actual_height = 0U;
+    if (!artwork_detect_image(data, logical_size, &actual_format, &actual_width, &actual_height)) {
         heap_caps_free(data);
         return ESP_ERR_INVALID_RESPONSE;
     }
@@ -797,6 +883,8 @@ static __attribute__((noinline)) esp_err_t artwork_read_blob(
     *out_data = data;
     *out_size = logical_size;
     *out_format = actual_format;
+    *out_width = actual_width;
+    *out_height = actual_height;
     return ESP_OK;
 }
 
@@ -853,7 +941,10 @@ static void artwork_task_main(void *)
         uint8_t *data = nullptr;
         size_t size = 0U;
         MediaArtworkFormatV2 actual_format = MediaArtworkFormatV2::Unknown;
-        const esp_err_t load_ret = artwork_read_blob(request, &data, &size, &actual_format);
+        uint16_t actual_width = 0U;
+        uint16_t actual_height = 0U;
+        const esp_err_t load_ret = artwork_read_blob(
+            request, &data, &size, &actual_format, &actual_width, &actual_height);
 
         if (!artwork_request_is_latest(request)) {
             heap_caps_free(data);
@@ -884,10 +975,10 @@ static void artwork_task_main(void *)
             continue;
         }
 
-        if (!cache_insert(request, data, size, actual_format, request->ref.width, request->ref.height)) {
+        if (!cache_insert(request, data, size, actual_format, actual_width, actual_height)) {
             heap_caps_free(data);
             artwork_publish_state(ArtworkLoadState::Failed, request, ESP_ERR_NO_MEM, false, 0U,
-                actual_format, request->ref.width, request->ref.height);
+                actual_format, actual_width, actual_height);
             ESP_LOGW(TAG, "封面缓存没有可淘汰空间：track=%lu bytes=%u（可能存在被 UI 固定的条目）",
                 static_cast<unsigned long>(request->track_index), static_cast<unsigned>(size));
             artwork_request_release(request);
@@ -895,7 +986,7 @@ static void artwork_task_main(void *)
         }
 
         artwork_publish_state(ArtworkLoadState::Ready, request, ESP_OK, false, static_cast<uint32_t>(size),
-            actual_format, request->ref.width, request->ref.height);
+            actual_format, actual_width, actual_height);
         ARTWORK_LOAD_TRACE("READY request=%lu track=%lu bytes=%u format=%u stack_hwm=%u",
             static_cast<unsigned long>(request->request_id),
             static_cast<unsigned long>(request->track_index),
