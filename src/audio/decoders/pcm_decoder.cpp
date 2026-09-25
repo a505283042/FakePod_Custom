@@ -373,6 +373,16 @@ esp_err_t pcm_decoder_seek_frame(
             }
             break;
 
+        case PcmDecoderType::Opus:
+            ret = opus_decoder_seek_frame(
+                &decoder->opus, target_frame, &actual_frame, &source_offset);
+            if (ret == ESP_OK) {
+                method = target_frame == 0
+                    ? PcmSeekMethod::RestartFromBeginning
+                    : PcmSeekMethod::OpusGranule;
+            }
+            break;
+
         default:
             ret = ESP_ERR_NOT_SUPPORTED;
             break;
@@ -397,6 +407,8 @@ bool pcm_decoder_seek_supported(const PcmDecoder *decoder, uint64_t target_frame
             return true;
         case PcmDecoderType::Flac:
             return target_frame == 0 || flac_decoder_has_seektable(&decoder->flac);
+        case PcmDecoderType::Opus:
+            return true;
         default:
             return false;
     }
@@ -479,6 +491,7 @@ const char *pcm_seek_method_name(PcmSeekMethod method)
         case PcmSeekMethod::Mp3CbrLinear: return "MP3_CBR_LINEAR";
         case PcmSeekMethod::Mp3VbrLinearFallback: return "MP3_VBR_LINEAR";
         case PcmSeekMethod::FlacSeektable: return "FLAC_SEEKTABLE";
+        case PcmSeekMethod::OpusGranule: return "OPUS_GRANULE";
         case PcmSeekMethod::RestartFromBeginning: return "RESTART_BEGIN";
         default: return "NONE";
     }

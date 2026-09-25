@@ -71,6 +71,8 @@ static constexpr uint32_t AUDIO_PCM_FADE_IN_MS = 30;
 static constexpr uint8_t AUDIO_PCM_UNMUTE_PRIME_BLOCKS = 4;
 static constexpr uint32_t AUDIO_I2S_WRITE_TIMEOUT_MS = 100;
 static constexpr uint32_t AUDIO_PCM_MUTE_SETTLE_MS = 150;
+// R32.1：MP3/Opus Seek 重建只缩短软静音收敛窗口；普通 Stop/暂停/其他输出关闭继续使用 150ms。
+static constexpr uint32_t AUDIO_SEEK_MUTE_SETTLE_MS = 50;
 // R.39.6.4.4：FLAC 压缩 ring 瞬时耗空不等于真实 I/O 故障。只要 PrefetchTask 仍存活、
 // 未报告 io_error 且尚未 EOF，就用短静音块维持 I2S 时钟，并给预取一个有硬上限的恢复窗口；
 // 不再把第一个 20ms 等待超时直接升级成 AUDIO_FAULT。
@@ -1014,7 +1016,10 @@ static esp_err_t audio_task_unmute_when_pcm_ready()
     return ESP_OK;
 }
 
-static esp_err_t audio_task_shutdown_output_hardware(uint32_t active_rate_hz, const char *owner)
+static esp_err_t audio_task_shutdown_output_hardware(
+    uint32_t active_rate_hz,
+    const char *owner,
+    uint32_t mute_settle_ms = AUDIO_PCM_MUTE_SETTLE_MS)
 {
     esp_err_t first_error = ESP_OK;
     const uint32_t settle_rate = active_rate_hz > 0U ? active_rate_hz : 48000U;
@@ -1033,20 +1038,20 @@ static esp_err_t audio_task_shutdown_output_hardware(uint32_t active_rate_hz, co
 
         if (mute_ret == ESP_OK) {
             const size_t settle_frames = static_cast<size_t>(
-                (static_cast<uint64_t>(settle_rate) * AUDIO_PCM_MUTE_SETTLE_MS + 999ULL) / 1000ULL
+                (static_cast<uint64_t>(settle_rate) * mute_settle_ms + 999ULL) / 1000ULL
             );
             if (g_pipeline_i2s_started && i2s_output_is_started()) {
 #if APP_DIAG_AUDIO_POP
                 ESP_LOGI(TAG, "PCM软静音收敛：owner=%s 保持%lums全零PCM，帧=%u",
                     owner != nullptr ? owner : "unknown",
-                    static_cast<unsigned long>(AUDIO_PCM_MUTE_SETTLE_MS),
+                    static_cast<unsigned long>(mute_settle_ms),
                     static_cast<unsigned>(settle_frames));
 #endif
                 audio_task_remember_first_error(
                     i2s_output_stream_write_silence(settle_frames, AUDIO_I2S_WRITE_TIMEOUT_MS),
                     &first_error);
             } else {
-                vTaskDelay(pdMS_TO_TICKS(AUDIO_PCM_MUTE_SETTLE_MS));
+                vTaskDelay(pdMS_TO_TICKS(mute_settle_ms));
             }
         }
 
@@ -1073,12 +1078,16 @@ static esp_err_t audio_task_shutdown_output_hardware(uint32_t active_rate_hz, co
     return first_error;
 }
 
-static esp_err_t audio_task_shutdown_pipeline()
+static esp_err_t audio_task_shutdown_pipeline(
+    uint32_t mute_settle_ms = AUDIO_PCM_MUTE_SETTLE_MS)
 {
     audio_task_reset_flac_starve_grace();
     audio_task_log_ram("shutdown_begin");
 
-    esp_err_t first_error = audio_task_shutdown_output_hardware(g_task_sample_rate_hz, "Music");
+    esp_err_t first_error = audio_task_shutdown_output_hardware(
+        g_task_sample_rate_hz,
+        "Music",
+        mute_settle_ms);
 
     if (pcm_decoder_is_open(&g_decoder)) {
         pcm_decoder_close(&g_decoder);
@@ -1096,8 +1105,10 @@ static esp_err_t audio_task_shutdown_pipeline()
 static void audio_task_log_index_snapshot(const AudioRequest *request)
 {
     if (request == nullptr || !request->has_technical_info) {
+#if APP_DIAG_AUDIO_INDEX
         ESP_LOGW(TAG, "INDEX_TRACE: 曲目=%lu 未携带技术索引快照，继续由decoder直接解析",
             request != nullptr ? static_cast<unsigned long>(request->track_index + 1U) : 0UL);
+#endif
         return;
     }
 
@@ -1183,6 +1194,7 @@ static void audio_task_verify_index_snapshot(
     }
 
     if (mismatch) {
+#if APP_DIAG_AUDIO_INDEX
         ESP_LOGW(TAG,
             "INDEX_TRACE: MISMATCH 格式=%s index=%luHz/%ubit/%uch total=%llu decoder=%luHz/%ubit/%uch total=%llu；本次继续以decoder为准",
             media_format_name(request->format),
@@ -1194,6 +1206,7 @@ static void audio_task_verify_index_snapshot(
             static_cast<unsigned>(g_decoder.info.bits_per_sample),
             static_cast<unsigned>(g_decoder.info.channels),
             static_cast<unsigned long long>(g_decoder.info.total_frames));
+#endif
         return;
     }
 
@@ -3909,7 +3922,6 @@ static esp_err_t audio_task_fast_seek_flac(
     if (ret != ESP_OK) {
         return ret;
     }
-
     ret = pcm_decoder_seek_frame(&g_decoder, target_frame, nullptr, out_result);
     if (ret != ESP_OK) {
         return ret;
@@ -4033,7 +4045,8 @@ static void audio_task_handle_seek(AudioRequest *request)
     bool fast_seek_done = false;
     esp_err_t ret = ESP_ERR_NOT_SUPPORTED;
     if (decoder_type == PcmDecoderType::Flac) {
-        ret = audio_task_fast_seek_flac(target_frame, was_paused, &seek_result);
+        ret = audio_task_fast_seek_flac(
+            target_frame, was_paused, &seek_result);
         fast_seek_done = ret == ESP_OK;
 #if APP_DIAG_AUDIO_SEEK
         if (!fast_seek_done) {
@@ -4046,7 +4059,11 @@ static void audio_task_handle_seek(AudioRequest *request)
     }
 
     if (!fast_seek_done) {
-        ret = audio_task_shutdown_pipeline();
+        const uint32_t seek_mute_settle_ms =
+            (decoder_type == PcmDecoderType::Mp3 || decoder_type == PcmDecoderType::Opus)
+            ? AUDIO_SEEK_MUTE_SETTLE_MS
+            : AUDIO_PCM_MUTE_SETTLE_MS;
+        ret = audio_task_shutdown_pipeline(seek_mute_settle_ms);
         if (ret != ESP_OK) {
             audio_task_set_state(AudioPlaybackState::Error, ret);
             audio_request_complete(request, false, ret);

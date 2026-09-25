@@ -18,6 +18,16 @@ static constexpr size_t OPUS_PACKET_BUFFER_BYTES = 64U * 1024U;
 // 解码 PCM 缓冲按 OpusHead 声道数 + 首音频 packet 的真实 frame duration 精确计算。
 // 仍保留按 needed_size 扩容的兜底，避免把乐鑫 decoder 的输出需求写死。
 static constexpr size_t OPUS_MAX_DECODED_BUFFER_BYTES = 128U * 1024U;
+// RFC 7845 4.6：随机 Seek 至少从目标前 80ms（48kHz 下 3840 帧）开始预滚。
+static constexpr uint64_t OPUS_SEEK_PREROLL_FRAMES = 3840ULL;
+static constexpr size_t OPUS_SEEK_DISCARD_CHUNK_FRAMES = 128U;
+// Ogg page 最大为 27B 固定头 + 255B lacing + 255*255B payload。
+// R31.4 随机探测只在一个最大页范围内寻找下一个合法 page，避免退化成全文件字节扫描。
+static constexpr uint64_t OPUS_OGG_MAX_PAGE_BYTES = 27ULL + 255ULL + 255ULL * 255ULL;
+static constexpr size_t OPUS_OGG_RESYNC_CHUNK_BYTES = 4096U;
+static constexpr uint32_t OPUS_SEEK_MAX_PROBES = 12U;
+// R31.5.1 实机复核：40s 分界偏早；前 60s 保留线性扫描，更远目标继续使用 R31.4 granule 快速定位。
+static constexpr uint64_t OPUS_SEEK_LINEAR_CUTOFF_FRAMES = 60ULL * 48000ULL;
 
 static esp_err_t opus_audio_error_to_esp(esp_audio_err_t error)
 {
@@ -63,6 +73,12 @@ static uint32_t opus_read_le32(const uint8_t *p)
         (static_cast<uint32_t>(p[1]) << 8) |
         (static_cast<uint32_t>(p[2]) << 16) |
         (static_cast<uint32_t>(p[3]) << 24);
+}
+
+static uint64_t opus_read_le64(const uint8_t *p)
+{
+    return static_cast<uint64_t>(opus_read_le32(p)) |
+        (static_cast<uint64_t>(opus_read_le32(p + 4U)) << 32U);
 }
 
 static esp_err_t opus_prepare_output_gain(OpusDecoder *decoder)
@@ -299,6 +315,272 @@ static esp_err_t opus_source_skip(AudioSource *source, size_t bytes)
         remaining -= chunk;
     }
     return ESP_OK;
+}
+
+struct OpusSeekPage
+{
+    uint64_t offset = 0ULL;
+    uint64_t base_granule = 0ULL;
+    bool valid = false;
+};
+
+struct OpusPageInfo
+{
+    uint64_t offset = 0ULL;
+    uint64_t end_offset = 0ULL;
+    uint64_t granule = UINT64_MAX;
+    uint32_t payload_bytes = 0U;
+    bool continued = false;
+};
+
+static esp_err_t opus_read_page_info_at(
+    OpusDecoder *decoder,
+    uint64_t offset,
+    uint64_t file_size,
+    OpusPageInfo *out_page)
+{
+    if (decoder == nullptr || decoder->source == nullptr || out_page == nullptr ||
+        offset > file_size || file_size - offset < 27ULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_page = {};
+
+    esp_err_t ret = audio_source_seek(
+        decoder->source, static_cast<int64_t>(offset), AudioSourceSeekOrigin::Begin);
+    if (ret != ESP_OK) return ret;
+
+    uint8_t header[27] = {};
+    ret = opus_source_read_exact(decoder->source, header, sizeof(header));
+    if (ret != ESP_OK) return ret;
+    if (memcmp(header, "OggS", 4U) != 0 || header[4] != 0U) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if (opus_read_le32(header + 14U) != decoder->ogg_serial) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    const uint8_t segment_count = header[26];
+    uint8_t lacing[255] = {};
+    if (segment_count > 0U) {
+        ret = opus_source_read_exact(decoder->source, lacing, segment_count);
+        if (ret != ESP_OK) return ret;
+    }
+
+    uint32_t payload_bytes = 0U;
+    for (uint16_t i = 0U; i < segment_count; ++i) payload_bytes += lacing[i];
+    const uint64_t payload_start = offset + 27ULL + segment_count;
+    if (payload_start > file_size || payload_bytes > file_size - payload_start) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    out_page->offset = offset;
+    out_page->end_offset = payload_start + payload_bytes;
+    out_page->granule = opus_read_le64(header + 6U);
+    out_page->payload_bytes = payload_bytes;
+    out_page->continued = (header[5] & 0x01U) != 0U;
+    return ESP_OK;
+}
+
+static esp_err_t opus_find_next_page(
+    OpusDecoder *decoder,
+    uint64_t start_offset,
+    uint64_t file_size,
+    OpusPageInfo *out_page)
+{
+    if (decoder == nullptr || decoder->source == nullptr || out_page == nullptr ||
+        start_offset >= file_size) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_page = {};
+
+    const uint64_t max_scan_end = start_offset > UINT64_MAX - OPUS_OGG_MAX_PAGE_BYTES - 4ULL
+        ? file_size
+        : start_offset + OPUS_OGG_MAX_PAGE_BYTES + 4ULL;
+    const uint64_t scan_end = max_scan_end < file_size ? max_scan_end : file_size;
+    uint8_t buffer[OPUS_OGG_RESYNC_CHUNK_BYTES] = {};
+    uint64_t chunk_offset = start_offset;
+
+    while (chunk_offset + 4ULL <= scan_end) {
+        const uint64_t remaining = scan_end - chunk_offset;
+        const size_t chunk_bytes = remaining < sizeof(buffer)
+            ? static_cast<size_t>(remaining)
+            : sizeof(buffer);
+        if (chunk_bytes < 4U) break;
+
+        esp_err_t ret = audio_source_seek(
+            decoder->source, static_cast<int64_t>(chunk_offset), AudioSourceSeekOrigin::Begin);
+        if (ret != ESP_OK) return ret;
+        ret = opus_source_read_exact(decoder->source, buffer, chunk_bytes);
+        if (ret != ESP_OK) return ret;
+
+        for (size_t i = 0U; i + 4U <= chunk_bytes; ++i) {
+            if (memcmp(buffer + i, "OggS", 4U) != 0) continue;
+            const uint64_t candidate_offset = chunk_offset + i;
+            if (candidate_offset + 27ULL > file_size) continue;
+
+            OpusPageInfo candidate = {};
+            ret = opus_read_page_info_at(decoder, candidate_offset, file_size, &candidate);
+            if (ret == ESP_OK) {
+                *out_page = candidate;
+                return ESP_OK;
+            }
+            // 压缩 payload 内偶然出现 "OggS" 时继续搜索；只有真正同 serial page 才作为探测结果。
+            if (ret != ESP_ERR_INVALID_RESPONSE && ret != ESP_ERR_NOT_SUPPORTED &&
+                ret != ESP_ERR_INVALID_SIZE) {
+                return ret;
+            }
+        }
+
+        if (chunk_bytes <= 3U) break;
+        chunk_offset += chunk_bytes - 3U;
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+static esp_err_t opus_scan_seek_pages(
+    OpusDecoder *decoder,
+    uint64_t start_offset,
+    uint64_t file_size,
+    uint64_t desired_granule,
+    bool have_previous_granule,
+    uint64_t previous_granule,
+    OpusSeekPage *out_page)
+{
+    if (decoder == nullptr || decoder->source == nullptr || out_page == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint64_t page_offset = start_offset;
+    uint64_t last_granule = previous_granule;
+    bool have_last_granule = have_previous_granule;
+    while (page_offset < file_size) {
+        OpusPageInfo page = {};
+        esp_err_t ret = opus_read_page_info_at(decoder, page_offset, file_size, &page);
+        if (ret != ESP_OK) return ret;
+        if (page.granule != UINT64_MAX) {
+            if (have_last_granule && page.granule < last_granule) {
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+            if (!page.continued && page.payload_bytes > 0U && page.granule > 0ULL &&
+                have_last_granule && last_granule <= desired_granule) {
+                out_page->offset = page.offset;
+                out_page->base_granule = last_granule;
+                out_page->valid = true;
+            }
+            last_granule = page.granule;
+            have_last_granule = true;
+        }
+
+        if (have_last_granule && last_granule >= desired_granule && out_page->valid) {
+            return ESP_OK;
+        }
+        if (page.end_offset <= page_offset) return ESP_ERR_INVALID_SIZE;
+        page_offset = page.end_offset;
+    }
+    return out_page->valid ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+static esp_err_t opus_find_seek_page_linear(
+    OpusDecoder *decoder,
+    uint64_t file_size,
+    uint64_t desired_granule,
+    OpusSeekPage *out_page)
+{
+    if (decoder == nullptr || out_page == nullptr) return ESP_ERR_INVALID_ARG;
+    *out_page = {};
+    return opus_scan_seek_pages(
+        decoder, 0ULL, file_size, desired_granule, false, 0ULL, out_page);
+}
+
+static esp_err_t opus_find_seek_page(
+    OpusDecoder *decoder,
+    uint64_t desired_granule,
+    OpusSeekPage *out_page)
+{
+    if (decoder == nullptr || decoder->source == nullptr || out_page == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_page = {};
+
+    uint64_t file_size = 0ULL;
+    esp_err_t ret = audio_source_size(decoder->source, &file_size);
+    if (ret != ESP_OK || file_size < 27ULL) {
+        return ret != ESP_OK ? ret : ESP_ERR_INVALID_SIZE;
+    }
+
+    // 只在实机已验证的短目标范围保留原线性路径，不依赖歌曲总时长、码率或页密度猜测。
+    // desired_granule 指向 target-80ms，因此把 60s 用户目标换算到同一 granule 基准后比较。
+    const uint64_t linear_cutoff_granule = static_cast<uint64_t>(decoder->pre_skip) +
+        OPUS_SEEK_LINEAR_CUTOFF_FRAMES - OPUS_SEEK_PREROLL_FRAMES;
+    if (desired_granule <= linear_cutoff_granule) {
+        return opus_find_seek_page_linear(decoder, file_size, desired_granule, out_page);
+    }
+
+    uint64_t low_offset = 0ULL;
+    uint64_t high_offset = file_size;
+    OpusPageInfo best_lower = {};
+    bool have_best_lower = false;
+    for (uint32_t probe = 0U; probe < OPUS_SEEK_MAX_PROBES; ++probe) {
+        if (high_offset <= low_offset ||
+            high_offset - low_offset <= OPUS_OGG_MAX_PAGE_BYTES * 2ULL) {
+            break;
+        }
+
+        const uint64_t guess = low_offset + (high_offset - low_offset) / 2ULL;
+        OpusPageInfo page = {};
+        ret = opus_find_next_page(decoder, guess, file_size, &page);
+        if (ret == ESP_ERR_NOT_FOUND) {
+            high_offset = guess;
+            continue;
+        }
+        if (ret != ESP_OK) {
+            break;
+        }
+        if (page.offset >= high_offset) {
+            high_offset = guess;
+            continue;
+        }
+
+        if (page.granule == UINT64_MAX) {
+            // granule=-1 的页无法判断目标在其前后；保守收缩到左侧，最终局部扫描或线性 fallback。
+            high_offset = page.offset;
+            continue;
+        }
+        if (page.granule <= desired_granule) {
+            best_lower = page;
+            have_best_lower = true;
+            low_offset = page.end_offset;
+        } else {
+            high_offset = page.offset;
+        }
+    }
+
+    if (have_best_lower) {
+        const uint64_t local_start = best_lower.offset > OPUS_OGG_MAX_PAGE_BYTES
+            ? best_lower.offset - OPUS_OGG_MAX_PAGE_BYTES
+            : 0ULL;
+        OpusPageInfo anchor = {};
+        ret = opus_find_next_page(decoder, local_start, file_size, &anchor);
+        if (ret == ESP_OK) {
+            if (anchor.granule != UINT64_MAX && anchor.end_offset < file_size) {
+                ret = opus_scan_seek_pages(
+                    decoder,
+                    anchor.end_offset,
+                    file_size,
+                    desired_granule,
+                    true,
+                    anchor.granule,
+                    out_page);
+                if (ret == ESP_OK) return ESP_OK;
+            }
+        }
+    }
+
+    // 快速探测拿不到可靠 granule 锚点时回退原顺序扫描；只牺牲性能，不牺牲 Seek 正确性。
+    OpusSeekPage linear = {};
+    ret = opus_find_seek_page_linear(decoder, file_size, desired_granule, &linear);
+    *out_page = linear;
+    return ret;
 }
 
 static esp_err_t opus_ogg_load_page(OpusDecoder *decoder, bool continuation_required, bool first_page)
@@ -774,6 +1056,35 @@ static esp_err_t opus_decode_next_output(OpusDecoder *decoder)
     return ESP_OK;
 }
 
+static esp_err_t opus_open_codec_handle(OpusDecoder *decoder)
+{
+    if (decoder == nullptr) return ESP_ERR_INVALID_ARG;
+    if (decoder->opus_handle != nullptr) {
+        esp_opus_dec_close(static_cast<esp_audio_dec_handle_t>(decoder->opus_handle));
+        decoder->opus_handle = nullptr;
+    }
+
+    esp_opus_dec_frame_duration_t codec_frame_duration = ESP_OPUS_DEC_FRAME_DURATION_INVALID;
+    if (!opus_codec_frame_duration(decoder->frame_duration_q4_ms, &codec_frame_duration)) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    esp_opus_dec_cfg_t opus_cfg = ESP_OPUS_DEC_CONFIG_DEFAULT();
+    opus_cfg.sample_rate = 48000;
+    opus_cfg.channel = decoder->channels;
+    opus_cfg.frame_duration = codec_frame_duration;
+    opus_cfg.self_delimited = false;
+
+    esp_audio_dec_handle_t handle = nullptr;
+    const esp_audio_err_t codec_ret = esp_opus_dec_open(&opus_cfg, sizeof(opus_cfg), &handle);
+    if (codec_ret != ESP_AUDIO_ERR_OK || handle == nullptr) {
+        ESP_LOGE(TAG, "打开乐鑫 Opus Decoder 失败：codec_ret=%d", static_cast<int>(codec_ret));
+        return opus_audio_error_to_esp(codec_ret);
+    }
+    decoder->opus_handle = handle;
+    return ESP_OK;
+}
+
 esp_err_t opus_decoder_open(
     OpusDecoder *decoder,
     AudioSource *source,
@@ -863,26 +1174,11 @@ esp_err_t opus_decoder_open(
     }
     decoder->decoded_capacity = decoded_buffer_bytes;
 
-    esp_opus_dec_frame_duration_t codec_frame_duration = ESP_OPUS_DEC_FRAME_DURATION_INVALID;
-    if (!opus_codec_frame_duration(decoder->frame_duration_q4_ms, &codec_frame_duration)) {
+    ret = opus_open_codec_handle(decoder);
+    if (ret != ESP_OK) {
         opus_decoder_close(decoder);
-        return ESP_ERR_NOT_SUPPORTED;
+        return ret;
     }
-
-    esp_opus_dec_cfg_t opus_cfg = ESP_OPUS_DEC_CONFIG_DEFAULT();
-    opus_cfg.sample_rate = 48000;
-    opus_cfg.channel = decoder->channels;
-    opus_cfg.frame_duration = codec_frame_duration;
-    opus_cfg.self_delimited = false;
-
-    esp_audio_dec_handle_t handle = nullptr;
-    const esp_audio_err_t codec_ret = esp_opus_dec_open(&opus_cfg, sizeof(opus_cfg), &handle);
-    if (codec_ret != ESP_AUDIO_ERR_OK || handle == nullptr) {
-        ESP_LOGE(TAG, "打开乐鑫 Opus Decoder 失败：codec_ret=%d", static_cast<int>(codec_ret));
-        opus_decoder_close(decoder);
-        return opus_audio_error_to_esp(codec_ret);
-    }
-    decoder->opus_handle = handle;
 
     // 在 I2S/DAC 启动前预解第一包 PCM，验证 Ogg 拆包和真实输出格式。
     ret = opus_decode_next_output(decoder);
@@ -1017,6 +1313,163 @@ esp_err_t opus_decoder_read_pcm32(
         }
     }
     *out_frames = produced;
+    return ESP_OK;
+}
+
+static esp_err_t opus_restart_from_beginning(OpusDecoder *decoder)
+{
+    if (decoder == nullptr || decoder->source == nullptr) return ESP_ERR_INVALID_ARG;
+    AudioSource *source = decoder->source;
+    AudioDecodeWorkspace *workspace = decoder->workspace;
+    const uint64_t total_frames = decoder->total_frames;
+    const esp_err_t ret = opus_decoder_open(decoder, source, workspace);
+    if (ret == ESP_OK) decoder->total_frames = total_frames;
+    return ret;
+}
+
+static esp_err_t opus_skip_packets_before_preroll(
+    OpusDecoder *decoder,
+    uint64_t preroll_frame)
+{
+    if (decoder == nullptr || decoder->frames_read > preroll_frame) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    while (decoder->frames_read < preroll_frame) {
+        size_t packet_size = 0U;
+        esp_err_t ret = opus_ogg_read_current_packet(
+            decoder, decoder->input_buffer, decoder->input_capacity, &packet_size);
+        if (ret != ESP_OK) return ret;
+
+        OpusPacketInfo packet_info = {};
+        ret = opus_parse_packet_info(decoder->input_buffer, packet_size, &packet_info);
+        if (ret != ESP_OK) return ret;
+        if (packet_info.frame_duration_q4_ms != decoder->frame_duration_q4_ms) {
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+
+        const uint64_t packet_frames =
+            static_cast<uint64_t>(packet_info.packet_duration_q4_ms) * 12ULL;
+        const uint64_t pre_skip_frames = decoder->pre_skip_remaining < packet_frames
+            ? decoder->pre_skip_remaining
+            : packet_frames;
+        const uint64_t playable_frames = packet_frames - pre_skip_frames;
+        const uint64_t remaining_before_preroll = preroll_frame - decoder->frames_read;
+
+        // 只有整包跳过后仍不越过 target-80ms，才允许不送入 Opus decoder。
+        // 当前包若跨过 pre-roll 起点，则保留在 input_buffer，作为新 decoder 的第一包。
+        if (playable_frames > remaining_before_preroll) {
+            decoder->input_size = packet_size;
+            decoder->input_packet_ready = true;
+            return ESP_OK;
+        }
+
+        decoder->pre_skip_remaining -= static_cast<uint32_t>(pre_skip_frames);
+        decoder->frames_read += playable_frames;
+        decoder->input_size = 0U;
+        decoder->input_packet_ready = false;
+        ret = opus_ogg_begin_next_packet(decoder);
+        if (ret != ESP_OK) return ret;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t opus_reset_to_seek_page(
+    OpusDecoder *decoder,
+    const OpusSeekPage &page,
+    uint64_t preroll_frame)
+{
+    if (decoder == nullptr || decoder->source == nullptr || !page.valid) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t ret = audio_source_seek(
+        decoder->source, static_cast<int64_t>(page.offset), AudioSourceSeekOrigin::Begin);
+    if (ret != ESP_OK) return ret;
+
+    decoder->ogg_segment_count = 0U;
+    decoder->ogg_segment_index = 0U;
+    decoder->ogg_segment_remaining = 0U;
+    decoder->ogg_segment_ends_packet = false;
+    decoder->ogg_packet_active = true;
+    decoder->ogg_packet_ended = false;
+    decoder->input_packet_ready = false;
+    decoder->input_size = 0U;
+    decoder->decoded_offset = 0U;
+    decoder->decoded_size = 0U;
+    decoder->eof = false;
+
+    ret = opus_ogg_load_page(decoder, false, false);
+    if (ret != ESP_OK) return ret;
+
+    decoder->pre_skip_remaining = page.base_granule < decoder->pre_skip
+        ? static_cast<uint32_t>(decoder->pre_skip - page.base_granule)
+        : 0U;
+    decoder->frames_read = page.base_granule > decoder->pre_skip
+        ? page.base_granule - decoder->pre_skip
+        : 0ULL;
+
+    ret = opus_skip_packets_before_preroll(decoder, preroll_frame);
+    if (ret != ESP_OK) return ret;
+    return opus_open_codec_handle(decoder);
+}
+
+static esp_err_t opus_discard_to_frame(OpusDecoder *decoder, uint64_t target_frame)
+{
+    if (decoder == nullptr || decoder->frames_read > target_frame) return ESP_ERR_INVALID_ARG;
+    int32_t scratch[OPUS_SEEK_DISCARD_CHUNK_FRAMES * 2U] = {};
+    while (decoder->frames_read < target_frame) {
+        const uint64_t remaining = target_frame - decoder->frames_read;
+        const size_t request = remaining < OPUS_SEEK_DISCARD_CHUNK_FRAMES
+            ? static_cast<size_t>(remaining)
+            : OPUS_SEEK_DISCARD_CHUNK_FRAMES;
+        size_t frames = 0U;
+        const esp_err_t ret = opus_decoder_read_pcm32(decoder, scratch, request, &frames);
+        if (ret != ESP_OK) return ret;
+        if (frames == 0U) return ESP_ERR_INVALID_SIZE;
+    }
+    return ESP_OK;
+}
+
+esp_err_t opus_decoder_seek_frame(
+    OpusDecoder *decoder,
+    uint64_t target_frame,
+    uint64_t *out_frame,
+    uint64_t *out_source_offset)
+{
+    if (out_frame != nullptr) *out_frame = 0ULL;
+    if (out_source_offset != nullptr) *out_source_offset = 0ULL;
+    if (decoder == nullptr || !opus_decoder_is_open(decoder)) return ESP_ERR_INVALID_STATE;
+    if (decoder->total_frames > 0ULL && target_frame >= decoder->total_frames) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t ret = ESP_OK;
+    uint64_t source_offset = 0ULL;
+    if (target_frame < OPUS_SEEK_PREROLL_FRAMES) {
+        ret = opus_restart_from_beginning(decoder);
+    } else {
+        const uint64_t preroll_frame = target_frame - OPUS_SEEK_PREROLL_FRAMES;
+        if (preroll_frame > UINT64_MAX - decoder->pre_skip) return ESP_ERR_INVALID_SIZE;
+        const uint64_t desired_granule = preroll_frame + decoder->pre_skip;
+        OpusSeekPage page = {};
+        ret = opus_find_seek_page(decoder, desired_granule, &page);
+        if (ret == ESP_OK && page.valid) {
+            ret = opus_reset_to_seek_page(decoder, page, preroll_frame);
+            source_offset = page.offset;
+        } else if (ret == ESP_ERR_NOT_FOUND) {
+            // 极端 lacing 结构没有可安全独立解码的页时，从流头回退；慢但保持正确。
+            ret = opus_restart_from_beginning(decoder);
+            source_offset = 0ULL;
+        }
+    }
+    if (ret != ESP_OK) return ret;
+    if (decoder->frames_read > target_frame) return ESP_ERR_INVALID_RESPONSE;
+
+    ret = opus_discard_to_frame(decoder, target_frame);
+    if (ret != ESP_OK) return ret;
+
+    if (out_frame != nullptr) *out_frame = decoder->frames_read;
+    if (out_source_offset != nullptr) *out_source_offset = source_offset;
     return ESP_OK;
 }
 

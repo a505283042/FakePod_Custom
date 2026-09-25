@@ -8,7 +8,7 @@
 #include "../sources/audio_source.h"
 
 // Ogg Opus 解码器负责：Ogg packet 拆包 -> 跳过 OpusHead/OpusTags -> RAW Opus -> PCM。
-// Ogg Opus 的播放时钟固定为 48kHz；本轮不实现随机 Seek。
+// Ogg Opus 的播放时钟固定为 48kHz；Seek 使用 Ogg granule + 80ms pre-roll。
 struct OpusDecoder
 {
     AudioSource *source = nullptr;
@@ -73,6 +73,13 @@ esp_err_t opus_decoder_read_pcm32(
 // Catalog 已按 RFC 7845 的 final granule - pre-skip 算出可播放 PCM 总帧。
 // 运行时只接收这个现成结果，不重新扫描文件尾；用于精确裁掉最后一个 packet 的 padding。
 esp_err_t opus_decoder_set_total_frames_hint(OpusDecoder *decoder, uint64_t total_frames);
+
+esp_err_t opus_decoder_seek_frame(
+    OpusDecoder *decoder,
+    uint64_t target_frame,
+    uint64_t *out_frame,
+    uint64_t *out_source_offset
+);
 
 void opus_decoder_close(OpusDecoder *decoder);
 bool opus_decoder_is_open(const OpusDecoder *decoder);
