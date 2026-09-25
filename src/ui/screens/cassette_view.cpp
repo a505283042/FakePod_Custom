@@ -247,6 +247,7 @@ struct CassetteCacheBuildResult
 enum class CassetteNextPrefetchState : uint8_t
 {
     Idle = 0,
+    ReuseNoArtwork,
     WaitingArtwork,
     WaitingSurface,
     Building,
@@ -393,6 +394,7 @@ static void cassette_view_handle_cache_result();
 static void cassette_view_service_cache_pipeline();
 static void cassette_view_cancel_next_prefetch(const char *reason);
 static bool cassette_view_try_promote_next_visual(uint32_t generation, uint32_t track);
+static bool cassette_view_try_reuse_next_no_artwork_visual(uint32_t generation, uint32_t track);
 static void cassette_view_promote_next_controls_only(uint32_t generation, uint32_t track);
 
 static uint16_t cassette_view_cover_source_width()
@@ -2608,6 +2610,16 @@ static void cassette_view_service_next_prefetch()
         MediaArtworkViewV2 artwork = {};
         if (!media_library_get_artwork_view(next_track, &artwork)) {
             g_next_prefetch.no_artwork = true;
+            const uint32_t current_track = static_cast<uint32_t>(player_state_get_index());
+            if (g_cover_is_no_artwork_fallback &&
+                g_cover_generation == generation && g_cover_track == current_track) {
+                // 当前与下一首都明确无封面时，两者使用同一套缺省视觉。只记住可复用关系，
+                // 不申请下一份 fallback，也不离屏生成下一首封面/壳体缓存。
+                g_next_prefetch.state = CassetteNextPrefetchState::ReuseNoArtwork;
+                ESP_LOGI(TAG, "下一首同为无封面，跳过封面预缓存：track=%lu",
+                    static_cast<unsigned long>(next_track));
+                return;
+            }
             (void)cassette_view_schedule_next_build(true);
             return;
         }
@@ -3141,6 +3153,27 @@ static bool cassette_view_try_promote_next_visual(uint32_t generation, uint32_t 
     return true;
 }
 
+static bool cassette_view_try_reuse_next_no_artwork_visual(uint32_t generation, uint32_t track)
+{
+    if (g_next_prefetch.state != CassetteNextPrefetchState::ReuseNoArtwork ||
+        g_next_prefetch.generation != generation || g_next_prefetch.track != track ||
+        !g_cover_is_no_artwork_fallback) {
+        return false;
+    }
+
+    // 缺省封面和原装粉色壳体已经是目标视觉；切歌时只更新视觉归属，
+    // 不重新绑定图片、不重新申请 fallback，也不触发封面预读。
+    g_cover_generation = generation;
+    g_cover_track = track;
+    g_cover_y_offset_px = 0;
+    cassette_view_mark_controls_cache_dirty();
+
+    g_next_prefetch = {};
+    ESP_LOGI(TAG, "下一首无封面视觉直接复用：track=%lu",
+        static_cast<unsigned long>(track));
+    return true;
+}
+
 static void cassette_view_promote_next_controls_only(uint32_t generation, uint32_t track)
 {
     if (g_next_prefetch.state != CassetteNextPrefetchState::Ready ||
@@ -3179,6 +3212,9 @@ static bool cassette_view_bind_current_cover()
 
     // Round 23：当前曲若正好是上一首播放期间完整预热的 next，直接提升整套视觉。
     if (cassette_view_try_promote_next_visual(generation, track)) {
+        return true;
+    }
+    if (cassette_view_try_reuse_next_no_artwork_visual(generation, track)) {
         return true;
     }
 
