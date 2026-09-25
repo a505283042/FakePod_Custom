@@ -211,16 +211,6 @@ static esp_err_t opus_parse_packet_info(
     }
 
     const uint16_t frame_duration_q4_ms = opus_toc_frame_duration_q4_ms(toc);
-    // 当前锁定的 esp_audio_codec 2.6.0 已在实机验证 20ms 配置。
-    // R24 先扩完整标准 packet framing（c=0/1/2/3），其它单帧时长留到确认乐鑫枚举后再扩。
-    if (frame_duration_q4_ms != 80U) {
-        ESP_LOGE(TAG, "暂不支持该 Opus 单帧时长：%u.%02ums TOC=0x%02X",
-            static_cast<unsigned>(frame_duration_q4_ms / 4U),
-            static_cast<unsigned>((frame_duration_q4_ms % 4U) * 25U),
-            static_cast<unsigned>(toc));
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-
     const uint32_t packet_duration_q4_ms =
         static_cast<uint32_t>(frame_duration_q4_ms) * frame_count;
     // RFC 6716 一个 Opus packet 最长 120ms。
@@ -237,6 +227,25 @@ static esp_err_t opus_parse_packet_info(
     out_info->frame_count = frame_count;
     out_info->frame_count_code = frame_count_code;
     return ESP_OK;
+}
+
+// TOC 时长单位为 1/4ms；这里只映射 RFC 6716 允许的单帧时长。
+static bool opus_codec_frame_duration(
+    uint16_t frame_duration_q4_ms,
+    esp_opus_dec_frame_duration_t *out_duration)
+{
+    if (out_duration == nullptr) {
+        return false;
+    }
+    switch (frame_duration_q4_ms) {
+        case 10U: *out_duration = ESP_OPUS_DEC_FRAME_DURATION_2_5_MS; return true;
+        case 20U: *out_duration = ESP_OPUS_DEC_FRAME_DURATION_5_MS; return true;
+        case 40U: *out_duration = ESP_OPUS_DEC_FRAME_DURATION_10_MS; return true;
+        case 80U: *out_duration = ESP_OPUS_DEC_FRAME_DURATION_20_MS; return true;
+        case 160U: *out_duration = ESP_OPUS_DEC_FRAME_DURATION_40_MS; return true;
+        case 240U: *out_duration = ESP_OPUS_DEC_FRAME_DURATION_60_MS; return true;
+        default: return false;
+    }
 }
 
 static esp_err_t opus_source_read_exact(AudioSource *source, void *buffer, size_t bytes)
@@ -666,9 +675,11 @@ static esp_err_t opus_decode_next_output(OpusDecoder *decoder)
 
         if (!decoder->runtime_info_verified) {
             ESP_LOGI(TAG,
-                "Opus首音频packet：%uB TOC=0x%02X frame=20ms frames=%u packet=%u.%02ums c=%u channels=%u pre_skip=%u output_gain_q8=%d",
+                "Opus首音频packet：%uB TOC=0x%02X frame=%u.%02ums frames=%u packet=%u.%02ums c=%u channels=%u pre_skip=%u output_gain_q8=%d",
                 static_cast<unsigned>(packet_size),
                 static_cast<unsigned>(decoder->input_buffer[0]),
+                static_cast<unsigned>(packet_info.frame_duration_q4_ms / 4U),
+                static_cast<unsigned>((packet_info.frame_duration_q4_ms % 4U) * 25U),
                 static_cast<unsigned>(packet_info.frame_count),
                 static_cast<unsigned>(packet_info.packet_duration_q4_ms / 4U),
                 static_cast<unsigned>((packet_info.packet_duration_q4_ms % 4U) * 25U),
@@ -802,7 +813,7 @@ esp_err_t opus_decoder_open(
     }
 
     // 在打开乐鑫 decoder 前先读取首个真正的音频 packet。
-    // esp_audio_codec 2.6.0 的 Opus frame_duration 必须和编码帧匹配，不能固定写 60ms。
+    // esp_audio_codec 2.6.0 的 Opus frame_duration 必须与首个音频 packet 的单帧时长匹配。
     size_t first_packet_size = 0U;
     ret = opus_ogg_read_current_packet(
         decoder,
@@ -852,10 +863,16 @@ esp_err_t opus_decoder_open(
     }
     decoder->decoded_capacity = decoded_buffer_bytes;
 
+    esp_opus_dec_frame_duration_t codec_frame_duration = ESP_OPUS_DEC_FRAME_DURATION_INVALID;
+    if (!opus_codec_frame_duration(decoder->frame_duration_q4_ms, &codec_frame_duration)) {
+        opus_decoder_close(decoder);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
     esp_opus_dec_cfg_t opus_cfg = ESP_OPUS_DEC_CONFIG_DEFAULT();
     opus_cfg.sample_rate = 48000;
     opus_cfg.channel = decoder->channels;
-    opus_cfg.frame_duration = ESP_OPUS_DEC_FRAME_DURATION_20_MS;
+    opus_cfg.frame_duration = codec_frame_duration;
     opus_cfg.self_delimited = false;
 
     esp_audio_dec_handle_t handle = nullptr;
