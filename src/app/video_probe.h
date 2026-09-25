@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
 
 namespace VideoProbe
 {
@@ -43,6 +44,11 @@ esp_err_t init();
 // 当前阶段不读取/解码 MJPEG frame，也不把 MP3 送入 AudioTask。
 esp_err_t start(const char *path);
 void cancel();
+
+// USB MSC 接管前取消所有旧 Probe，并等待其 FILE/extractor 真正关闭。
+// 返回 false 时上层必须取消本次 VFS 卸载，不能只依赖“SD mutex 此刻空闲”。
+bool prepare_storage_handoff(TickType_t timeout_ticks);
+
 bool get_snapshot(Snapshot *out_snapshot);
 const char *state_name(State state);
 

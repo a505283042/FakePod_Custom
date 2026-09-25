@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
 
 namespace VisualMusicNsf
 {
@@ -55,6 +56,10 @@ esp_err_t init();
 // VM09 先支持传统 NESM NSF；NSFE/NSF2 容器在后续阶段单独接入。
 esp_err_t start(const char *path);
 void cancel();
+
+// USB MSC 接管前取消所有旧 NSF Loader，并等待其 FILE 真正关闭。
+bool prepare_storage_handoff(TickType_t timeout_ticks);
+
 bool take_result(LoadResult *out_result);
 void release_image(Image *image);
 

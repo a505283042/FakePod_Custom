@@ -171,6 +171,9 @@ void gesture_router_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t ti
 {
     if (pressed) {
         if (!g_state.pressed) {
+            // R44.3：新一轮物理触摸开始后，上一轮尚未被 UI timer 消费的动作已经过期。
+            // 宁可丢弃旧动作，也不能让它在新手指已经按下后跨触摸生命周期执行。
+            g_state.pending = UiGestureAction::None;
             g_state.pressed = true;
             g_state.press_origin_valid = true;
             g_state.suppress_click = false;

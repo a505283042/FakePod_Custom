@@ -11,6 +11,7 @@
 #include "esp_log.h"
 
 #include "board_pins.h"
+#include "persistent_state.h"
 
 #ifndef FAKEPOD_BATTERY_DIAGNOSTIC_LOG
 #define FAKEPOD_BATTERY_DIAGNOSTIC_LOG 0
@@ -145,6 +146,13 @@ static void battery_update_log_state(const BatterySnapshot &snapshot)
         ESP_LOGW(TAG, "进入严重低电量：%u%%，%umV",
             static_cast<unsigned>(snapshot.percent),
             static_cast<unsigned>(snapshot.filtered_mv));
+
+        // R44.3：严重低电量只在状态边沿触发一次持久化，尽量在 Brownout 前保存最新播放状态。
+        // 不做自动关机，避免改变现有产品行为；这里只缩小异常掉电丢状态窗口。
+        const esp_err_t flush_ret = persistent_state_flush();
+        if (flush_ret != ESP_OK && flush_ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "严重低电量保存运行状态失败：%s", esp_err_to_name(flush_ret));
+        }
     } else if (next == BatteryLogState::Low) {
         if (previous == BatteryLogState::Critical) {
             ESP_LOGI(TAG, "电量已离开严重低电量区间：%u%%，%umV",

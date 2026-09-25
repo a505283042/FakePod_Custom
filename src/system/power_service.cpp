@@ -12,6 +12,7 @@
 #include "device_settings.h"
 #include "screen_lock_simple.h"
 #include "app/app_manager.h"
+#include "usb_storage_service.h"
 
 static const char *TAG = "电源";
 
@@ -112,6 +113,15 @@ void power_service_update()
                 ESP_LOGI(TAG, "GPIO48 已检测到首次松键，关机长按检测正式布防");
             } else if (g_press_started_tick != 0 && !g_save_attempted_this_press) {
                 if (held_ms <= SHORT_ACTION_MAX_HOLD_MS) {
+                    // USB MSC active 时 TF owner 属于电脑。系统循环仍轮询电源键只是为了保留
+                    // 长按关机保存检测；短按媒体动作不能重新提交后台 Music 请求。
+                    if (usb_storage_service_is_active()) {
+                        ESP_LOGI(TAG, "电源键短按释放：USB MSC活动中，忽略媒体动作");
+                        g_press_started_tick = 0;
+                        g_save_attempted_this_press = false;
+                        return;
+                    }
+
                     // 短按功能由“辅助键模式”统一决定；长按关机保存逻辑完全不变。
                     DeviceSettingsSnapshot settings = {};
                     const bool track_mode = device_settings_get_snapshot(&settings) &&

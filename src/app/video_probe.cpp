@@ -31,6 +31,7 @@ struct TaskArgs
 static portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
 static Snapshot g_snapshot = {};
 static uint32_t g_generation = 1U;
+static uint32_t g_active_tasks = 0U;
 static bool g_registered = false;
 
 static bool generation_current(uint32_t generation)
@@ -49,11 +50,28 @@ static void publish(const Snapshot &snapshot)
     portEXIT_CRITICAL(&g_mux);
 }
 
+static void task_finished()
+{
+    portENTER_CRITICAL(&g_mux);
+    if (g_active_tasks > 0U) --g_active_tasks;
+    portEXIT_CRITICAL(&g_mux);
+}
+
+static uint32_t active_task_count()
+{
+    uint32_t count = 0U;
+    portENTER_CRITICAL(&g_mux);
+    count = g_active_tasks;
+    portEXIT_CRITICAL(&g_mux);
+    return count;
+}
+
 static void probe_task(void *arg)
 {
     TaskArgs *args = static_cast<TaskArgs *>(arg);
     if (args == nullptr || args->path == nullptr) {
         if (args != nullptr) heap_caps_free(args);
+        task_finished();
         vTaskDelete(nullptr);
         return;
     }
@@ -155,6 +173,7 @@ static void probe_task(void *arg)
 
     heap_caps_free(args->path);
     heap_caps_free(args);
+    task_finished();
     vTaskDelete(nullptr);
 }
 
@@ -187,6 +206,7 @@ esp_err_t start(const char *path)
     if (g_generation == 0U) ++g_generation;
     args->generation = g_generation;
     args->path = path_copy;
+    ++g_active_tasks;
     g_snapshot = {};
     g_snapshot.state = State::Running;
     g_snapshot.generation = g_generation;
@@ -204,6 +224,7 @@ esp_err_t start(const char *path)
         heap_caps_free(path_copy);
         heap_caps_free(args);
         portENTER_CRITICAL(&g_mux);
+        if (g_active_tasks > 0U) --g_active_tasks;
         g_snapshot.state = State::Failed;
         g_snapshot.result = ESP_ERR_NO_MEM;
         portEXIT_CRITICAL(&g_mux);
@@ -220,6 +241,25 @@ void cancel()
     g_snapshot = {};
     g_snapshot.generation = g_generation;
     portEXIT_CRITICAL(&g_mux);
+}
+
+bool prepare_storage_handoff(TickType_t timeout_ticks)
+{
+    cancel();
+    const TickType_t started = xTaskGetTickCount();
+    TickType_t poll = pdMS_TO_TICKS(5);
+    if (poll == 0) poll = 1;
+
+    while (active_task_count() != 0U) {
+        if (timeout_ticks == 0 ||
+            (timeout_ticks != portMAX_DELAY && xTaskGetTickCount() - started >= timeout_ticks)) {
+            ESP_LOGE(TAG, "USB接管等待AVI Probe退出超时：active=%lu",
+                static_cast<unsigned long>(active_task_count()));
+            return false;
+        }
+        vTaskDelay(poll);
+    }
+    return true;
 }
 
 bool get_snapshot(Snapshot *out_snapshot)

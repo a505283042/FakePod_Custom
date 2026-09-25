@@ -2,6 +2,7 @@
 #include "storage_io.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +48,11 @@ static constexpr TickType_t LIBRARY_SD_LOCK_TIMEOUT = pdMS_TO_TICKS(2000);
 // 正常开机的“新增歌曲快扫”先用一个极轻量的 TF 变更戳判断介质是否可能变化。
 // 命中时直接复用已经通过 CRC/semantic 校验的 V2 Catalog，不再枚举 /MUSIC 的千个长文件名。
 // 正常开机和 USB MSC 归还都先走这条快判定；只有变更戳不一致才进入完整增量扫描。
+static bool media_library_errno_is_missing(int error_code)
+{
+    return error_code == ENOENT || error_code == ENOTDIR;
+}
+
 static constexpr uint32_t LIBRARY_QUICK_STAMP_MAGIC = 0x46505331U; // "FPS1"
 static constexpr uint16_t LIBRARY_QUICK_STAMP_VERSION = 1U;
 
@@ -908,6 +914,18 @@ static esp_err_t media_library_scan_with_scratch(
     bool out_of_memory = false;
     bool storage_timeout = false;
     bool root_missing = false;
+    bool scan_io_error = false;
+    int scan_io_errno = 0;
+    char scan_io_stage[24] = {};
+    char scan_io_path[128] = {};
+    const auto record_scan_io_error = [&](const char *stage, const char *path, int error_code) {
+        if (!scan_io_error) {
+            scan_io_errno = error_code;
+            snprintf(scan_io_stage, sizeof(scan_io_stage), "%s", stage != nullptr ? stage : "I/O");
+            snprintf(scan_io_path, sizeof(scan_io_path), "%s", path != nullptr ? path : "");
+        }
+        scan_io_error = true;
+    };
 
     // 首次建库时给启动页持续反馈“已经发现多少首音乐”。
     // 不能每发现一首就抢一次 LVGL 锁，否则大曲库会把扫描本身拖慢；
@@ -975,13 +993,14 @@ static esp_err_t media_library_scan_with_scratch(
         }
     };
 
-    while (stack.count > 0 && !out_of_memory && !storage_timeout) {
+    while (stack.count > 0 && !out_of_memory && !storage_timeout && !scan_io_error) {
         DirectoryStackItem directory_item = directory_stack_pop(&stack);
         char *directory = directory_item.path;
         if (directory == nullptr) {
             break;
         }
         DIR *dir = nullptr;
+        int directory_errno = 0;
         {
             StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
             if (!sd_lock.locked()) {
@@ -992,16 +1011,23 @@ static esp_err_t media_library_scan_with_scratch(
                 media_library_reset_build_state(replace_runtime_catalog);
                 return ESP_ERR_TIMEOUT;
             }
+            errno = 0;
             dir = opendir(directory);
+            if (dir == nullptr) {
+                directory_errno = errno;
+            }
         }
         if (dir == nullptr) {
-            if (strcmp(directory, MUSIC_ROOT) == 0) {
-                root_missing = true;
-            } else {
-                ESP_LOGW(TAG, "无法打开目录，已跳过：%s", directory);
+            if (media_library_errno_is_missing(directory_errno)) {
+                if (strcmp(directory, MUSIC_ROOT) == 0) {
+                    root_missing = true;
+                }
+                heap_caps_free(directory);
+                continue;
             }
+            record_scan_io_error("opendir", directory, directory_errno);
             heap_caps_free(directory);
-            continue;
+            break;
         }
         directory_count++;
 
@@ -1050,15 +1076,23 @@ static esp_err_t media_library_scan_with_scratch(
         }
         struct dirent *entry = nullptr;
         while (true) {
+            int readdir_errno = 0;
             {
                 StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
                 if (!sd_lock.locked()) {
                     storage_timeout = true;
                     break;
                 }
+                errno = 0;
                 entry = readdir(dir);
+                if (entry == nullptr) {
+                    readdir_errno = errno;
+                }
             }
             if (entry == nullptr) {
+                if (readdir_errno != 0) {
+                    record_scan_io_error("readdir", directory, readdir_errno);
+                }
                 break;
             }
             if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
@@ -1124,6 +1158,7 @@ static esp_err_t media_library_scan_with_scratch(
             }
 #endif
 
+            int stat_errno = 0;
             if (!stat_ok) {
                 StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
                 if (!sd_lock.locked()) {
@@ -1131,11 +1166,19 @@ static esp_err_t media_library_scan_with_scratch(
                     break;
                 }
                 strict_stat_count++;
+                errno = 0;
                 stat_ok = stat(full_path, &info) == 0;
+                if (!stat_ok) {
+                    stat_errno = errno;
+                }
             }
             if (!stat_ok) {
-                ESP_LOGW(TAG, "无法读取文件属性，已跳过：%s", full_path);
-                continue;
+                if (media_library_errno_is_missing(stat_errno)) {
+                    ESP_LOGW(TAG, "扫描期间文件已不存在，按删除处理：%s", full_path);
+                    continue;
+                }
+                record_scan_io_error("stat", full_path, stat_errno);
+                break;
             }
             if (S_ISDIR(info.st_mode)) {
                 if (directory_item.depth < MAX_MUSIC_SUBDIR_DEPTH) {
@@ -1700,6 +1743,46 @@ static esp_err_t media_library_scan_with_scratch(
     }
     directory_stack_destroy(&stack);
     const int64_t scan_walk_finished_us = esp_timer_get_time();
+
+    if (scan_io_error) {
+        ESP_LOGE(TAG, "扫描遇到TF/FAT I/O异常：stage=%s errno=%d path=%s；本轮不发布残缺Catalog",
+            scan_io_stage, scan_io_errno, scan_io_path);
+
+        // 正常开机若已有通过校验的旧 V2 Catalog，I/O 异常时继续发布旧库，
+        // 避免瞬态坏卡把播放器降级成空曲库。USB 热刷新则保持当前运行时 Catalog 不变。
+        if (!replace_runtime_catalog && have_previous_v2) {
+            const uint32_t fallback_track_count = previous_v2.catalog.track_count;
+            const uint32_t fallback_crc = previous_v2.index_crc32;
+            next_catalog = previous_v2.catalog;
+            previous_v2.catalog = {};
+            const esp_err_t publish_ret = media_catalog_v2_publish(&next_catalog, fallback_crc);
+            if (publish_ret == ESP_OK) {
+                media_catalog_store_v2_release(&previous_v2);
+                media_index_store_release(&previous_v1);
+                media_library_release_build_buffers();
+                g_ready = true;
+                if (out_changes != nullptr) {
+                    out_changes->had_previous_catalog = true;
+                    out_changes->previous_count = fallback_track_count;
+                    out_changes->current_count = fallback_track_count;
+                    out_changes->issue_count = 1U;
+                    snprintf(out_changes->first_issue_file, sizeof(out_changes->first_issue_file), "%s", scan_io_path);
+                    snprintf(out_changes->first_issue_reason, sizeof(out_changes->first_issue_reason),
+                        "TF/FAT I/O异常，已保留旧曲库");
+                }
+                ESP_LOGW(TAG, "扫描异常后已回退旧V2 Catalog：tracks=%u",
+                    static_cast<unsigned>(fallback_track_count));
+                return ESP_OK;
+            }
+            media_catalog_v2_release(&next_catalog);
+            ESP_LOGE(TAG, "扫描异常后发布旧V2 Catalog失败：%s", esp_err_to_name(publish_ret));
+        }
+
+        media_catalog_store_v2_release(&previous_v2);
+        media_index_store_release(&previous_v1);
+        media_library_reset_build_state(replace_runtime_catalog);
+        return ESP_FAIL;
+    }
 
     if (storage_timeout) {
         ESP_LOGE(TAG, "扫描过程中等待TF访问锁超时，终止本次建库，避免永久卡住");

@@ -1038,8 +1038,19 @@ bool screen_lock_should_block_touch(void)
 void screen_lock_simple_set_power(ScreenPowerState power)
 {
     if (!g_ready) return;
+
+    // R44.3：panel 参数命令与 LVGL flush 共用同一把锁；拿锁失败则整次切换不提交，
+    // 避免 C++ 状态已改变、UI 未改变，或 brightness/disp_on_off 与 flush 抢 SPI。
+    if (!lvgl_port_lock(200)) {
+        ESP_LOGW(TAG, "screen_lock_set_power LVGL 锁超时，本次屏态不提交");
+        return;
+    }
+
     const ScreenPowerState prev = g_power;
-    if (prev == power) return;
+    if (prev == power) {
+        lvgl_port_unlock();
+        return;
+    }
     if (power == ScreenPowerNormal) {
         // 任何显式唤醒都从“刚刚有用户活动”重新计时，避免刚亮屏就再次自动熄屏。
         g_last_user_activity_tick = xTaskGetTickCount();
@@ -1049,14 +1060,11 @@ void screen_lock_simple_set_power(ScreenPowerState power)
         g_lock = ScreenLockLocked;
     }
 
-    if (!lvgl_port_lock(200)) {
-        ESP_LOGW(TAG, "screen_lock_set_power LVGL 锁超时");
-    } else {
-        apply_power_ui(prev, power);
-        apply_lock_ui();
-        lvgl_port_unlock();
-    }
+    apply_power_ui(prev, power);
+    apply_lock_ui();
     apply_power_hw(power);
+    lvgl_port_unlock();
+
     ESP_LOGI(TAG, "屏态切换：%u -> %u，锁定=%s",
         (unsigned)prev, (unsigned)power,
         g_lock == ScreenLockLocked ? "YES" : "NO");
@@ -1067,19 +1075,27 @@ void screen_lock_simple_set_lock(ScreenLockState lock)
     if (!g_ready) return;
     if (lock == ScreenLockUnlocked && g_power != ScreenPowerNormal) {
         screen_lock_simple_set_power(ScreenPowerNormal);
+        if (g_power != ScreenPowerNormal) {
+            return;
+        }
     }
-    if (g_lock == lock) return;
+
+    if (!lvgl_port_lock(200)) {
+        ESP_LOGW(TAG, "screen_lock_set_lock LVGL 锁超时，本次锁状态不提交");
+        return;
+    }
+    if (g_lock == lock) {
+        lvgl_port_unlock();
+        return;
+    }
+
     g_lock = lock;
     if (lock == ScreenLockUnlocked) {
         g_last_user_activity_tick = xTaskGetTickCount();
     }
+    apply_lock_ui();
+    lvgl_port_unlock();
 
-    if (!lvgl_port_lock(200)) {
-        ESP_LOGW(TAG, "screen_lock_set_lock LVGL 锁超时");
-    } else {
-        apply_lock_ui();
-        lvgl_port_unlock();
-    }
     ESP_LOGI(TAG, "锁状态切换：%s",
         g_lock == ScreenLockLocked ? "LOCKED" : "UNLOCKED");
 }
@@ -1200,18 +1216,13 @@ void screen_lock_wake_if_needed(void)
 //
 // 调用场景：GPIO0 长按从 AOD / 熄屏 / 锁定态唤醒。
 // 设计要点：
-//   ① apply_power_hw(Normal) 锁外独立执行 —— 屏幕先亮，用户立即有反馈；
-//      它只调 esp_lcd_panel_co5300_set_brightness / disp_on_off，不碰 LVGL。
-//   ② LVGL 锁内一次性完成：g_power=Normal + g_lock=Unlocked + 两个 apply_*_ui，
-//      彻底消除 set_power() + set_lock() 两次独立锁之间的脏窗口。
-//   ③ 锁超时 500ms + 最多 1 次 retry（方向 C 加固）。
-//   ④ 锁超时则返回 false —— 硬件已亮但 C++ 状态未变，下次 GPIO0 长按可重试，
-//      不会留下「屏幕亮了但 AOD root 还盖着」的半切换态。
+//   ① panel brightness / disp_on_off 与 LVGL flush 共用同一把锁，避免抢同一 SPI device；
+//   ② 同一锁内一次性完成：g_power=Normal + g_lock=Unlocked + UI + panel 硬件；
+//   ③ 锁超时 500ms + 最多 1 次 retry；
+//   ④ 锁超时则返回 false，C++ 状态、UI、panel 硬件都不提交，下次长按可完整重试。
 //
-// 不复用现有 set_power() / set_lock() 是因为：
-//   - set_lock(L1062-1063) 在 Unlocked 且非 Normal 时会递归调 set_power，
-//     重入会导致「同一线程内第二次 lvgl_port_lock」死锁风险。
-//   - 单独复用 set_power + set_lock 等价于两次独立锁获取，脏窗口依旧存在。
+// 不复用现有 set_power() / set_lock()：复合唤醒只获取一次 LVGL 锁，避免两次独立
+// 锁获取之间出现 Normal+Locked 等中间态。
 // ============================================================
 bool screen_lock_simple_wake_and_unlock(void)
 {
@@ -1226,10 +1237,7 @@ bool screen_lock_simple_wake_and_unlock(void)
     const ScreenPowerState prev_power = g_power;
     const ScreenLockState  prev_lock  = g_lock;
 
-    // 锁外：硬件先亮（AdvisorTool 确认安全 —— 不碰 LVGL 对象）
-    apply_power_hw(ScreenPowerNormal);
-
-    // 锁内：所有 C++ 状态变量 + LVGL UI 操作一起原子完成
+    // 所有 C++ 状态、LVGL UI 与 panel 命令都在同一把锁内提交。
     constexpr TickType_t kWakeLockTimeoutMs = pdMS_TO_TICKS(500);
     constexpr int        kWakeMaxRetry      = 1;  // 首次 + 1 次重试
 
@@ -1240,9 +1248,10 @@ bool screen_lock_simple_wake_and_unlock(void)
             g_lock  = ScreenLockUnlocked;
             g_last_user_activity_tick = xTaskGetTickCount();
 
-            // UI：AOD→Normal 恢复音乐页面，锁图标显/隐同步
+            // UI：AOD→Normal 恢复音乐页面，锁图标显/隐同步。
             apply_power_ui(prev_power, ScreenPowerNormal);
             apply_lock_ui();
+            apply_power_hw(ScreenPowerNormal);
 
             lvgl_port_unlock();
             ESP_LOGI(TAG,
@@ -1258,7 +1267,7 @@ bool screen_lock_simple_wake_and_unlock(void)
             static_cast<unsigned long>(pdMS_TO_TICKS(500) * portTICK_PERIOD_MS));
     }
 
-    ESP_LOGE(TAG, "复合唤醒失败：LVGL 锁多次超时；硬件已亮屏但 UI 未恢复，下次 GPIO0 长按可重试");
+    ESP_LOGE(TAG, "复合唤醒失败：LVGL 锁多次超时；状态/UI/硬件均未提交，下次 GPIO0 长按可重试");
     return false;
 }
 

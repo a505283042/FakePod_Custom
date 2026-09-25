@@ -31,6 +31,7 @@ struct TaskArgs
 
 static portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t g_generation = 1U;
+static uint32_t g_active_tasks = 0U;
 static bool g_initialized = false;
 static bool g_result_pending = false;
 static LoadResult g_pending_result = {};
@@ -42,6 +43,22 @@ static bool generation_current(uint32_t generation)
     current = generation == g_generation;
     portEXIT_CRITICAL(&g_mux);
     return current;
+}
+
+static void task_finished()
+{
+    portENTER_CRITICAL(&g_mux);
+    if (g_active_tasks > 0U) --g_active_tasks;
+    portEXIT_CRITICAL(&g_mux);
+}
+
+static uint32_t active_task_count()
+{
+    uint32_t count = 0U;
+    portENTER_CRITICAL(&g_mux);
+    count = g_active_tasks;
+    portEXIT_CRITICAL(&g_mux);
+    return count;
 }
 
 static uint16_t read_le16(const uint8_t *p)
@@ -203,6 +220,7 @@ static void load_task(void *arg)
     TaskArgs *args = static_cast<TaskArgs *>(arg);
     if (args == nullptr || args->path == nullptr) {
         if (args != nullptr) heap_caps_free(args);
+        task_finished();
         vTaskDelete(nullptr);
         return;
     }
@@ -253,6 +271,7 @@ static void load_task(void *arg)
 
     heap_caps_free(args->path);
     heap_caps_free(args);
+    task_finished();
     vTaskDelete(nullptr);
 }
 
@@ -290,6 +309,7 @@ esp_err_t start(const char *path)
     ++g_generation;
     if (g_generation == 0U) ++g_generation;
     args->generation = g_generation;
+    ++g_active_tasks;
     portEXIT_CRITICAL(&g_mux);
     args->path = path_copy;
     clear_pending_result();
@@ -305,6 +325,9 @@ esp_err_t start(const char *path)
     if (created != pdPASS) {
         heap_caps_free(path_copy);
         heap_caps_free(args);
+        portENTER_CRITICAL(&g_mux);
+        if (g_active_tasks > 0U) --g_active_tasks;
+        portEXIT_CRITICAL(&g_mux);
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -317,6 +340,25 @@ void cancel()
     if (g_generation == 0U) ++g_generation;
     portEXIT_CRITICAL(&g_mux);
     clear_pending_result();
+}
+
+bool prepare_storage_handoff(TickType_t timeout_ticks)
+{
+    cancel();
+    const TickType_t started = xTaskGetTickCount();
+    TickType_t poll = pdMS_TO_TICKS(5);
+    if (poll == 0) poll = 1;
+
+    while (active_task_count() != 0U) {
+        if (timeout_ticks == 0 ||
+            (timeout_ticks != portMAX_DELAY && xTaskGetTickCount() - started >= timeout_ticks)) {
+            ESP_LOGE(TAG, "USB接管等待NSF Loader退出超时：active=%lu",
+                static_cast<unsigned long>(active_task_count()));
+            return false;
+        }
+        vTaskDelay(poll);
+    }
+    return true;
 }
 
 bool take_result(LoadResult *out_result)

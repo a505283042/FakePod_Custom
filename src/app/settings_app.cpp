@@ -29,6 +29,8 @@
 #include "artwork_loader.h"
 #include "lyrics/lyrics_service.h"
 #include "media_library.h"
+#include "video_probe.h"
+#include "visual_music_nsf.h"
 #include "screen_lock_simple.h"
 #include "settings_menu_icons.h"
 #include "ui/screens/cassette_view.h"
@@ -1215,6 +1217,8 @@ static void usb_tf_runtime_enter_task(void *)
 {
     bool artwork_quiet = false;
     bool lyrics_quiet = false;
+    bool video_probe_quiet = false;
+    bool nsf_loader_quiet = false;
     bool storage_exclusive = false;
 
     // 软件热切换不会经过 Settings leave，因此显式提交本会话设置与播放器持久化状态。
@@ -1235,12 +1239,20 @@ static void usb_tf_runtime_enter_task(void *)
 
     artwork_quiet = artwork_loader_prepare_storage_handoff(pdMS_TO_TICKS(3000));
     lyrics_quiet = lyrics_service_prepare_storage_handoff(pdMS_TO_TICKS(3000));
-    if (!artwork_quiet || !lyrics_quiet) {
-        ESP_LOGE(TAG, "后台TF文件任务未能在时限内静默，取消USB接管");
+    video_probe_quiet = VideoProbe::prepare_storage_handoff(pdMS_TO_TICKS(3000));
+    nsf_loader_quiet = VisualMusicNsf::prepare_storage_handoff(pdMS_TO_TICKS(3000));
+    if (!artwork_quiet || !lyrics_quiet || !video_probe_quiet || !nsf_loader_quiet) {
+        ESP_LOGE(TAG,
+            "后台TF文件任务未能在时限内静默：artwork=%d lyrics=%d video_probe=%d nsf=%d；取消USB接管",
+            artwork_quiet ? 1 : 0,
+            lyrics_quiet ? 1 : 0,
+            video_probe_quiet ? 1 : 0,
+            nsf_loader_quiet ? 1 : 0);
         goto fail;
     }
 
-    // 这里拿到全局 SD mutex 后，所有旧临界区都已经退出；blocked 发布后普通任务无法再穿透。
+    // 不只要求“此刻SD mutex空闲”，还要求所有异步FILE owner已退出；
+    // 之后再发布 blocked，VFS 卸载时不会遗留 NSF/Video Probe 的打开句柄。
     storage_exclusive = storage_io_begin_usb_handoff(pdMS_TO_TICKS(3000));
     if (!storage_exclusive) {
         ESP_LOGE(TAG, "获取USB独占TF总线超时");
