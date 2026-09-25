@@ -65,6 +65,8 @@ struct DeviceSettingsSnapshot {
 // NVS namespace: device_cfg。初始化只加载设置，不主动应用硬件状态。
 esp_err_t device_settings_init();
 bool device_settings_get_snapshot(DeviceSettingsSnapshot *out_snapshot);
+// 轻量查询：Settings 未就绪时沿用历史默认行为（记住音量=true），避免调用方复制完整快照到栈。
+bool device_settings_remember_volume_enabled();
 
 // 后续功能模块统一通过这些 setter 修改设置；每次只提交一个很小的 NVS 事务。
 esp_err_t device_settings_set_usb_mode(DeviceUsbMode mode);

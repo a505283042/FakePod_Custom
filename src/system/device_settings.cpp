@@ -234,6 +234,11 @@ bool device_settings_get_snapshot(DeviceSettingsSnapshot *out_snapshot)
     return g_settings.ready;
 }
 
+bool device_settings_remember_volume_enabled()
+{
+    return !g_settings.ready || g_settings.remember_volume;
+}
+
 esp_err_t device_settings_set_usb_mode(DeviceUsbMode mode)
 {
     if (!usb_mode_valid(static_cast<uint8_t>(mode))) return ESP_ERR_INVALID_ARG;

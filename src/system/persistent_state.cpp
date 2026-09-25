@@ -50,13 +50,6 @@ struct PersistentStateData
 
 static PersistentStateData g_state = {};
 
-static bool persistent_remember_volume_enabled()
-{
-    DeviceSettingsSnapshot settings = {};
-    // Settings 尚未就绪时保持历史行为，避免持久化层初始化失败连带改变音量策略。
-    return !device_settings_get_snapshot(&settings) || settings.remember_volume;
-}
-
 static void persistent_free_string(char **value)
 {
     if (value != nullptr && *value != nullptr) {
@@ -322,7 +315,7 @@ esp_err_t persistent_state_init()
 bool persistent_state_restore_audio()
 {
     if (!g_state.ready || !g_state.schema_valid || !g_state.has_volume ||
-        !persistent_remember_volume_enabled()) {
+        !device_settings_remember_volume_enabled()) {
         return true;
     }
     if (!audio_service_set_volume(g_state.volume, true)) {
@@ -546,7 +539,7 @@ void persistent_state_observe_runtime()
         return;
     }
 
-    if (persistent_remember_volume_enabled()) {
+    if (device_settings_remember_volume_enabled()) {
         AudioStateSnapshot audio = {};
         if (audio_service_get_snapshot(&audio) && audio.ready &&
             (!g_state.has_volume || g_state.volume != audio.volume_percent)) {
