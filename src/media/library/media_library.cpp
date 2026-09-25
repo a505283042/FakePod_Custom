@@ -1510,7 +1510,7 @@ static esp_err_t media_library_scan_with_scratch(
                                                 out_of_memory = true;
                                             } else {
                                                 record_scan_issue(full_path, format == MediaFormat::OPUS
-                                                    ? "目录封面索引失败，已按无封面处理"
+                                                    ? "Opus内嵌/目录封面解析失败，已按无封面处理"
                                                     : "APIC/PICTURE 封面解析失败，已按无封面处理");
                                             }
                                         }
@@ -1591,7 +1591,8 @@ static esp_err_t media_library_scan_with_scratch(
 
                     if (artwork_build != nullptr) {
                         if (artwork_build->source == MediaArtworkSourceV2::Mp3Apic ||
-                            artwork_build->source == MediaArtworkSourceV2::FlacPicture) {
+                            artwork_build->source == MediaArtworkSourceV2::FlacPicture ||
+                            artwork_build->source == MediaArtworkSourceV2::OpusPicture) {
                             artwork_embedded_count++;
                         } else if (artwork_build->source == MediaArtworkSourceV2::ExternalFile) {
                             artwork_external_count++;

@@ -39,6 +39,8 @@ enum class MediaArtworkSourceV2 : uint8_t
     Mp3Apic = 1,
     FlacPicture = 2,
     ExternalFile = 3,
+    // Ogg Opus 的 METADATA_BLOCK_PICTURE；data_offset 保存 OpusTags comment 序号。
+    OpusPicture = 4,
 };
 
 enum class MediaArtworkFormatV2 : uint8_t

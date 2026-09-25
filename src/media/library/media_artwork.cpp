@@ -12,6 +12,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "media_catalog_v2.h"
+#include "media_ogg_opus.h"
 #include "app_diag_config.h"
 
 #if APP_DIAG_LIBRARY_ARTWORK
@@ -657,6 +658,26 @@ esp_err_t media_artwork_find_directory_fallback_v2(
     return ESP_OK;
 }
 
+static esp_err_t scan_opus_embedded(FILE *file, uint64_t file_size, MediaArtworkBuildV2 *selected)
+{
+    if (file == nullptr || selected == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    MediaOggOpusPictureInfo picture = {};
+    const esp_err_t ret = media_ogg_opus_find_picture(file, file_size, &picture);
+    if (ret == ESP_ERR_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    assign_embedded_candidate(
+        selected, MediaArtworkSourceV2::OpusPicture,
+        picture.comment_index, picture.data_size, MEDIA_ARTWORK_REF_NONE_V2,
+        picture.width, picture.height, picture.format, picture.picture_type);
+    return ESP_OK;
+}
+
 esp_err_t media_artwork_scan_open_file_v2(
     FILE *file,
     const char *path,
@@ -671,13 +692,18 @@ esp_err_t media_artwork_scan_open_file_v2(
     }
     media_artwork_build_release_v2(out_artwork);
 
-    if (format == MediaFormat::MP3 || format == MediaFormat::FLAC) {
+    if (format == MediaFormat::MP3 || format == MediaFormat::FLAC || format == MediaFormat::OPUS) {
         if (file == nullptr) {
             return ESP_ERR_INVALID_ARG;
         }
-        const esp_err_t embedded_ret = format == MediaFormat::MP3
-            ? scan_mp3_embedded(file, file_size, out_artwork)
-            : scan_flac_embedded(file, file_size, out_artwork);
+        esp_err_t embedded_ret = ESP_OK;
+        if (format == MediaFormat::MP3) {
+            embedded_ret = scan_mp3_embedded(file, file_size, out_artwork);
+        } else if (format == MediaFormat::FLAC) {
+            embedded_ret = scan_flac_embedded(file, file_size, out_artwork);
+        } else {
+            embedded_ret = scan_opus_embedded(file, file_size, out_artwork);
+        }
         if (embedded_ret == ESP_ERR_NO_MEM) {
             return embedded_ret;
         }
@@ -736,7 +762,7 @@ esp_err_t media_artwork_scan_file_v2(
         return ESP_ERR_TIMEOUT;
     }
 
-    if (format != MediaFormat::MP3 && format != MediaFormat::FLAC) {
+    if (format != MediaFormat::MP3 && format != MediaFormat::FLAC && format != MediaFormat::OPUS) {
         return media_artwork_scan_open_file_v2(
             nullptr, path, format, file_size, directory_fallback, out_artwork);
     }
@@ -770,7 +796,8 @@ esp_err_t media_artwork_catalog_reuse_unchanged_v2(
         }
         const ArtworkRefV2 &source = catalog->artwork_refs[track.artwork_ref_id];
         if (source.source == MediaArtworkSourceV2::Mp3Apic ||
-            source.source == MediaArtworkSourceV2::FlacPicture) {
+            source.source == MediaArtworkSourceV2::FlacPicture ||
+            source.source == MediaArtworkSourceV2::OpusPicture) {
             *out_unchanged = true;
             return ESP_OK;
         }
@@ -875,7 +902,8 @@ esp_err_t media_artwork_clone_from_catalog_v2(
             return ESP_ERR_INVALID_RESPONSE;
         }
         const ArtworkRefV2 &source = catalog->artwork_refs[track.artwork_ref_id];
-        if (source.source == MediaArtworkSourceV2::Mp3Apic || source.source == MediaArtworkSourceV2::FlacPicture) {
+        if (source.source == MediaArtworkSourceV2::Mp3Apic || source.source == MediaArtworkSourceV2::FlacPicture ||
+            source.source == MediaArtworkSourceV2::OpusPicture) {
             out_artwork->data_offset = source.data_offset;
             out_artwork->data_size = source.data_size;
             out_artwork->source_modified_time = 0;

@@ -18,6 +18,7 @@
 #include "flac_decoder.h"
 #include "media_catalog_v2.h"
 #include "media_library.h"
+#include "media_ogg_opus.h"
 #include "storage_io.h"
 
 static const char *TAG = "封面加载";
@@ -520,7 +521,7 @@ static size_t artwork_deunsynchronise_in_place(uint8_t *data, size_t size)
     return write_pos;
 }
 
-static esp_err_t artwork_validate_source(const ArtworkLoadRequest *request)
+static esp_err_t artwork_validate_source(const ArtworkLoadRequest *request, uint64_t *out_file_size)
 {
     if (request == nullptr || !request->has_artwork || request->source_path == nullptr ||
         request->ref.data_size == 0U) {
@@ -538,8 +539,10 @@ static esp_err_t artwork_validate_source(const ArtworkLoadRequest *request)
         }
     }
     const uint64_t file_size = static_cast<uint64_t>(info.st_size);
-    if (request->ref.data_offset > file_size ||
-        static_cast<uint64_t>(request->ref.data_size) > file_size - request->ref.data_offset) {
+    if (out_file_size != nullptr) *out_file_size = file_size;
+    if (request->ref.source != MediaArtworkSourceV2::OpusPicture &&
+        (request->ref.data_offset > file_size ||
+         static_cast<uint64_t>(request->ref.data_size) > file_size - request->ref.data_offset)) {
         return ESP_ERR_INVALID_SIZE;
     }
     if (request->ref.source == MediaArtworkSourceV2::ExternalFile && request->ref.source_modified_time != 0 &&
@@ -562,6 +565,47 @@ static void artwork_close_file_cooperatively(FILE *file)
     storage_sd_unlock();
 }
 
+static esp_err_t artwork_opus_io_callback(
+    FILE *file, void *buffer, uint32_t bytes, bool skip, void *context)
+{
+    const auto *request = static_cast<const ArtworkLoadRequest *>(context);
+    if (file == nullptr || request == nullptr || (buffer == nullptr && !skip && bytes != 0U)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint32_t done = 0U;
+    while (done < bytes) {
+        if (!artwork_request_is_latest(request)) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        size_t planned_chunk = 0U;
+        {
+            ArtworkSdSliceGuard sd_lock(request, &planned_chunk);
+            if (!sd_lock.locked()) {
+                return ESP_ERR_INVALID_STATE;
+            }
+            const uint32_t remaining = bytes - done;
+            const uint32_t chunk = remaining < planned_chunk
+                ? remaining
+                : static_cast<uint32_t>(planned_chunk);
+            if (skip) {
+                if (fseek(file, static_cast<long>(chunk), SEEK_CUR) != 0) {
+                    return ESP_FAIL;
+                }
+            } else if (chunk > 0U && fread(static_cast<uint8_t *>(buffer) + done, 1, chunk, file) != chunk) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+            done += chunk;
+        }
+        if (done < bytes) {
+            vTaskDelay(ARTWORK_POST_SLICE_DELAY);
+        }
+    }
+    if (bytes >= ARTWORK_READ_CHUNK_MAX_BYTES && artwork_request_is_latest(request)) {
+        vTaskDelay(ARTWORK_POST_SLICE_DELAY);
+    }
+    return ESP_OK;
+}
+
 static __attribute__((noinline)) esp_err_t artwork_read_blob(
     const ArtworkLoadRequest *request,
     uint8_t **out_data,
@@ -579,10 +623,66 @@ static __attribute__((noinline)) esp_err_t artwork_read_blob(
     if (request->ref.data_size == 0U || request->ref.data_size > ARTWORK_MAX_COMPRESSED_BYTES) {
         return ESP_ERR_INVALID_SIZE;
     }
-    const esp_err_t source_ret = artwork_validate_source(request);
+    uint64_t source_file_size = 0ULL;
+    const esp_err_t source_ret = artwork_validate_source(request, &source_file_size);
     if (source_ret != ESP_OK) {
         return source_ret;
     }
+
+    if (request->ref.source == MediaArtworkSourceV2::OpusPicture) {
+        uint8_t *data = static_cast<uint8_t *>(
+            heap_caps_malloc(request->ref.data_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (data == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
+
+        FILE *file = nullptr;
+        {
+            size_t ignored_chunk = 0U;
+            ArtworkSdSliceGuard sd_lock(request, &ignored_chunk);
+            if (!sd_lock.locked()) {
+                heap_caps_free(data);
+                return ESP_ERR_INVALID_STATE;
+            }
+            if (!artwork_request_is_latest(request)) {
+                heap_caps_free(data);
+                return ESP_ERR_INVALID_STATE;
+            }
+            file = fopen(request->source_path, "rb");
+            if (file != nullptr) g_sd_file_open = true;
+        }
+        if (file == nullptr) {
+            heap_caps_free(data);
+            return ESP_ERR_NOT_FOUND;
+        }
+
+        MediaOggOpusPictureInfo picture = {};
+        const esp_err_t read_ret = media_ogg_opus_read_picture(
+            file, source_file_size, static_cast<uint32_t>(request->ref.data_offset),
+            data, request->ref.data_size, &picture, artwork_opus_io_callback,
+            const_cast<ArtworkLoadRequest *>(request));
+        artwork_close_file_cooperatively(file);
+        if (read_ret != ESP_OK || picture.data_size != request->ref.data_size) {
+            heap_caps_free(data);
+            return read_ret != ESP_OK ? read_ret : ESP_ERR_INVALID_SIZE;
+        }
+        const MediaArtworkFormatV2 actual_format = artwork_detect_format(data, picture.data_size);
+        if (actual_format == MediaArtworkFormatV2::Unknown) {
+            heap_caps_free(data);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        if (request->ref.format != MediaArtworkFormatV2::Unknown && request->ref.format != actual_format) {
+            ESP_LOGW(TAG, "Opus内嵌封面 magic 与 Catalog 格式不一致：track=%lu catalog=%u actual=%u",
+                static_cast<unsigned long>(request->track_index),
+                static_cast<unsigned>(request->ref.format),
+                static_cast<unsigned>(actual_format));
+        }
+        *out_data = data;
+        *out_size = picture.data_size;
+        *out_format = actual_format;
+        return ESP_OK;
+    }
+
     if (request->ref.data_offset > static_cast<uint64_t>(LONG_MAX)) {
         return ESP_ERR_NOT_SUPPORTED;
     }

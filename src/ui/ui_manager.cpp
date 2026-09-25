@@ -246,7 +246,8 @@ static void ui_display_flush_sync_event_cb(lv_event_t *event)
             }
         }
 
-        ++g_display_flush_submit_sequence;
+        const uint32_t next_submit_sequence = g_display_flush_submit_sequence + 1U;
+        g_display_flush_submit_sequence = next_submit_sequence;
         // LV_EVENT_FLUSH_START 的参数在不同 LVGL 小版本中并不保证暴露刷新区域；
         // 这里不依赖私有 display 状态，超时诊断以事务序号为主。
         g_display_flush_last_area = {};

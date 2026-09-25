@@ -253,7 +253,8 @@ esp_err_t media_catalog_v2_validate(const MusicCatalogV2 *catalog)
             const ArtworkRefV2 &artwork = catalog->artwork_refs[track.artwork_ref_id];
             const bool source_valid = artwork.source == MediaArtworkSourceV2::Mp3Apic ||
                 artwork.source == MediaArtworkSourceV2::FlacPicture ||
-                artwork.source == MediaArtworkSourceV2::ExternalFile;
+                artwork.source == MediaArtworkSourceV2::ExternalFile ||
+                artwork.source == MediaArtworkSourceV2::OpusPicture;
             const bool format_valid = artwork.format == MediaArtworkFormatV2::Jpeg ||
                 artwork.format == MediaArtworkFormatV2::Png;
             if (!source_valid || !format_valid || artwork.data_size == 0U || artwork.reserved0 != 0U ||
@@ -265,6 +266,13 @@ esp_err_t media_catalog_v2_validate(const MusicCatalogV2 *catalog)
                 if (artwork_path == nullptr || artwork_path[0] == '\0' || artwork.data_offset != 0U ||
                     artwork.flags != MEDIA_ARTWORK_REF_NONE_V2) {
                     return ESP_ERR_INVALID_RESPONSE;
+                }
+            } else if (artwork.source == MediaArtworkSourceV2::OpusPicture) {
+                // OpusPicture 的 data_offset 是 OpusTags comment 序号，不是物理文件偏移。
+                if (artwork.path_off != 0U || artwork.source_modified_time != 0 ||
+                    artwork.flags != MEDIA_ARTWORK_REF_NONE_V2 || track.format != MediaFormat::OPUS ||
+                    artwork.data_offset > UINT32_MAX) {
+                    return ESP_ERR_INVALID_SIZE;
                 }
             } else {
                 if (artwork.path_off != 0U || artwork.source_modified_time != 0 ||

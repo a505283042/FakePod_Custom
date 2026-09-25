@@ -34,7 +34,7 @@ esp_err_t media_artwork_find_directory_fallback_v2(
 );
 
 // 解析一首歌的封面 locator：
-// 1) MP3 APIC / PIC 或 FLAC PICTURE，优先 picture type=3 Front Cover；
+// 1) MP3 APIC / PIC、FLAC PICTURE 或 OpusTags METADATA_BLOCK_PICTURE，优先 type=3 Front Cover；
 // 2) 没有有效内嵌封面时使用 directory_fallback_path；
 // 3) 不读取整张图片，仅读取最小头部用于 JPEG/PNG magic 与尺寸识别。
 esp_err_t media_artwork_scan_file_v2(

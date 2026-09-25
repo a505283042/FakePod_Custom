@@ -113,8 +113,9 @@ struct LyricsRefV2
     uint8_t reserved0 = 0;
 };
 
-// Stage 12.0：每首歌最多选择一个首选封面 locator。
-// Embedded source 使用 track 音频文件 + data_offset/data_size；ExternalFile 使用 path_off。
+// 每首歌最多选择一个首选封面 locator。
+// MP3/FLAC Embedded 使用音频文件 + 物理 data_offset/data_size；OpusPicture 的 data_offset
+// 保存 OpusTags comment 序号、data_size 保存解码后的 JPEG/PNG 字节数；ExternalFile 使用 path_off。
 struct ArtworkRefV2
 {
     uint64_t data_offset = 0;
