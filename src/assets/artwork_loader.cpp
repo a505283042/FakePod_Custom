@@ -42,7 +42,6 @@ static constexpr size_t ARTWORK_READ_CHUNK_MAX_BYTES = 8U * 1024U;
 // 的瞬时交换，正常稳态在 Surface 成功后会全部清空。
 static constexpr size_t ARTWORK_CACHE_SLOT_COUNT = 2U;
 static constexpr size_t ARTWORK_CACHE_BUDGET_BYTES = 2U * 1024U * 1024U;
-static constexpr size_t ARTWORK_MAX_COMPRESSED_BYTES = 2U * 1024U * 1024U;
 // P1.5R.1：SD 锁竞争属于正常背压。锁尝试明确使用 0 tick（非阻塞），
 // 失败后明确阻塞 1 个 RTOS tick。禁止再用 pdMS_TO_TICKS(1/2/3)，因为
 // 在 100Hz tick 下这些值会变成 0，导致 ArtworkTask 看似 delay、实际仍 Ready。
@@ -620,7 +619,7 @@ static __attribute__((noinline)) esp_err_t artwork_read_blob(
     *out_size = 0U;
     *out_format = MediaArtworkFormatV2::Unknown;
 
-    if (request->ref.data_size == 0U || request->ref.data_size > ARTWORK_MAX_COMPRESSED_BYTES) {
+    if (request->ref.data_size == 0U || request->ref.data_size > MEDIA_ARTWORK_MAX_COMPRESSED_BYTES_V2) {
         return ESP_ERR_INVALID_SIZE;
     }
     uint64_t source_file_size = 0ULL;
@@ -867,11 +866,11 @@ static void artwork_task_main(void *)
         }
 
         if (load_ret != ESP_OK) {
-            if (load_ret == ESP_ERR_INVALID_SIZE && request->ref.data_size > ARTWORK_MAX_COMPRESSED_BYTES) {
+            if (load_ret == ESP_ERR_INVALID_SIZE && request->ref.data_size > MEDIA_ARTWORK_MAX_COMPRESSED_BYTES_V2) {
                 ESP_LOGW(TAG, "封面过大，跳过缓存：track=%lu size=%luB 上限=%uB",
                     static_cast<unsigned long>(request->track_index),
                     static_cast<unsigned long>(request->ref.data_size),
-                    static_cast<unsigned>(ARTWORK_MAX_COMPRESSED_BYTES));
+                    static_cast<unsigned>(MEDIA_ARTWORK_MAX_COMPRESSED_BYTES_V2));
             } else {
                 ESP_LOGW(TAG, "封面异步读取失败：track=%lu source=%u size=%lu result=%s",
                     static_cast<unsigned long>(request->track_index),

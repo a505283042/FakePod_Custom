@@ -50,6 +50,9 @@ enum class MediaArtworkFormatV2 : uint8_t
     Png = 2,
 };
 
+// 压缩封面统一加载上限；内嵌扫描也使用同一数值提前过滤。
+static constexpr uint32_t MEDIA_ARTWORK_MAX_COMPRESSED_BYTES_V2 = 2U * 1024U * 1024U;
+
 enum MediaArtworkRefFlagsV2 : uint32_t
 {
     MEDIA_ARTWORK_REF_NONE_V2 = 0,

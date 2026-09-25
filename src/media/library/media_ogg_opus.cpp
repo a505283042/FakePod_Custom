@@ -12,7 +12,6 @@ static constexpr uint32_t OGG_MAX_COMMENT_COUNT = 4096U;
 static constexpr uint32_t OGG_MAX_TEXT_COMMENT_BYTES = 16U * 1024U;
 static constexpr size_t OGG_TAIL_SCAN_BYTES = 128U * 1024U;
 static constexpr size_t OGG_BASE64_READ_BYTES = 8U * 1024U;
-static constexpr uint32_t OGG_MAX_PICTURE_BYTES = 2U * 1024U * 1024U;
 static constexpr char OGG_PICTURE_KEY[] = "METADATA_BLOCK_PICTURE=";
 
 static uint16_t read_le16(const uint8_t *p)
@@ -553,7 +552,7 @@ static esp_err_t parse_picture_block(
     const uint32_t width32 = read_be32(fields);
     const uint32_t height32 = read_be32(fields + 4U);
     const uint32_t data_size = read_be32(fields + 16U);
-    if (data_size == 0U || data_size > OGG_MAX_PICTURE_BYTES) {
+    if (data_size == 0U || data_size > MEDIA_ARTWORK_MAX_COMPRESSED_BYTES_V2) {
         return finish(ESP_ERR_INVALID_SIZE);
     }
 

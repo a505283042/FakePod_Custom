@@ -234,7 +234,9 @@ static bool assign_embedded_candidate(
     uint8_t picture_type
 )
 {
-    if (selected == nullptr || data_size == 0U || format == MediaArtworkFormatV2::Unknown) {
+    if (selected == nullptr || data_size == 0U ||
+        data_size > MEDIA_ARTWORK_MAX_COMPRESSED_BYTES_V2 ||
+        format == MediaArtworkFormatV2::Unknown) {
         return false;
     }
     const bool have_selected = selected->source != MediaArtworkSourceV2::None;
