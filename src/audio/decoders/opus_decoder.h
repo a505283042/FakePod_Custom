@@ -46,6 +46,10 @@ struct OpusDecoder
     uint32_t bitrate = 0U;
     uint16_t pre_skip = 0U;
     uint32_t pre_skip_remaining = 0U;
+    // OpusHead Output Gain：有符号 Q7.8 dB。播放时必须叠加在用户音量之外。
+    int16_t output_gain_q8_db = 0;
+    // 线性增益使用 Q24，避免在每个 PCM sample 上做浮点运算。
+    uint64_t output_gain_q24 = (1ULL << 24U);
     uint64_t total_frames = 0ULL;
     uint64_t frames_read = 0ULL;
 

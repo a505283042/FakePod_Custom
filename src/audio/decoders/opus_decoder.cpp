@@ -1,5 +1,6 @@
 #include "opus_decoder.h"
 
+#include <math.h>
 #include <string.h>
 
 #include "esp_audio_dec.h"
@@ -64,8 +65,49 @@ static uint32_t opus_read_le32(const uint8_t *p)
         (static_cast<uint32_t>(p[3]) << 24);
 }
 
-// 按乐鑫 decoder 的真实输出需求预留一帧 PCM。
-// 后续仍保留 ESP_AUDIO_ERR_BUFF_NOT_ENOUGH -> needed_size 扩容作为兜底。
+static esp_err_t opus_prepare_output_gain(OpusDecoder *decoder)
+{
+    if (decoder == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // RFC 7845：linear = 10^(output_gain / (20 * 256))。
+    // 这里只在打开流时计算一次，再转成 Q24；热路径保持纯整数乘法。
+    const double gain_db = static_cast<double>(decoder->output_gain_q8_db) / 256.0;
+    const double gain_linear = pow(10.0, gain_db / 20.0);
+    const double gain_q24 = gain_linear * static_cast<double>(1ULL << 24U);
+    if (!isfinite(gain_q24) || gain_q24 < 1.0 || gain_q24 > 281474976710655.0) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    decoder->output_gain_q24 = static_cast<uint64_t>(llround(gain_q24));
+    if (decoder->output_gain_q24 == 0ULL) {
+        decoder->output_gain_q24 = 1ULL;
+    }
+    return ESP_OK;
+}
+
+static int32_t opus_pcm16_to_pcm32_with_gain(int16_t sample, uint64_t gain_q24)
+{
+    if (gain_q24 == (1ULL << 24U)) {
+        return static_cast<int32_t>(sample) * 65536;
+    }
+
+    // sample(Q0) * gain(Q24) >> 8 => PCM32 的 Q16 对齐格式。
+    // OpusHead 最大 +127.996dB 时该中间值仍在 int64_t 范围内。
+    int64_t scaled = static_cast<int64_t>(sample) * static_cast<int64_t>(gain_q24);
+    scaled >>= 8U;
+    if (scaled > INT32_MAX) {
+        return INT32_MAX;
+    }
+    if (scaled < INT32_MIN) {
+        return INT32_MIN;
+    }
+    return static_cast<int32_t>(scaled);
+}
+
+// 按乐鑫 decoder 的真实输出需求预留一个完整 Opus packet 的 PCM。
+// packet 最长 120ms；后续仍保留 ESP_AUDIO_ERR_BUFF_NOT_ENOUGH -> needed_size 扩容作为兜底。
 static esp_err_t opus_calculate_decoded_buffer_bytes(
     uint16_t channels,
     uint16_t frame_duration_q4_ms,
@@ -113,34 +155,64 @@ static uint16_t opus_toc_frame_duration_q4_ms(uint8_t toc)
     return kCeltDurationsQ4[config & 0x03U];
 }
 
-static esp_err_t opus_validate_single_frame_packet(
-    const OpusDecoder *decoder,
+struct OpusPacketInfo
+{
+    uint16_t frame_duration_q4_ms = 0U;
+    uint16_t packet_duration_q4_ms = 0U;
+    uint8_t frame_count = 0U;
+    uint8_t frame_count_code = 0U;
+};
+
+static esp_err_t opus_parse_packet_info(
     const uint8_t *packet,
     size_t packet_size,
-    uint16_t *out_frame_duration_q4_ms)
+    OpusPacketInfo *out_info)
 {
-    if (out_frame_duration_q4_ms != nullptr) {
-        *out_frame_duration_q4_ms = 0U;
+    if (out_info != nullptr) {
+        *out_info = {};
     }
-    if (decoder == nullptr || packet == nullptr || packet_size == 0U ||
-        out_frame_duration_q4_ms == nullptr) {
+    if (packet == nullptr || packet_size == 0U || out_info == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
 
     const uint8_t toc = packet[0];
     const uint8_t frame_count_code = static_cast<uint8_t>(toc & 0x03U);
-    if (frame_count_code != 0U) {
-        // esp_opus_dec_decode() 的直接接口按单个 encoded frame 工作。
-        // Ogg packet 内含多帧时必须继续拆 Opus 内部 framing；本轮先安全拒绝，不能误喂底层库。
-        ESP_LOGE(TAG, "暂不支持多帧 Opus packet：TOC=0x%02X c=%u",
-            static_cast<unsigned>(toc),
-            static_cast<unsigned>(frame_count_code));
-        return ESP_ERR_NOT_SUPPORTED;
+    uint8_t frame_count = 0U;
+    switch (frame_count_code) {
+    case 0U:
+        frame_count = 1U;
+        break;
+    case 1U:
+        // RFC 6716 code 1：两个等长 frame。除 TOC 外的 payload 必须能平均分成两份。
+        if (packet_size <= 1U || ((packet_size - 1U) & 1U) != 0U) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        frame_count = 2U;
+        break;
+    case 2U:
+        // RFC 6716 code 2：两个 VBR frame；第二字节开始保存第一帧长度。
+        if (packet_size <= 1U) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        frame_count = 2U;
+        break;
+    case 3U:
+        // RFC 6716 code 3：第二字节低 6 bit 是 frame 数；标准上限为 48。
+        if (packet_size <= 1U) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        frame_count = static_cast<uint8_t>(packet[1] & 0x3FU);
+        if (frame_count == 0U || frame_count > 48U) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        break;
+    default:
+        return ESP_ERR_INVALID_RESPONSE;
     }
 
     const uint16_t frame_duration_q4_ms = opus_toc_frame_duration_q4_ms(toc);
-    // 当前锁定的 esp_audio_codec 2.6.0 需要显式匹配 frame_duration。
-    // 先支持音乐文件最常见的 20ms 单帧 packet；其它时长安全失败，避免再次触发库内 BREAK。
+    // 当前锁定的 esp_audio_codec 2.6.0 已在实机验证 20ms 配置。
+    // R24 先扩完整标准 packet framing（c=0/1/2/3），其它单帧时长留到确认乐鑫枚举后再扩。
     if (frame_duration_q4_ms != 80U) {
         ESP_LOGE(TAG, "暂不支持该 Opus 单帧时长：%u.%02ums TOC=0x%02X",
             static_cast<unsigned>(frame_duration_q4_ms / 4U),
@@ -149,7 +221,21 @@ static esp_err_t opus_validate_single_frame_packet(
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    *out_frame_duration_q4_ms = frame_duration_q4_ms;
+    const uint32_t packet_duration_q4_ms =
+        static_cast<uint32_t>(frame_duration_q4_ms) * frame_count;
+    // RFC 6716 一个 Opus packet 最长 120ms。
+    if (packet_duration_q4_ms == 0U || packet_duration_q4_ms > 480U) {
+        ESP_LOGE(TAG, "非法 Opus packet 时长：frames=%u frame=%u/4ms total=%lu/4ms",
+            static_cast<unsigned>(frame_count),
+            static_cast<unsigned>(frame_duration_q4_ms),
+            static_cast<unsigned long>(packet_duration_q4_ms));
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    out_info->frame_duration_q4_ms = frame_duration_q4_ms;
+    out_info->packet_duration_q4_ms = static_cast<uint16_t>(packet_duration_q4_ms);
+    out_info->frame_count = frame_count;
+    out_info->frame_count_code = frame_count_code;
     return ESP_OK;
 }
 
@@ -459,6 +545,17 @@ static esp_err_t opus_parse_stream_headers(OpusDecoder *decoder)
     decoder->channels = channels;
     decoder->pre_skip = opus_read_le16(head + 10U);
     decoder->pre_skip_remaining = decoder->pre_skip;
+    decoder->output_gain_q8_db = static_cast<int16_t>(opus_read_le16(head + 16U));
+    ret = opus_prepare_output_gain(decoder);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "OpusHead Output Gain 无效：raw=%d",
+            static_cast<int>(decoder->output_gain_q8_db));
+        return ret;
+    }
+    if (decoder->output_gain_q8_db != 0) {
+        ESP_LOGI(TAG, "OpusHead Output Gain：raw=%d（Q7.8 dB）",
+            static_cast<int>(decoder->output_gain_q8_db));
+    }
     ret = opus_ogg_finish_packet(decoder);
     if (ret != ESP_OK) {
         return ret;
@@ -541,30 +638,44 @@ static esp_err_t opus_decode_next_output(OpusDecoder *decoder)
             }
             decoder->input_size = packet_size;
 
-            uint16_t frame_duration_q4_ms = 0U;
-            ret = opus_validate_single_frame_packet(
-                decoder,
-                decoder->input_buffer,
-                packet_size,
-                &frame_duration_q4_ms);
-            if (ret != ESP_OK) {
-                return ret;
-            }
-            if (frame_duration_q4_ms != decoder->frame_duration_q4_ms) {
-                ESP_LOGE(TAG, "Opus 流中途改变帧时长：当前=%u/4ms 新=%u/4ms",
-                    static_cast<unsigned>(decoder->frame_duration_q4_ms),
-                    static_cast<unsigned>(frame_duration_q4_ms));
-                return ESP_ERR_NOT_SUPPORTED;
-            }
         }
         decoder->input_packet_ready = true;
 
+        OpusPacketInfo packet_info = {};
+        ret = opus_parse_packet_info(decoder->input_buffer, packet_size, &packet_info);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        if (packet_info.frame_duration_q4_ms != decoder->frame_duration_q4_ms) {
+            ESP_LOGE(TAG, "Opus 流中途改变单帧时长：当前=%u/4ms 新=%u/4ms",
+                static_cast<unsigned>(decoder->frame_duration_q4_ms),
+                static_cast<unsigned>(packet_info.frame_duration_q4_ms));
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+
+        size_t packet_pcm_bytes = 0U;
+        ret = opus_calculate_decoded_buffer_bytes(
+            decoder->channels, packet_info.packet_duration_q4_ms, &packet_pcm_bytes);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        ret = opus_resize_decoded_buffer(decoder, packet_pcm_bytes);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+
         if (!decoder->runtime_info_verified) {
-            ESP_LOGI(TAG, "Opus首音频packet：%uB TOC=0x%02X frame=20ms channels=%u pre_skip=%u",
+            ESP_LOGI(TAG,
+                "Opus首音频packet：%uB TOC=0x%02X frame=20ms frames=%u packet=%u.%02ums c=%u channels=%u pre_skip=%u output_gain_q8=%d",
                 static_cast<unsigned>(packet_size),
                 static_cast<unsigned>(decoder->input_buffer[0]),
+                static_cast<unsigned>(packet_info.frame_count),
+                static_cast<unsigned>(packet_info.packet_duration_q4_ms / 4U),
+                static_cast<unsigned>((packet_info.packet_duration_q4_ms % 4U) * 25U),
+                static_cast<unsigned>(packet_info.frame_count_code),
                 static_cast<unsigned>(decoder->channels),
-                static_cast<unsigned>(decoder->pre_skip));
+                static_cast<unsigned>(decoder->pre_skip),
+                static_cast<int>(decoder->output_gain_q8_db));
         }
 
         esp_audio_dec_in_raw_t raw = {};
@@ -703,29 +814,26 @@ esp_err_t opus_decoder_open(
         opus_decoder_close(decoder);
         return ret;
     }
-    uint16_t frame_duration_q4_ms = 0U;
-    ret = opus_validate_single_frame_packet(
-        decoder,
-        decoder->input_buffer,
-        first_packet_size,
-        &frame_duration_q4_ms);
+    OpusPacketInfo first_packet_info = {};
+    ret = opus_parse_packet_info(
+        decoder->input_buffer, first_packet_size, &first_packet_info);
     if (ret != ESP_OK) {
         opus_decoder_close(decoder);
         return ret;
     }
     decoder->input_size = first_packet_size;
     decoder->input_packet_ready = true;
-    decoder->frame_duration_q4_ms = frame_duration_q4_ms;
+    decoder->frame_duration_q4_ms = first_packet_info.frame_duration_q4_ms;
 
     size_t decoded_buffer_bytes = 0U;
     ret = opus_calculate_decoded_buffer_bytes(
         decoder->channels,
-        decoder->frame_duration_q4_ms,
+        first_packet_info.packet_duration_q4_ms,
         &decoded_buffer_bytes);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "计算 Opus PCM 缓冲失败：channels=%u frame_q4=%u ret=%s",
+        ESP_LOGE(TAG, "计算 Opus PCM 缓冲失败：channels=%u packet_q4=%u ret=%s",
             static_cast<unsigned>(decoder->channels),
-            static_cast<unsigned>(decoder->frame_duration_q4_ms),
+            static_cast<unsigned>(first_packet_info.packet_duration_q4_ms),
             esp_err_to_name(ret));
         opus_decoder_close(decoder);
         return ret;
@@ -871,8 +979,10 @@ esp_err_t opus_decoder_read_pcm32(
             if (decoder->channels == 2U) {
                 memcpy(&right, src + sizeof(int16_t), sizeof(right));
             }
-            out_interleaved_stereo[(produced + i) * 2U] = static_cast<int32_t>(left) * 65536;
-            out_interleaved_stereo[(produced + i) * 2U + 1U] = static_cast<int32_t>(right) * 65536;
+            out_interleaved_stereo[(produced + i) * 2U] =
+                opus_pcm16_to_pcm32_with_gain(left, decoder->output_gain_q24);
+            out_interleaved_stereo[(produced + i) * 2U + 1U] =
+                opus_pcm16_to_pcm32_with_gain(right, decoder->output_gain_q24);
             src += source_frame_bytes;
         }
 
