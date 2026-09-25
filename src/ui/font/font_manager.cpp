@@ -2,9 +2,12 @@
 #include "storage_io.h"
 #include "device_settings.h"
 
+#include <dirent.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 
 #include "esp_heap_caps.h"
@@ -48,10 +51,10 @@ static const char *TAG = "字体";
 // 2bpp 位图每行单独按字节对齐，每字节从高位到低位存 4 个像素。
 // ============================================================
 
-static constexpr const char *FONT_PATH_CUSTOM_EXT_24 = "/sdcard/FONTS/CUSTOM_EXT_24.bin";
-static constexpr const char *FONT_PATH_SYHT_EXT_24 = "/sdcard/FONTS/SYHT_EXT_24.bin";
-static constexpr const char *FONT_PATH_SYHT_BOLD_EXT_24 = "/sdcard/FONTS/SYHT_BOLD_EXT_24.bin";
-static constexpr const char *FONT_PATH_SYST_BOLD_EXT_24 = "/sdcard/FONTS/SYST_BOLD_EXT_24.bin";
+static constexpr const char *FONT_DIRECTORY = "/sdcard/FONTS";
+static constexpr size_t FONT_FILENAME_MAX = DEVICE_UI_FONT_FILENAME_MAX;
+static constexpr size_t FONT_PATH_MAX = 256U;
+static constexpr size_t FONT_LIST_MAX = 16U;
 static constexpr size_t FONT_HEADER_SIZE = 12;
 static constexpr size_t GLYPH_HEADER_SIZE = 6;
 static constexpr uint32_t EXPECTED_BPP = 2;
@@ -60,7 +63,7 @@ static constexpr uint32_t EXPECTED_BPP = 2;
 // 分区只负责缓存 TF 上的字体；缓存损坏或分区不存在时自动回退 TF -> PSRAM。
 static constexpr const char *FONT_CACHE_PARTITION_LABEL = "fontcache";
 static constexpr uint32_t FONT_CACHE_MAGIC = 0x31435446U;  // "FTC1"
-static constexpr uint32_t FONT_CACHE_VERSION = 2U;
+static constexpr uint32_t FONT_CACHE_VERSION = 3U;
 static constexpr size_t FONT_CACHE_DATA_OFFSET = 256U * 1024U;
 static constexpr size_t FONT_CACHE_COPY_CHUNK = 16U * 1024U;
 
@@ -69,7 +72,7 @@ struct FontCacheHeader
     uint32_t magic;
     uint32_t version;
     uint32_t font_size;
-    uint32_t font_id;
+    uint32_t font_name_hash;
     int64_t source_mtime;
     uint32_t line_height;
     uint32_t base_line;
@@ -89,6 +92,11 @@ struct OriginalFontContext
     int32_t baseline_y;
 };
 
+struct FontEntry
+{
+    char filename[FONT_FILENAME_MAX];
+};
+
 static OriginalFontContext g_context = {};
 static lv_font_t g_ui_font = {};
 static bool g_ready = false;
@@ -98,20 +106,10 @@ static esp_partition_mmap_handle_t g_font_cache_mmap_handle = 0;
 static FontCacheHeader g_font_cache_header = {};
 static bool g_font_cache_mapped = false;
 static bool g_font_cache_metrics_valid = false;
-static DeviceUiFont g_selected_font = DeviceUiFont::CustomExt24;
-static const char *g_font_path = FONT_PATH_CUSTOM_EXT_24;
-
-static const char *font_manager_path_for(DeviceUiFont font)
-{
-    switch (font) {
-        case DeviceUiFont::SyhtExt24: return FONT_PATH_SYHT_EXT_24;
-        case DeviceUiFont::SyhtBoldExt24: return FONT_PATH_SYHT_BOLD_EXT_24;
-        case DeviceUiFont::SystBoldExt24: return FONT_PATH_SYST_BOLD_EXT_24;
-        case DeviceUiFont::CustomExt24:
-        default:
-            return FONT_PATH_CUSTOM_EXT_24;
-    }
-}
+static FontEntry g_available_fonts[FONT_LIST_MAX] = {};
+static size_t g_available_font_count = 0U;
+static char g_selected_font_file[FONT_FILENAME_MAX] = {};
+static char g_font_path[FONT_PATH_MAX] = {};
 
 static uint16_t font_manager_read_le16(const uint8_t *data)
 {
@@ -125,6 +123,134 @@ static uint32_t font_manager_read_le32(const uint8_t *data)
         (static_cast<uint32_t>(data[1]) << 8) |
         (static_cast<uint32_t>(data[2]) << 16) |
         (static_cast<uint32_t>(data[3]) << 24);
+}
+
+static bool font_manager_has_bin_extension(const char *filename)
+{
+    if (filename == nullptr) return false;
+    const size_t length = strlen(filename);
+    return length > 4U && strcasecmp(filename + length - 4U, ".bin") == 0;
+}
+
+static uint32_t font_manager_filename_hash(const char *filename)
+{
+    uint32_t hash = 2166136261U;
+    if (filename == nullptr) return hash;
+    for (const uint8_t *p = reinterpret_cast<const uint8_t *>(filename); *p != 0U; ++p) {
+        hash ^= *p;
+        hash *= 16777619U;
+    }
+    return hash;
+}
+
+static bool font_manager_validate_candidate_locked(const char *path, const struct stat &info)
+{
+    if (path == nullptr || info.st_size < 0 ||
+        static_cast<size_t>(info.st_size) < FONT_HEADER_SIZE) return false;
+
+    uint8_t header[FONT_HEADER_SIZE] = {};
+    FILE *file = fopen(path, "rb");
+    if (file == nullptr) return false;
+    const size_t got = fread(header, 1U, sizeof(header), file);
+    fclose(file);
+    if (got != sizeof(header)) return false;
+
+    const uint16_t lower = font_manager_read_le16(header);
+    const uint16_t upper = font_manager_read_le16(header + 2);
+    const uint32_t bpp = font_manager_read_le32(header + 4);
+    const uint32_t missing_offset = font_manager_read_le32(header + 8);
+    if (lower >= upper || bpp != EXPECTED_BPP) return false;
+
+    const size_t table_count = static_cast<size_t>(upper - lower);
+    const size_t table_end = FONT_HEADER_SIZE + table_count * sizeof(uint32_t);
+    const size_t file_size = static_cast<size_t>(info.st_size);
+    return table_end <= file_size &&
+        static_cast<size_t>(missing_offset) + GLYPH_HEADER_SIZE <= file_size;
+}
+
+static int font_manager_compare_entries(const void *lhs, const void *rhs)
+{
+    const FontEntry *a = static_cast<const FontEntry *>(lhs);
+    const FontEntry *b = static_cast<const FontEntry *>(rhs);
+    return strcmp(a->filename, b->filename);
+}
+
+static int font_manager_find_available_index(const char *filename)
+{
+    if (filename == nullptr || filename[0] == '\0') return -1;
+    for (size_t i = 0; i < g_available_font_count; ++i) {
+        if (strcmp(g_available_fonts[i].filename, filename) == 0) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+static esp_err_t font_manager_scan_available_fonts()
+{
+    g_available_font_count = 0U;
+    memset(g_available_fonts, 0, sizeof(g_available_fonts));
+
+    StorageSdLockGuard sd_lock;
+    if (!sd_lock.locked()) return ESP_ERR_TIMEOUT;
+
+    DIR *directory = opendir(FONT_DIRECTORY);
+    if (directory == nullptr) {
+        ESP_LOGE(TAG, "字体目录不存在：%s", FONT_DIRECTORY);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    struct dirent *entry = nullptr;
+    while ((entry = readdir(directory)) != nullptr) {
+        const char *filename = entry->d_name;
+        if (!font_manager_has_bin_extension(filename)) continue;
+
+        const size_t filename_length = strlen(filename);
+        if (filename_length >= FONT_FILENAME_MAX) {
+            ESP_LOGW(TAG, "字体文件名过长，已跳过：%s", filename);
+            continue;
+        }
+        if (g_available_font_count >= FONT_LIST_MAX) {
+            ESP_LOGW(TAG, "字体数量超过上限 %u，后续文件已忽略",
+                static_cast<unsigned>(FONT_LIST_MAX));
+            break;
+        }
+
+        char path[FONT_PATH_MAX] = {};
+        const int path_length = snprintf(path, sizeof(path), "%s/%s", FONT_DIRECTORY, filename);
+        if (path_length <= 0 || static_cast<size_t>(path_length) >= sizeof(path)) {
+            ESP_LOGW(TAG, "字体路径过长，已跳过：%s", filename);
+            continue;
+        }
+
+        struct stat info = {};
+        if (stat(path, &info) != 0 || !S_ISREG(info.st_mode) ||
+            !font_manager_validate_candidate_locked(path, info)) {
+            ESP_LOGW(TAG, "字体格式无效，已跳过：%s", filename);
+            continue;
+        }
+
+        snprintf(
+            g_available_fonts[g_available_font_count].filename,
+            sizeof(g_available_fonts[g_available_font_count].filename),
+            "%s",
+            filename);
+        ++g_available_font_count;
+    }
+    closedir(directory);
+
+    if (g_available_font_count == 0U) {
+        ESP_LOGE(TAG, "字体目录中没有可用的 .bin 字体：%s", FONT_DIRECTORY);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    qsort(
+        g_available_fonts,
+        g_available_font_count,
+        sizeof(g_available_fonts[0]),
+        font_manager_compare_entries);
+    ESP_LOGI(TAG, "可用界面字体：%u 个", static_cast<unsigned>(g_available_font_count));
+    return ESP_OK;
 }
 
 static uint32_t font_manager_lookup_glyph_offset(uint32_t unicode)
@@ -386,7 +512,7 @@ static bool font_manager_cache_header_matches(const FontCacheHeader &header, con
 {
     if (header.magic != FONT_CACHE_MAGIC ||
         header.version != FONT_CACHE_VERSION ||
-        header.font_id != static_cast<uint32_t>(g_selected_font) ||
+        header.font_name_hash != font_manager_filename_hash(g_selected_font_file) ||
         header.font_size == 0U ||
         header.font_size != static_cast<uint32_t>(source_info.st_size) ||
         header.source_mtime != static_cast<int64_t>(source_info.st_mtime)) {
@@ -453,7 +579,7 @@ static esp_err_t font_manager_try_map_flash_cache(const struct stat &source_info
     g_context.size = static_cast<size_t>(header.font_size);
 
     ESP_LOGI(TAG, "界面字体Flash缓存命中：%s %u KB mmap=%u ms metrics=%s",
-        device_settings_ui_font_name(g_selected_font),
+        g_selected_font_file,
         static_cast<unsigned>(g_context.size / 1024U),
         static_cast<unsigned>((esp_timer_get_time() - started_us) / 1000),
         g_font_cache_metrics_valid ? "CACHED" : "RECALC");
@@ -560,7 +686,7 @@ static esp_err_t font_manager_build_flash_cache(
     header.magic = FONT_CACHE_MAGIC;
     header.version = FONT_CACHE_VERSION;
     header.font_size = static_cast<uint32_t>(font_size);
-    header.font_id = static_cast<uint32_t>(g_selected_font);
+    header.font_name_hash = font_manager_filename_hash(g_selected_font_file);
     header.source_mtime = static_cast<int64_t>(source_info.st_mtime);
     ret = esp_partition_write(partition, 0U, &header, sizeof(header));
     if (ret != ESP_OK) {
@@ -663,11 +789,26 @@ esp_err_t font_manager_init(FontManagerCacheWriteCallback cache_write_callback)
         return ESP_ERR_INVALID_STATE;
     }
 
+    esp_err_t ret = font_manager_scan_available_fonts();
+    if (ret != ESP_OK) return ret;
+
     DeviceSettingsSnapshot settings = {};
-    if (device_settings_get_snapshot(&settings)) {
-        g_selected_font = settings.ui_font;
+    (void)device_settings_get_snapshot(&settings);
+    int selected_index = font_manager_find_available_index(settings.ui_font_file);
+    if (selected_index < 0) {
+        selected_index = 0;
+        if (settings.ui_font_file[0] != '\0') {
+            ESP_LOGW(TAG, "已保存字体不存在，临时使用：%s",
+                g_available_fonts[selected_index].filename);
+        }
     }
-    g_font_path = font_manager_path_for(g_selected_font);
+    snprintf(g_selected_font_file, sizeof(g_selected_font_file), "%s",
+        g_available_fonts[selected_index].filename);
+    const int path_length = snprintf(
+        g_font_path, sizeof(g_font_path), "%s/%s", FONT_DIRECTORY, g_selected_font_file);
+    if (path_length <= 0 || static_cast<size_t>(path_length) >= sizeof(g_font_path)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
 
     const int64_t total_started_us = esp_timer_get_time();
     struct stat info = {};
@@ -698,7 +839,7 @@ esp_err_t font_manager_init(FontManagerCacheWriteCallback cache_write_callback)
         return load_ret;
     }
 
-    esp_err_t ret = font_manager_validate_format();
+    ret = font_manager_validate_format();
     if (ret != ESP_OK) {
         if (g_psram_font_data != nullptr) {
             heap_caps_free(g_psram_font_data);
@@ -754,7 +895,7 @@ esp_err_t font_manager_init(FontManagerCacheWriteCallback cache_write_callback)
     g_ready = true;
     const size_t psram_after = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     ESP_LOGI(TAG, "界面字体初始化成功：字体=%s，文件=%u KB，行高=%ld，基线=%ld，来源=%s，总耗时=%u ms，度量=%u ms",
-        device_settings_ui_font_name(g_selected_font),
+        g_selected_font_file,
         static_cast<unsigned>(g_context.size / 1024U),
         static_cast<long>(g_context.line_height),
         static_cast<long>(g_context.base_line),
@@ -766,6 +907,39 @@ esp_err_t font_manager_init(FontManagerCacheWriteCallback cache_write_callback)
         static_cast<unsigned>(psram_after / 1024U));
 
     return ESP_OK;
+}
+
+const char *font_manager_active_filename()
+{
+    return g_selected_font_file[0] != '\0' ? g_selected_font_file : nullptr;
+}
+
+bool font_manager_is_available_filename(const char *filename)
+{
+    return font_manager_find_available_index(filename) >= 0;
+}
+
+const char *font_manager_next_available_filename(const char *current_filename)
+{
+    if (g_available_font_count == 0U) return nullptr;
+    const int current_index = font_manager_find_available_index(current_filename);
+    if (current_index < 0) return g_available_fonts[0].filename;
+    const size_t next_index = (static_cast<size_t>(current_index) + 1U) % g_available_font_count;
+    return g_available_fonts[next_index].filename;
+}
+
+bool font_manager_format_display_name(
+    const char *filename,
+    char *out_name,
+    size_t out_name_size)
+{
+    if (filename == nullptr || out_name == nullptr || out_name_size == 0U) return false;
+    const size_t length = strlen(filename);
+    const size_t display_length = font_manager_has_bin_extension(filename) ? length - 4U : length;
+    if (display_length + 1U > out_name_size) return false;
+    memcpy(out_name, filename, display_length);
+    out_name[display_length] = '\0';
+    return true;
 }
 
 const lv_font_t *font_manager_get_ui_font()

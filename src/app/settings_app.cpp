@@ -899,31 +899,28 @@ static void aux_key_mode_click_cb(lv_event_t *event)
     lv_async_call(show_page_async, nullptr);
 }
 
-static DeviceUiFont next_ui_font(DeviceUiFont current)
-{
-    switch (current) {
-        case DeviceUiFont::CustomExt24: return DeviceUiFont::SyhtExt24;
-        case DeviceUiFont::SyhtExt24: return DeviceUiFont::SyhtBoldExt24;
-        case DeviceUiFont::SyhtBoldExt24: return DeviceUiFont::SystBoldExt24;
-        case DeviceUiFont::SystBoldExt24:
-        default:
-            return DeviceUiFont::CustomExt24;
-    }
-}
-
 static void ui_font_click_cb(lv_event_t *event)
 {
     if (!click_is_valid(event) || g_page != SettingsPage::System) return;
     DeviceSettingsSnapshot settings = {};
     if (!device_settings_get_snapshot(&settings)) return;
 
-    const DeviceUiFont next = next_ui_font(settings.ui_font);
-    const esp_err_t ret = device_settings_set_ui_font(next);
+    const char *current = settings.ui_font_file;
+    if (!font_manager_is_available_filename(current)) {
+        current = font_manager_active_filename();
+    }
+    const char *next = font_manager_next_available_filename(current);
+    if (next == nullptr) {
+        ESP_LOGW(TAG, "没有可用界面字体");
+        return;
+    }
+
+    const esp_err_t ret = device_settings_set_ui_font_file(next);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "保存界面字体失败：%s", esp_err_to_name(ret));
         return;
     }
-    ESP_LOGI(TAG, "界面字体已选择：%s；重启后生效", device_settings_ui_font_name(next));
+    ESP_LOGI(TAG, "界面字体已选择：%s；重启后生效", next);
     g_pending_page = SettingsPage::System;
     lv_async_call(show_page_async, nullptr);
 }
@@ -1965,6 +1962,15 @@ static void create_music_player_page(const DeviceSettingsSnapshot &settings)
 
 static void create_system_page(const DeviceSettingsSnapshot &settings)
 {
+    const char *font_file = settings.ui_font_file;
+    if (!font_manager_is_available_filename(font_file)) {
+        font_file = font_manager_active_filename();
+    }
+    char font_name[DEVICE_UI_FONT_FILENAME_MAX] = {};
+    if (!font_manager_format_display_name(font_file, font_name, sizeof(font_name))) {
+        snprintf(font_name, sizeof(font_name), "%s", "无可用字体");
+    }
+
     create_audio_output_control(settings);
     create_brightness_control(settings, 1);
     add_clickable_detail_row(
@@ -1988,7 +1994,7 @@ static void create_system_page(const DeviceSettingsSnapshot &settings)
     add_clickable_detail_row(
         5,
         "界面字体(重启)",
-        device_settings_ui_font_name(settings.ui_font),
+        font_name,
         SettingsDetailIcon::None,
         ui_font_click_cb);
 }

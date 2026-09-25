@@ -40,7 +40,7 @@ static DeviceSettingsSnapshot make_defaults()
     defaults.motion_controls_enabled = true;
     defaults.nsf_gain_compensation_db = 3U;
     defaults.remember_volume = true;
-    defaults.ui_font = DeviceUiFont::CustomExt24;
+    defaults.ui_font_file[0] = '\0';
     return defaults;
 }
 
@@ -87,11 +87,6 @@ static bool music_list_scope_valid(uint8_t raw)
 static bool nsf_gain_compensation_valid(uint8_t db)
 {
     return db <= 6U;
-}
-
-static bool ui_font_valid(uint8_t raw)
-{
-    return raw <= static_cast<uint8_t>(DeviceUiFont::SystBoldExt24);
 }
 
 static esp_err_t open_rw(nvs_handle_t *out_handle)
@@ -213,8 +208,9 @@ esp_err_t device_settings_init()
     if (nvs_get_u8(handle, "memvol", &u8) == ESP_OK && u8 <= 1U) {
         g_settings.remember_volume = u8 != 0U;
     }
-    if (nvs_get_u8(handle, "font", &u8) == ESP_OK && ui_font_valid(u8)) {
-        g_settings.ui_font = static_cast<DeviceUiFont>(u8);
+    size_t font_file_bytes = sizeof(g_settings.ui_font_file);
+    if (nvs_get_str(handle, "fontfile", g_settings.ui_font_file, &font_file_bytes) != ESP_OK) {
+        g_settings.ui_font_file[0] = '\0';
     }
 
     nvs_close(handle);
@@ -409,14 +405,28 @@ esp_err_t device_settings_set_remember_volume(bool enabled)
     return ret;
 }
 
-esp_err_t device_settings_set_ui_font(DeviceUiFont font)
+esp_err_t device_settings_set_ui_font_file(const char *filename)
 {
-    if (!ui_font_valid(static_cast<uint8_t>(font))) return ESP_ERR_INVALID_ARG;
-    const DeviceUiFont old = g_settings.ui_font;
-    g_settings.ui_font = font;
-    const esp_err_t ret = commit_u8("font", static_cast<uint8_t>(font));
-    if (ret != ESP_OK) g_settings.ui_font = old;
-    log_commit_failure("font", ret);
+    if (filename == nullptr || filename[0] == '\0' ||
+        strlen(filename) >= sizeof(g_settings.ui_font_file)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char old[sizeof(g_settings.ui_font_file)] = {};
+    snprintf(old, sizeof(old), "%s", g_settings.ui_font_file);
+    snprintf(g_settings.ui_font_file, sizeof(g_settings.ui_font_file), "%s", filename);
+
+    nvs_handle_t handle = 0;
+    esp_err_t ret = open_rw(&handle);
+    if (ret == ESP_OK) ret = nvs_set_u16(handle, "schema", kSchemaVersion);
+    if (ret == ESP_OK) ret = nvs_set_str(handle, "fontfile", g_settings.ui_font_file);
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    if (handle != 0) nvs_close(handle);
+
+    if (ret != ESP_OK) {
+        snprintf(g_settings.ui_font_file, sizeof(g_settings.ui_font_file), "%s", old);
+        log_commit_failure("fontfile", ret);
+    }
     return ret;
 }
 
@@ -496,17 +506,6 @@ const char *device_settings_music_list_scope_name(DeviceMusicListScope scope)
         case DeviceMusicListScope::All: return "总列表";
         case DeviceMusicListScope::Level1: return "一级列表";
         case DeviceMusicListScope::Level2: return "二级列表";
-        default: return "未知";
-    }
-}
-
-const char *device_settings_ui_font_name(DeviceUiFont font)
-{
-    switch (font) {
-        case DeviceUiFont::CustomExt24: return "CUSTOM_EXT_24";
-        case DeviceUiFont::SyhtExt24: return "SYHT_EXT_24";
-        case DeviceUiFont::SyhtBoldExt24: return "SYHT_BOLD_EXT_24";
-        case DeviceUiFont::SystBoldExt24: return "SYST_BOLD_EXT_24";
         default: return "未知";
     }
 }
