@@ -230,11 +230,10 @@ static esp_err_t font_manager_scan_available_fonts()
             continue;
         }
 
-        snprintf(
+        memcpy(
             g_available_fonts[g_available_font_count].filename,
-            sizeof(g_available_fonts[g_available_font_count].filename),
-            "%s",
-            filename);
+            filename,
+            filename_length + 1U);
         ++g_available_font_count;
     }
     closedir(directory);
@@ -802,8 +801,12 @@ esp_err_t font_manager_init(FontManagerCacheWriteCallback cache_write_callback)
                 g_available_fonts[selected_index].filename);
         }
     }
-    snprintf(g_selected_font_file, sizeof(g_selected_font_file), "%s",
-        g_available_fonts[selected_index].filename);
+    const char *selected_filename = g_available_fonts[selected_index].filename;
+    const size_t selected_filename_length = strnlen(selected_filename, FONT_FILENAME_MAX);
+    if (selected_filename_length == 0U || selected_filename_length >= sizeof(g_selected_font_file)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    memcpy(g_selected_font_file, selected_filename, selected_filename_length + 1U);
     const int path_length = snprintf(
         g_font_path, sizeof(g_font_path), "%s/%s", FONT_DIRECTORY, g_selected_font_file);
     if (path_length <= 0 || static_cast<size_t>(path_length) >= sizeof(g_font_path)) {

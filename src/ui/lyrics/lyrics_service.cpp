@@ -670,13 +670,18 @@ static esp_err_t lyrics_parse_utf8_lrc(
                 return normalize_ret;
             }
 
-            for (size_t i = 0U; i < timestamp_used && row_used < timestamp_count; ++i) {
-                int64_t adjusted = static_cast<int64_t>(timestamps[i]) + global_offset_ms;
-                if (adjusted < 0) adjusted = 0;
-                if (adjusted > UINT32_MAX) adjusted = UINT32_MAX;
-                rows[row_used].time_ms = static_cast<uint32_t>(adjusted);
-                rows[row_used].text_off = text_off;
-                ++row_used;
+            if (text_pool[text_off] == '\0') {
+                // 规范化后为空的歌词行不进入时间轴，避免列表出现空白占位。
+                text_used = text_off;
+            } else {
+                for (size_t i = 0U; i < timestamp_used && row_used < timestamp_count; ++i) {
+                    int64_t adjusted = static_cast<int64_t>(timestamps[i]) + global_offset_ms;
+                    if (adjusted < 0) adjusted = 0;
+                    if (adjusted > UINT32_MAX) adjusted = UINT32_MAX;
+                    rows[row_used].time_ms = static_cast<uint32_t>(adjusted);
+                    rows[row_used].text_off = text_off;
+                    ++row_used;
+                }
             }
         }
         p = lyrics_next_line(line_end, end);
