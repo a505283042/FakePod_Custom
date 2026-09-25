@@ -1,5 +1,6 @@
 #include "media_probe.h"
 #include "storage_io.h"
+#include "media_ogg_opus.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -524,16 +525,20 @@ esp_err_t media_probe_open_file(
     }
 
     *out_info = {};
-    if (format != MediaFormat::FLAC && format != MediaFormat::MP3) {
+    if (format != MediaFormat::FLAC && format != MediaFormat::MP3 && format != MediaFormat::OPUS) {
         return ESP_ERR_NOT_SUPPORTED;
     }
 
     if (!seek_u64(file, 0U)) {
         return ESP_FAIL;
     }
-    return format == MediaFormat::FLAC
-        ? probe_flac(file, out_info)
-        : probe_mp3(file, file_size, out_info);
+    if (format == MediaFormat::FLAC) {
+        return probe_flac(file, out_info);
+    }
+    if (format == MediaFormat::OPUS) {
+        return media_ogg_opus_probe(file, file_size, out_info);
+    }
+    return probe_mp3(file, file_size, out_info);
 }
 
 esp_err_t media_probe_file(
@@ -546,7 +551,7 @@ esp_err_t media_probe_file(
         return ESP_ERR_INVALID_ARG;
     }
     *out_info = {};
-    if (format != MediaFormat::FLAC && format != MediaFormat::MP3) {
+    if (format != MediaFormat::FLAC && format != MediaFormat::MP3 && format != MediaFormat::OPUS) {
         return ESP_ERR_NOT_SUPPORTED;
     }
 

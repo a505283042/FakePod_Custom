@@ -61,6 +61,7 @@ idf_component_register(
         "audio/decoders/wav_decoder.cpp"
         "audio/decoders/flac_decoder.cpp"
         "audio/decoders/mp3_decoder.cpp"
+        "audio/decoders/opus_decoder.cpp"
 
         "assets/artwork_loader.cpp"
         "assets/fallback_cover_images.cpp"
@@ -75,6 +76,7 @@ idf_component_register(
         "media/library/media_groups_v2.cpp"
         "media/library/media_catalog_store_v2.cpp"
         "media/library/media_probe.cpp"
+        "media/library/media_ogg_opus.cpp"
         "media/library/media_metadata.cpp"
         "media/library/media_artwork.cpp"
 

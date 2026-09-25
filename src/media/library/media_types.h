@@ -10,7 +10,9 @@ enum class MediaFormat : uint8_t
     FLAC,
     WAV,
     NSF,
-    NSFE
+    NSFE,
+    // 追加到末尾以保持旧 Catalog 中既有格式枚举值稳定。
+    OPUS
 };
 
 // 媒体格式名称属于稳定媒体类型层，供 Catalog / Probe / Audio / UI 共用。
@@ -24,6 +26,7 @@ inline const char *media_format_name(MediaFormat format)
         case MediaFormat::WAV: return "WAV";
         case MediaFormat::NSF: return "NSF";
         case MediaFormat::NSFE: return "NSFE";
+        case MediaFormat::OPUS: return "OPUS";
     }
     return "未知";
 }

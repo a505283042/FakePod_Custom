@@ -58,7 +58,9 @@ static void audio_task_log_ram(const char *stage)
 static inline void audio_task_log_ram(const char *) {}
 #endif
 
-static constexpr uint32_t AUDIO_TASK_STACK_BYTES = 8192;
+// 加入 Opus 后 8KB 已在实机触发 AudioTask stack overflow；恢复到 24KB，
+// 给 esp_audio_codec Opus 解码热路径保留足够内部栈余量。
+static constexpr uint32_t AUDIO_TASK_STACK_BYTES = 24U * 1024U;
 static constexpr UBaseType_t AUDIO_TASK_PRIORITY = 5;
 static constexpr BaseType_t AUDIO_TASK_CORE = 0;
 static constexpr UBaseType_t AUDIO_COMMAND_QUEUE_LENGTH = 8;
@@ -85,7 +87,7 @@ static constexpr TickType_t AUDIO_START_WAIT_TIMEOUT = pdMS_TO_TICKS(1500);
 // 默认模拟输出保持实机验证的普通耳机安全档 0.5Vrms；Settings 可由 AudioTask 安全切换高阻/线路档。
 // P1.5.3.2R.13 重新分配逻辑音量曲线后，默认逻辑音量改为 50%（约 -18dB），
 // 保持接近旧版 80%=-20dB 的启动实际响度；运行期音量仍只能由 AudioTask 写 DAC。
-// SRAM.2 压力审计记录峰值栈使用 5588B；收敛到 8192B，仍保留 2604B 观测余量。
+// 旧的 SRAM.2 栈审计只覆盖加入 Opus 之前的 codec；Opus 实机栈占用需重新观测。
 
 
 enum class AudioCommandType : uint8_t
@@ -199,7 +201,7 @@ static uint32_t g_flac_starve_grace_attempts = 0;
 static int64_t g_flac_starve_grace_started_us = 0;
 
 // 正式播放资源也只属于 AudioTask。
-// WAV/FLAC/MP3 都通过统一 PcmDecoder 产出 32bit stereo PCM，I2S/DAC 不关心源格式。
+// WAV/FLAC/MP3/Ogg Opus 都通过统一 PcmDecoder 产出 32bit stereo PCM，I2S/DAC 不关心源格式。
 static PcmDecoder g_decoder = {};
 static AudioDecodeWorkspace g_decode_workspace = {};
 
@@ -1150,7 +1152,7 @@ static void audio_task_verify_index_snapshot(
     if (index.bits_per_sample != 0U && index.bits_per_sample != g_decoder.info.bits_per_sample) {
         mismatch = true;
     }
-    // MP3 Simple Decoder 当前不发布 total_frames，因此只有两边都非零时才核对总帧。
+    // MP3/Ogg Opus Simple Decoder 当前不发布 total_frames，因此只有两边都非零时才核对总帧。
     if (
         index.total_frames != 0ULL &&
         g_decoder.info.total_frames != 0ULL &&
@@ -1414,7 +1416,7 @@ static esp_err_t audio_task_start_pcm_pipeline(
     }
 
     // 格式解析和可选 Seek 均已完成；从这里开始才进入连续播放阶段。
-    // MP3/WAV 切换到 Core1 顺序预读，避免 AudioTask 在 I2S 运行期间直接等待 FATFS。
+    // MP3/WAV/Ogg Opus 切换到 Core1 顺序预读，避免 AudioTask 在 I2S 运行期间直接等待 FATFS。
     ret = pcm_decoder_enable_runtime_read_ahead(&g_decoder, path);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "启用运行期音频预读失败：format=%s ret=%s",
@@ -3722,6 +3724,7 @@ static PcmDecoderType audio_decoder_type_for_format(MediaFormat format)
         case MediaFormat::WAV: return PcmDecoderType::Wav;
         case MediaFormat::FLAC: return PcmDecoderType::Flac;
         case MediaFormat::MP3: return PcmDecoderType::Mp3;
+        case MediaFormat::OPUS: return PcmDecoderType::Opus;
         default: return PcmDecoderType::None;
     }
 }
@@ -3797,7 +3800,7 @@ static void audio_task_handle_play(AudioRequest *request)
 
     const PcmDecoderType decoder_type = audio_decoder_type_for_format(request->format);
     if (decoder_type == PcmDecoderType::None) {
-        ESP_LOGW(TAG, "统一 PCM Core 已接入 WAV/FLAC/MP3；%s 解码器尚未接入",
+        ESP_LOGW(TAG, "统一 PCM Core 已接入 WAV/FLAC/MP3/OPUS；%s 解码器尚未接入",
             media_format_name(request->format));
         audio_task_set_state(AudioPlaybackState::Error, ESP_ERR_NOT_SUPPORTED);
         audio_request_complete(request, false, ESP_ERR_NOT_SUPPORTED);

@@ -50,6 +50,7 @@ void media_metadata_build_release(MediaMetadataBuildV2 *metadata);
 // 扫描当前已接入的压缩格式 metadata：
 // - FLAC: Vorbis Comment + 外置同名 .lrc
 // - MP3: ID3v2.2/v2.3/v2.4（并兼容 ID3v1 fallback）+ USLT/SYLT + 外置同名 .lrc
+// - Ogg Opus: OpusTags 文本字段 + 外置同名 .lrc（本轮不解析内嵌封面/歌词）
 // 不读取歌词正文；内嵌歌词仅记录文件 offset/size/编码/语言。
 esp_err_t media_metadata_scan_file_v2(
     const char *path,

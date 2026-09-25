@@ -18,6 +18,10 @@ esp_err_t pcm_decoder_register_backends()
     if (mp3_ret != ESP_OK) {
         ESP_LOGW(TAG, "MP3 后端暂未就绪：%s；其他格式仍可继续", esp_err_to_name(mp3_ret));
     }
+    const esp_err_t opus_ret = opus_decoder_register_backend();
+    if (opus_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Ogg Opus 后端暂未就绪：%s；其他格式仍可继续", esp_err_to_name(opus_ret));
+    }
     return ESP_OK;
 }
 
@@ -64,6 +68,15 @@ esp_err_t pcm_decoder_open(
                 decoder->info.channels = decoder->mp3.channels;
                 decoder->info.bits_per_sample = decoder->mp3.bits_per_sample;
                 decoder->info.total_frames = decoder->mp3.total_frames;
+            }
+            break;
+        case PcmDecoderType::Opus:
+            ret = opus_decoder_open(&decoder->opus, &decoder->source, workspace);
+            if (ret == ESP_OK) {
+                decoder->info.sample_rate_hz = decoder->opus.sample_rate_hz;
+                decoder->info.channels = decoder->opus.channels;
+                decoder->info.bits_per_sample = decoder->opus.bits_per_sample;
+                decoder->info.total_frames = decoder->opus.total_frames;
             }
             break;
         default:
@@ -179,7 +192,8 @@ esp_err_t pcm_decoder_enable_runtime_read_ahead(PcmDecoder *decoder, const char 
     if (decoder->type == PcmDecoderType::Flac) {
         return ESP_OK;
     }
-    if (decoder->type != PcmDecoderType::Mp3 && decoder->type != PcmDecoderType::Wav) {
+    if (decoder->type != PcmDecoderType::Mp3 && decoder->type != PcmDecoderType::Wav &&
+        decoder->type != PcmDecoderType::Opus) {
         return ESP_ERR_NOT_SUPPORTED;
     }
 
@@ -235,6 +249,8 @@ esp_err_t pcm_decoder_read_pcm32(
             return flac_decoder_read_pcm32(&decoder->flac, out_interleaved_stereo, max_frames, out_frames);
         case PcmDecoderType::Mp3:
             return mp3_decoder_read_pcm32(&decoder->mp3, out_interleaved_stereo, max_frames, out_frames);
+        case PcmDecoderType::Opus:
+            return opus_decoder_read_pcm32(&decoder->opus, out_interleaved_stereo, max_frames, out_frames);
         default:
             return ESP_ERR_INVALID_STATE;
     }
@@ -253,6 +269,9 @@ void pcm_decoder_close(PcmDecoder *decoder)
     }
     if (mp3_decoder_is_open(&decoder->mp3)) {
         mp3_decoder_close(&decoder->mp3);
+    }
+    if (opus_decoder_is_open(&decoder->opus)) {
+        opus_decoder_close(&decoder->opus);
     }
 
     // 先关闭 Codec，再关闭当前 Source；若运行期启用了顺序预读，Source close 会负责停止 Core1 任务。
@@ -382,6 +401,8 @@ bool pcm_decoder_is_open(const PcmDecoder *decoder)
             return flac_decoder_is_open(&decoder->flac);
         case PcmDecoderType::Mp3:
             return mp3_decoder_is_open(&decoder->mp3);
+        case PcmDecoderType::Opus:
+            return opus_decoder_is_open(&decoder->opus);
         default:
             return false;
     }
@@ -399,6 +420,8 @@ bool pcm_decoder_is_eof(const PcmDecoder *decoder)
             return flac_decoder_is_eof(&decoder->flac);
         case PcmDecoderType::Mp3:
             return mp3_decoder_is_eof(&decoder->mp3);
+        case PcmDecoderType::Opus:
+            return opus_decoder_is_eof(&decoder->opus);
         default:
             return false;
     }
@@ -416,6 +439,8 @@ uint64_t pcm_decoder_position_frames(const PcmDecoder *decoder)
             return decoder->flac.frames_read;
         case PcmDecoderType::Mp3:
             return decoder->mp3.frames_read;
+        case PcmDecoderType::Opus:
+            return decoder->opus.frames_read;
         default:
             return 0;
     }
@@ -427,6 +452,7 @@ const char *pcm_decoder_type_name(PcmDecoderType type)
         case PcmDecoderType::Wav: return "WAV";
         case PcmDecoderType::Flac: return "FLAC";
         case PcmDecoderType::Mp3: return "MP3";
+        case PcmDecoderType::Opus: return "OPUS";
         default: return "NONE";
     }
 }

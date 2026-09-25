@@ -1,5 +1,6 @@
 #include "media_metadata.h"
 #include "storage_io.h"
+#include "media_ogg_opus.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -1028,6 +1029,63 @@ static bool vorbis_key_equals(const char *key, const char *expected)
     return key != nullptr && expected != nullptr && strcasecmp(key, expected) == 0;
 }
 
+static esp_err_t apply_vorbis_text_owned(
+    const char *key,
+    char *value,
+    MediaMetadataBuildV2 *metadata
+)
+{
+    if (key == nullptr || value == nullptr || metadata == nullptr) {
+        heap_caps_free(value);
+        return ESP_ERR_INVALID_ARG;
+    }
+    trim_ascii_in_place(value);
+    if (value[0] == '\0') {
+        heap_caps_free(value);
+        return ESP_OK;
+    }
+
+    if (vorbis_key_equals(key, "TITLE")) {
+        if (metadata->title == nullptr) {
+            metadata->title = value;
+            metadata->metadata_flags |= MEDIA_TRACK_META_HAS_TITLE_TAG_V2;
+            return ESP_OK;
+        }
+    } else if (vorbis_key_equals(key, "ARTIST")) {
+        if (!add_artist_owned(metadata, value)) {
+            return ESP_ERR_NO_MEM;
+        }
+        metadata->metadata_flags |= MEDIA_TRACK_META_HAS_ARTIST_TAG_V2;
+        return ESP_OK;
+    } else if (vorbis_key_equals(key, "ALBUM")) {
+        if (metadata->album == nullptr) {
+            metadata->album = value;
+            metadata->metadata_flags |= MEDIA_TRACK_META_HAS_ALBUM_TAG_V2;
+            return ESP_OK;
+        }
+    } else if (vorbis_key_equals(key, "ALBUMARTIST") || vorbis_key_equals(key, "ALBUM ARTIST")) {
+        if (metadata->album_artist == nullptr) {
+            metadata->album_artist = value;
+            metadata->metadata_flags |= MEDIA_TRACK_META_HAS_ALBUM_ARTIST_TAG_V2;
+            return ESP_OK;
+        }
+    } else if (vorbis_key_equals(key, "TRACKNUMBER")) {
+        apply_track_number(metadata, value);
+    } else if (vorbis_key_equals(key, "TRACKTOTAL") || vorbis_key_equals(key, "TOTALTRACKS")) {
+        apply_track_total(metadata, value);
+    } else if (vorbis_key_equals(key, "DISCNUMBER")) {
+        apply_disc_number(metadata, value);
+    } else if (vorbis_key_equals(key, "DISCTOTAL") || vorbis_key_equals(key, "TOTALDISCS")) {
+        apply_disc_total(metadata, value);
+    } else if (vorbis_key_equals(key, "DATE") || vorbis_key_equals(key, "YEAR")) {
+        apply_release_year(metadata, value);
+    } else if (vorbis_key_equals(key, "ORIGINALDATE") || vorbis_key_equals(key, "ORIGINALYEAR")) {
+        apply_original_year(metadata, value);
+    }
+    heap_caps_free(value);
+    return ESP_OK;
+}
+
 static esp_err_t apply_vorbis_comment(
     FILE *file,
     uint64_t comment_offset,
@@ -1094,50 +1152,45 @@ static esp_err_t apply_vorbis_comment(
     if (read_ret != ESP_OK) {
         return read_ret;
     }
-    if (value[0] == '\0') {
+    return apply_vorbis_text_owned(prefix, value, metadata);
+}
+
+static esp_err_t apply_opus_tag_comment(const char *comment, uint32_t length, void *context)
+{
+    MediaMetadataBuildV2 *metadata = static_cast<MediaMetadataBuildV2 *>(context);
+    if (comment == nullptr || metadata == nullptr || length == 0U) {
+        return ESP_OK;
+    }
+    const char *equals = static_cast<const char *>(memchr(comment, '=', length));
+    if (equals == nullptr || equals == comment) {
+        return ESP_OK;
+    }
+    const size_t key_length = static_cast<size_t>(equals - comment);
+    if (key_length > MAX_VORBIS_KEY_BYTES) {
+        return ESP_OK;
+    }
+    char key[MAX_VORBIS_KEY_BYTES + 1U] = {};
+    memcpy(key, comment, key_length);
+
+    const char *value_begin = equals + 1;
+    const size_t value_length = length - key_length - 1U;
+    char *value = metadata_strdup_n(value_begin, value_length);
+    if (value == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    // 本轮只接入文本 metadata；OpusTags 内嵌歌词/封面不生成 locator。外置 LRC 仍走统一路径。
+    if (vorbis_key_equals(key, "LYRICS") || vorbis_key_equals(key, "UNSYNCEDLYRICS") ||
+        vorbis_key_equals(key, "SYNCEDLYRICS") || vorbis_key_equals(key, "METADATA_BLOCK_PICTURE")) {
         heap_caps_free(value);
         return ESP_OK;
     }
+    return apply_vorbis_text_owned(key, value, metadata);
+}
 
-    if (vorbis_key_equals(prefix, "TITLE")) {
-        if (metadata->title == nullptr) {
-            metadata->title = value;
-            metadata->metadata_flags |= MEDIA_TRACK_META_HAS_TITLE_TAG_V2;
-            value = nullptr;
-        }
-    } else if (vorbis_key_equals(prefix, "ARTIST")) {
-        if (!add_artist_owned(metadata, value)) {
-            return ESP_ERR_NO_MEM;
-        }
-        value = nullptr;
-        metadata->metadata_flags |= MEDIA_TRACK_META_HAS_ARTIST_TAG_V2;
-    } else if (vorbis_key_equals(prefix, "ALBUM")) {
-        if (metadata->album == nullptr) {
-            metadata->album = value;
-            metadata->metadata_flags |= MEDIA_TRACK_META_HAS_ALBUM_TAG_V2;
-            value = nullptr;
-        }
-    } else if (vorbis_key_equals(prefix, "ALBUMARTIST") || vorbis_key_equals(prefix, "ALBUM ARTIST")) {
-        if (metadata->album_artist == nullptr) {
-            metadata->album_artist = value;
-            metadata->metadata_flags |= MEDIA_TRACK_META_HAS_ALBUM_ARTIST_TAG_V2;
-            value = nullptr;
-        }
-    } else if (vorbis_key_equals(prefix, "TRACKNUMBER")) {
-        apply_track_number(metadata, value);
-    } else if (vorbis_key_equals(prefix, "TRACKTOTAL") || vorbis_key_equals(prefix, "TOTALTRACKS")) {
-        apply_track_total(metadata, value);
-    } else if (vorbis_key_equals(prefix, "DISCNUMBER")) {
-        apply_disc_number(metadata, value);
-    } else if (vorbis_key_equals(prefix, "DISCTOTAL") || vorbis_key_equals(prefix, "TOTALDISCS")) {
-        apply_disc_total(metadata, value);
-    } else if (vorbis_key_equals(prefix, "DATE") || vorbis_key_equals(prefix, "YEAR")) {
-        apply_release_year(metadata, value);
-    } else if (vorbis_key_equals(prefix, "ORIGINALDATE") || vorbis_key_equals(prefix, "ORIGINALYEAR")) {
-        apply_original_year(metadata, value);
-    }
-    heap_caps_free(value);
-    return ESP_OK;
+static esp_err_t parse_opus_tags(FILE *file, uint64_t file_size, MediaMetadataBuildV2 *metadata)
+{
+    return media_ogg_opus_visit_text_comments(
+        file, file_size, apply_opus_tag_comment, metadata);
 }
 
 static esp_err_t parse_flac_vorbis(FILE *file, uint64_t file_size, MediaMetadataBuildV2 *metadata)
@@ -1254,7 +1307,7 @@ static esp_err_t media_metadata_scan_open_file_common_v2(
     }
     media_metadata_build_release(out_metadata);
 
-    if (format != MediaFormat::FLAC && format != MediaFormat::MP3) {
+    if (format != MediaFormat::FLAC && format != MediaFormat::MP3 && format != MediaFormat::OPUS) {
         out_metadata->metadata_flags |= MEDIA_TRACK_META_SCANNED_V2;
         const bool lrc_ok = external_lrc_resolved
             ? add_resolved_external_lrc(external_lrc_path, out_metadata)
@@ -1265,9 +1318,14 @@ static esp_err_t media_metadata_scan_open_file_common_v2(
         return ESP_ERR_INVALID_ARG;
     }
 
-    esp_err_t ret = format == MediaFormat::FLAC
-        ? parse_flac_vorbis(file, file_size, out_metadata)
-        : parse_id3(file, file_size, out_metadata);
+    esp_err_t ret = ESP_OK;
+    if (format == MediaFormat::FLAC) {
+        ret = parse_flac_vorbis(file, file_size, out_metadata);
+    } else if (format == MediaFormat::OPUS) {
+        ret = parse_opus_tags(file, file_size, out_metadata);
+    } else {
+        ret = parse_id3(file, file_size, out_metadata);
+    }
     if (ret == ESP_OK && format == MediaFormat::MP3) {
         ret = parse_id3v1(file, file_size, out_metadata);
     }
@@ -1327,7 +1385,7 @@ esp_err_t media_metadata_scan_file_v2(
         return ESP_ERR_TIMEOUT;
     }
 
-    if (format != MediaFormat::FLAC && format != MediaFormat::MP3) {
+    if (format != MediaFormat::FLAC && format != MediaFormat::MP3 && format != MediaFormat::OPUS) {
         return media_metadata_scan_open_file_v2(nullptr, path, format, file_size, out_metadata);
     }
 

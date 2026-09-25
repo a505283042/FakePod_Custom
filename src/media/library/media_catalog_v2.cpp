@@ -175,7 +175,7 @@ esp_err_t media_catalog_v2_validate(const MusicCatalogV2 *catalog)
         if (path == nullptr || path[0] == '\0' ||
             !pool_offset_valid(catalog->pool, track.title_off) ||
             !pool_offset_valid(catalog->pool, track.display_artist_off) ||
-            track.format > MediaFormat::NSFE ||
+            track.format > MediaFormat::OPUS ||
             (track.album_id != MEDIA_CATALOG_INVALID_ID_V2 && track.album_id >= catalog->album_count) ||
             (track.artwork_ref_id != MEDIA_CATALOG_INVALID_ID_V2 && track.artwork_ref_id >= catalog->artwork_ref_count) ||
             track.reserved0 != 0U || track.reserved1 != 0U ||

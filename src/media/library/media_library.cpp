@@ -689,6 +689,8 @@ static bool media_library_detect_format(const char *name, MediaFormat *format)
         *format = MediaFormat::NSF;
     } else if (strcasecmp(extension, ".nsfe") == 0) {
         *format = MediaFormat::NSFE;
+    } else if (strcasecmp(extension, ".opus") == 0) {
+        *format = MediaFormat::OPUS;
     } else {
         return false;
     }
@@ -882,7 +884,7 @@ static esp_err_t media_library_scan_with_scratch(
     }
 
     size_t directory_count = 0;
-    size_t format_count[static_cast<size_t>(MediaFormat::NSFE) + 1U] = {};
+    size_t format_count[static_cast<size_t>(MediaFormat::OPUS) + 1U] = {};
     size_t reused_count = 0;
     size_t probed_count = 0;
     size_t probe_failed_count = 0;
@@ -1161,7 +1163,7 @@ static esp_err_t media_library_scan_with_scratch(
                     const TrackRowV2 *old_v2_track = nullptr;
 
                     const bool deep_probe_format =
-                        format == MediaFormat::FLAC || format == MediaFormat::MP3;
+                        format == MediaFormat::FLAC || format == MediaFormat::MP3 || format == MediaFormat::OPUS;
 
                     if (have_previous_v2) {
                         const MediaManifestRecordV2 *old_manifest = nullptr;
@@ -1327,7 +1329,7 @@ static esp_err_t media_library_scan_with_scratch(
                         break;
                     }
 
-                    // MP3/FLAC 只要本轮存在任意需要重新解析的阶段，就共享一次 fopen。
+                    // MP3/FLAC/Ogg Opus 只要本轮存在任意需要重新解析的阶段，就共享一次 fopen。
                     // 这样首次建库、读卡器新增歌曲后的启动增量扫描、USB MSC 归还后的热刷新
                     // 都不会再为“技术探测 / Metadata / 封面索引”分别重新按路径打开同一个文件。
                     // 对大目录而言 fopen(path) 的 FAT 长文件名查找往往比解析本身更贵，因此这里
@@ -1374,12 +1376,27 @@ static esp_err_t media_library_scan_with_scratch(
                                             snprintf(reason, sizeof(reason), "MP3 %lu Hz 当前不可播放，歌曲仍保留在曲库",
                                                 static_cast<unsigned long>(technical.sample_rate_hz));
                                             record_scan_issue(full_path, reason);
+                                        } else if (format == MediaFormat::OPUS && technical.channels > 2U) {
+                                            char reason[96] = {};
+                                            snprintf(reason, sizeof(reason), "Opus %u 声道当前不可播放，歌曲仍保留在曲库",
+                                                static_cast<unsigned>(technical.channels));
+                                            record_scan_issue(full_path, reason);
                                         }
                                     } else {
                                         technical = {};
                                         probe_failed_count++;
                                         if (probe_ret == ESP_ERR_NO_MEM) {
                                             out_of_memory = true;
+                                        } else if (format == MediaFormat::OPUS) {
+                                            if (probe_ret == ESP_ERR_NOT_SUPPORTED) {
+                                                record_scan_issue(full_path, "暂不支持该 Ogg Opus 结构，已保留基础条目");
+                                            } else if (probe_ret == ESP_ERR_INVALID_SIZE) {
+                                                record_scan_issue(full_path, "Ogg Opus 页面或长度异常，已保留基础条目");
+                                            } else if (probe_ret == ESP_ERR_INVALID_RESPONSE) {
+                                                record_scan_issue(full_path, "Ogg/OpusHead 结构异常，已保留基础条目");
+                                            } else {
+                                                record_scan_issue(full_path, "Ogg Opus 技术探测失败，已保留基础条目");
+                                            }
                                         } else if (probe_ret == ESP_ERR_NOT_FOUND) {
                                             record_scan_issue(full_path, "未找到连续有效 MPEG Header，已保留基础条目");
                                         } else if (probe_ret == ESP_ERR_INVALID_SIZE) {
@@ -1433,6 +1450,10 @@ static esp_err_t media_library_scan_with_scratch(
                                             metadata_failed_count++;
                                             if (metadata_ret == ESP_ERR_NO_MEM) {
                                                 out_of_memory = true;
+                                            } else if (format == MediaFormat::OPUS && metadata_ret == ESP_ERR_INVALID_SIZE) {
+                                                record_scan_issue(full_path, "OpusTags 字段范围异常，已回退文件名");
+                                            } else if (format == MediaFormat::OPUS && metadata_ret == ESP_ERR_INVALID_RESPONSE) {
+                                                record_scan_issue(full_path, "OpusTags 结构异常，已回退文件名");
                                             } else if (metadata_ret == ESP_ERR_INVALID_SIZE) {
                                                 record_scan_issue(full_path, "ID3 Size/Frame 范围异常，已回退文件名");
                                             } else if (metadata_ret == ESP_ERR_INVALID_RESPONSE) {
@@ -1488,7 +1509,9 @@ static esp_err_t media_library_scan_with_scratch(
                                             if (artwork_ret == ESP_ERR_NO_MEM) {
                                                 out_of_memory = true;
                                             } else {
-                                                record_scan_issue(full_path, "APIC/PICTURE 封面解析失败，已按无封面处理");
+                                                record_scan_issue(full_path, format == MediaFormat::OPUS
+                                                    ? "目录封面索引失败，已按无封面处理"
+                                                    : "APIC/PICTURE 封面解析失败，已按无封面处理");
                                             }
                                         }
                                     }
@@ -1826,12 +1849,13 @@ static esp_err_t media_library_scan_with_scratch(
             static_cast<unsigned>(artwork_external_count),
             static_cast<unsigned>(artwork_none_count),
             static_cast<unsigned>(artwork_failed_count));
-        LIB_BOOT_LOGI("格式统计：MP3=%u，FLAC=%u，WAV=%u，NSF=%u，NSFE=%u",
+        LIB_BOOT_LOGI("格式统计：MP3=%u，FLAC=%u，WAV=%u，NSF=%u，NSFE=%u，OPUS=%u",
             static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::MP3)]),
             static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::FLAC)]),
             static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::WAV)]),
             static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::NSF)]),
-            static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::NSFE)]));
+            static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::NSFE)]),
+            static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::OPUS)]));
         const MusicCatalogV2 *published = media_catalog_v2_current();
         LIB_BOOT_LOGI("MusicCatalogV2 PSRAM：tracks=%luB artists=%luB albums=%luB artist_refs=%luB lyrics_refs=%luB artwork_refs=%luB strings=%luB groups=%uB generation=%lu",
             static_cast<unsigned long>(final_track_bytes),
@@ -1868,7 +1892,7 @@ static esp_err_t media_library_scan_with_scratch(
             const uint32_t old_track_index =
                 static_cast<uint32_t>(old_track - previous_v2.catalog.tracks);
             const bool deep_probe_format =
-                entry.format == MediaFormat::FLAC || entry.format == MediaFormat::MP3;
+                entry.format == MediaFormat::FLAC || entry.format == MediaFormat::MP3 || entry.format == MediaFormat::OPUS;
 
             if (deep_probe_format && entry.metadata_build == nullptr &&
                 (old_track->metadata_flags & MEDIA_TRACK_META_SCANNED_V2) != 0U) {
@@ -2171,12 +2195,13 @@ static esp_err_t media_library_scan_with_scratch(
         static_cast<unsigned>(artwork_external_count),
         static_cast<unsigned>(artwork_none_count),
         static_cast<unsigned>(artwork_failed_count));
-    LIB_BOOT_LOGI("格式统计：MP3=%u，FLAC=%u，WAV=%u，NSF=%u，NSFE=%u",
+    LIB_BOOT_LOGI("格式统计：MP3=%u，FLAC=%u，WAV=%u，NSF=%u，NSFE=%u，OPUS=%u",
         static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::MP3)]),
         static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::FLAC)]),
         static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::WAV)]),
         static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::NSF)]),
-        static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::NSFE)]));
+        static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::NSFE)]),
+        static_cast<unsigned>(format_count[static_cast<size_t>(MediaFormat::OPUS)]));
     const MusicCatalogV2 *published = media_catalog_v2_current();
     LIB_BOOT_LOGI("MusicCatalogV2 PSRAM：tracks=%luB artists=%luB albums=%luB artist_refs=%luB lyrics_refs=%luB artwork_refs=%luB strings=%luB groups=%uB generation=%lu",
         static_cast<unsigned long>(final_track_bytes),
