@@ -83,6 +83,18 @@ static bool is_ascii_space(uint32_t cp)
     return cp == ' ' || cp == '\t';
 }
 
+static bool is_latin_word_codepoint(uint32_t cp)
+{
+    if ((cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z') ||
+        (cp >= '0' && cp <= '9')) {
+        return true;
+    }
+    if ((cp >= 0x00C0U && cp <= 0x02AFU) && cp != 0x00D7U && cp != 0x00F7U) {
+        return true;
+    }
+    return cp == '\'' || cp == '-' || cp == 0x2010U || cp == 0x2011U || cp == 0x2019U;
+}
+
 static bool is_preferred_break_after(uint32_t cp)
 {
     switch (cp) {
@@ -231,7 +243,7 @@ bool lyrics_text_format_balanced(
         const char *second_begin = nullptr;
         int32_t score = INT32_MAX;
         bool both_fit = false;
-    } best;
+    } best_safe, best_hard;
 
     const char *p = text;
     while (p < text_end && *p != '\0') {
@@ -264,6 +276,8 @@ bool lyrics_text_format_balanced(
 
         uint32_t second_cp = 0U;
         decode_utf8(reinterpret_cast<const uint8_t *>(second_begin), &second_cp);
+        const bool splits_latin_word =
+            is_latin_word_codepoint(cp) && is_latin_word_codepoint(second_cp);
         const int32_t first_w = measure_text_range(text, first_end);
         const int32_t second_w = measure_text_range(second_begin, text_end);
         const bool first_fit = first_w <= max_width;
@@ -282,16 +296,21 @@ bool lyrics_text_format_balanced(
             score += 80;
         }
 
-        if ((both_fit && !best.both_fit) ||
-            (both_fit == best.both_fit && score < best.score)) {
-            best.first_end = first_end;
-            best.second_begin = second_begin;
-            best.score = score;
-            best.both_fit = both_fit;
+        // 英文/拉丁单词内部的断点只作为最后兜底；只要存在空格、标点、
+        // 中英文边界或中文字符边界，就绝不从单词中间拆开。
+        BreakChoice &candidate = splits_latin_word ? best_hard : best_safe;
+        if ((both_fit && !candidate.both_fit) ||
+            (both_fit == candidate.both_fit && score < candidate.score)) {
+            candidate.first_end = first_end;
+            candidate.second_begin = second_begin;
+            candidate.score = score;
+            candidate.both_fit = both_fit;
         }
         p = after;
     }
 
+    const BreakChoice &best =
+        best_safe.first_end != nullptr ? best_safe : best_hard;
     if (best.first_end == nullptr || best.second_begin == nullptr) {
         copy_text(out, out_size, text);
         return false;
