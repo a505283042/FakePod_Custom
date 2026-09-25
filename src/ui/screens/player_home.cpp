@@ -809,9 +809,10 @@ static lv_obj_t *player_home_create_battery_status(lv_obj_t *parent)
 
     g_battery_label = player_home_create_label(
         status, "--%", lv_color_hex(0xF5F7FA), font_manager_get_ui_font());
-    lv_obj_set_size(g_battery_label, 50, 28);
+    // R33: 电量百分比文字区与已验证的音量标签保持一致，避免较宽数字组合挤掉末尾 % 字形。
+    lv_obj_set_size(g_battery_label, 54, 28);
     lv_obj_set_style_text_align(g_battery_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(g_battery_label, LV_ALIGN_RIGHT_MID, -4, 0);
+    lv_obj_align(g_battery_label, LV_ALIGN_RIGHT_MID, -3, 0);
     return status;
 }
 
