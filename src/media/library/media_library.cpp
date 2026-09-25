@@ -272,6 +272,12 @@ struct MediaLibraryScanScratch
     struct stat file_info = {};
     MediaTechnicalInfo technical = {};
     MusicCatalogV2 next_catalog = {};
+    char first_issue_file[96] = {};
+    char first_issue_reason[96] = {};
+    bool scan_io_error = false;
+    int scan_io_errno = 0;
+    char scan_io_stage[24] = {};
+    char scan_io_path[128] = {};
     char *scan_path = nullptr;
     size_t scan_path_capacity = 0U;
 };
@@ -291,6 +297,25 @@ static void media_library_scan_scratch_release(MediaLibraryScanScratch *scratch)
     scratch->scan_path = nullptr;
     scratch->scan_path_capacity = 0U;
     heap_caps_free(scratch);
+}
+
+static void media_library_record_scan_io_error(
+    MediaLibraryScanScratch *scratch,
+    const char *stage,
+    const char *path,
+    int error_code)
+{
+    if (scratch == nullptr) {
+        return;
+    }
+    if (!scratch->scan_io_error) {
+        scratch->scan_io_errno = error_code;
+        snprintf(scratch->scan_io_stage, sizeof(scratch->scan_io_stage), "%s",
+            stage != nullptr ? stage : "I/O");
+        snprintf(scratch->scan_io_path, sizeof(scratch->scan_io_path), "%s",
+            path != nullptr ? path : "");
+    }
+    scratch->scan_io_error = true;
 }
 
 static MediaEntry *g_entries = nullptr;
@@ -847,15 +872,15 @@ static esp_err_t media_library_scan_with_scratch(
     size_t updated_count = 0U;
     size_t issue_count = 0U;
     size_t skipped_track_count = 0U;
-    char first_issue_file[96] = {};
-    char first_issue_reason[96] = {};
+    char *const first_issue_file = scratch->first_issue_file;
+    char *const first_issue_reason = scratch->first_issue_reason;
     const auto record_scan_issue = [&](const char *path, const char *reason) {
         issue_count++;
         if (first_issue_file[0] == '\0') {
             const char *name = path != nullptr ? strrchr(path, '/') : nullptr;
-            snprintf(first_issue_file, sizeof(first_issue_file), "%s",
+            snprintf(first_issue_file, sizeof(scratch->first_issue_file), "%s",
                 name != nullptr ? name + 1 : (path != nullptr ? path : "未知文件"));
-            snprintf(first_issue_reason, sizeof(first_issue_reason), "%s",
+            snprintf(first_issue_reason, sizeof(scratch->first_issue_reason), "%s",
                 reason != nullptr ? reason : "媒体文件异常，已自动降级处理");
         }
         ESP_LOGW(TAG, "曲库单曲异常：%s，%s",
@@ -914,18 +939,10 @@ static esp_err_t media_library_scan_with_scratch(
     bool out_of_memory = false;
     bool storage_timeout = false;
     bool root_missing = false;
-    bool scan_io_error = false;
-    int scan_io_errno = 0;
-    char scan_io_stage[24] = {};
-    char scan_io_path[128] = {};
-    const auto record_scan_io_error = [&](const char *stage, const char *path, int error_code) {
-        if (!scan_io_error) {
-            scan_io_errno = error_code;
-            snprintf(scan_io_stage, sizeof(scan_io_stage), "%s", stage != nullptr ? stage : "I/O");
-            snprintf(scan_io_path, sizeof(scan_io_path), "%s", path != nullptr ? path : "");
-        }
-        scan_io_error = true;
-    };
+    bool &scan_io_error = scratch->scan_io_error;
+    int &scan_io_errno = scratch->scan_io_errno;
+    char *const scan_io_stage = scratch->scan_io_stage;
+    char *const scan_io_path = scratch->scan_io_path;
 
     // 首次建库时给启动页持续反馈“已经发现多少首音乐”。
     // 不能每发现一首就抢一次 LVGL 锁，否则大曲库会把扫描本身拖慢；
@@ -1025,7 +1042,7 @@ static esp_err_t media_library_scan_with_scratch(
                 heap_caps_free(directory);
                 continue;
             }
-            record_scan_io_error("opendir", directory, directory_errno);
+            media_library_record_scan_io_error(scratch, "opendir", directory, directory_errno);
             heap_caps_free(directory);
             break;
         }
@@ -1091,7 +1108,7 @@ static esp_err_t media_library_scan_with_scratch(
             }
             if (entry == nullptr) {
                 if (readdir_errno != 0) {
-                    record_scan_io_error("readdir", directory, readdir_errno);
+                    media_library_record_scan_io_error(scratch, "readdir", directory, readdir_errno);
                 }
                 break;
             }
@@ -1177,7 +1194,7 @@ static esp_err_t media_library_scan_with_scratch(
                     ESP_LOGW(TAG, "扫描期间文件已不存在，按删除处理：%s", full_path);
                     continue;
                 }
-                record_scan_io_error("stat", full_path, stat_errno);
+                media_library_record_scan_io_error(scratch, "stat", full_path, stat_errno);
                 break;
             }
             if (S_ISDIR(info.st_mode)) {
@@ -1766,7 +1783,8 @@ static esp_err_t media_library_scan_with_scratch(
                     out_changes->previous_count = fallback_track_count;
                     out_changes->current_count = fallback_track_count;
                     out_changes->issue_count = 1U;
-                    snprintf(out_changes->first_issue_file, sizeof(out_changes->first_issue_file), "%s", scan_io_path);
+                    snprintf(out_changes->first_issue_file, sizeof(out_changes->first_issue_file), "%.*s",
+                        static_cast<int>(sizeof(out_changes->first_issue_file) - 1U), scan_io_path);
                     snprintf(out_changes->first_issue_reason, sizeof(out_changes->first_issue_reason),
                         "TF/FAT I/O异常，已保留旧曲库");
                 }
