@@ -53,8 +53,6 @@ struct OpusDecoder
     bool eof = false;
 };
 
-esp_err_t opus_decoder_register_backend();
-
 esp_err_t opus_decoder_open(
     OpusDecoder *decoder,
     AudioSource *source,

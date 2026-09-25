@@ -14,8 +14,8 @@ static const char *TAG = "OPUS";
 // RFC 7845 对 family 0/1 建议 demuxer 能处理到 61,440B 的音频 packet。
 // 这里使用 64KB PSRAM；OpusTags 无论多大都流式跳过，不进入该缓冲。
 static constexpr size_t OPUS_PACKET_BUFFER_BYTES = 64U * 1024U;
-// 48kHz / 双声道 / 16bit / 120ms PCM 约 23KB，32KB 足够正常 Ogg Opus packet。
-static constexpr size_t OPUS_DECODED_BUFFER_BYTES = 32U * 1024U;
+// 解码 PCM 缓冲按 OpusHead 声道数 + 首音频 packet 的真实 frame duration 精确计算。
+// 仍保留按 needed_size 扩容的兜底，避免把乐鑫 decoder 的输出需求写死。
 static constexpr size_t OPUS_MAX_DECODED_BUFFER_BYTES = 128U * 1024U;
 
 static esp_err_t opus_audio_error_to_esp(esp_audio_err_t error)
@@ -62,6 +62,39 @@ static uint32_t opus_read_le32(const uint8_t *p)
         (static_cast<uint32_t>(p[1]) << 8) |
         (static_cast<uint32_t>(p[2]) << 16) |
         (static_cast<uint32_t>(p[3]) << 24);
+}
+
+// 按乐鑫 decoder 的真实输出需求预留一帧 PCM。
+// 后续仍保留 ESP_AUDIO_ERR_BUFF_NOT_ENOUGH -> needed_size 扩容作为兜底。
+static esp_err_t opus_calculate_decoded_buffer_bytes(
+    uint16_t channels,
+    uint16_t frame_duration_q4_ms,
+    size_t *out_bytes)
+{
+    if (out_bytes != nullptr) {
+        *out_bytes = 0U;
+    }
+    if ((channels != 1U && channels != 2U) ||
+        frame_duration_q4_ms == 0U ||
+        out_bytes == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // frame_duration_q4_ms 的单位是 1/4ms。
+    // 48kHz 下：samples = 48000 * q4_ms / 4000。
+    const uint64_t sample_numerator = 48000ULL * frame_duration_q4_ms;
+    if ((sample_numerator % 4000ULL) != 0ULL) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    const uint64_t samples_per_channel = sample_numerator / 4000ULL;
+    const uint64_t required =
+        samples_per_channel * channels * static_cast<uint64_t>(sizeof(int16_t));
+    if (required == 0ULL || required > OPUS_MAX_DECODED_BUFFER_BYTES) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    *out_bytes = static_cast<size_t>(required);
+    return ESP_OK;
 }
 
 // RFC 6716 TOC 的 config 决定“单个 Opus frame”的时长。
@@ -619,17 +652,6 @@ static esp_err_t opus_decode_next_output(OpusDecoder *decoder)
     return ESP_OK;
 }
 
-esp_err_t opus_decoder_register_backend()
-{
-    // 直接使用 esp_opus_dec_open/decode；这里只保留注册动作，供统一后端初始化路径复用。
-    const esp_audio_err_t opus_ret = esp_opus_dec_register();
-    if (opus_ret != ESP_AUDIO_ERR_OK && opus_ret != ESP_AUDIO_ERR_ALREADY_EXIST) {
-        ESP_LOGE(TAG, "注册乐鑫 Opus 解码器失败：codec_ret=%d", static_cast<int>(opus_ret));
-        return opus_audio_error_to_esp(opus_ret);
-    }
-    return ESP_OK;
-}
-
 esp_err_t opus_decoder_open(
     OpusDecoder *decoder,
     AudioSource *source,
@@ -640,10 +662,6 @@ esp_err_t opus_decoder_open(
     }
     opus_decoder_close(decoder);
 
-    esp_err_t ret = opus_decoder_register_backend();
-    if (ret != ESP_OK) {
-        return ret;
-    }
     if (!audio_source_has_capability(source, AUDIO_SOURCE_CAP_READ) ||
         !audio_source_has_capability(source, AUDIO_SOURCE_CAP_SEEK)) {
         return ESP_ERR_NOT_SUPPORTED;
@@ -651,26 +669,19 @@ esp_err_t opus_decoder_open(
 
     decoder->source = source;
     decoder->workspace = workspace;
+    esp_err_t ret = ESP_OK;
     if (workspace != nullptr) {
         ret = audio_decode_workspace_reserve_input(
             workspace, OPUS_PACKET_BUFFER_BYTES, &decoder->input_buffer);
-        if (ret == ESP_OK) {
-            ret = audio_decode_workspace_reserve_decoded(
-                workspace, OPUS_DECODED_BUFFER_BYTES, &decoder->decoded_buffer);
-        }
     } else {
         decoder->input_buffer = opus_alloc_buffer(OPUS_PACKET_BUFFER_BYTES);
-        decoder->decoded_buffer = opus_alloc_buffer(OPUS_DECODED_BUFFER_BYTES);
-        ret = decoder->input_buffer != nullptr && decoder->decoded_buffer != nullptr
-            ? ESP_OK
-            : ESP_ERR_NO_MEM;
+        ret = decoder->input_buffer != nullptr ? ESP_OK : ESP_ERR_NO_MEM;
     }
-    if (ret != ESP_OK || decoder->input_buffer == nullptr || decoder->decoded_buffer == nullptr) {
+    if (ret != ESP_OK || decoder->input_buffer == nullptr) {
         opus_decoder_close(decoder);
         return ret != ESP_OK ? ret : ESP_ERR_NO_MEM;
     }
     decoder->input_capacity = OPUS_PACKET_BUFFER_BYTES;
-    decoder->decoded_capacity = OPUS_DECODED_BUFFER_BYTES;
 
     ret = opus_parse_stream_headers(decoder);
     if (ret != ESP_OK) {
@@ -705,6 +716,33 @@ esp_err_t opus_decoder_open(
     decoder->input_size = first_packet_size;
     decoder->input_packet_ready = true;
     decoder->frame_duration_q4_ms = frame_duration_q4_ms;
+
+    size_t decoded_buffer_bytes = 0U;
+    ret = opus_calculate_decoded_buffer_bytes(
+        decoder->channels,
+        decoder->frame_duration_q4_ms,
+        &decoded_buffer_bytes);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "计算 Opus PCM 缓冲失败：channels=%u frame_q4=%u ret=%s",
+            static_cast<unsigned>(decoder->channels),
+            static_cast<unsigned>(decoder->frame_duration_q4_ms),
+            esp_err_to_name(ret));
+        opus_decoder_close(decoder);
+        return ret;
+    }
+
+    if (workspace != nullptr) {
+        ret = audio_decode_workspace_reserve_decoded(
+            workspace, decoded_buffer_bytes, &decoder->decoded_buffer);
+    } else {
+        decoder->decoded_buffer = opus_alloc_buffer(decoded_buffer_bytes);
+        ret = decoder->decoded_buffer != nullptr ? ESP_OK : ESP_ERR_NO_MEM;
+    }
+    if (ret != ESP_OK || decoder->decoded_buffer == nullptr) {
+        opus_decoder_close(decoder);
+        return ret != ESP_OK ? ret : ESP_ERR_NO_MEM;
+    }
+    decoder->decoded_capacity = decoded_buffer_bytes;
 
     esp_opus_dec_cfg_t opus_cfg = ESP_OPUS_DEC_CONFIG_DEFAULT();
     opus_cfg.sample_rate = 48000;

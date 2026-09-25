@@ -18,10 +18,6 @@ esp_err_t pcm_decoder_register_backends()
     if (mp3_ret != ESP_OK) {
         ESP_LOGW(TAG, "MP3 后端暂未就绪：%s；其他格式仍可继续", esp_err_to_name(mp3_ret));
     }
-    const esp_err_t opus_ret = opus_decoder_register_backend();
-    if (opus_ret != ESP_OK) {
-        ESP_LOGW(TAG, "Ogg Opus 后端暂未就绪：%s；其他格式仍可继续", esp_err_to_name(opus_ret));
-    }
     return ESP_OK;
 }
 
