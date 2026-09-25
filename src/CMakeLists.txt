@@ -92,6 +92,7 @@ idf_component_register(
         "ui/search/pinyin_initial.cpp"
         "ui/search/search_key_builder.cpp"
         "ui/lyrics/lyrics_service.cpp"
+        "ui/lyrics/lyrics_text_layout.cpp"
         "ui/lyrics/lyrics_view.cpp"
         "ui/spectrum/spectrum_view.cpp"
         "ui/widgets/quick_index_keyboard.cpp"

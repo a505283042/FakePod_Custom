@@ -26,6 +26,7 @@
 #include "system/device_settings.h"
 #include "system/screen_lock_simple.h"
 #include "lyrics/lyrics_service.h"
+#include "lyrics/lyrics_text_layout.h"
 #include "gesture/gesture_router.h"
 #include "ui_common.h"
 
@@ -45,7 +46,8 @@ static constexpr int16_t kTitleHeight = 29;
 static constexpr int16_t kArtistY = 35;
 static constexpr int16_t kArtistHeight = 24;
 static constexpr int16_t kCurrentLyricY = 374;
-static constexpr int16_t kCurrentLyricHeight = 38;
+static constexpr int16_t kCurrentLyricHeight = 62;
+static constexpr int32_t kMiniLyricTextMaxW = 408;
 static constexpr int16_t kNextLyricY = 415;
 static constexpr int16_t kNextLyricHeight = 30;
 
@@ -679,12 +681,21 @@ static void cassette_view_update_mini_lyrics()
 
     // 歌曲开头尚未到第一句时间戳时，磁带页先预显示第一句，避免刚进入视图时首行空白。
     // 到达第一句时间戳后仍按歌词服务的 current 标记正常同步，不改变全局歌词时序。
-    cassette_view_set_text_if_changed(
-        g_current_lyric_label,
-        current.valid && (current.current || before_first_line) ? current.text : "");
+    const char *current_text =
+        current.valid && (current.current || before_first_line) ? current.text : "";
+    char formatted_current[LYRICS_VIEW_TEXT_BYTES + 8U] = {};
+    const bool current_two_lines =
+        lyrics_text_measure_width(current_text) > kMiniLyricTextMaxW;
+    lyrics_text_format_balanced(
+        current_text,
+        kMiniLyricTextMaxW,
+        formatted_current,
+        sizeof(formatted_current));
+
+    cassette_view_set_text_if_changed(g_current_lyric_label, formatted_current);
     cassette_view_set_text_if_changed(
         g_next_lyric_label,
-        next.valid ? next.text : "");
+        !current_two_lines && next.valid ? next.text : "");
 }
 
 static void cassette_view_release_pending_cover()
@@ -3286,6 +3297,10 @@ esp_err_t cassette_view_create(lv_obj_t *parent)
         g_root, kCurrentLyricY, kCurrentLyricHeight, lv_color_hex(0xFFFFFF));
     g_next_lyric_label = cassette_view_create_text_label(
         g_root, kNextLyricY, kNextLyricHeight, lv_color_hex(0x737D8B));
+    if (g_current_lyric_label != nullptr) {
+        lv_label_set_long_mode(g_current_lyric_label, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_line_space(g_current_lyric_label, 2, 0);
+    }
     if (g_title_label == nullptr || g_artist_label == nullptr ||
         g_current_lyric_label == nullptr || g_next_lyric_label == nullptr) {
         return ESP_ERR_NO_MEM;

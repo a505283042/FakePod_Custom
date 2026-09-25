@@ -1,7 +1,6 @@
 #include "lyrics_view.h"
 
 #include <stdio.h>
-#include <string.h>
 
 #include "audio_service.h"
 #include "board_pins.h"
@@ -12,6 +11,7 @@
 #include "gesture/gesture_router.h"
 #include "input/touch_input.h"
 #include "lyrics_service.h"
+#include "lyrics_text_layout.h"
 #include "media_catalog_v2.h"
 #include "player_control.h"
 #include "player_state.h"
@@ -788,77 +788,13 @@ static bool lyrics_view_overlay_volume_gesture_update()
     return true;
 }
 
-static size_t lyrics_view_decode_utf8(const uint8_t *p, uint32_t *codepoint)
-{
-    if (p == nullptr || codepoint == nullptr || p[0] == 0U) {
-        return 0U;
-    }
-    if (p[0] < 0x80U) {
-        *codepoint = p[0];
-        return 1U;
-    }
-    if ((p[0] & 0xE0U) == 0xC0U && p[1] != 0U && (p[1] & 0xC0U) == 0x80U) {
-        const uint32_t cp = ((p[0] & 0x1FU) << 6U) | (p[1] & 0x3FU);
-        if (cp >= 0x80U) {
-            *codepoint = cp;
-            return 2U;
-        }
-    }
-    if ((p[0] & 0xF0U) == 0xE0U && p[1] != 0U && p[2] != 0U &&
-        (p[1] & 0xC0U) == 0x80U && (p[2] & 0xC0U) == 0x80U) {
-        const uint32_t cp = ((p[0] & 0x0FU) << 12U) |
-            ((p[1] & 0x3FU) << 6U) | (p[2] & 0x3FU);
-        if (cp >= 0x800U && !(cp >= 0xD800U && cp <= 0xDFFFU)) {
-            *codepoint = cp;
-            return 3U;
-        }
-    }
-    if ((p[0] & 0xF8U) == 0xF0U && p[1] != 0U && p[2] != 0U && p[3] != 0U &&
-        (p[1] & 0xC0U) == 0x80U && (p[2] & 0xC0U) == 0x80U && (p[3] & 0xC0U) == 0x80U) {
-        const uint32_t cp = ((p[0] & 0x07U) << 18U) |
-            ((p[1] & 0x3FU) << 12U) | ((p[2] & 0x3FU) << 6U) | (p[3] & 0x3FU);
-        if (cp >= 0x10000U && cp <= 0x10FFFFU) {
-            *codepoint = cp;
-            return 4U;
-        }
-    }
-    return 0U;
-}
-
-static int32_t lyrics_view_measure_text_width(const char *text)
-{
-    if (text == nullptr || text[0] == '\0') {
-        return 0;
-    }
-    const lv_font_t *font = font_manager_get_ui_font();
-    if (font == nullptr || font->get_glyph_dsc == nullptr) {
-        return static_cast<int32_t>(strlen(text)) * 12;
-    }
-
-    int32_t width = 0;
-    const uint8_t *p = reinterpret_cast<const uint8_t *>(text);
-    while (*p != 0U) {
-        uint32_t cp = 0U;
-        const size_t used = lyrics_view_decode_utf8(p, &cp);
-        if (used == 0U) {
-            ++p;
-            continue;
-        }
-        uint32_t next_cp = 0U;
-        lyrics_view_decode_utf8(p + used, &next_cp);
-        width += static_cast<int32_t>(lv_font_get_glyph_width(font, cp, next_cp));
-        p += used;
-    }
-    return width;
-}
-
 static bool lyrics_view_current_needs_two_lines(const LyricsWindowSnapshot &window)
 {
     const LyricsWindowLine &current = window.lines[2];
     if (!current.valid || !current.current || current.text[0] == '\0') {
         return false;
     }
-    return lyrics_view_measure_text_width(current.text) > (LYRICS_LINE_W - 8);
+    return lyrics_text_measure_width(current.text) > (LYRICS_LINE_W - 8);
 }
 
 static LyricsLayout lyrics_view_build_layout(const LyricsWindowSnapshot &window)
@@ -969,7 +905,17 @@ static void lyrics_view_apply_ready_window(const LyricsWindowSnapshot &window, b
             continue;
         }
         const LyricsWindowLine &line = window.lines[i];
-        lv_label_set_text(g_lines[i], line.valid ? line.text : "");
+        const char *display_text = line.valid ? line.text : "";
+        char formatted[LYRICS_VIEW_TEXT_BYTES + 8U] = {};
+        if (line.valid && line.current) {
+            lyrics_text_format_balanced(
+                line.text,
+                LYRICS_LINE_W - 8,
+                formatted,
+                sizeof(formatted));
+            display_text = formatted;
+        }
+        lv_label_set_text(g_lines[i], display_text);
         lyrics_view_apply_line_role(i, new_layout, line.current);
     }
 
