@@ -1152,7 +1152,7 @@ static void audio_task_verify_index_snapshot(
     if (index.bits_per_sample != 0U && index.bits_per_sample != g_decoder.info.bits_per_sample) {
         mismatch = true;
     }
-    // MP3/Ogg Opus Simple Decoder 当前不发布 total_frames，因此只有两边都非零时才核对总帧。
+    // 只有 index 与运行时两边都给出总帧时才核对；Opus 会在打开后注入 Catalog 的 final-granule 总帧。
     if (
         index.total_frames != 0ULL &&
         g_decoder.info.total_frames != 0ULL &&
@@ -1386,6 +1386,27 @@ static esp_err_t audio_task_start_pcm_pipeline(
         }
         return ret;
     }
+    // Ogg Opus 的 final granule 已在建库时解析成 total_frames。运行时直接复用，
+    // 让 decoder 精确裁掉最后一个 packet 的 padding，并在该帧数立即进入逻辑 EOF。
+    // 这里不重新扫描文件尾，因此不会增加播放启动时的 SD I/O。
+    if (
+        decoder_type == PcmDecoderType::Opus &&
+        request != nullptr &&
+        request->has_technical_info &&
+        (request->technical_info.flags & MEDIA_TECH_PARSED) != 0U &&
+        request->technical_info.sample_rate_hz == g_decoder.info.sample_rate_hz &&
+        request->technical_info.channels == g_decoder.info.channels &&
+        request->technical_info.total_frames > 0ULL
+    ) {
+        ret = pcm_decoder_set_total_frames_hint(
+            &g_decoder, request->technical_info.total_frames);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "应用 Opus total_frames 失败：%s", esp_err_to_name(ret));
+            pcm_decoder_close(&g_decoder);
+            return ret;
+        }
+    }
+
     audio_task_verify_index_snapshot(request, decoder_type);
 
     if (apply_seek) {

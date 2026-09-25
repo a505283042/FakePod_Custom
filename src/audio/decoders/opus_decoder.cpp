@@ -740,6 +740,19 @@ esp_err_t opus_decoder_open(
     return ESP_OK;
 }
 
+esp_err_t opus_decoder_set_total_frames_hint(OpusDecoder *decoder, uint64_t total_frames)
+{
+    if (decoder == nullptr || !opus_decoder_is_open(decoder) || total_frames == 0ULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (decoder->frames_read > total_frames) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    decoder->total_frames = total_frames;
+    return ESP_OK;
+}
+
 esp_err_t opus_decoder_read_pcm32(
     OpusDecoder *decoder,
     int32_t *out_interleaved_stereo,
@@ -755,6 +768,14 @@ esp_err_t opus_decoder_read_pcm32(
     }
 
     const size_t source_frame_bytes = sizeof(int16_t) * decoder->channels;
+    if (decoder->total_frames > 0ULL && decoder->frames_read >= decoder->total_frames) {
+        // final granule 已到：不再依赖物理文件 EOF，避免最后一个 packet 的 padding
+        // 或预读 Source 的 EOF 时序拖住 Finished/自动下一首。
+        decoder->decoded_offset = decoder->decoded_size;
+        decoder->eof = true;
+        return ESP_OK;
+    }
+
     size_t produced = 0U;
     while (produced < max_frames) {
         if (decoder->decoded_offset >= decoder->decoded_size) {
@@ -787,6 +808,20 @@ esp_err_t opus_decoder_read_pcm32(
             }
         }
 
+        if (decoder->total_frames > 0ULL) {
+            const uint64_t remaining_total = decoder->total_frames - decoder->frames_read;
+            if (remaining_total == 0ULL) {
+                decoder->decoded_offset = decoder->decoded_size;
+                decoder->eof = true;
+                break;
+            }
+            if (remaining_total < available_frames) {
+                // RFC 7845 end trimming：最后一个 Opus packet 可以包含超过 final granule 的 padding。
+                // frames_read 已经排除了 pre-skip，因此直接按 Catalog 的可播放总帧裁尾。
+                available_frames = static_cast<size_t>(remaining_total);
+            }
+        }
+
         const size_t copy_frames = (max_frames - produced) < available_frames
             ? max_frames - produced
             : available_frames;
@@ -807,6 +842,14 @@ esp_err_t opus_decoder_read_pcm32(
         decoder->decoded_offset += consumed_bytes;
         decoder->frames_read += copy_frames;
         produced += copy_frames;
+
+        if (decoder->total_frames > 0ULL && decoder->frames_read >= decoder->total_frames) {
+            // 精确到 final granule 后立即进入逻辑 EOF。即使底层 Source 还预读了数据，
+            // 下一次 AudioTask 调用也会得到 0 frame + EOF，从而发布 Finished 并自动下一首。
+            decoder->decoded_offset = decoder->decoded_size;
+            decoder->eof = true;
+            break;
+        }
     }
     *out_frames = produced;
     return ESP_OK;

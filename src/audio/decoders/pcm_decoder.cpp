@@ -233,6 +233,23 @@ esp_err_t pcm_decoder_enable_runtime_read_ahead(PcmDecoder *decoder, const char 
     return ESP_OK;
 }
 
+esp_err_t pcm_decoder_set_total_frames_hint(PcmDecoder *decoder, uint64_t total_frames)
+{
+    if (decoder == nullptr || total_frames == 0ULL || !pcm_decoder_is_open(decoder)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (decoder->type != PcmDecoderType::Opus) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    const esp_err_t ret = opus_decoder_set_total_frames_hint(&decoder->opus, total_frames);
+    if (ret == ESP_OK) {
+        decoder->info.total_frames = total_frames;
+    }
+    return ret;
+}
+
 esp_err_t pcm_decoder_read_pcm32(
     PcmDecoder *decoder,
     int32_t *out_interleaved_stereo,

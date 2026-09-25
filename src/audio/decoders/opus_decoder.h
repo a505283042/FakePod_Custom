@@ -68,6 +68,10 @@ esp_err_t opus_decoder_read_pcm32(
     size_t *out_frames
 );
 
+// Catalog 已按 RFC 7845 的 final granule - pre-skip 算出可播放 PCM 总帧。
+// 运行时只接收这个现成结果，不重新扫描文件尾；用于精确裁掉最后一个 packet 的 padding。
+esp_err_t opus_decoder_set_total_frames_hint(OpusDecoder *decoder, uint64_t total_frames);
+
 void opus_decoder_close(OpusDecoder *decoder);
 bool opus_decoder_is_open(const OpusDecoder *decoder);
 bool opus_decoder_is_eof(const OpusDecoder *decoder);

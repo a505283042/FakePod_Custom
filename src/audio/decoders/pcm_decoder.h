@@ -88,6 +88,9 @@ esp_err_t pcm_decoder_open_for_seek(
 // MP3/WAV/Ogg Opus 完成格式解析和可选 Seek 后，将后续连续读取切换到 Core1 预读。
 // 必须在 I2S/DAC 启动前调用；FLAC 已有独立预取，本阶段保持原实现。
 esp_err_t pcm_decoder_enable_runtime_read_ahead(PcmDecoder *decoder, const char *path);
+// 对没有自行扫描文件尾的运行时解码器注入 Catalog 已验证的可播放总帧。
+// 当前仅 Ogg Opus 使用，用于 final-granule 尾部裁剪；不会触发额外 SD I/O。
+esp_err_t pcm_decoder_set_total_frames_hint(PcmDecoder *decoder, uint64_t total_frames);
 
 esp_err_t pcm_decoder_read_pcm32(
     PcmDecoder *decoder,
