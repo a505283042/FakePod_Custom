@@ -4,7 +4,6 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
-#include "freertos/stream_buffer.h"
 #include "freertos/task.h"
 #include "esp_audio_simple_dec.h"
 #include "esp_audio_types.h"
@@ -24,13 +23,13 @@ static constexpr size_t FLAC_INPUT_BUFFER_BYTES = 32768;
 // STREAMINFO 的 max_frame_size 再留少量保护字节，避免窗口边界导致一次 PCM refill 需要两轮 process。
 static constexpr size_t FLAC_INPUT_FRAME_GUARD_BYTES = 64;
 static constexpr size_t FLAC_PREFETCH_RING_48K_BYTES = 192 * 1024;
-static constexpr size_t FLAC_PREFETCH_RING_96K_BYTES = 192 * 1024;
+static constexpr size_t FLAC_PREFETCH_RING_96K_BYTES = 256 * 1024;
 static constexpr size_t FLAC_PREFETCH_RING_192K_BYTES = 256 * 1024;
 static constexpr size_t FLAC_PREFETCH_READ_48K_BYTES = 8192;
-static constexpr size_t FLAC_PREFETCH_READ_96K_BYTES = 16384;
+static constexpr size_t FLAC_PREFETCH_READ_96K_BYTES = 32768;
 static constexpr size_t FLAC_PREFETCH_READ_192K_BYTES = 32768;
 static constexpr size_t FLAC_PREFETCH_START_48K_BYTES = 64 * 1024;
-static constexpr size_t FLAC_PREFETCH_START_96K_BYTES = 96 * 1024;
+static constexpr size_t FLAC_PREFETCH_START_96K_BYTES = 128 * 1024;
 // 176.4/192k 长测中 256KB ring 最低仍约 198KB、starve=0，128KB 起播预充偏保守。
 // Stage 9.5.4 将高采样率起播目标降到 64KB，预计减少约两次 32KB SD 读取的等待；
 // 稳态 ring、SD read chunk 和解码窗口均保持不变。
@@ -52,7 +51,6 @@ static constexpr uint32_t FLAC_PREFETCH_QOS_BATCH_EMERGENCY = 8;
 static constexpr uint32_t FLAC_PREFETCH_QOS_BATCH_RECOVERY = 6;
 static constexpr uint32_t FLAC_PREFETCH_QOS_BATCH_NORMAL = 4;
 static constexpr uint32_t FLAC_PREFETCH_QOS_BATCH_PLENTY = 2;
-static constexpr TickType_t FLAC_PREFETCH_SEND_WAIT = pdMS_TO_TICKS(20);
 static constexpr TickType_t FLAC_PREFETCH_RECEIVE_WAIT = pdMS_TO_TICKS(20);
 // I2S 启动前的首块预解码和 Seek discard 都不受实时播放预算约束。
 // 允许等待完整一次较慢的 SD 读取，避免预取环的短暂空窗被误判为解码失败。
@@ -129,13 +127,15 @@ enum class FlacPrefetchQosState : uint8_t
 struct FlacPrefetchContext
 {
     AudioSource *source = nullptr;
-    StreamBufferHandle_t stream = nullptr;
-    StaticStreamBuffer_t stream_storage = {};
+    StaticSemaphore_t data_ready_storage = {};
+    SemaphoreHandle_t data_ready = nullptr;
     StaticSemaphore_t done_storage = {};
     SemaphoreHandle_t done = nullptr;
     TaskHandle_t task = nullptr;
     uint8_t *ring_storage = nullptr;
-    uint8_t *read_buffer = nullptr;
+    size_t ring_read_pos = 0;
+    size_t ring_write_pos = 0;
+    size_t ring_buffered_bytes = 0;
     uint8_t prefix[FLAC_SYNTHETIC_HEADER_BYTES] = {};
     size_t prefix_size = 0;
     size_t prefix_offset = 0;
@@ -171,6 +171,158 @@ struct FlacPrefetchContext
 
 static bool g_flac_backend_registered = false;
 
+// R45.15：FLAC 预取改为单生产者/单消费者字节环。
+// 只在极短临界区保护读写位置与已缓存字节数；SD fread 和 PSRAM memcpy 均不持锁。
+static portMUX_TYPE g_flac_prefetch_ring_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static size_t flac_prefetch_ring_buffered(const FlacPrefetchContext *context)
+{
+    if (context == nullptr || context->ring_storage == nullptr || context->ring_bytes == 0) {
+        return 0;
+    }
+
+    portENTER_CRITICAL(&g_flac_prefetch_ring_mux);
+    const size_t buffered = context->ring_buffered_bytes;
+    portEXIT_CRITICAL(&g_flac_prefetch_ring_mux);
+    return buffered;
+}
+
+static size_t flac_prefetch_ring_free(const FlacPrefetchContext *context)
+{
+    if (context == nullptr || context->ring_storage == nullptr || context->ring_bytes == 0) {
+        return 0;
+    }
+
+    portENTER_CRITICAL(&g_flac_prefetch_ring_mux);
+    const size_t free_bytes = context->ring_bytes - context->ring_buffered_bytes;
+    portEXIT_CRITICAL(&g_flac_prefetch_ring_mux);
+    return free_bytes;
+}
+
+static size_t flac_prefetch_ring_write_span(FlacPrefetchContext *context, uint8_t **out_ptr)
+{
+    if (out_ptr != nullptr) {
+        *out_ptr = nullptr;
+    }
+    if (context == nullptr || out_ptr == nullptr || context->ring_storage == nullptr || context->ring_bytes == 0) {
+        return 0;
+    }
+
+    portENTER_CRITICAL(&g_flac_prefetch_ring_mux);
+    const size_t free_bytes = context->ring_bytes - context->ring_buffered_bytes;
+    const size_t tail_bytes = context->ring_bytes - context->ring_write_pos;
+    const size_t span = free_bytes < tail_bytes ? free_bytes : tail_bytes;
+    if (span > 0) {
+        *out_ptr = context->ring_storage + context->ring_write_pos;
+    }
+    portEXIT_CRITICAL(&g_flac_prefetch_ring_mux);
+    return span;
+}
+
+static void flac_prefetch_ring_commit_write(FlacPrefetchContext *context, size_t bytes)
+{
+    if (context == nullptr || bytes == 0 || context->ring_bytes == 0) {
+        return;
+    }
+
+    portENTER_CRITICAL(&g_flac_prefetch_ring_mux);
+    context->ring_write_pos = (context->ring_write_pos + bytes) % context->ring_bytes;
+    context->ring_buffered_bytes += bytes;
+    portEXIT_CRITICAL(&g_flac_prefetch_ring_mux);
+
+    if (context->data_ready != nullptr) {
+        xSemaphoreGive(context->data_ready);
+    }
+}
+
+static size_t flac_prefetch_ring_write_copy(
+    FlacPrefetchContext *context,
+    const uint8_t *source,
+    size_t bytes
+)
+{
+    if (context == nullptr || source == nullptr || bytes == 0) {
+        return 0;
+    }
+
+    size_t written = 0;
+    while (written < bytes) {
+        uint8_t *write_ptr = nullptr;
+        const size_t span = flac_prefetch_ring_write_span(context, &write_ptr);
+        if (span == 0 || write_ptr == nullptr) {
+            break;
+        }
+        const size_t chunk = (bytes - written) < span ? (bytes - written) : span;
+        memcpy(write_ptr, source + written, chunk);
+        flac_prefetch_ring_commit_write(context, chunk);
+        written += chunk;
+    }
+    return written;
+}
+
+static size_t flac_prefetch_ring_read_once(
+    FlacPrefetchContext *context,
+    uint8_t *destination,
+    size_t capacity
+)
+{
+    if (context == nullptr || destination == nullptr || capacity == 0 ||
+        context->ring_storage == nullptr || context->ring_bytes == 0) {
+        return 0;
+    }
+
+    size_t read_pos = 0;
+    size_t received = 0;
+    portENTER_CRITICAL(&g_flac_prefetch_ring_mux);
+    read_pos = context->ring_read_pos;
+    received = capacity < context->ring_buffered_bytes ? capacity : context->ring_buffered_bytes;
+    portEXIT_CRITICAL(&g_flac_prefetch_ring_mux);
+    if (received == 0) {
+        return 0;
+    }
+
+    const size_t first = received < (context->ring_bytes - read_pos)
+        ? received
+        : (context->ring_bytes - read_pos);
+    memcpy(destination, context->ring_storage + read_pos, first);
+    if (first < received) {
+        memcpy(destination + first, context->ring_storage, received - first);
+    }
+
+    portENTER_CRITICAL(&g_flac_prefetch_ring_mux);
+    context->ring_read_pos = (context->ring_read_pos + received) % context->ring_bytes;
+    context->ring_buffered_bytes -= received;
+    portEXIT_CRITICAL(&g_flac_prefetch_ring_mux);
+    return received;
+}
+
+static size_t flac_prefetch_ring_receive(
+    FlacPrefetchContext *context,
+    uint8_t *destination,
+    size_t capacity,
+    TickType_t wait_ticks
+)
+{
+    const TickType_t start_tick = xTaskGetTickCount();
+    while (true) {
+        const size_t received = flac_prefetch_ring_read_once(context, destination, capacity);
+        if (received > 0 || wait_ticks == 0 || context == nullptr ||
+            context->eof || context->io_error || context->stop_requested) {
+            return received;
+        }
+
+        const TickType_t elapsed = xTaskGetTickCount() - start_tick;
+        if (elapsed >= wait_ticks) {
+            return 0;
+        }
+        const TickType_t remaining = wait_ticks - elapsed;
+        if (context->data_ready == nullptr || xSemaphoreTake(context->data_ready, remaining) != pdTRUE) {
+            return 0;
+        }
+        // 二值信号量可能是此前提交留下的旧通知；重新检查 ring，必要时继续等待剩余预算。
+    }
+}
+
 // P1.2.8：后台封面 I/O 只需要知道“当前 FLAC ring 是否有足够安全余量”。
 // 用独立 POD 快照避免 Artwork/System 直接碰 FlacPrefetchContext 生命周期。
 static portMUX_TYPE g_flac_storage_window_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -179,11 +331,11 @@ static FlacStorageWindowSnapshot g_flac_storage_window = {};
 static void flac_storage_window_publish(const FlacPrefetchContext *context)
 {
     FlacStorageWindowSnapshot snapshot = {};
-    if (context != nullptr && context->stream != nullptr) {
+    if (context != nullptr && context->ring_storage != nullptr) {
         snapshot.active = true;
         snapshot.storage_competes = context->storage_competes;
         snapshot.sample_rate_hz = context->sample_rate_hz;
-        snapshot.buffered_bytes = static_cast<uint32_t>(xStreamBufferBytesAvailable(context->stream));
+        snapshot.buffered_bytes = static_cast<uint32_t>(flac_prefetch_ring_buffered(context));
         snapshot.capacity_bytes = static_cast<uint32_t>(context->ring_bytes);
         snapshot.pressure_active = context->qos_pressure_active;
         snapshot.qos_level = static_cast<uint8_t>(context->qos_state);
@@ -222,7 +374,7 @@ bool flac_decoder_get_prefetch_runtime(
     }
 
     const FlacPrefetchContext *context = static_cast<const FlacPrefetchContext *>(decoder->prefetch_context);
-    if (context == nullptr || context->stream == nullptr) {
+    if (context == nullptr || context->ring_storage == nullptr) {
         return false;
     }
 
@@ -233,7 +385,7 @@ bool flac_decoder_get_prefetch_runtime(
     out_snapshot->eof = context->eof;
     out_snapshot->qos_level = static_cast<uint8_t>(context->qos_state);
     out_snapshot->sample_rate_hz = context->sample_rate_hz;
-    out_snapshot->buffered_bytes = static_cast<uint32_t>(xStreamBufferBytesAvailable(context->stream));
+    out_snapshot->buffered_bytes = static_cast<uint32_t>(flac_prefetch_ring_buffered(context));
     out_snapshot->capacity_bytes = static_cast<uint32_t>(context->ring_bytes);
     out_snapshot->min_buffered_bytes = static_cast<uint32_t>(context->qos_min_buffered_bytes);
     out_snapshot->emergency_entries = context->qos_emergency_entries;
@@ -413,8 +565,8 @@ static void flac_perf_reset_runtime(FlacDecoder *decoder)
     decoder->perf_prefetch_wait_over_2ms = 0;
     decoder->perf_prefetch_starve_count = 0;
     const FlacPrefetchContext *prefetch = flac_prefetch_context(decoder);
-    decoder->perf_prefetch_min_buffered_bytes = prefetch != nullptr && prefetch->stream != nullptr
-        ? xStreamBufferBytesAvailable(prefetch->stream)
+    decoder->perf_prefetch_min_buffered_bytes = prefetch != nullptr && prefetch->ring_storage != nullptr
+        ? flac_prefetch_ring_buffered(prefetch)
         : 0;
 }
 
@@ -457,8 +609,8 @@ static void flac_perf_maybe_publish(FlacDecoder *decoder, uint64_t now_us)
     snapshot.read_over_10ms = read_over_10ms;
     snapshot.read_calls = read_calls;
 
-    snapshot.ring_buffered_bytes = context != nullptr && context->stream != nullptr
-        ? static_cast<uint32_t>(xStreamBufferBytesAvailable(context->stream))
+    snapshot.ring_buffered_bytes = context != nullptr && context->ring_storage != nullptr
+        ? static_cast<uint32_t>(flac_prefetch_ring_buffered(context))
         : 0;
     snapshot.ring_capacity_bytes = context != nullptr
         ? static_cast<uint32_t>(context->ring_bytes)
@@ -590,8 +742,8 @@ static void flac_prefetch_task(void *arg)
     if (
         context == nullptr ||
         context->source == nullptr ||
-        context->stream == nullptr ||
-        context->read_buffer == nullptr
+        context->ring_storage == nullptr ||
+        context->data_ready == nullptr
     ) {
         if (context != nullptr) {
             context->io_error = true;
@@ -645,11 +797,10 @@ static void flac_prefetch_task(void *arg)
         // 前缀只存在于本次 Prefetch 生命周期，不修改底层文件，也不改变 AudioSource 的绝对位置语义。
         if (context->prefix_offset < context->prefix_size) {
             const size_t remaining_prefix = context->prefix_size - context->prefix_offset;
-            const size_t sent = xStreamBufferSend(
-                context->stream,
+            const size_t sent = flac_prefetch_ring_write_copy(
+                context,
                 context->prefix + context->prefix_offset,
-                remaining_prefix,
-                FLAC_PREFETCH_SEND_WAIT
+                remaining_prefix
             );
             context->prefix_offset += sent;
             flac_storage_window_publish(context);
@@ -659,17 +810,27 @@ static void flac_prefetch_task(void *arg)
             continue;
         }
 
-        const size_t buffered_before = xStreamBufferBytesAvailable(context->stream);
+        const size_t buffered_before = flac_prefetch_ring_buffered(context);
         if (context->adaptive_qos_active) {
             flac_prefetch_qos_observe(context, buffered_before);
         }
 
-        const size_t free_bytes = xStreamBufferSpacesAvailable(context->stream);
+        const size_t free_bytes = flac_prefetch_ring_free(context);
         if (free_bytes < context->read_chunk_bytes) {
             flac_storage_window_publish(context);
             // ring 本身已经逼近满水位，这次容量等待就是一次真实 cooperative block。
             // 清零连续读取计数，避免刚有空间后又因为旧计数立即二次 sleep。
             cooperative_read_count = 0;
+            vTaskDelay(FLAC_PREFETCH_COOPERATIVE_BLOCK_TICKS);
+            continue;
+        }
+
+        uint8_t *write_ptr = nullptr;
+        const size_t write_span = flac_prefetch_ring_write_span(context, &write_ptr);
+        const size_t read_request = write_span < context->read_chunk_bytes
+            ? write_span
+            : context->read_chunk_bytes;
+        if (read_request == 0 || write_ptr == nullptr) {
             vTaskDelay(FLAC_PREFETCH_COOPERATIVE_BLOCK_TICKS);
             continue;
         }
@@ -680,8 +841,8 @@ static void flac_prefetch_task(void *arg)
         size_t bytes_read = 0;
         const esp_err_t source_ret = audio_source_read(
             context->source,
-            context->read_buffer,
-            context->read_chunk_bytes,
+            write_ptr,
+            read_request,
             &bytes_read
         );
 #if APP_DIAG_FLAC_PERFORMANCE
@@ -694,16 +855,7 @@ static void flac_prefetch_task(void *arg)
 #endif
 
         if (bytes_read > 0) {
-            size_t sent = 0;
-            while (sent < bytes_read && !context->stop_requested) {
-                const size_t chunk = xStreamBufferSend(
-                    context->stream,
-                    context->read_buffer + sent,
-                    bytes_read - sent,
-                    FLAC_PREFETCH_SEND_WAIT
-                );
-                sent += chunk;
-            }
+            flac_prefetch_ring_commit_write(context, bytes_read);
             flac_storage_window_publish(context);
 
             // P1.5R.2：起播预充阶段仍保持 P1.2.15 固定4次读取后阻塞1 tick；
@@ -711,7 +863,7 @@ static void flac_prefetch_task(void *arg)
             // 高水位更积极让出 Core1，但任何状态都保留真实阻塞，防止 IDLE1 WDT 回归。
             uint32_t cooperative_batch = FLAC_PREFETCH_COOPERATIVE_READ_BATCH;
             if (context->adaptive_qos_active) {
-                const size_t buffered_after = xStreamBufferBytesAvailable(context->stream);
+                const size_t buffered_after = flac_prefetch_ring_buffered(context);
                 const FlacPrefetchQosState qos_state = flac_prefetch_qos_observe(
                     context,
                     buffered_after
@@ -743,7 +895,7 @@ static void flac_prefetch_task(void *arg)
             }
             break;
         }
-        if (bytes_read < context->read_chunk_bytes) {
+        if (bytes_read < read_request) {
             if (audio_source_eof(context->source)) {
                 context->eof = true;
             } else if (!context->stop_requested) {
@@ -757,6 +909,10 @@ static void flac_prefetch_task(void *arg)
 #if APP_DIAG_FLAC_PERFORMANCE
     context->stack_hwm = uxTaskGetStackHighWaterMark(nullptr);
 #endif
+    // EOF/故障/停止都唤醒可能正在等待数据的 AudioTask，避免无意义等满剩余超时。
+    if (context->data_ready != nullptr) {
+        xSemaphoreGive(context->data_ready);
+    }
     if (context->done != nullptr) {
         xSemaphoreGive(context->done);
     }
@@ -797,14 +953,8 @@ static void flac_prefetch_destroy(FlacDecoder *decoder)
             static_cast<unsigned>(context->qos_cooperative_blocks));
     }
 
-    if (context->stream != nullptr) {
-        vStreamBufferDelete(context->stream);
-        context->stream = nullptr;
-    }
     flac_free_buffer(context->ring_storage);
-    flac_free_buffer(context->read_buffer);
     context->ring_storage = nullptr;
-    context->read_buffer = nullptr;
     decoder->prefetch_context = nullptr;
     flac_storage_window_publish(nullptr);
     heap_caps_free(context);
@@ -839,22 +989,16 @@ static esp_err_t flac_prefetch_start(FlacDecoder *decoder)
     if (context->prefix_size > 0) {
         memcpy(context->prefix, decoder->prefetch_prefix, context->prefix_size);
     }
-    context->ring_storage = flac_alloc_buffer(context->ring_bytes + 1U);
-    context->read_buffer = flac_alloc_buffer(context->read_chunk_bytes);
-    if (context->ring_storage == nullptr || context->read_buffer == nullptr) {
+    context->ring_storage = flac_alloc_buffer(context->ring_bytes);
+    if (context->ring_storage == nullptr) {
         decoder->prefetch_context = context;
         flac_prefetch_destroy(decoder);
         return ESP_ERR_NO_MEM;
     }
 
-    context->stream = xStreamBufferCreateStatic(
-        context->ring_bytes + 1U,
-        1,
-        context->ring_storage,
-        &context->stream_storage
-    );
+    context->data_ready = xSemaphoreCreateBinaryStatic(&context->data_ready_storage);
     context->done = xSemaphoreCreateBinaryStatic(&context->done_storage);
-    if (context->stream == nullptr || context->done == nullptr) {
+    if (context->data_ready == nullptr || context->done == nullptr) {
         decoder->prefetch_context = context;
         flac_prefetch_destroy(decoder);
         return ESP_ERR_NO_MEM;
@@ -891,7 +1035,7 @@ static esp_err_t flac_prefetch_start(FlacDecoder *decoder)
 
     const TickType_t start_tick = xTaskGetTickCount();
     while (
-        xStreamBufferBytesAvailable(context->stream) < target &&
+        flac_prefetch_ring_buffered(context) < target &&
         !context->eof &&
         !context->io_error &&
         xTaskGetTickCount() - start_tick < FLAC_PREFETCH_START_WAIT
@@ -899,7 +1043,7 @@ static esp_err_t flac_prefetch_start(FlacDecoder *decoder)
         vTaskDelay(FLAC_PREFETCH_COOPERATIVE_BLOCK_TICKS);
     }
 
-    const size_t primed = xStreamBufferBytesAvailable(context->stream);
+    const size_t primed = flac_prefetch_ring_buffered(context);
     flac_storage_window_publish(context);
     if (context->io_error || primed < minimum) {
         const bool io_error = context->io_error;
@@ -936,7 +1080,7 @@ static esp_err_t flac_prefetch_start(FlacDecoder *decoder)
 
 #if APP_DIAG_AUDIO_CODEC
     ESP_LOGI(TAG,
-        "FLAC压缩流预取已就绪：%luHz，核心=%d，PSRAM环形=%uKB，SD块=%uB，起播缓存=%uB，任务栈=%uB",
+        "FLAC压缩流预取已就绪：%luHz，核心=%d，PSRAM环形=%uKB，SD直写块=%uB，起播缓存=%uB，任务栈=%uB",
         static_cast<unsigned long>(decoder->sample_rate_hz),
         static_cast<int>(context->core_id),
         static_cast<unsigned>(context->ring_bytes / 1024U),
@@ -1837,7 +1981,7 @@ static esp_err_t flac_prepare_input_window(FlacDecoder *decoder, bool *out_recei
     }
 
     FlacPrefetchContext *context = flac_prefetch_context(decoder);
-    if (context == nullptr || context->stream == nullptr) {
+    if (context == nullptr || context->ring_storage == nullptr) {
         ESP_LOGE(TAG, "FLAC 压缩流预取上下文不存在");
         return ESP_ERR_INVALID_STATE;
     }
@@ -1848,7 +1992,7 @@ static esp_err_t flac_prepare_input_window(FlacDecoder *decoder, bool *out_recei
     // 只有当前尾部不足以覆盖 max_frame_size + guard 时才补窗。
     if (remaining >= target) {
         decoder->input_chunk_eos =
-            context->eof && xStreamBufferBytesAvailable(context->stream) == 0;
+            context->eof && flac_prefetch_ring_buffered(context) == 0;
         return ESP_OK;
     }
 
@@ -1877,7 +2021,7 @@ static esp_err_t flac_prepare_input_window(FlacDecoder *decoder, bool *out_recei
 
     while ((decoder->input_size - decoder->input_offset) < target) {
 #if APP_DIAG_FLAC_PERFORMANCE
-        const size_t buffered_before = xStreamBufferBytesAvailable(context->stream);
+        const size_t buffered_before = flac_prefetch_ring_buffered(context);
         if (
             decoder->perf_prefetch_wait_calls == 0 ||
             buffered_before < decoder->perf_prefetch_min_buffered_bytes
@@ -1916,8 +2060,8 @@ static esp_err_t flac_prepare_input_window(FlacDecoder *decoder, bool *out_recei
 #if APP_DIAG_FLAC_PERFORMANCE
         const int64_t wait_begin_us = esp_timer_get_time();
 #endif
-        const size_t received = xStreamBufferReceive(
-            context->stream,
+        const size_t received = flac_prefetch_ring_receive(
+            context,
             decoder->input_buffer + decoder->input_size,
             receive_capacity,
             receive_wait
@@ -1970,7 +2114,7 @@ static esp_err_t flac_prepare_input_window(FlacDecoder *decoder, bool *out_recei
     }
 
     decoder->input_chunk_eos =
-        context->eof && xStreamBufferBytesAvailable(context->stream) == 0;
+        context->eof && flac_prefetch_ring_buffered(context) == 0;
     if (decoder->input_size == 0 && decoder->input_chunk_eos) {
         decoder->eof = true;
     }

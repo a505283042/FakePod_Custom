@@ -40,6 +40,10 @@ struct OpusDecoder
     size_t decoded_offset = 0U;
     size_t decoded_size = 0U;
 
+    // Seek 缓冲只在首次 Seek 时按需分配：4KB resync 用 internal heap 保吞吐，1KB discard 放 PSRAM 降栈峰值。
+    uint8_t *seek_resync_buffer = nullptr;
+    int32_t *seek_discard_buffer = nullptr;
+
     uint32_t sample_rate_hz = 0U;
     uint16_t channels = 0U;
     uint16_t bits_per_sample = 0U;

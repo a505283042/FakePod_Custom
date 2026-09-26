@@ -30,7 +30,7 @@ static const char *TAG = "音频服务";
 #endif
 
 // 仅在控制路径关键节点采样，不进入 PCM 热循环。
-// 用于判断 AudioTask 栈是否可以后续从 24KB 安全下调，以及播放链路是否侵蚀内部 RAM。
+// 用于验证 AudioTask 从 24KB 下调到 18KB 后的栈安全余量，以及播放链路是否侵蚀内部 RAM。
 #if APP_DIAG_AUDIO_RAM
 static void audio_task_log_ram(const char *stage)
 {
@@ -58,9 +58,9 @@ static void audio_task_log_ram(const char *stage)
 static inline void audio_task_log_ram(const char *) {}
 #endif
 
-// 加入 Opus 后 8KB 已在实机触发 AudioTask stack overflow；恢复到 24KB，
-// 给 esp_audio_codec Opus 解码热路径保留足够内部栈余量。
-static constexpr uint32_t AUDIO_TASK_STACK_BYTES = 24U * 1024U;
+// 加入 Opus 后 8KB 已在实机触发 AudioTask stack overflow；R45.12 基于 24KB 实测峰值下调到 18KB，
+// 继续保留 RAM_TRACE 诊断，确认 Opus 正常播放与连续 Seek 下仍有足够栈余量。
+static constexpr uint32_t AUDIO_TASK_STACK_BYTES = 18U * 1024U;
 static constexpr UBaseType_t AUDIO_TASK_PRIORITY = 5;
 static constexpr BaseType_t AUDIO_TASK_CORE = 0;
 static constexpr UBaseType_t AUDIO_COMMAND_QUEUE_LENGTH = 8;
@@ -1770,7 +1770,7 @@ static void audio_task_service_pcm_playback()
     audio_playback_clock_commit_pcm(&g_playback_clock, frames);
 
     // P1.5.2R.3：只在“真实 PCM 已成功进入 I2S DMA”之后旁路采样。
-    // AudioTask 只负责约20Hz抽取/降采样并填充256点mono窗；FFT在Core1/P1任务执行。
+    // 所有格式统一约24Hz抽取，略高于20FPS频谱UI；FFT仍在Core1/P1任务执行。
     audio_spectrum_snapshot_publish_pcm(
         g_pcm_block,
         frames,

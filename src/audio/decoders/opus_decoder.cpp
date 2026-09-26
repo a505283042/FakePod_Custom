@@ -56,6 +56,13 @@ static uint8_t *opus_alloc_buffer(size_t bytes)
         : nullptr;
 }
 
+static uint8_t *opus_alloc_internal_buffer(size_t bytes)
+{
+    return bytes > 0U
+        ? static_cast<uint8_t *>(heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT))
+        : nullptr;
+}
+
 static void opus_free_buffer(void *buffer)
 {
     heap_caps_free(buffer);
@@ -397,14 +404,19 @@ static esp_err_t opus_find_next_page(
         ? file_size
         : start_offset + OPUS_OGG_MAX_PAGE_BYTES + 4ULL;
     const uint64_t scan_end = max_scan_end < file_size ? max_scan_end : file_size;
-    uint8_t buffer[OPUS_OGG_RESYNC_CHUNK_BYTES] = {};
+    if (decoder->seek_resync_buffer == nullptr) {
+        // Ogg resync 是连续字节扫描，放 internal heap 保持 Seek 吞吐；仅首次 Opus Seek 按需分配。
+        decoder->seek_resync_buffer = opus_alloc_internal_buffer(OPUS_OGG_RESYNC_CHUNK_BYTES);
+        if (decoder->seek_resync_buffer == nullptr) return ESP_ERR_NO_MEM;
+    }
+    uint8_t *const buffer = decoder->seek_resync_buffer;
     uint64_t chunk_offset = start_offset;
 
     while (chunk_offset + 4ULL <= scan_end) {
         const uint64_t remaining = scan_end - chunk_offset;
-        const size_t chunk_bytes = remaining < sizeof(buffer)
+        const size_t chunk_bytes = remaining < OPUS_OGG_RESYNC_CHUNK_BYTES
             ? static_cast<size_t>(remaining)
-            : sizeof(buffer);
+            : OPUS_OGG_RESYNC_CHUNK_BYTES;
         if (chunk_bytes < 4U) break;
 
         esp_err_t ret = audio_source_seek(
@@ -1416,7 +1428,12 @@ static esp_err_t opus_reset_to_seek_page(
 static esp_err_t opus_discard_to_frame(OpusDecoder *decoder, uint64_t target_frame)
 {
     if (decoder == nullptr || decoder->frames_read > target_frame) return ESP_ERR_INVALID_ARG;
-    int32_t scratch[OPUS_SEEK_DISCARD_CHUNK_FRAMES * 2U] = {};
+    if (decoder->seek_discard_buffer == nullptr) {
+        decoder->seek_discard_buffer = reinterpret_cast<int32_t *>(opus_alloc_buffer(
+            OPUS_SEEK_DISCARD_CHUNK_FRAMES * 2U * sizeof(int32_t)));
+        if (decoder->seek_discard_buffer == nullptr) return ESP_ERR_NO_MEM;
+    }
+    int32_t *const scratch = decoder->seek_discard_buffer;
     while (decoder->frames_read < target_frame) {
         const uint64_t remaining = target_frame - decoder->frames_read;
         const size_t request = remaining < OPUS_SEEK_DISCARD_CHUNK_FRAMES
@@ -1453,6 +1470,9 @@ esp_err_t opus_decoder_seek_frame(
         const uint64_t desired_granule = preroll_frame + decoder->pre_skip;
         OpusSeekPage page = {};
         ret = opus_find_seek_page(decoder, desired_granule, &page);
+        // 4KB resync 只服务于 Ogg 页定位；定位结束立即归还 internal heap，避免整首 Opus 长期占用内部 RAM。
+        opus_free_buffer(decoder->seek_resync_buffer);
+        decoder->seek_resync_buffer = nullptr;
         if (ret == ESP_OK && page.valid) {
             ret = opus_reset_to_seek_page(decoder, page, preroll_frame);
             source_offset = page.offset;
@@ -1481,6 +1501,8 @@ void opus_decoder_close(OpusDecoder *decoder)
     if (decoder->opus_handle != nullptr) {
         esp_opus_dec_close(static_cast<esp_audio_dec_handle_t>(decoder->opus_handle));
     }
+    opus_free_buffer(decoder->seek_resync_buffer);
+    opus_free_buffer(decoder->seek_discard_buffer);
     if (decoder->workspace == nullptr) {
         opus_free_buffer(decoder->input_buffer);
         opus_free_buffer(decoder->decoded_buffer);

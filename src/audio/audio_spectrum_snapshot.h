@@ -20,7 +20,8 @@ void audio_spectrum_snapshot_reset(
     uint32_t sample_rate_hz);
 
 // PCM 必须是 AudioTask 已经成功提交给 I2S 的 32bit stereo block。
-// AudioTask 只按约20Hz抽取/降采样并填充小型 256 点 mono 窗，不在实时热路径执行 FFT。
+// 所有格式统一约24Hz抽取，略高于20FPS频谱UI，保留调度余量并降低后台FFT负载。
+// AudioTask 只负责抽取/降采样并填充小型 256 点 mono 窗，不在实时热路径执行 FFT。
 void audio_spectrum_snapshot_publish_pcm(
     const int32_t *interleaved_stereo,
     size_t frames,

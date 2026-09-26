@@ -24,7 +24,7 @@ static const char *TAG = "音频频谱";
 // 第一有效 bin 约 57~63Hz，优先保留底鼓/贝斯瞬态；有效视觉频段约覆盖到 7~8kHz。
 constexpr size_t FFT_SIZE = 256U;
 constexpr uint32_t ANALYSIS_TARGET_RATE_HZ = 16000U;
-constexpr uint32_t ANALYSIS_CAPTURE_HZ = 30U;
+constexpr uint32_t ANALYSIS_CAPTURE_HZ = 24U;
 constexpr uint8_t FFT_FRAME_SLOT_COUNT = 2U;
 constexpr uint32_t FFT_TASK_STACK_BYTES = 4096U;
 constexpr UBaseType_t FFT_TASK_PRIORITY = 1U;
@@ -572,7 +572,7 @@ void audio_spectrum_snapshot_publish_pcm(
         g_capture_active = false;
         g_capture_count = 0U;
         // P1.5.2R.3.1：节流锚定“本窗开始时间”而不是完成时间。256点/约16kHz窗口约16ms，
-        // 这样30Hz配置得到约33ms start-to-start 节奏，而不是额外再叠加一个窗口时长。
+        // 这样24Hz配置得到约42ms start-to-start 节奏，而不是额外再叠加一个窗口时长。
         // 即使双槽满也只会丢这一帧，不做补帧循环，因此不会反向阻塞 AudioTask。
     }
 }
