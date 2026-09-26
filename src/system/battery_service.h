@@ -21,6 +21,7 @@ struct BatterySnapshot
 // BatteryService V1：GPIO1 / ADC1_CH0，BAT+ 经 10k/10k 1:2 分压。
 // 负责校准采样、滤波与SOC估算；UI只读取快照，RELEASE默认不输出周期遥测。
 esp_err_t battery_service_init();
+bool battery_service_is_ready();
 
 // system_loop 每轮可调用；内部自行限频为每 2 秒一次 32-sample burst。
 void battery_service_update();

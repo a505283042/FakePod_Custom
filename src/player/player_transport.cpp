@@ -16,6 +16,9 @@ static std::atomic<uint8_t> g_loop_mode{
 };
 static uint32_t g_last_audio_state_revision = 0U;
 static uint32_t g_last_finished_playback_revision = 0U;
+static uint32_t g_last_track_error_playback_revision = 0U;
+static uint32_t g_track_error_skip_count = 0U;
+static constexpr uint32_t TRACK_ERROR_AUTO_SKIP_MAX = 8U;
 
 // P1.5.3.2R.8：随机播放只维护一个很小的“实际播放历史”，不生成整张 Shuffle Bag。
 // 这样不会按曲库规模分配内存；上一曲可以回到随机模式下真正听过的上一首。
@@ -219,6 +222,7 @@ bool player_transport_set_loop_mode(PlayerLoopMode mode)
 
     const PlayerLoopMode previous = player_transport_get_loop_mode();
     g_loop_mode.store(static_cast<uint8_t>(mode), std::memory_order_relaxed);
+    g_track_error_skip_count = 0U;
 
     if (mode == PlayerLoopMode::Shuffle && previous != PlayerLoopMode::Shuffle) {
         PlayerFolderQueueSnapshot list = {};
@@ -253,7 +257,7 @@ PlayerLoopMode player_transport_cycle_loop_mode()
     return next;
 }
 
-bool player_transport_play_current(const char *reason)
+static bool player_transport_play_current_internal(const char *reason)
 {
     if (!player_state_is_ready()) {
         ESP_LOGW(TAG, "播放当前歌曲失败：Player 尚未就绪");
@@ -288,6 +292,13 @@ bool player_transport_play_current(const char *reason)
     );
 }
 
+bool player_transport_play_current(const char *reason)
+{
+    // 显式用户起播开启新的容错窗口；自动 EOF/坏曲跳过走 internal，不会把连续坏曲计数清零。
+    g_track_error_skip_count = 0U;
+    return player_transport_play_current_internal(reason);
+}
+
 static bool player_transport_shuffle_next(const char *reason)
 {
     PlayerFolderQueueSnapshot list = {};
@@ -301,7 +312,7 @@ static bool player_transport_shuffle_next(const char *reason)
         if (!list.current_in_queue && !player_state_select_folder_queue_position(0U)) {
             return false;
         }
-        return player_transport_play_current(reason != nullptr ? reason : "随机单曲重播");
+        return player_transport_play_current_internal(reason != nullptr ? reason : "随机单曲重播");
     }
 
     const uint32_t next_position = player_transport_shuffle_reserve_position(list);
@@ -314,11 +325,12 @@ static bool player_transport_shuffle_next(const char *reason)
             static_cast<unsigned long>(next_position));
         return false;
     }
-    return player_transport_play_current(reason != nullptr ? reason : "随机下一首");
+    return player_transport_play_current_internal(reason != nullptr ? reason : "随机下一首");
 }
 
 bool player_transport_previous()
 {
+    g_track_error_skip_count = 0U;
     AudioStateSnapshot snapshot = {};
     const bool has_audio = audio_service_get_snapshot(&snapshot) && snapshot.ready;
     const size_t current_track = player_state_get_index();
@@ -354,7 +366,7 @@ bool player_transport_previous()
                     static_cast<unsigned long>(previous_position));
                 return false;
             }
-            return player_transport_play_current("随机上一首历史");
+            return player_transport_play_current_internal("随机上一首历史");
         }
         // 本次随机会话还没有历史时，保留传统“上一首”的可预测回退。
     }
@@ -363,11 +375,12 @@ bool player_transport_previous()
         ESP_LOGW(TAG, "手动上一曲：当前播放列表无法移动");
         return false;
     }
-    return player_transport_play_current("手动上一曲");
+    return player_transport_play_current_internal("手动上一曲");
 }
 
 bool player_transport_next()
 {
+    g_track_error_skip_count = 0U;
     if (player_transport_get_loop_mode() == PlayerLoopMode::Shuffle) {
         return player_transport_shuffle_next("手动随机下一首");
     }
@@ -376,7 +389,7 @@ bool player_transport_next()
         ESP_LOGW(TAG, "手动下一曲：当前播放列表无法移动");
         return false;
     }
-    return player_transport_play_current("手动下一曲");
+    return player_transport_play_current_internal("手动下一曲");
 }
 
 
@@ -455,6 +468,7 @@ static void player_transport_handle_finished(const AudioStateSnapshot &audio)
         return;
     }
     g_last_finished_playback_revision = audio.playback_revision;
+    g_track_error_skip_count = 0U;
 
     PlayerFolderQueueSnapshot list = {};
     if (!player_state_get_folder_queue_snapshot(&list) || list.track_count == 0U) {
@@ -489,7 +503,7 @@ static void player_transport_handle_finished(const AudioStateSnapshot &audio)
 #endif
 
     if (mode == PlayerLoopMode::SingleRepeat) {
-        if (!player_transport_play_current("单曲循环 EOF")) {
+        if (!player_transport_play_current_internal("单曲循环 EOF")) {
             ESP_LOGE(TAG, "AUTO_NEXT_TRACE: 单曲循环重播请求失败");
         }
         return;
@@ -515,9 +529,75 @@ static void player_transport_handle_finished(const AudioStateSnapshot &audio)
         return;
     }
 
-    if (!player_transport_play_current(
+    if (!player_transport_play_current_internal(
             mode == PlayerLoopMode::ListRepeat ? "列表循环 EOF" : "顺序播放 EOF")) {
         ESP_LOGE(TAG, "AUTO_NEXT_TRACE: 下一首播放请求失败");
+    }
+}
+
+static void player_transport_handle_track_error(const AudioStateSnapshot &audio)
+{
+    if (audio.playback_revision == 0U ||
+        audio.playback_revision == g_last_track_error_playback_revision) {
+        return;
+    }
+    g_last_track_error_playback_revision = audio.playback_revision;
+
+    PlayerFolderQueueSnapshot list = {};
+    if (!player_state_get_folder_queue_snapshot(&list) || list.track_count == 0U) {
+        ESP_LOGW(TAG, "坏曲跳过失败：当前目录播放范围不可用，保持 Error");
+        return;
+    }
+    if (audio.track_index == UINT32_MAX || audio.track_index != list.track_index) {
+        return;
+    }
+
+    const PlayerLoopMode mode = player_transport_get_loop_mode();
+    if (mode == PlayerLoopMode::SingleRepeat) {
+        ESP_LOGW(TAG, "单曲循环遇到不可播放曲目：track=%lu err=%s，保持 Error 等待用户处理",
+            static_cast<unsigned long>(audio.track_index),
+            esp_err_to_name(audio.last_error));
+        return;
+    }
+
+    ++g_track_error_skip_count;
+    const uint32_t skip_limit = list.track_count < TRACK_ERROR_AUTO_SKIP_MAX
+        ? list.track_count
+        : TRACK_ERROR_AUTO_SKIP_MAX;
+    if (g_track_error_skip_count >= skip_limit) {
+        ESP_LOGE(TAG, "连续不可播放曲目已达保护上限：count=%lu limit=%lu，停止继续尝试",
+            static_cast<unsigned long>(g_track_error_skip_count),
+            static_cast<unsigned long>(skip_limit));
+        return;
+    }
+
+    ESP_LOGW(TAG,
+        "当前曲不可播放，自动跳过：track=%lu err=%s mode=%s skip=%lu/%lu",
+        static_cast<unsigned long>(audio.track_index),
+        esp_err_to_name(audio.last_error),
+        player_transport_loop_mode_name(mode),
+        static_cast<unsigned long>(g_track_error_skip_count),
+        static_cast<unsigned long>(list.track_count));
+
+    if (mode == PlayerLoopMode::Shuffle) {
+        if (!player_transport_shuffle_next("坏曲自动跳过")) {
+            ESP_LOGE(TAG, "坏曲自动跳过：随机下一首请求失败");
+        }
+        return;
+    }
+
+    if (mode == PlayerLoopMode::Sequential &&
+        list.current_in_queue && list.position + 1U >= list.track_count) {
+        ESP_LOGW(TAG, "顺序播放末尾曲目不可播放，保持 Error");
+        return;
+    }
+
+    if (!player_state_next()) {
+        ESP_LOGE(TAG, "坏曲自动跳过：推进下一首失败");
+        return;
+    }
+    if (!player_transport_play_current_internal("坏曲自动跳过")) {
+        ESP_LOGE(TAG, "坏曲自动跳过：下一首播放请求失败");
     }
 }
 
@@ -535,5 +615,8 @@ void player_transport_update()
 
     if (snapshot.state == AudioPlaybackState::Finished) {
         player_transport_handle_finished(snapshot);
+    } else if (snapshot.state == AudioPlaybackState::Error &&
+               snapshot.failure_scope == AudioFailureScope::Track) {
+        player_transport_handle_track_error(snapshot);
     }
 }

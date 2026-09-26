@@ -352,6 +352,11 @@ esp_err_t battery_service_init()
     return ESP_OK;
 }
 
+bool battery_service_is_ready()
+{
+    return g_ready;
+}
+
 void battery_service_update()
 {
     if (!g_ready) {

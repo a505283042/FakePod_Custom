@@ -22,11 +22,73 @@
 #include "battery_service.h"
 #include "motion_service.h"
 #include "screen_lock_simple.h"
+#include "usb_storage_service.h"
 
 static const char *TAG = "运行期";
 
 static bool g_ready_published = false;
 static bool g_background_start_attempted = false;
+
+// READY 后的一次性启动若碰到 NO_MEM/I2C 瞬态错误，不应让可选服务永久失效。
+// 这里只补启动已证明幂等的轻量服务；App 注册、GPIO按键等带注册副作用的模块不在此重试。
+static constexpr TickType_t OPTIONAL_SERVICE_HEALTH_INTERVAL = pdMS_TO_TICKS(2000);
+static TickType_t g_optional_service_health_due_tick = 0;
+
+static bool runtime_tick_due(TickType_t now, TickType_t due)
+{
+    return static_cast<int32_t>(now - due) >= 0;
+}
+
+static void runtime_optional_service_health_update()
+{
+    const TickType_t now = xTaskGetTickCount();
+    if (g_optional_service_health_due_tick != 0 &&
+        !runtime_tick_due(now, g_optional_service_health_due_tick)) {
+        return;
+    }
+    g_optional_service_health_due_tick = now + OPTIONAL_SERVICE_HEALTH_INTERVAL;
+
+    esp_err_t battery_ret = ESP_OK;
+    esp_err_t motion_ret = ESP_OK;
+    esp_err_t spectrum_ret = ESP_OK;
+    esp_err_t lyrics_ret = ESP_OK;
+    bool attempted = false;
+
+    if (!battery_service_is_ready()) {
+        attempted = true;
+        battery_ret = battery_service_init();
+    }
+    if (!motion_service_is_ready()) {
+        attempted = true;
+        motion_ret = motion_service_init();
+    }
+    if (!audio_spectrum_snapshot_is_ready()) {
+        attempted = true;
+        spectrum_ret = audio_spectrum_snapshot_start();
+    }
+    if (!usb_storage_service_blocks_normal_runtime() &&
+        sdcard_is_mounted() && media_catalog_v2_ready() && !lyrics_service_is_ready()) {
+        attempted = true;
+        lyrics_ret = lyrics_service_start();
+    }
+
+    if (!attempted) {
+        return;
+    }
+
+    if (battery_ret != ESP_OK || motion_ret != ESP_OK ||
+        spectrum_ret != ESP_OK || lyrics_ret != ESP_OK) {
+        ESP_LOGW(TAG,
+            "可选服务补启动未完成：Battery=%s Motion=%s Spectrum=%s Lyrics=%s；2秒后重试",
+            esp_err_to_name(battery_ret),
+            esp_err_to_name(motion_ret),
+            esp_err_to_name(spectrum_ret),
+            esp_err_to_name(lyrics_ret));
+        return;
+    }
+
+    ESP_LOGI(TAG, "可选服务健康恢复完成：Battery/Motion/Spectrum/Lyrics 已按当前可用依赖补齐");
+}
 
 static AudioOutputMode runtime_audio_output_mode(DeviceAudioOutputMode mode)
 {
@@ -50,7 +112,11 @@ void system_ready_publish()
 
 void system_runtime_update()
 {
-    if (!g_ready_published || g_background_start_attempted) {
+    if (!g_ready_published) {
+        return;
+    }
+    if (g_background_start_attempted) {
+        runtime_optional_service_health_update();
         return;
     }
 
@@ -178,6 +244,8 @@ void system_runtime_update()
             ESP_LOGW(TAG, "LyricsTask 启动失败，歌词功能降级：%s", esp_err_to_name(lyrics_ret));
         }
     }
+
+    g_optional_service_health_due_tick = xTaskGetTickCount() + OPTIONAL_SERVICE_HEALTH_INTERVAL;
 
     ESP_LOGI(
         TAG,

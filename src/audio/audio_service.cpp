@@ -180,6 +180,7 @@ static uint32_t g_task_last_request_id = 0;
 static uint32_t g_task_track_index = UINT32_MAX;
 static MediaFormat g_task_format = MediaFormat::Unknown;
 static esp_err_t g_task_last_error = ESP_OK;
+static AudioFailureScope g_task_failure_scope = AudioFailureScope::None;
 static uint32_t g_task_sample_rate_hz = 0;
 static uint16_t g_task_channels = 0;
 static uint16_t g_task_bits_per_sample = 0;
@@ -588,6 +589,7 @@ static void audio_task_publish_snapshot()
     snapshot.track_index = g_task_track_index;
     snapshot.format = g_task_format;
     snapshot.last_error = g_task_last_error;
+    snapshot.failure_scope = g_task_failure_scope;
     snapshot.queue_depth = g_command_queue != nullptr
         ? static_cast<uint32_t>(uxQueueMessagesWaiting(g_command_queue))
         : 0;
@@ -618,10 +620,29 @@ static void audio_task_publish_snapshot()
     portEXIT_CRITICAL(&g_snapshot_mux);
 }
 
-static void audio_task_set_state(AudioPlaybackState state, esp_err_t error = ESP_OK)
+static AudioFailureScope audio_decoder_failure_scope(esp_err_t error)
+{
+    // 资源/调度类错误通常会影响后续所有歌曲，不能把它误判成坏文件后连续跳歌。
+    switch (error) {
+        case ESP_ERR_NO_MEM:
+        case ESP_ERR_TIMEOUT:
+        case ESP_ERR_INVALID_STATE:
+            return AudioFailureScope::System;
+        default:
+            return AudioFailureScope::Track;
+    }
+}
+
+static void audio_task_set_state(
+    AudioPlaybackState state,
+    esp_err_t error = ESP_OK,
+    AudioFailureScope failure_scope = AudioFailureScope::System)
 {
     g_task_state = state;
     g_task_last_error = error;
+    g_task_failure_scope = state == AudioPlaybackState::Error
+        ? failure_scope
+        : AudioFailureScope::None;
     audio_task_publish_snapshot();
 }
 
@@ -1374,9 +1395,13 @@ static esp_err_t audio_task_start_pcm_pipeline(
     const AudioRequest *request,
     bool apply_seek = false,
     uint64_t seek_target_ms = 0,
-    PcmSeekResult *out_seek_result = nullptr
+    PcmSeekResult *out_seek_result = nullptr,
+    AudioFailureScope *out_failure_scope = nullptr
 )
 {
+    if (out_failure_scope != nullptr) {
+        *out_failure_scope = AudioFailureScope::System;
+    }
     audio_task_log_ram("before_decoder_open");
     PcmSeekResult seek_result = {};
     esp_err_t ret = apply_seek
@@ -1390,6 +1415,9 @@ static esp_err_t audio_task_start_pcm_pipeline(
             &seek_result)
         : pcm_decoder_open(&g_decoder, decoder_type, path, &g_decode_workspace);
     if (ret != ESP_OK) {
+        if (out_failure_scope != nullptr) {
+            *out_failure_scope = audio_decoder_failure_scope(ret);
+        }
         audio_task_log_ram("decoder_open_failed");
         if (apply_seek) {
             ESP_LOGE(TAG, "SEEK_TRACE: codec定位失败 format=%s target=%llums ret=%s",
@@ -1414,6 +1442,9 @@ static esp_err_t audio_task_start_pcm_pipeline(
         ret = pcm_decoder_set_total_frames_hint(
             &g_decoder, request->technical_info.total_frames);
         if (ret != ESP_OK) {
+            if (out_failure_scope != nullptr) {
+                *out_failure_scope = audio_decoder_failure_scope(ret);
+            }
             ESP_LOGE(TAG, "应用 Opus total_frames 失败：%s", esp_err_to_name(ret));
             pcm_decoder_close(&g_decoder);
             return ret;
@@ -1647,7 +1678,10 @@ static void audio_task_capture_fault(esp_err_t error, const char *stage)
         static_cast<unsigned long>(snapshot.psram_free_bytes));
 }
 
-static void audio_task_fail_stream(esp_err_t error, const char *stage)
+static void audio_task_fail_stream(
+    esp_err_t error,
+    const char *stage,
+    AudioFailureScope failure_scope = AudioFailureScope::System)
 {
     audio_task_capture_fault(error, stage);
     ESP_LOGE(TAG, "%s播放失败：阶段=%s，错误=%s",
@@ -1655,10 +1689,14 @@ static void audio_task_fail_stream(esp_err_t error, const char *stage)
         stage != nullptr ? stage : "未知",
         esp_err_to_name(error));
     esp_err_t cleanup_error = audio_task_shutdown_pipeline();
+    if (cleanup_error != ESP_OK) {
+        // 即使最初是坏文件，收尾阶段出现 DAC/I2S 错误也必须升级为系统故障，禁止继续扫队列。
+        failure_scope = AudioFailureScope::System;
+    }
     if (error == ESP_OK) {
         error = cleanup_error != ESP_OK ? cleanup_error : ESP_FAIL;
     }
-    audio_task_set_state(AudioPlaybackState::Error, error);
+    audio_task_set_state(AudioPlaybackState::Error, error, failure_scope);
 }
 
 static void audio_task_finish_stream()
@@ -1731,7 +1769,7 @@ static void audio_task_service_pcm_playback()
             return;
         }
         audio_task_reset_flac_starve_grace();
-        audio_task_fail_stream(ret, "读取PCM");
+        audio_task_fail_stream(ret, "读取PCM", audio_decoder_failure_scope(ret));
         return;
     }
     audio_task_log_flac_starve_recovered();
@@ -1744,7 +1782,7 @@ static void audio_task_service_pcm_playback()
         if (pcm_decoder_is_eof(&g_decoder)) {
             audio_task_finish_stream();
         } else {
-            audio_task_fail_stream(ESP_FAIL, "PCM无进度");
+            audio_task_fail_stream(ESP_FAIL, "PCM无进度", AudioFailureScope::Track);
         }
         return;
     }
@@ -3827,7 +3865,7 @@ static void audio_task_handle_play(AudioRequest *request)
     audio_task_log_index_snapshot(request);
 
     if (path == nullptr || path[0] == '\0') {
-        audio_task_set_state(AudioPlaybackState::Error, ESP_ERR_INVALID_ARG);
+        audio_task_set_state(AudioPlaybackState::Error, ESP_ERR_INVALID_ARG, AudioFailureScope::Track);
         audio_request_complete(request, false, ESP_ERR_INVALID_ARG);
         return;
     }
@@ -3836,12 +3874,14 @@ static void audio_task_handle_play(AudioRequest *request)
     if (decoder_type == PcmDecoderType::None) {
         ESP_LOGW(TAG, "统一 PCM Core 已接入 WAV/FLAC/MP3/OPUS；%s 解码器尚未接入",
             media_format_name(request->format));
-        audio_task_set_state(AudioPlaybackState::Error, ESP_ERR_NOT_SUPPORTED);
+        audio_task_set_state(AudioPlaybackState::Error, ESP_ERR_NOT_SUPPORTED, AudioFailureScope::Track);
         audio_request_complete(request, false, ESP_ERR_NOT_SUPPORTED);
         return;
     }
 
-    esp_err_t ret = audio_task_start_pcm_pipeline(decoder_type, path, request);
+    AudioFailureScope start_failure_scope = AudioFailureScope::System;
+    esp_err_t ret = audio_task_start_pcm_pipeline(
+        decoder_type, path, request, false, 0, nullptr, &start_failure_scope);
     if (ret == ESP_ERR_TIMEOUT &&
         audio_transport_request_is_latest(request) &&
         !audio_task_pipeline_has_resources()) {
@@ -3851,7 +3891,8 @@ static void audio_task_handle_play(AudioRequest *request)
             static_cast<unsigned long>(request->track_index + 1U));
         vTaskDelay(pdMS_TO_TICKS(30));
         if (audio_transport_request_is_latest(request)) {
-            ret = audio_task_start_pcm_pipeline(decoder_type, path, request);
+            ret = audio_task_start_pcm_pipeline(
+                decoder_type, path, request, false, 0, nullptr, &start_failure_scope);
         } else {
             ret = ESP_ERR_INVALID_STATE;
         }
@@ -3863,7 +3904,7 @@ static void audio_task_handle_play(AudioRequest *request)
             audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
             return;
         }
-        audio_task_set_state(AudioPlaybackState::Error, ret);
+        audio_task_set_state(AudioPlaybackState::Error, ret, start_failure_scope);
         audio_request_complete(request, false, ret);
         return;
     }
@@ -4546,6 +4587,7 @@ static void audio_task_main(void *arg)
         g_task_ready = false;
         g_task_state = AudioPlaybackState::Error;
         g_task_last_error = g_start_result;
+        g_task_failure_scope = AudioFailureScope::System;
         audio_task_publish_snapshot();
         ESP_LOGE(TAG, "AudioTask 核心绑定异常：当前=%d，期望=%d",
             static_cast<int>(current_core),
@@ -4567,12 +4609,14 @@ static void audio_task_main(void *arg)
         g_task_ready = true;
         g_task_state = AudioPlaybackState::Ready;
         g_task_last_error = ESP_OK;
+        g_task_failure_scope = AudioFailureScope::None;
         audio_task_publish_snapshot();
         ESP_LOGI(TAG, "AudioTask 已取得运行期音频硬件所有权；统一 PCM Core 已就绪，DAC 当前保持安全掉电状态");
     } else {
         g_task_ready = false;
         g_task_state = AudioPlaybackState::Error;
         g_task_last_error = g_start_result;
+        g_task_failure_scope = AudioFailureScope::System;
         audio_task_publish_snapshot();
         ESP_LOGE(TAG, "AudioTask 初始化播放器后端失败：%s", esp_err_to_name(g_start_result));
     }

@@ -9,6 +9,7 @@
 // P1.5.2R.3：启动低优先级 SpectrumFFT 任务。任务常态阻塞，只有频谱页启用且
 // AudioTask 提交了新的 256 点分析窗时才被唤醒；失败不会改变 AudioTask ownership。
 esp_err_t audio_spectrum_snapshot_start();
+bool audio_spectrum_snapshot_is_ready();
 
 // 频谱页显示时启用捕获；隐藏时关闭。这里只改变旁路分析开关，不控制 decoder/I2S。
 void audio_spectrum_snapshot_set_enabled(bool enabled);

@@ -783,6 +783,10 @@ esp_err_t motion_service_init()
     return ESP_OK;
 }
 
+bool motion_service_is_ready()
+{
+    return g_ready;
+}
 
 void motion_service_update()
 {

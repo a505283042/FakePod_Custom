@@ -420,6 +420,11 @@ esp_err_t audio_spectrum_snapshot_start()
     return ESP_OK;
 }
 
+bool audio_spectrum_snapshot_is_ready()
+{
+    return g_fft_task != nullptr;
+}
+
 void audio_spectrum_snapshot_set_enabled(bool enabled)
 {
     const bool previous = g_enabled.exchange(enabled, std::memory_order_acq_rel);

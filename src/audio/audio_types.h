@@ -19,6 +19,15 @@ enum class AudioPlaybackState : uint8_t
     Error
 };
 
+// Error 只区分“当前曲目自身不可播放”和“系统音频链故障”。
+// Player 仅允许自动跳过 Track；System 必须停住，避免 DAC/I2S/内存故障时连续扫完整个队列。
+enum class AudioFailureScope : uint8_t
+{
+    None = 0,
+    Track,
+    System,
+};
+
 // 只读快照只包含 POD 数据，可安全跨任务复制。
 // 高频进度由 AudioTask 每约250ms发布一次，UI不直接访问解码器/文件/I2S。
 struct AudioStateSnapshot
@@ -31,6 +40,7 @@ struct AudioStateSnapshot
     uint32_t track_index = UINT32_MAX;
     MediaFormat format = MediaFormat::Unknown;
     esp_err_t last_error = ESP_OK;
+    AudioFailureScope failure_scope = AudioFailureScope::None;
     uint32_t queue_depth = 0;
 
     uint32_t sample_rate_hz = 0;
