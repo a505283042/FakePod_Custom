@@ -342,15 +342,30 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
 {
     CoverSurfaceLease lease = {};
     if (!cover_surface_cache_acquire(track_index, &lease)) return false;
-    if (lease.normal_rgb565 == nullptr || lease.dimmed_rgb565 == nullptr ||
+    if (lease.normal_rgb565 == nullptr ||
         lease.width == 0U || lease.height == 0U || lease.data_size == 0U) {
         cover_surface_cache_release(&lease);
         return false;
     }
 
+    // 磁带模式会主动回收 dimmed。切回封面时只从现有 normal 重建，
+    // 不重新访问 SD，也不重新解码 JPEG/PNG。若此刻 PSRAM 仍不足，
+    // 继续使用 normal，并由播放器现有 Alpha Backdrop 承担临时压暗，不能因此丢封面。
+    if (g_dimmed_requested && lease.dimmed_rgb565 == nullptr) {
+        cover_surface_cache_release(&lease);
+        (void)cover_surface_cache_restore_dimmed(track_index);
+        if (!cover_surface_cache_acquire(track_index, &lease) ||
+            lease.normal_rgb565 == nullptr ||
+            lease.width == 0U || lease.height == 0U || lease.data_size == 0U) {
+            cover_surface_cache_release(&lease);
+            return false;
+        }
+    }
+
     const uint32_t previous_track = artwork_ui_displayed_track();
     const bool replacing_track = previous_track != UINT32_MAX && previous_track != track_index;
-    const uint8_t *present_surface = g_dimmed_requested
+    const bool dimmed_available = lease.dimmed_rgb565 != nullptr;
+    const uint8_t *present_surface = g_dimmed_requested && dimmed_available
         ? lease.dimmed_rgb565
         : lease.normal_rgb565;
     const uint8_t *bounded_surface = present_surface;
@@ -393,8 +408,8 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
     // 新 lease 已经到手后才释放旧 lease；等待阶段旧图一直可见。
     artwork_ui_release_all_sources(false);
     g_surface_lease = lease;
-    // R.36：新 Surface 已 pin、旧 lease 已释放。此时清理交换槽中的旧曲，
-    // 并释放所有未被 fallback 固定的压缩原图，稳态只留下当前 normal+dimmed。
+    // 新 Surface 已 pin、旧 lease 已释放。此时清理交换槽中的旧曲，
+    // 并释放所有未被 fallback 固定的压缩原图；normal 保留，dimmed 按当前视觉模式决定。
     cover_surface_cache_retain_track(track_index);
     artwork_loader_discard_unpinned();
     artwork_ui_init_rgb565_dsc(
@@ -403,13 +418,17 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
         g_surface_lease.width,
         g_surface_lease.height,
         g_surface_lease.data_size);
-    artwork_ui_init_rgb565_dsc(
-        &g_surface_dimmed_dsc,
-        g_surface_lease.dimmed_rgb565,
-        g_surface_lease.width,
-        g_surface_lease.height,
-        g_surface_lease.data_size);
-    g_dimmed_applied = g_dimmed_requested;
+    if (g_surface_lease.dimmed_rgb565 != nullptr) {
+        artwork_ui_init_rgb565_dsc(
+            &g_surface_dimmed_dsc,
+            g_surface_lease.dimmed_rgb565,
+            g_surface_lease.width,
+            g_surface_lease.height,
+            g_surface_lease.data_size);
+    } else {
+        g_surface_dimmed_dsc = {};
+    }
+    g_dimmed_applied = g_dimmed_requested && g_surface_lease.dimmed_rgb565 != nullptr;
 
     // BoundedSPI 已经把完整新封面写进 CO5300 GRAM。此时必须同步更新 LVGL 的 image source，
     // 但不能再次把 460x460 image 标成 invalid，否则会重新走 70ms 左右的整屏 render/flush。

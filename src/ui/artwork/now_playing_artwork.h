@@ -5,8 +5,8 @@
 #include "esp_err.h"
 #include "lvgl.h"
 
-// 首页封面展示器。R.20 正常路径消费后台预处理完成的 normal + dimmed 460x460 RGB565 Surface；
-// 压缩 JPEG/PNG -> LVGL decoder 仅保留为兼容回退。
+// 首页封面展示器。正常路径消费后台预处理完成的 460x460 RGB565 normal；
+// dimmed 在封面视图按需保留，磁带视图可释放后再由 normal 重建；压缩 JPEG/PNG 仅保留兼容回退。
 esp_err_t now_playing_artwork_create(lv_obj_t *parent, int32_t size_px, lv_obj_t **out_container);
 
 void now_playing_artwork_update();
@@ -14,7 +14,7 @@ void now_playing_artwork_refresh_context();
 
 // R.36：主页被歌词/频谱/曲库完整覆盖时释放 UI 持有的封面 lease。
 // 两个 Surface 槽只用于切歌瞬时交换；再次激活时按当前 Player context 重新 acquire/bind，
-// 绑定完成后会清理其它未 pin 槽，稳态只保留当前曲 normal+dimmed。
+// 绑定完成后会清理其它未 pin 槽；normal 保留，dimmed 按当前视觉模式决定是否驻留。
 // suppress_invalidation=true 仅用于外部 BoundedSPI 已接管/即将接管物理 GRAM 的交接窗口：
 // lease 与 LVGL source 状态照常更新，但不产生整屏 invalidation，避免迟到的 LVGL flush 覆盖物理快路径。
 void now_playing_artwork_set_active(bool active, bool suppress_invalidation = false);

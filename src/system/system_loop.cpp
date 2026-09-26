@@ -58,7 +58,7 @@ static uint32_t g_last_mp3_perf_sequence =
 #endif
 
 // 封面资源采用 Current-Only 编排；system_loop 只负责当前曲：
-// 读取当前 JPEG/PNG 压缩原图 -> CoverTask 生成 normal+dimmed -> 压缩原图释放。
+// 读取当前 JPEG/PNG 压缩原图 -> CoverTask 生成 normal + 按需 dimmed -> 压缩原图释放。
 // 不再计算/读取/预热下一曲，避免 PSRAM 中长期保存无效 next 资源。
 enum class ArtworkCurrentStage : uint8_t
 {
@@ -72,6 +72,7 @@ enum class ArtworkCurrentStage : uint8_t
 static uint32_t g_artwork_context_generation = 0U;
 static uint32_t g_artwork_current_track = UINT32_MAX;
 static ArtworkCurrentStage g_artwork_stage = ArtworkCurrentStage::Idle;
+static bool g_artwork_surface_terminal_failure = false;
 
 // 当前曲封面只在 SD 瞬态繁忙时退避；不再存在 next 的 750ms 慢重试。
 static constexpr TickType_t ARTWORK_CURRENT_RETRY_BASE = pdMS_TO_TICKS(200);
@@ -198,7 +199,7 @@ static bool system_artwork_snapshot_is_current_request(
 static bool system_cover_surface_cached(uint32_t track_index)
 {
     CoverSurfaceLease lease = {};
-    if (!cover_surface_cache_acquire(track_index, &lease)) return false;
+    if (!cover_surface_cache_acquire_normal(track_index, &lease)) return false;
     cover_surface_cache_release(&lease);
     return true;
 }
@@ -252,6 +253,7 @@ static void system_artwork_begin_context(uint32_t generation, uint32_t current_t
     g_artwork_context_generation = generation;
     g_artwork_current_track = current_track;
     g_artwork_stage = ArtworkCurrentStage::Idle;
+    g_artwork_surface_terminal_failure = false;
     g_artwork_retry_due_tick = 0;
     g_artwork_current_retry_count = 0U;
     g_artwork_pending_request_id = 0U;
@@ -434,15 +436,18 @@ static void system_artwork_current_update()
             if (!cover_surface_cache_get_snapshot(&snapshot) ||
                 snapshot.catalog_generation != generation || snapshot.track_index != current_track) break;
             if (snapshot.state == CoverSurfaceState::Ready) {
+                g_artwork_surface_terminal_failure = false;
                 g_artwork_stage = ArtworkCurrentStage::Complete;
             } else if (snapshot.state == CoverSurfaceState::Failed) {
                 if (snapshot.result == ESP_ERR_NO_MEM) {
-                    // 两槽交换期间可能短暂同时被 pin，或 cache mutex 瞬态繁忙。Surface 插入失败
-                    // 不能永久宣告 Complete，否则当前曲会一直停在压缩图 LVGL fallback，直到再次切歌。
-                    // 保留压缩原图并走现有退避，槽位释放后自动重试 Surface。
+                    // PSRAM 瞬态不足、两槽交换期间同时被 pin，或 cache mutex 瞬态繁忙都允许退避后重试。
+                    // 特别是磁带视图退出会回收约2MiB PSRAM，当前曲无需切歌即可在后续退避周期恢复 Surface。
+                    g_artwork_surface_terminal_failure = false;
                     system_artwork_schedule_retry(current_track);
                 } else {
-                    // 真正解码/格式失败保留压缩原图给 LVGL fallback；只有 Surface 成功才释放原图。
+                    // 解码损坏、格式/尺寸预算等确定性失败只保留压缩图 fallback。
+                    // Complete 阶段不得每20ms重新提交同一 Surface。
+                    g_artwork_surface_terminal_failure = true;
                     g_artwork_stage = ArtworkCurrentStage::Complete;
                 }
             }
@@ -455,7 +460,8 @@ static void system_artwork_current_update()
 
         case ArtworkCurrentStage::Complete:
             // CoverSurface 若比 ArtworkLoader 晚启动，在压缩 fallback 已经可见的情况下补做一次 Surface。
-            if (cover_surface_cache_is_ready() &&
+            if (!g_artwork_surface_terminal_failure &&
+                cover_surface_cache_is_ready() &&
                 !system_cover_surface_cached(current_track) &&
                 system_artwork_compressed_cached(current_track)) {
                 if (cover_surface_cache_request_track(current_track, nullptr)) {

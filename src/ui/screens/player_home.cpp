@@ -192,8 +192,11 @@ enum class MusicVisualMode : uint8_t
 };
 
 static MusicVisualMode g_music_visual_mode = MusicVisualMode::Artwork;
-// 封面→磁带切换时，Artwork 继续保持显示，直到 Cassette 的封面+壳体整套视觉 ready。
+// 封面→磁带切换时 Artwork 继续保持显示；若控件已展开，还必须等压暗静态磁带快照 ready。
 static bool g_cassette_visual_switch_pending = false;
+// 动态磁带展开控件时先冻结机械层并后台合成 460x460 压暗静态磁带。
+// 快照 ready 前不显示控件；ready 后在同一 LVGL 回调里让背景与控件一起出现。
+static bool g_cassette_controls_present_pending = false;
 
 enum class PlaybackGestureScope : uint8_t
 {
@@ -357,6 +360,8 @@ static void player_home_progress_sync(const AudioStateSnapshot &snapshot);
 static void player_home_apply_audio_snapshot(const AudioStateSnapshot &snapshot);
 static void player_home_overlay_hide();
 static bool player_home_finish_cassette_switch_if_ready();
+static bool player_home_finish_cassette_controls_present_if_ready();
+static void player_home_refresh_visual_mode_button();
 
 static void player_home_control_capture_cb(lv_event_t *event)
 {
@@ -1119,6 +1124,10 @@ static void player_home_launcher_release_surface_lease()
     g_launcher_surface_lease_track = UINT32_MAX;
     g_launcher_surface_lease_us = 0U;
     fallback_cover_image_discard_unpinned();
+    if (g_music_visual_mode == MusicVisualMode::Cassette) {
+        // 磁带稳态不保留压暗 Surface。Launcher 临时恢复的 dimmed 在 lease 释放后立即回收。
+        cover_surface_cache_set_dimmed_retained(false);
+    }
 }
 
 static bool player_home_launcher_acquire_surface(
@@ -1135,6 +1144,10 @@ static bool player_home_launcher_acquire_surface(
     }
 
     const int64_t started_us = esp_timer_get_time();
+    if (g_music_visual_mode == MusicVisualMode::Cassette &&
+        !cover_surface_cache_restore_dimmed(track_index)) {
+        return false;
+    }
     CoverSurfaceLease lease = {};
     if (!cover_surface_cache_acquire(track_index, &lease)) {
         return false;
@@ -2844,10 +2857,11 @@ static void player_home_overlay_apply_dim_path()
     // R.20：CoverSurface 命中时直接切预暗 RGB565，backdrop 保持全透明；
     // 只有 Overlay 可见且压缩 JPEG/PNG 回退路径没有 dimmed Surface 时，才启用旧 alpha 黑层。
     bool fast_dim = false;
-    if (g_music_visual_mode == MusicVisualMode::Artwork) {
+    if (g_music_visual_mode == MusicVisualMode::Artwork ||
+        g_cassette_visual_switch_pending) {
         fast_dim = now_playing_artwork_set_dimmed(g_overlay_visible);
     } else if (g_music_visual_mode == MusicVisualMode::Cassette) {
-        // Round 22：磁带命中预暗 PSRAM RGB565 时，不再叠实时 Alpha 黑层。
+        // 磁带控件直接使用磁带稳态预存的 current 压暗静态快照。
         fast_dim = cassette_view_controls_cache_active();
     }
     const lv_opa_t backdrop_opa =
@@ -2855,6 +2869,27 @@ static void player_home_overlay_apply_dim_path()
             ? kOverlayDimOpacity
             : static_cast<lv_opa_t>(LV_OPA_TRANSP);
     player_home_overlay_set_backdrop_opa_if_changed(backdrop_opa);
+}
+
+static bool player_home_finish_cassette_controls_present_if_ready()
+{
+    if (!g_cassette_controls_present_pending) return false;
+    if (!g_overlay_visible) {
+        g_cassette_controls_present_pending = false;
+        return false;
+    }
+    if (!cassette_view_controls_cache_active()) return false;
+
+    const PlayerHomeOverlayInvalidationBatch batch =
+        player_home_overlay_begin_atomic_transition();
+    g_cassette_controls_present_pending = false;
+    player_home_overlay_apply_dim_path();
+    player_home_overlay_set_controls_visible(true);
+    player_home_overlay_set_backdrop_clickable(true);
+    player_home_overlay_end_atomic_transition(batch);
+    player_home_overlay_arm_timeout();
+    ESP_LOGI(TAG, "磁带控件静态页已就绪：压暗磁带与控件同帧显示");
+    return true;
 }
 
 static void player_home_overlay_show()
@@ -2870,10 +2905,28 @@ static void player_home_overlay_show()
             player_home_overlay_begin_atomic_transition();
         g_overlay_visible = true;
         player_home_set_volume_adjust_armed(false);
-        cassette_view_set_controls_visible(true);
-        player_home_overlay_apply_dim_path();
-        player_home_overlay_set_controls_visible(true);
-        player_home_overlay_set_backdrop_clickable(true);
+
+        if (g_music_visual_mode == MusicVisualMode::Cassette &&
+            !g_cassette_visual_switch_pending) {
+            // current 压暗磁带通常已在后台预存，可直接冻结并显示控件。
+            // 极端情况下快照尚未 ready，仍保持旧规则：ready 前不显示半成品控件页。
+            cassette_view_set_controls_visible(true);
+            g_cassette_controls_present_pending =
+                !cassette_view_controls_cache_active();
+            if (g_cassette_controls_present_pending) {
+                player_home_overlay_set_controls_visible(false);
+                player_home_overlay_set_backdrop_clickable(false);
+                player_home_overlay_set_backdrop_opa_if_changed(LV_OPA_TRANSP);
+            } else {
+                player_home_overlay_apply_dim_path();
+                player_home_overlay_set_controls_visible(true);
+                player_home_overlay_set_backdrop_clickable(true);
+            }
+        } else {
+            player_home_overlay_apply_dim_path();
+            player_home_overlay_set_controls_visible(true);
+            player_home_overlay_set_backdrop_clickable(true);
+        }
         player_home_overlay_end_atomic_transition(batch);
     }
     player_home_overlay_arm_timeout();
@@ -2889,6 +2942,7 @@ static void player_home_overlay_hide()
         player_home_overlay_begin_atomic_transition();
     player_home_set_volume_adjust_armed(false);
     g_overlay_visible = false;
+    g_cassette_controls_present_pending = false;
     if (g_overlay_timer != nullptr) {
         lv_timer_pause(g_overlay_timer);
     }
@@ -3792,21 +3846,25 @@ static void player_home_artwork_timer_cb(lv_timer_t *timer)
     if (screen_action_menu_is_open()) {
         return;
     }
-    if (ui_touch_input_recent_activity(kInteractionYieldMs)) {
-        return;
-    }
-    if (g_cassette_visual_switch_pending) {
-        // 切换准备期间 Artwork 继续留在屏幕上；这里只推进隐藏的 Cassette 状态机。
+    if (g_cassette_visual_switch_pending || g_cassette_controls_present_pending) {
+        // 用户刚触发的原子视觉交接优先推进一次，不被“刚触摸过”节流挡住。
         cassette_view_update();
-        if (player_home_finish_cassette_switch_if_ready()) {
+        if (g_cassette_visual_switch_pending &&
+            player_home_finish_cassette_switch_if_ready()) {
             return;
         }
+        if (g_cassette_controls_present_pending &&
+            player_home_finish_cassette_controls_present_if_ready()) {
+            return;
+        }
+    }
+    if (ui_touch_input_recent_activity(kInteractionYieldMs)) {
+        return;
     }
 
     if (g_music_visual_mode == MusicVisualMode::Cassette) {
         cassette_view_update();
-        if (g_overlay_visible) {
-            // 新歌缓存可能在本次后台刷新刚刚准备完成，立即撤掉实时 Alpha Backdrop。
+        if (g_overlay_visible && !g_cassette_controls_present_pending) {
             player_home_overlay_apply_dim_path();
         }
     } else {
@@ -3931,6 +3989,9 @@ static bool player_home_finish_cassette_switch_if_ready()
     now_playing_artwork_set_bounded_present_allowed(false);
     (void)now_playing_artwork_set_dimmed(false);
     now_playing_artwork_set_active(false);
+    // Cassette 只消费 normal Surface；Artwork lease 已释放后即可回收 dimmed。
+    // 后续磁带模式切歌也按 normal-only 生成，避免重新占回这 413KiB。
+    cover_surface_cache_set_dimmed_retained(false);
     g_artwork_resume_without_invalidation = false;
 
     player_home_refresh_visual_mode_button();
@@ -3944,8 +4005,12 @@ static bool player_home_finish_cassette_switch_if_ready()
 static bool player_home_set_visual_mode(MusicVisualMode mode)
 {
     if (mode == MusicVisualMode::Artwork && g_cassette_visual_switch_pending) {
+        // 目标仍是当前 Artwork，取消尚未提交的隐藏磁带即可。
         g_cassette_visual_switch_pending = false;
+        cassette_view_set_controls_visible(false);
         (void)cassette_view_set_active(false);
+        player_home_refresh_visual_mode_button();
+        return true;
     }
 
     if (mode == g_music_visual_mode) {
@@ -3956,8 +4021,9 @@ static bool player_home_set_visual_mode(MusicVisualMode mode)
     if (mode == MusicVisualMode::Cassette) {
         if (g_cassette_visual_switch_pending) return true;
 
-        // 不再先显示粉色 Cassette 再关闭 Artwork。磁带层保持隐藏，后台准备当前封面和壳体颜色；
-        // ready 后由 player_home_finish_cassette_switch_if_ready() 在同一帧完成视觉交接。
+        // 无论控件是否打开，都先让 Cassette 在隐藏态准备完整。
+        // 控件打开时 set_controls_visible(true) 会让 deferred present 额外等待
+        // 460x460 压暗静态磁带快照，ready 后再和现有控件同帧交接。
         if (!cassette_view_prepare_deferred_active()) {
             ESP_LOGW(TAG, "切换磁带模式失败：磁带视觉层未就绪");
             return false;
@@ -3965,13 +4031,27 @@ static bool player_home_set_visual_mode(MusicVisualMode mode)
         cassette_view_set_controls_visible(g_overlay_visible);
         g_cassette_visual_switch_pending = true;
         if (!player_home_finish_cassette_switch_if_ready()) {
-            ESP_LOGI(TAG, "Music视觉模式：磁带准备中，继续保持当前封面");
+            ESP_LOGI(TAG, "Music视觉模式：磁带准备中，继续保持当前压暗封面/封面");
         }
         return true;
     }
 
-    g_music_visual_mode = MusicVisualMode::Artwork;
-    (void)cassette_view_set_active(false);
+    // Cassette -> Artwork：旧的压暗静态磁带必须继续留在前台，直到 dimmed Artwork
+    // 已从当前 normal Surface 恢复并成功绑定。只有目标背景 ready 后才关闭 Cassette。
+    cover_surface_cache_set_dimmed_retained(true);
+    bool require_dimmed_surface = false;
+    if (player_state_is_ready() && media_library_get_count() > 0U) {
+        const uint32_t track = static_cast<uint32_t>(player_state_get_index());
+        MediaArtworkViewV2 artwork = {};
+        require_dimmed_surface = media_library_get_artwork_view(track, &artwork);
+        if (require_dimmed_surface && !cover_surface_cache_restore_dimmed(track)) {
+            cover_surface_cache_set_dimmed_retained(false);
+            ESP_LOGW(TAG, "切回封面模式失败：dimmed Surface暂未恢复，继续保持静态磁带 track=%lu",
+                static_cast<unsigned long>(track));
+            return false;
+        }
+    }
+
     const bool should_run =
         g_app_foreground &&
         !library_view_is_visible() &&
@@ -3979,19 +4059,30 @@ static bool player_home_set_visual_mode(MusicVisualMode mode)
         !spectrum_view_is_visible() &&
         !g_launcher_visible;
     now_playing_artwork_set_bounded_present_allowed(should_run);
-    (void)now_playing_artwork_set_dimmed(g_overlay_visible);
     now_playing_artwork_set_active(should_run);
     if (should_run) {
         now_playing_artwork_refresh_context();
         now_playing_artwork_update();
+        const bool dimmed_bound = !g_overlay_visible || now_playing_artwork_set_dimmed(true);
+        if (require_dimmed_surface && !dimmed_bound) {
+            now_playing_artwork_set_active(false);
+            cover_surface_cache_set_dimmed_retained(false);
+            ESP_LOGW(TAG, "切回封面模式失败：压暗封面未能绑定，继续保持静态磁带");
+            return false;
+        }
         player_home_repaint_controls_after_bounded_present();
     }
+
+    g_music_visual_mode = MusicVisualMode::Artwork;
+    g_cassette_controls_present_pending = false;
+    (void)cassette_view_set_active(false);
+    cassette_view_set_controls_visible(false);
 
     player_home_refresh_visual_mode_button();
     player_home_overlay_apply_dim_path();
     lv_obj_t *screen = lv_screen_active();
     if (screen != nullptr) lv_obj_invalidate(screen);
-    ESP_LOGI(TAG, "Music视觉模式：封面");
+    ESP_LOGI(TAG, "Music视觉模式：封面（压暗封面已就绪后原子交接）");
     return true;
 }
 
@@ -4146,6 +4237,9 @@ esp_err_t player_home_app_leave_background()
     lyrics_view_close();
     spectrum_view_close();
     player_home_launcher_abort_for_app_switch(g_keep_cassette_prefetch_in_background);
+
+    // 控件若正停在压暗静态磁带页，先正常收起 Overlay；这会释放按需快照，
+    // 再由既有 Background QoS 决定保留 next 预取还是完整回收磁带资源。
     player_home_overlay_hide();
     player_home_cancel_progress_interaction();
     g_volume_dragging = false;
@@ -4257,7 +4351,9 @@ void player_home_create(lv_obj_t *screen)
     g_volume_adjust_armed = false;
     g_overlay_visible = false;
     g_music_visual_mode = MusicVisualMode::Artwork;
+    cover_surface_cache_set_dimmed_retained(true);
     g_cassette_visual_switch_pending = false;
+    g_cassette_controls_present_pending = false;
     g_visual_mode_button = nullptr;
     g_visual_mode_label = nullptr;
     g_last_loop_mode_valid = false;

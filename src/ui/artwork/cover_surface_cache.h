@@ -5,9 +5,9 @@
 
 #include "esp_err.h"
 
-// R.36：最终封面只保留当前曲 normal + dimmed 两张 native RGB565。CoverTask 固定 Core1；
-// 2 个槽只承担切歌瞬间“旧 lease + 新 Surface”的安全交换，绑定完成后立即清理旧槽，
-// 不再长期保存下一曲，也不再维护第三张 wire-order Surface。BoundedSPI Cover Present 直接消费 native Surface，并在传输层按需转换 wire-order。
+// 最终封面以 normal native RGB565 为共享基底：封面视图按需保留 dimmed，磁带视图只保留 normal。
+// 2 个槽只承担切歌瞬间“旧 lease + 新 Surface”的安全交换，不再维护第三张 wire-order Surface。
+// BoundedSPI Cover Present 直接消费 native Surface，并在传输层按需转换 wire-order。
 enum class CoverSurfaceState : uint8_t
 {
     Stopped = 0,
@@ -46,6 +46,19 @@ struct CoverSurfaceLease
 
     uint32_t slot_revision = 0;
     uint8_t slot_index = 0xFFU;
+    bool dimmed_pinned = false;
+};
+
+// 仅用于定位 PSRAM 常驻项；不改变缓存生命周期。
+struct CoverSurfaceDebugSnapshot
+{
+    size_t normal_bytes = 0U;
+    size_t dimmed_bytes = 0U;
+    uint16_t valid_slots = 0U;
+    uint16_t normal_slots = 0U;
+    uint16_t dimmed_slots = 0U;
+    uint16_t normal_pins = 0U;
+    uint16_t dimmed_pins = 0U;
 };
 
 esp_err_t cover_surface_cache_start();
@@ -56,7 +69,17 @@ bool cover_surface_cache_request_track(uint32_t track_index, uint32_t *out_reque
 
 bool cover_surface_cache_get_snapshot(CoverSurfaceSnapshot *out_snapshot);
 bool cover_surface_cache_acquire(uint32_t track_index, CoverSurfaceLease *out_lease);
+// 磁带视图只依赖 normal；该 lease 不固定 dimmed，允许磁带稳态回收压暗 Surface。
+bool cover_surface_cache_acquire_normal(uint32_t track_index, CoverSurfaceLease *out_lease);
 void cover_surface_cache_release(CoverSurfaceLease *lease);
+
+// 封面模式需要 normal+dimmed；磁带模式只保留 normal。切回封面或进入 Launcher 时，
+// dimmed 直接从现有 normal 重建，不重新访问 SD，也不重新解码 JPEG/PNG。
+void cover_surface_cache_set_dimmed_retained(bool retained);
+bool cover_surface_cache_restore_dimmed(uint32_t track_index);
 
 // R.36：新当前曲已经安全绑定后，清理所有其它未 pin Surface。稳态只留下当前曲。
 void cover_surface_cache_retain_track(uint32_t track_index);
+
+// 诊断快照只读取槽位统计；获取失败时返回 false，不影响正常缓存。
+bool cover_surface_cache_get_debug_snapshot(CoverSurfaceDebugSnapshot *out_snapshot);

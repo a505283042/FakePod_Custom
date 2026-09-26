@@ -122,9 +122,9 @@ static constexpr uint8_t kCassetteTintMaxSaturation = 190U;
 static constexpr uint8_t kCassetteTintMinValue = 200U;
 static constexpr uint8_t kCassetteTintMaxValue = 224U;
 
-// Round 23：Controls 背景改为独立低优先级任务直接在 PSRAM 合成，不再调用 LVGL Snapshot。
-// 同时保留 current/next 两块 RGB565 buffer：当前 A 播放时后台把已确定的下一首 B
-// 的封面、壳体颜色和固定机械件一起准备好，真正切到 B 时直接提升为当前视觉。
+// Controls 兜底背景仍由独立低优先级任务直接在 PSRAM 合成，不调用 LVGL Snapshot。
+// 正常磁带预取不再制作 460x460 next 控件整屏；下一首只 pin normal CoverSurface，
+// 并预做 460x296 变色磁带壳，切歌时直接提升这两份资源。
 static constexpr uint8_t kControlsCacheDimOpacity = 150U;
 static constexpr uint16_t kControlsCacheWidth = FAKEPOD_LCD_WIDTH;
 static constexpr uint16_t kControlsCacheHeight = FAKEPOD_LCD_HEIGHT;
@@ -135,6 +135,7 @@ static constexpr size_t kPrefetchShellBytes =
 static constexpr uint32_t kCassetteCacheTaskStackBytes = 5120U;
 static constexpr UBaseType_t kCassetteCacheTaskPriority = 1U;
 static constexpr BaseType_t kCassetteCacheTaskCore = 1;
+static constexpr uint32_t kCassetteTrimWaitMs = 1000U;
 
 // C2.4.1 固定几何（均为 460x296 磁带局部坐标）。
 // 大轮：左轮用左侧圆周切点，右轮用右侧圆周切点；磁带量增加时只沿X向外最多5px。
@@ -198,9 +199,12 @@ static lv_obj_t *g_next_lyric_label = nullptr;
 static bool g_active = false;
 static bool g_controls_visible = false;
 
-// current/next 双缓冲。current 只负责当前歌曲控件背景；next 在播放期间提前生成。
+// 磁带模式常驻 current + next 两张 460x460 压暗静态快照。
+// current 用于展开控件立即显示；next 与下一首封面/变色壳同批预热，
+// 控件页切歌时只交换指针，不再现场读盘、解码、找色、Tint 或合成压暗页。
 static lv_obj_t *g_controls_cache_image = nullptr;
 static uint8_t *g_controls_cache_pixels = nullptr;
+static uint8_t *g_controls_cache_back_pixels = nullptr;
 static uint8_t *g_next_controls_cache_pixels = nullptr;
 static uint8_t *g_next_shell_rgb565 = nullptr;
 static lv_image_dsc_t g_controls_cache_dsc = {};
@@ -247,7 +251,6 @@ struct CassetteCacheBuildResult
 enum class CassetteNextPrefetchState : uint8_t
 {
     Idle = 0,
-    ReuseNoArtwork,
     WaitingArtwork,
     WaitingSurface,
     Building,
@@ -265,6 +268,7 @@ struct CassetteNextPrefetch
     bool dynamic_tint = false;
     bool no_artwork = false;
     CoverSurfaceLease promotion_cover = {};
+    FallbackCoverImageLease promotion_fallback = {};
     uint16_t tint_lut[256] = {};
 };
 
@@ -274,6 +278,7 @@ static QueueHandle_t g_cache_result_queue = nullptr;
 static TaskHandle_t g_cache_task = nullptr;
 static bool g_cache_build_busy = false;
 static uint32_t g_cache_build_serial = 0U;
+
 // C2.4.10：进度条拖动和Audio Seek提交期间冻结所有磁带机械刷新。
 static bool g_seek_frozen = false;
 // C2.4.13：Launcher 显示期间冻结 Cassette 机械层。高速 Launcher 会进一步隐藏整个
@@ -319,6 +324,7 @@ static uint8_t *g_tape_amount_pixels = nullptr;
 static lv_image_dsc_t g_big_reel_dsc = {};
 static lv_image_dsc_t g_small_roller_dsc = {};
 static lv_image_dsc_t g_tape_amount_dsc = {};
+
 static bool g_mechanics_ready = false;
 static uint32_t g_big_reel_phase_q16[2] = {};
 static uint32_t g_small_roller_phase_q16 = 0U;
@@ -374,6 +380,95 @@ static bool g_pending_cover_valid = false;
 // 从封面视图首次切到磁带时，先在隐藏状态准备完整视觉，防止粉色壳体闪现。
 static bool g_present_deferred = false;
 
+// 临时诊断：把磁带页能明确归属的 PSRAM 全部按实际指针计账。
+// 只在关键状态切换时打印，不进入20Hz机械热循环。
+static void cassette_view_log_psram_ledger(const char *reason)
+{
+    CoverSurfaceDebugSnapshot cover = {};
+    FallbackCoverImageDebugSnapshot fallback = {};
+    const bool cover_ok = cover_surface_cache_get_debug_snapshot(&cover);
+    fallback_cover_image_get_debug_snapshot(&fallback);
+
+    const size_t current_snapshot = g_controls_cache_pixels != nullptr ? kControlsCacheBytes : 0U;
+    const size_t back_snapshot = g_controls_cache_back_pixels != nullptr ? kControlsCacheBytes : 0U;
+    const size_t next_snapshot = g_next_controls_cache_pixels != nullptr ? kControlsCacheBytes : 0U;
+    const size_t next_shell = g_next_shell_rgb565 != nullptr ? kPrefetchShellBytes : 0U;
+
+    const size_t shell_native = g_shell_pixels != nullptr ? g_shell_dsc.data_size : 0U;
+    const size_t shell_base = g_shell_base_rgb565 != nullptr ? kPrefetchShellBytes : 0U;
+    const size_t shell_work = g_shell_tint_work_rgb565 != nullptr ? kPrefetchShellBytes : 0U;
+    const size_t shell_luma = g_shell_tint_luma != nullptr
+        ? static_cast<size_t>(kCassetteWidth) * kCassetteHeight : 0U;
+
+    const size_t big_reel = g_big_reel_pixels != nullptr ? g_big_reel_dsc.data_size : 0U;
+    const size_t small_roller = g_small_roller_pixels != nullptr ? g_small_roller_dsc.data_size : 0U;
+    const size_t small_pixels =
+        static_cast<size_t>(g_small_roller_dsc.header.w) * g_small_roller_dsc.header.h;
+    const size_t small_base = g_small_roller_base_rgb565 != nullptr ? small_pixels * 2U : 0U;
+    const size_t small_luma = g_small_roller_tint_luma != nullptr ? small_pixels : 0U;
+    const size_t tape_amount = g_tape_amount_pixels != nullptr ? g_tape_amount_dsc.data_size : 0U;
+
+    const size_t cassette_bytes = current_snapshot + back_snapshot + next_snapshot + next_shell +
+        shell_native + shell_base + shell_work + shell_luma + big_reel + small_roller +
+        small_base + small_luma + tape_amount;
+    const size_t cover_bytes = cover.normal_bytes + cover.dimmed_bytes;
+    const size_t fallback_bytes = fallback.artwork_bytes + fallback.cassette_bytes;
+    const size_t known_bytes = cassette_bytes + cover_bytes + fallback_bytes;
+    const size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+
+    ESP_LOGI(TAG,
+        "PSRAM账本[%s]：free=%uB largest=%uB known=%uB cassette=%uB cover=%uB fallback=%uB",
+        reason != nullptr ? reason : "?",
+        static_cast<unsigned>(free_psram),
+        static_cast<unsigned>(largest),
+        static_cast<unsigned>(known_bytes),
+        static_cast<unsigned>(cassette_bytes),
+        static_cast<unsigned>(cover_bytes),
+        static_cast<unsigned>(fallback_bytes));
+    ESP_LOGI(TAG,
+        "PSRAM账本[%s] 快照：current=%u back=%u next=%u next_shell=%u cache_busy=%u next_state=%u",
+        reason != nullptr ? reason : "?",
+        static_cast<unsigned>(current_snapshot),
+        static_cast<unsigned>(back_snapshot),
+        static_cast<unsigned>(next_snapshot),
+        static_cast<unsigned>(next_shell),
+        static_cast<unsigned>(g_cache_build_busy),
+        static_cast<unsigned>(g_next_prefetch.state));
+    ESP_LOGI(TAG,
+        "PSRAM账本[%s] 磁带：shell=%u base=%u work=%u luma=%u big=%u small=%u small_base=%u small_luma=%u tape=%u",
+        reason != nullptr ? reason : "?",
+        static_cast<unsigned>(shell_native),
+        static_cast<unsigned>(shell_base),
+        static_cast<unsigned>(shell_work),
+        static_cast<unsigned>(shell_luma),
+        static_cast<unsigned>(big_reel),
+        static_cast<unsigned>(small_roller),
+        static_cast<unsigned>(small_base),
+        static_cast<unsigned>(small_luma),
+        static_cast<unsigned>(tape_amount));
+    ESP_LOGI(TAG,
+        "PSRAM账本[%s] 封面：ok=%u slots=%u normal=%uB/%u slots pins=%u dimmed=%uB/%u slots pins=%u",
+        reason != nullptr ? reason : "?",
+        static_cast<unsigned>(cover_ok),
+        static_cast<unsigned>(cover.valid_slots),
+        static_cast<unsigned>(cover.normal_bytes),
+        static_cast<unsigned>(cover.normal_slots),
+        static_cast<unsigned>(cover.normal_pins),
+        static_cast<unsigned>(cover.dimmed_bytes),
+        static_cast<unsigned>(cover.dimmed_slots),
+        static_cast<unsigned>(cover.dimmed_pins));
+    ESP_LOGI(TAG,
+        "PSRAM账本[%s] 替补：artwork=%uB pins=%u cassette=%uB pins=%u lease_cur=%u lease_next=%u",
+        reason != nullptr ? reason : "?",
+        static_cast<unsigned>(fallback.artwork_bytes),
+        static_cast<unsigned>(fallback.artwork_pins),
+        static_cast<unsigned>(fallback.cassette_bytes),
+        static_cast<unsigned>(fallback.cassette_pins),
+        static_cast<unsigned>(g_fallback_cover_lease.slot_index != 0xFFU),
+        static_cast<unsigned>(g_next_prefetch.promotion_fallback.slot_index != 0xFFU));
+}
+
 static void cassette_view_init_rgb565_dsc(
     lv_image_dsc_t *dsc,
     const uint8_t *data,
@@ -394,8 +489,6 @@ static void cassette_view_handle_cache_result();
 static void cassette_view_service_cache_pipeline();
 static void cassette_view_cancel_next_prefetch(const char *reason);
 static bool cassette_view_try_promote_next_visual(uint32_t generation, uint32_t track);
-static bool cassette_view_try_reuse_next_no_artwork_visual(uint32_t generation, uint32_t track);
-static void cassette_view_promote_next_controls_only(uint32_t generation, uint32_t track);
 
 static uint16_t cassette_view_cover_source_width()
 {
@@ -573,7 +666,10 @@ static void cassette_view_set_text_if_changed(lv_obj_t *label, const char *text)
 
 static void cassette_view_apply_aux_visibility()
 {
-    const bool visible = g_active && !g_controls_visible;
+    const bool controls_covering =
+        g_controls_visible && g_controls_cache_ready && g_controls_cache_image != nullptr &&
+        !lv_obj_has_flag(g_controls_cache_image, LV_OBJ_FLAG_HIDDEN);
+    const bool visible = g_active && !controls_covering;
     lv_obj_t *labels[] = {g_title_label, g_artist_label, g_current_lyric_label, g_next_lyric_label};
     for (lv_obj_t *label : labels) {
         if (label == nullptr) continue;
@@ -774,8 +870,11 @@ static void cassette_view_cancel_next_prefetch(const char *reason)
     if (g_next_prefetch.promotion_cover.slot_index != 0xFFU) {
         cover_surface_cache_release(&g_next_prefetch.promotion_cover);
     }
+    if (g_next_prefetch.promotion_fallback.slot_index != 0xFFU) {
+        fallback_cover_image_release(&g_next_prefetch.promotion_fallback);
+    }
     g_next_prefetch = {};
-    // serial 自增使正在后台合成的旧结果自动失效；buffer 本身固定复用，不释放。
+    // serial 自增使正在后台合成的旧结果自动失效；next 快照/壳体 buffer 固定复用，到退出磁带时统一释放。
     ++g_cache_build_serial;
     if (g_cache_build_serial == 0U) g_cache_build_serial = 1U;
     if (old_track != UINT32_MAX && reason != nullptr) {
@@ -2104,7 +2203,8 @@ static void cassette_view_blit_shell(
     const uint16_t tint_lut[256],
     bool dynamic_tint)
 {
-    if (dst == nullptr || g_shell_pixels == nullptr || g_shell_base_rgb565 == nullptr) return;
+    if ((dst == nullptr && shell_output == nullptr) ||
+        g_shell_pixels == nullptr || g_shell_base_rgb565 == nullptr) return;
     const size_t pixel_count = static_cast<size_t>(kCassetteWidth) * kCassetteHeight;
     const uint8_t *alpha_plane = g_shell_pixels + pixel_count * 2U;
     for (int16_t y = 0; y < kCassetteHeight; ++y) {
@@ -2119,7 +2219,7 @@ static void cassette_view_blit_shell(
                 cassette_view_store_rgb565(shell_output + index * 2U, color);
             }
             const uint8_t alpha = alpha_plane[index];
-            if (alpha != 0U) {
+            if (dst != nullptr && alpha != 0U) {
                 cassette_view_put_pixel(
                     dst, static_cast<int16_t>(kCassetteX + x),
                     static_cast<int16_t>(kCassetteY + y), color, alpha);
@@ -2241,10 +2341,16 @@ static bool cassette_view_compose_cache_job(
     const CassetteCacheBuildJob &job,
     CassetteCacheBuildResult *out_result)
 {
-    if (out_result == nullptr || job.controls_output == nullptr ||
-        g_shell_base_rgb565 == nullptr || g_shell_tint_luma == nullptr ||
-        !g_mechanics_ready || g_big_reel_pixels == nullptr ||
-        g_small_roller_pixels == nullptr || g_tape_amount_pixels == nullptr) {
+    if (out_result == nullptr ||
+        (job.controls_output == nullptr && job.shell_output == nullptr) ||
+        g_shell_base_rgb565 == nullptr || g_shell_tint_luma == nullptr) {
+        return false;
+    }
+
+    const bool build_controls = job.controls_output != nullptr;
+    if (build_controls &&
+        (!g_mechanics_ready || g_big_reel_pixels == nullptr ||
+         g_small_roller_pixels == nullptr || g_tape_amount_pixels == nullptr)) {
         return false;
     }
 
@@ -2254,14 +2360,17 @@ static bool cassette_view_compose_cache_job(
         ? job.fallback_lease.width : job.cover_lease.width;
     const uint16_t cover_height = job.no_artwork
         ? job.fallback_lease.height : job.cover_lease.height;
-    if (cover == nullptr || cover_width == 0U || cover_height == 0U) return false;
+    if (!job.no_artwork &&
+        (cover == nullptr || cover_width == 0U || cover_height == 0U)) {
+        return false;
+    }
 
     CassetteTintColor extracted = {};
     CassetteTintColor target = kCassetteNeutralTint;
     uint16_t source_hue = 0U;
     uint16_t target_hue = 0U;
     uint32_t samples = 0U;
-    bool apply_dynamic = job.dynamic_tint && !job.no_artwork;
+    const bool apply_dynamic = job.dynamic_tint && !job.no_artwork;
     if (apply_dynamic) {
         const bool chromatic = cassette_view_extract_cover_tint(
             job.cover_lease, &extracted, &source_hue, &samples);
@@ -2271,45 +2380,55 @@ static bool cassette_view_compose_cache_job(
         cassette_view_build_tint_lut(target, out_result->tint_lut);
     }
 
-    uint16_t *dst = reinterpret_cast<uint16_t *>(job.controls_output);
-    memset(job.controls_output, 0, kControlsCacheBytes);
-    cassette_view_blit_cover(
-        dst, cover, cover_width, cover_height, job.cover_y_offset_px);
+    uint16_t *dst = build_controls
+        ? reinterpret_cast<uint16_t *>(job.controls_output)
+        : nullptr;
+    if (build_controls) {
+        memset(job.controls_output, 0, kControlsCacheBytes);
+        if (cover != nullptr && cover_width > 0U && cover_height > 0U) {
+            cassette_view_blit_cover(
+                dst, cover, cover_width, cover_height, job.cover_y_offset_px);
+        }
 
-    cassette_view_blit_rgb565a8_frame(
-        dst, g_tape_amount_pixels,
-        static_cast<uint16_t>(kTapeAmountWidth), static_cast<uint16_t>(kTapeAmountHeight),
-        0U, static_cast<uint16_t>(kTapeAmountWidth),
-        static_cast<int16_t>(kCassetteX + kTapeAmountBaseX - kTapeAmountTravelPx),
-        static_cast<int16_t>(kCassetteY + kTapeAmountY));
-    cassette_view_blit_rgb565a8_frame(
-        dst, g_big_reel_pixels,
-        static_cast<uint16_t>(kBigReelSize * kBigReelFrameCount),
-        static_cast<uint16_t>(kBigReelSize),
-        0U, static_cast<uint16_t>(kBigReelSize),
-        static_cast<int16_t>(kCassetteX + kBigReelLeftX),
-        static_cast<int16_t>(kCassetteY + kBigReelY));
-    cassette_view_blit_rgb565a8_frame(
-        dst, g_big_reel_pixels,
-        static_cast<uint16_t>(kBigReelSize * kBigReelFrameCount),
-        static_cast<uint16_t>(kBigReelSize),
-        0U, static_cast<uint16_t>(kBigReelSize),
-        static_cast<int16_t>(kCassetteX + kBigReelRightX),
-        static_cast<int16_t>(kCassetteY + kBigReelY));
-    cassette_view_blit_small_roller_tinted(
-        dst,
-        static_cast<int16_t>(kCassetteX + kSmallRollerLeftX),
-        static_cast<int16_t>(kCassetteY + kSmallRollerY),
-        out_result->tint_lut, apply_dynamic);
-    cassette_view_blit_small_roller_tinted(
-        dst,
-        static_cast<int16_t>(kCassetteX + kSmallRollerRightX),
-        static_cast<int16_t>(kCassetteY + kSmallRollerY),
-        out_result->tint_lut, apply_dynamic);
+        cassette_view_blit_rgb565a8_frame(
+            dst, g_tape_amount_pixels,
+            static_cast<uint16_t>(kTapeAmountWidth), static_cast<uint16_t>(kTapeAmountHeight),
+            0U, static_cast<uint16_t>(kTapeAmountWidth),
+            static_cast<int16_t>(kCassetteX + kTapeAmountBaseX - kTapeAmountTravelPx),
+            static_cast<int16_t>(kCassetteY + kTapeAmountY));
+        cassette_view_blit_rgb565a8_frame(
+            dst, g_big_reel_pixels,
+            static_cast<uint16_t>(kBigReelSize * kBigReelFrameCount),
+            static_cast<uint16_t>(kBigReelSize),
+            0U, static_cast<uint16_t>(kBigReelSize),
+            static_cast<int16_t>(kCassetteX + kBigReelLeftX),
+            static_cast<int16_t>(kCassetteY + kBigReelY));
+        cassette_view_blit_rgb565a8_frame(
+            dst, g_big_reel_pixels,
+            static_cast<uint16_t>(kBigReelSize * kBigReelFrameCount),
+            static_cast<uint16_t>(kBigReelSize),
+            0U, static_cast<uint16_t>(kBigReelSize),
+            static_cast<int16_t>(kCassetteX + kBigReelRightX),
+            static_cast<int16_t>(kCassetteY + kBigReelY));
+        cassette_view_blit_small_roller_tinted(
+            dst,
+            static_cast<int16_t>(kCassetteX + kSmallRollerLeftX),
+            static_cast<int16_t>(kCassetteY + kSmallRollerY),
+            out_result->tint_lut, apply_dynamic);
+        cassette_view_blit_small_roller_tinted(
+            dst,
+            static_cast<int16_t>(kCassetteX + kSmallRollerRightX),
+            static_cast<int16_t>(kCassetteY + kSmallRollerY),
+            out_result->tint_lut, apply_dynamic);
+    }
+
+    // current/next 都生成 460x460 压暗静态磁带；next 同时生成已变色磁带壳。
     cassette_view_blit_shell(
         dst, job.shell_output, out_result->tint_lut, apply_dynamic);
-    cassette_view_draw_fixed_tape_path(dst);
-    cassette_view_dim_buffer(dst);
+    if (build_controls) {
+        cassette_view_draw_fixed_tape_path(dst);
+        cassette_view_dim_buffer(dst);
+    }
 
     out_result->dynamic_tint = apply_dynamic;
     return true;
@@ -2328,6 +2447,12 @@ static void cassette_view_cache_task_main(void *argument)
         result.generation = job.generation;
         result.track = job.track;
         result.no_artwork = job.no_artwork;
+        // 下一首无封面也在 Core1 低优先级任务里提前读 SD + 解 JPEG。
+        // 这样不会把缺省封面的首次解码延迟挪到真正切歌那一帧。
+        if (job.no_artwork && job.fallback_lease.slot_index == 0xFFU) {
+            (void)fallback_cover_image_acquire(
+                FallbackCoverImageKind::Cassette, &job.fallback_lease);
+        }
         result.fallback_lease = job.fallback_lease;
         const int64_t started_us = esp_timer_get_time();
         result.ok = cassette_view_compose_cache_job(job, &result);
@@ -2364,7 +2489,7 @@ static bool cassette_view_start_cache_task()
         g_cache_task = nullptr;
         return false;
     }
-    ESP_LOGI(TAG, "磁带预缓存任务已启动：Core=%d Priority=%u current+next双缓冲",
+    ESP_LOGI(TAG, "磁带预缓存任务已启动：Core=%d Priority=%u current+next压暗快照+next壳体预取",
         static_cast<int>(kCassetteCacheTaskCore),
         static_cast<unsigned>(kCassetteCacheTaskPriority));
     return true;
@@ -2391,8 +2516,8 @@ static bool cassette_view_submit_cache_job(CassetteCacheBuildJob *job)
 static void cassette_view_promote_controls_buffer(uint32_t generation, uint32_t track)
 {
     uint8_t *old_current = g_controls_cache_pixels;
-    g_controls_cache_pixels = g_next_controls_cache_pixels;
-    g_next_controls_cache_pixels = old_current;
+    g_controls_cache_pixels = g_controls_cache_back_pixels;
+    g_controls_cache_back_pixels = nullptr;
     if (g_controls_cache_pixels == nullptr) return;
 
     cassette_view_init_rgb565_dsc(
@@ -2411,6 +2536,41 @@ static void cassette_view_promote_controls_buffer(uint32_t generation, uint32_t 
         lv_obj_remove_flag(g_controls_cache_image, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(g_controls_cache_image);
     }
+    // back buffer 只用于原子生成；提升完成后旧前台图立即释放，不长期保留第二张 460x460。
+    if (old_current != nullptr) heap_caps_free(old_current);
+    cassette_view_apply_aux_visibility();
+}
+
+static bool cassette_view_promote_next_controls_buffer(uint32_t generation, uint32_t track)
+{
+    if (g_next_controls_cache_pixels == nullptr) return false;
+
+    // next 快照已经完整离屏生成。直接交换 current/next 指针，旧 current buffer
+    // 留作下一轮 next 的复用缓冲，切歌路径不 malloc/free 413KiB 大块。
+    uint8_t *old_current = g_controls_cache_pixels;
+    g_controls_cache_pixels = g_next_controls_cache_pixels;
+    g_next_controls_cache_pixels = old_current;
+
+    cassette_view_init_rgb565_dsc(
+        &g_controls_cache_dsc,
+        g_controls_cache_pixels,
+        kControlsCacheWidth,
+        kControlsCacheHeight,
+        kControlsCacheBytes);
+    lv_image_set_src(g_controls_cache_image, &g_controls_cache_dsc);
+    lv_image_set_antialias(g_controls_cache_image, false);
+    g_controls_cache_generation = generation;
+    g_controls_cache_track = track;
+    g_controls_cache_dirty = false;
+    g_controls_cache_ready = true;
+    if (g_controls_visible) {
+        lv_obj_remove_flag(g_controls_cache_image, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(g_controls_cache_image);
+    } else {
+        lv_obj_add_flag(g_controls_cache_image, LV_OBJ_FLAG_HIDDEN);
+    }
+    cassette_view_apply_aux_visibility();
+    return true;
 }
 
 static void cassette_view_handle_cache_result()
@@ -2420,11 +2580,10 @@ static void cassette_view_handle_cache_result()
     if (xQueueReceive(g_cache_result_queue, &result, 0) != pdTRUE) return;
     g_cache_build_busy = false;
 
-    if (result.fallback_lease.slot_index != 0xFFU) {
-        fallback_cover_image_release(&result.fallback_lease);
-    }
-
     if (result.serial != g_cache_build_serial) {
+        if (result.fallback_lease.slot_index != 0xFFU) {
+            fallback_cover_image_release(&result.fallback_lease);
+        }
         ESP_LOGI(TAG, "磁带预缓存丢弃过期结果：track=%lu role=%s",
             static_cast<unsigned long>(result.track),
             result.role == CassetteCacheBuildRole::Next ? "next" : "current");
@@ -2432,43 +2591,161 @@ static void cassette_view_handle_cache_result()
     }
 
     if (result.role == CassetteCacheBuildRole::Current) {
+        if (result.fallback_lease.slot_index != 0xFFU) {
+            fallback_cover_image_release(&result.fallback_lease);
+        }
         const bool still_current = player_state_is_ready() && media_library_get_count() > 0U &&
             media_catalog_v2_generation() == result.generation &&
             static_cast<uint32_t>(player_state_get_index()) == result.track &&
             g_cover_generation == result.generation && g_cover_track == result.track;
-        if (!result.ok || !still_current || g_next_controls_cache_pixels == nullptr) {
-            // 结果过期时只丢弃 back buffer 内容，绝不能把仍在屏幕上的旧 front cache 判失效。
+        if (!result.ok || !still_current || g_controls_cache_back_pixels == nullptr) {
             return;
         }
         cassette_view_promote_controls_buffer(result.generation, result.track);
         ESP_LOGI(TAG,
-            "磁带控件PSRAM缓存就绪：track=%lu bytes=%u compose=%lldus（旧显示保持到新缓存原子换源）",
+            "当前磁带压暗快照预存就绪：track=%lu bytes=%u compose=%lldus",
             static_cast<unsigned long>(result.track),
             static_cast<unsigned>(kControlsCacheBytes),
             static_cast<long long>(result.elapsed_us));
+        cassette_view_log_psram_ledger("current_snapshot_ready");
         return;
     }
 
     if (g_next_prefetch.serial != result.serial ||
         g_next_prefetch.generation != result.generation ||
         g_next_prefetch.track != result.track) {
+        if (result.fallback_lease.slot_index != 0xFFU) {
+            fallback_cover_image_release(&result.fallback_lease);
+        }
         return;
     }
-    if (!result.ok) {
+    if (!result.ok || g_next_controls_cache_pixels == nullptr || g_next_shell_rgb565 == nullptr) {
+        if (result.fallback_lease.slot_index != 0xFFU) {
+            fallback_cover_image_release(&result.fallback_lease);
+        }
         cassette_view_cancel_next_prefetch("离屏合成失败");
         return;
     }
+
+    if (result.no_artwork) {
+        if (g_next_prefetch.promotion_fallback.slot_index != 0xFFU) {
+            fallback_cover_image_release(&g_next_prefetch.promotion_fallback);
+        }
+        if (result.fallback_lease.slot_index != 0xFFU &&
+            result.fallback_lease.rgb565 != nullptr) {
+            // 任务中的 fallback lease 直接转交给 next，保持解码后的缺省封面常驻到切歌。
+            g_next_prefetch.promotion_fallback = result.fallback_lease;
+            result.fallback_lease = {};
+        } else {
+            ESP_LOGW(TAG,
+                "下一首缺省封面JPG不可用：track=%lu，预存黑标签+粉色磁带快照",
+                static_cast<unsigned long>(result.track));
+        }
+    } else if (result.fallback_lease.slot_index != 0xFFU) {
+        fallback_cover_image_release(&result.fallback_lease);
+    }
+
     memcpy(g_next_prefetch.tint_lut, result.tint_lut, sizeof(result.tint_lut));
     g_next_prefetch.dynamic_tint = result.dynamic_tint;
     g_next_prefetch.no_artwork = result.no_artwork;
     g_next_prefetch.state = CassetteNextPrefetchState::Ready;
     ESP_LOGI(TAG,
-        "下一首磁带预缓存就绪：track=%lu controls=%uB shell=%uB compose=%lldus mode=%s",
+        "下一首磁带预缓存就绪：track=%lu snapshot=%uB shell=%uB compose=%lldus mode=%s",
         static_cast<unsigned long>(result.track),
         static_cast<unsigned>(kControlsCacheBytes),
         static_cast<unsigned>(kPrefetchShellBytes),
         static_cast<long long>(result.elapsed_us),
-        result.no_artwork ? "无封面粉色" : (result.dynamic_tint ? "动态配色" : "原装粉色"));
+        result.no_artwork ? "缺省封面+粉色" :
+            (result.dynamic_tint ? "动态配色" : "原装粉色"));
+    cassette_view_log_psram_ledger("next_prefetch_ready");
+}
+
+static bool cassette_view_wait_cache_idle_for_trim()
+{
+    if (!g_cache_build_busy) return true;
+    if (g_cache_result_queue == nullptr) return false;
+
+    const TickType_t timeout = pdMS_TO_TICKS(kCassetteTrimWaitMs);
+    const TickType_t started = xTaskGetTickCount();
+    while (g_cache_build_busy) {
+        const TickType_t elapsed = xTaskGetTickCount() - started;
+        if (elapsed >= timeout) return false;
+        TickType_t wait = timeout - elapsed;
+        const TickType_t slice = pdMS_TO_TICKS(20);
+        if (wait > slice) wait = slice;
+
+        CassetteCacheBuildResult result = {};
+        if (xQueueReceive(g_cache_result_queue, &result, wait) != pdTRUE) continue;
+        g_cache_build_busy = false;
+        if (result.fallback_lease.slot_index != 0xFFU) {
+            fallback_cover_image_release(&result.fallback_lease);
+        }
+    }
+    return true;
+}
+
+static void cassette_view_free_psram(uint8_t **buffer)
+{
+    if (buffer == nullptr || *buffer == nullptr) return;
+    heap_caps_free(*buffer);
+    *buffer = nullptr;
+}
+
+static bool cassette_view_trim_memory()
+{
+    if (g_active) return false;
+    if (!cassette_view_wait_cache_idle_for_trim()) {
+        ESP_LOGW(TAG, "磁带PSRAM回收延后：后台缓存任务1秒内未退出，保留缓存避免UAF");
+        return false;
+    }
+
+    const size_t before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+
+    // 所有相关 LVGL 对象此时均已隐藏。descriptor 是静态对象，先解除数据引用，
+    // 再释放像素，确保下一次进入磁带时只能经过 prepare/bind 重新建立来源。
+    g_controls_cache_dsc = {};
+    g_shell_dsc = {};
+    g_big_reel_dsc = {};
+    g_small_roller_dsc = {};
+    g_tape_amount_dsc = {};
+
+    cassette_view_free_psram(&g_controls_cache_pixels);
+    cassette_view_free_psram(&g_controls_cache_back_pixels);
+    cassette_view_free_psram(&g_next_controls_cache_pixels);
+    cassette_view_free_psram(&g_next_shell_rgb565);
+
+    cassette_view_free_psram(&g_shell_pixels);
+    cassette_view_free_psram(&g_shell_base_rgb565);
+    cassette_view_free_psram(&g_shell_tint_work_rgb565);
+    cassette_view_free_psram(&g_shell_tint_luma);
+
+    cassette_view_free_psram(&g_big_reel_pixels);
+    cassette_view_free_psram(&g_small_roller_pixels);
+    cassette_view_free_psram(&g_small_roller_base_rgb565);
+    cassette_view_free_psram(&g_small_roller_tint_luma);
+    cassette_view_free_psram(&g_tape_amount_pixels);
+
+    g_controls_cache_ready = false;
+    g_controls_cache_dirty = true;
+    g_controls_cache_generation = 0U;
+    g_controls_cache_track = UINT32_MAX;
+    g_shell_tintable_pixels = 0U;
+    g_shell_tint_generation = 0U;
+    g_shell_tint_track = UINT32_MAX;
+    g_small_roller_tintable_pixels = 0U;
+    g_mechanics_ready = false;
+    g_last_tape_shift = INT16_MIN;
+    g_last_tape_path_step = -1;
+    g_last_big_reel_frame[0] = 0xFFU;
+    g_last_big_reel_frame[1] = 0xFFU;
+    g_last_small_roller_frame = 0xFFU;
+    g_last_glint_snapshot = 0xFFU;
+
+    const size_t after = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    ESP_LOGI(TAG, "磁带PSRAM已回收：reclaimed=%uB free=%u->%uB",
+        static_cast<unsigned>(after >= before ? after - before : 0U),
+        static_cast<unsigned>(before), static_cast<unsigned>(after));
+    return true;
 }
 
 static bool cassette_view_schedule_current_cache()
@@ -2476,15 +2753,11 @@ static bool cassette_view_schedule_current_cache()
     if (g_cache_build_busy || !g_active ||
         !cassette_view_current_visual_ready() ||
         !cassette_view_ensure_cache_buffer(
-            &g_next_controls_cache_pixels, kControlsCacheBytes, "磁带控件后台交换缓存")) {
+            &g_controls_cache_back_pixels, kControlsCacheBytes, "磁带控件后台交换缓存")) {
         return false;
     }
-    // next buffer 同时承担“下一首预缓存”和“当前控件缓存后台重建”的 back buffer。
-    // 当前缓存需要重建时先取消尚未消费的 next，避免后台重建覆盖一张仍标记 Ready 的下一首图。
-    if (g_next_prefetch.state != CassetteNextPrefetchState::Idle) {
-        cassette_view_cancel_next_prefetch("当前控件缓存需重建");
-    }
-
+    // 当前快照始终优先于 next 预取，但不销毁已经准备好的 next。
+    // 后台任务单实例串行执行，因此 current/next 可以安全长期各保留一张快照。
     const uint32_t generation = media_catalog_v2_generation();
     const uint32_t track = static_cast<uint32_t>(player_state_get_index());
     CassetteCacheBuildJob job = {};
@@ -2493,35 +2766,37 @@ static bool cassette_view_schedule_current_cache()
     job.track = track;
     job.cover_y_offset_px = g_cover_y_offset_px;
     // 永远写 back buffer。即使 Controls 正在显示上一首 PSRAM 图，也不会边合成边改坏前台图。
-    job.controls_output = g_next_controls_cache_pixels;
+    job.controls_output = g_controls_cache_back_pixels;
     job.no_artwork = g_cover_is_no_artwork_fallback;
     DeviceSettingsSnapshot settings = {};
     job.dynamic_tint = device_settings_get_snapshot(&settings) &&
         settings.cassette_dynamic_tint_enabled && !job.no_artwork;
 
-    if (job.no_artwork) {
-        if (!fallback_cover_image_acquire(FallbackCoverImageKind::Cassette, &job.fallback_lease)) {
-            return false;
-        }
-    } else if (!cover_surface_cache_acquire(track, &job.cover_lease)) {
+    // 无封面 current 也让 Core1 任务自行 acquire fallback：命中已解码缓存时是快路径，
+    // 缺省 JPG 缺失时则直接合成黑标签+粉色磁带，不在 UI tick 反复读 SD。
+    if (!job.no_artwork && !cover_surface_cache_acquire_normal(track, &job.cover_lease)) {
         return false;
     }
 
     if (!cassette_view_submit_cache_job(&job)) {
         if (job.cover_lease.slot_index != 0xFFU) cover_surface_cache_release(&job.cover_lease);
-        if (job.fallback_lease.slot_index != 0xFFU) fallback_cover_image_release(&job.fallback_lease);
         return false;
     }
     return true;
 }
 
-static bool cassette_view_schedule_next_build(bool no_artwork)
+static bool cassette_view_schedule_next_build()
 {
     if (g_cache_build_busy || g_next_prefetch.track == UINT32_MAX ||
         !cassette_view_ensure_cache_buffer(
-            &g_next_controls_cache_pixels, kControlsCacheBytes, "下一首磁带控件缓存") ||
+            &g_next_controls_cache_pixels, kControlsCacheBytes, "下一首压暗磁带快照") ||
         !cassette_view_ensure_cache_buffer(
             &g_next_shell_rgb565, kPrefetchShellBytes, "下一首磁带壳缓存")) {
+        return false;
+    }
+
+    if (!g_next_prefetch.no_artwork &&
+        g_next_prefetch.promotion_cover.slot_index == 0xFFU) {
         return false;
     }
 
@@ -2532,25 +2807,20 @@ static bool cassette_view_schedule_next_build(bool no_artwork)
     job.cover_y_offset_px = 0;
     job.controls_output = g_next_controls_cache_pixels;
     job.shell_output = g_next_shell_rgb565;
-    job.no_artwork = no_artwork;
+    job.no_artwork = g_next_prefetch.no_artwork;
     DeviceSettingsSnapshot settings = {};
     job.dynamic_tint = device_settings_get_snapshot(&settings) &&
-        settings.cassette_dynamic_tint_enabled && !no_artwork;
+        settings.cassette_dynamic_tint_enabled && !job.no_artwork;
 
-    if (no_artwork) {
-        if (!fallback_cover_image_acquire(FallbackCoverImageKind::Cassette, &job.fallback_lease)) {
-            return false;
-        }
-    } else {
-        if (g_next_prefetch.promotion_cover.slot_index == 0xFFU ||
-            !cover_surface_cache_acquire(g_next_prefetch.track, &job.cover_lease)) {
-            return false;
-        }
+    if (!job.no_artwork &&
+        !cover_surface_cache_acquire_normal(g_next_prefetch.track, &job.cover_lease)) {
+        return false;
     }
 
     if (!cassette_view_submit_cache_job(&job)) {
-        if (job.cover_lease.slot_index != 0xFFU) cover_surface_cache_release(&job.cover_lease);
-        if (job.fallback_lease.slot_index != 0xFFU) fallback_cover_image_release(&job.fallback_lease);
+        if (job.cover_lease.slot_index != 0xFFU) {
+            cover_surface_cache_release(&job.cover_lease);
+        }
         return false;
     }
     return true;
@@ -2578,7 +2848,7 @@ static bool cassette_view_current_lyrics_settled()
 
 static void cassette_view_service_next_prefetch()
 {
-    if (!g_active || !g_controls_cache_ready || g_cache_build_busy ||
+    if (!g_active || g_cache_build_busy ||
         !player_state_is_ready() || media_library_get_count() == 0U) {
         return;
     }
@@ -2609,26 +2879,21 @@ static void cassette_view_service_next_prefetch()
         g_next_prefetch.track = next_track;
         MediaArtworkViewV2 artwork = {};
         if (!media_library_get_artwork_view(next_track, &artwork)) {
+            // 缺省封面也进入完整 next 预热：Core1 提前读/解 460x460 JPG，
+            // 同时生成粉色磁带壳和压暗静态磁带，真正切歌时只做资源提升。
             g_next_prefetch.no_artwork = true;
-            const uint32_t current_track = static_cast<uint32_t>(player_state_get_index());
-            if (g_cover_is_no_artwork_fallback &&
-                g_cover_generation == generation && g_cover_track == current_track) {
-                // 当前与下一首都明确无封面时，两者使用同一套缺省视觉。只记住可复用关系，
-                // 不申请下一份 fallback，也不离屏生成下一首封面/壳体缓存。
-                g_next_prefetch.state = CassetteNextPrefetchState::ReuseNoArtwork;
-                ESP_LOGI(TAG, "下一首同为无封面，跳过封面预缓存：track=%lu",
-                    static_cast<unsigned long>(next_track));
-                return;
-            }
-            (void)cassette_view_schedule_next_build(true);
+            g_next_prefetch.state = CassetteNextPrefetchState::WaitingSurface;
+            ESP_LOGI(TAG, "下一首缺省封面预取开始：track=%lu",
+                static_cast<unsigned long>(next_track));
+            (void)cassette_view_schedule_next_build();
             return;
         }
 
         CoverSurfaceLease promotion = {};
-        if (cover_surface_cache_acquire(next_track, &promotion)) {
+        if (cover_surface_cache_acquire_normal(next_track, &promotion)) {
             g_next_prefetch.promotion_cover = promotion;
             g_next_prefetch.state = CassetteNextPrefetchState::WaitingSurface;
-            (void)cassette_view_schedule_next_build(false);
+            (void)cassette_view_schedule_next_build();
             return;
         }
 
@@ -2652,12 +2917,13 @@ static void cassette_view_service_next_prefetch()
     }
 
     if (g_next_prefetch.state == CassetteNextPrefetchState::WaitingSurface) {
-        if (g_next_prefetch.promotion_cover.slot_index == 0xFFU) {
+        if (!g_next_prefetch.no_artwork &&
+            g_next_prefetch.promotion_cover.slot_index == 0xFFU) {
             CoverSurfaceLease promotion = {};
-            if (!cover_surface_cache_acquire(next_track, &promotion)) return;
+            if (!cover_surface_cache_acquire_normal(next_track, &promotion)) return;
             g_next_prefetch.promotion_cover = promotion;
         }
-        (void)cassette_view_schedule_next_build(false);
+        (void)cassette_view_schedule_next_build();
     }
 }
 
@@ -2667,17 +2933,17 @@ static void cassette_view_service_cache_pipeline()
     if (!g_active || g_root == nullptr || !cassette_view_current_visual_ready()) {
         return;
     }
-    // 封面→磁带的 deferred 切换期间 root 本来就是隐藏的，但离屏 Controls 缓存完全不依赖
-    // LVGL root 是否可见。若此时播放控件已经打开，先在后台把当前曲 PSRAM 压暗图准备好，
-    // 再允许整套 Cassette 出场，避免“实时Backdrop压暗一次→PSRAM又换一次”。
     if (!g_present_deferred && lv_obj_has_flag(g_root, LV_OBJ_FLAG_HIDDEN)) {
         return;
     }
 
+    // current 压暗快照属于磁带稳态资源：当前视觉一 ready 就后台预生成，
+    // 因此用户第一次展开控件也能直接显示，不再等待现场合成。
     if (!cassette_view_controls_cache_matches_current()) {
         (void)cassette_view_schedule_current_cache();
         return;
     }
+    // current 完整以后再准备 next：next normal/fallback + 找色 + 变色壳 + 压暗快照。
     cassette_view_service_next_prefetch();
 }
 
@@ -3082,18 +3348,21 @@ static bool cassette_view_prepare_shell()
 static bool cassette_view_try_promote_next_visual(uint32_t generation, uint32_t track)
 {
     if (g_next_prefetch.state != CassetteNextPrefetchState::Ready ||
-        g_next_prefetch.no_artwork ||
         g_next_prefetch.generation != generation || g_next_prefetch.track != track ||
-        g_next_prefetch.promotion_cover.slot_index == 0xFFU ||
-        g_next_prefetch.promotion_cover.normal_rgb565 == nullptr ||
-        g_next_shell_rgb565 == nullptr || g_next_controls_cache_pixels == nullptr) {
+        g_next_controls_cache_pixels == nullptr || g_next_shell_rgb565 == nullptr) {
+        return false;
+    }
+    if (!g_next_prefetch.no_artwork &&
+        (g_next_prefetch.promotion_cover.slot_index == 0xFFU ||
+         g_next_prefetch.promotion_cover.normal_rgb565 == nullptr)) {
         return false;
     }
 
     DeviceSettingsSnapshot settings = {};
     const bool dynamic_now = device_settings_get_snapshot(&settings) &&
         settings.cassette_dynamic_tint_enabled;
-    if (dynamic_now != g_next_prefetch.dynamic_tint) {
+    const bool expected_dynamic = dynamic_now && !g_next_prefetch.no_artwork;
+    if (expected_dynamic != g_next_prefetch.dynamic_tint) {
         cassette_view_cancel_next_prefetch("配色模式已变化");
         return false;
     }
@@ -3103,30 +3372,53 @@ static bool cassette_view_try_promote_next_visual(uint32_t generation, uint32_t 
 
     CoverSurfaceLease old_cover = g_cover_lease;
     FallbackCoverImageLease old_fallback = g_fallback_cover_lease;
-    g_cover_lease = g_next_prefetch.promotion_cover;
-    g_next_prefetch.promotion_cover = {};
+    g_cover_lease = {};
     g_fallback_cover_lease = {};
     g_cover_generation = generation;
     g_cover_track = track;
     g_cover_y_offset_px = 0;
-    g_cover_is_no_artwork_fallback = false;
+    g_cover_is_no_artwork_fallback = g_next_prefetch.no_artwork;
 
-    cassette_view_init_rgb565_dsc(
-        &g_cover_dsc,
-        g_cover_lease.normal_rgb565,
-        g_cover_lease.width,
-        g_cover_lease.height,
-        g_cover_lease.data_size);
-    g_cover_scale_q8 = cassette_view_cover_scale_for_size(
-        g_cover_lease.width, g_cover_lease.height);
-    lv_image_set_src(g_cover_image, &g_cover_dsc);
-    lv_image_set_scale(g_cover_image, g_cover_scale_q8);
-    lv_image_set_antialias(g_cover_image, false);
-    cassette_view_apply_cover_position();
-    lv_obj_remove_flag(g_cover_image, LV_OBJ_FLAG_HIDDEN);
+    const uint8_t *cover_pixels = nullptr;
+    uint16_t cover_width = 0U;
+    uint16_t cover_height = 0U;
+    size_t cover_size = 0U;
+    if (g_next_prefetch.no_artwork) {
+        g_fallback_cover_lease = g_next_prefetch.promotion_fallback;
+        g_next_prefetch.promotion_fallback = {};
+        if (g_fallback_cover_lease.slot_index != 0xFFU &&
+            g_fallback_cover_lease.rgb565 != nullptr) {
+            cover_pixels = g_fallback_cover_lease.rgb565;
+            cover_width = g_fallback_cover_lease.width;
+            cover_height = g_fallback_cover_lease.height;
+            cover_size = g_fallback_cover_lease.data_size;
+        }
+    } else {
+        g_cover_lease = g_next_prefetch.promotion_cover;
+        g_next_prefetch.promotion_cover = {};
+        cover_pixels = g_cover_lease.normal_rgb565;
+        cover_width = g_cover_lease.width;
+        cover_height = g_cover_lease.height;
+        cover_size = g_cover_lease.data_size;
+    }
+
+    if (cover_pixels != nullptr && cover_width > 0U && cover_height > 0U) {
+        cassette_view_init_rgb565_dsc(
+            &g_cover_dsc, cover_pixels, cover_width, cover_height, cover_size);
+        g_cover_scale_q8 = cassette_view_cover_scale_for_size(cover_width, cover_height);
+        lv_image_set_src(g_cover_image, &g_cover_dsc);
+        lv_image_set_scale(g_cover_image, g_cover_scale_q8);
+        lv_image_set_antialias(g_cover_image, false);
+        cassette_view_apply_cover_position();
+        lv_obj_remove_flag(g_cover_image, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        g_cover_dsc = {};
+        g_cover_scale_q8 = kLvImageScaleNone;
+        lv_obj_add_flag(g_cover_image, LV_OBJ_FLAG_HIDDEN);
+    }
 
     memcpy(g_shell_pixels, g_next_shell_rgb565, kPrefetchShellBytes);
-    if (dynamic_now) {
+    if (expected_dynamic) {
         cassette_view_apply_small_roller_tint(g_next_prefetch.tint_lut);
         g_shell_tint_generation = generation;
         g_shell_tint_track = track;
@@ -3137,56 +3429,28 @@ static bool cassette_view_try_promote_next_visual(uint32_t generation, uint32_t 
     }
     if (g_shell_image != nullptr) lv_obj_invalidate(g_shell_image);
 
-    cassette_view_promote_controls_buffer(generation, track);
+    // next 的压暗静态磁带已经完整生成，切歌只交换 current/next 指针。
+    // 控件若正在显示，背景在同一个 LVGL 回调内直接换成新歌，不闪动态中间态。
+    if (!cassette_view_promote_next_controls_buffer(generation, track)) {
+        return false;
+    }
 
     if (old_cover.slot_index != 0xFFU) cover_surface_cache_release(&old_cover);
     if (old_fallback.slot_index != 0xFFU) fallback_cover_image_release(&old_fallback);
     fallback_cover_image_discard_unpinned();
-    cover_surface_cache_retain_track(track);
+    if (!g_cover_is_no_artwork_fallback) {
+        cover_surface_cache_retain_track(track);
+    }
 
     const uint32_t promoted_track = g_next_prefetch.track;
+    const bool promoted_fallback = g_next_prefetch.no_artwork;
     g_next_prefetch = {};
     lv_obj_invalidate(g_root);
     ESP_LOGI(TAG,
-        "下一首磁带预缓存命中：track=%lu 封面+壳体+控件缓存直接提升，无Tint等待",
-        static_cast<unsigned long>(promoted_track));
+        "下一首磁带预缓存命中：track=%lu %s+磁带壳+压暗快照直接提升",
+        static_cast<unsigned long>(promoted_track),
+        promoted_fallback ? "缺省封面" : "原始封面");
     return true;
-}
-
-static bool cassette_view_try_reuse_next_no_artwork_visual(uint32_t generation, uint32_t track)
-{
-    if (g_next_prefetch.state != CassetteNextPrefetchState::ReuseNoArtwork ||
-        g_next_prefetch.generation != generation || g_next_prefetch.track != track ||
-        !g_cover_is_no_artwork_fallback) {
-        return false;
-    }
-
-    // 缺省封面和原装粉色壳体已经是目标视觉；切歌时只更新视觉归属，
-    // 不重新绑定图片、不重新申请 fallback，也不触发封面预读。
-    g_cover_generation = generation;
-    g_cover_track = track;
-    g_cover_y_offset_px = 0;
-    cassette_view_mark_controls_cache_dirty();
-
-    g_next_prefetch = {};
-    ESP_LOGI(TAG, "下一首无封面视觉直接复用：track=%lu",
-        static_cast<unsigned long>(track));
-    return true;
-}
-
-static void cassette_view_promote_next_controls_only(uint32_t generation, uint32_t track)
-{
-    if (g_next_prefetch.state != CassetteNextPrefetchState::Ready ||
-        !g_next_prefetch.no_artwork ||
-        g_next_prefetch.generation != generation || g_next_prefetch.track != track ||
-        g_next_controls_cache_pixels == nullptr) {
-        return;
-    }
-    cassette_view_promote_controls_buffer(generation, track);
-    const uint32_t promoted_track = g_next_prefetch.track;
-    g_next_prefetch = {};
-    ESP_LOGI(TAG, "下一首无封面磁带控件缓存命中：track=%lu",
-        static_cast<unsigned long>(promoted_track));
 }
 
 static bool cassette_view_bind_current_cover()
@@ -3214,9 +3478,6 @@ static bool cassette_view_bind_current_cover()
     if (cassette_view_try_promote_next_visual(generation, track)) {
         return true;
     }
-    if (cassette_view_try_reuse_next_no_artwork_visual(generation, track)) {
-        return true;
-    }
 
     if (g_cover_is_no_artwork_fallback &&
         g_cover_generation == generation && g_cover_track == track) {
@@ -3235,13 +3496,11 @@ static bool cassette_view_bind_current_cover()
     // 前者提交磁带专用 fallback + 粉色壳体；后者继续保留上一套完整视觉。
     MediaArtworkViewV2 artwork = {};
     if (!media_library_get_artwork_view(track, &artwork)) {
-        const bool bound = cassette_view_bind_no_artwork_label(generation, track);
-        if (bound) cassette_view_promote_next_controls_only(generation, track);
-        return bound;
+        return cassette_view_bind_no_artwork_label(generation, track);
     }
 
     CoverSurfaceLease next = {};
-    if (!cover_surface_cache_acquire(track, &next) || next.normal_rgb565 == nullptr ||
+    if (!cover_surface_cache_acquire_normal(track, &next) || next.normal_rgb565 == nullptr ||
         next.width == 0U || next.height == 0U || next.data_size == 0U) {
         return false;
     }
@@ -3570,6 +3829,9 @@ static bool cassette_view_set_active_internal(bool active, bool preserve_next_pr
     g_lyrics_requested_track = UINT32_MAX;
     cassette_view_clear_lyrics();
     cassette_view_apply_aux_visibility();
+    if (!preserve_next_prefetch) {
+        (void)cassette_view_trim_memory();
+    }
     return true;
 }
 
@@ -3595,7 +3857,7 @@ bool cassette_view_prepare_track_transition_hold()
 
     const uint32_t track = static_cast<uint32_t>(player_state_get_index());
     CoverSurfaceLease lease = {};
-    if (!cover_surface_cache_acquire(track, &lease)) {
+    if (!cover_surface_cache_acquire_normal(track, &lease)) {
         ESP_LOGI(TAG, "磁带曲库交接未命中旧Surface：track=%lu",
             static_cast<unsigned long>(track));
         return false;
@@ -3662,7 +3924,7 @@ bool cassette_view_try_present_deferred()
     cassette_view_apply_aux_visibility();
     cassette_view_update_mini_lyrics();
     cassette_view_update_mechanics();
-    // 控件缓存延后到后续 100ms 背景刷新再生成，不能拖慢首次切入磁带的视觉提交。
+    // Controls 已打开时，上面已经等待压暗静态快照 ready；这里一次提交完整磁带控件背景。
     lv_obj_invalidate(g_root);
     return true;
 }
@@ -3731,29 +3993,36 @@ void cassette_view_set_controls_visible(bool visible)
 {
     if (g_controls_visible == visible) {
         cassette_view_apply_aux_visibility();
+        if (visible && g_active && !cassette_view_controls_cache_matches_current()) {
+            (void)cassette_view_schedule_current_cache();
+        }
         return;
     }
 
     g_controls_visible = visible;
-    cassette_view_apply_aux_visibility();
     if (!g_active) {
-        // Artwork 模式也会同步 Controls 状态；只记状态，不操作未激活的磁带机械层。
+        cassette_view_apply_aux_visibility();
         return;
     }
 
     if (visible) {
-        // 点击时以“屏幕当前实际显示的磁带视觉”为准，而不是 PlayerState 的目标 track。
-        // 切歌未命中缓存时 PlayerState 会先变化，但屏幕仍应继续显示上一首完整磁带+封面。
-        if (cassette_view_controls_cache_matches_visible_visual() && g_controls_cache_image != nullptr) {
+        // current 快照在正常磁带播放期间已经预存。命中时直接显示；
+        // 极端情况下还没准备完，则保持冻结画面并补做一次 current。
+        if (cassette_view_controls_cache_matches_visible_visual() &&
+            g_controls_cache_image != nullptr) {
             lv_obj_remove_flag(g_controls_cache_image, LV_OBJ_FLAG_HIDDEN);
             lv_obj_move_foreground(g_controls_cache_image);
+        } else {
+            (void)cassette_view_schedule_current_cache();
         }
     } else if (g_controls_cache_image != nullptr) {
+        // 关闭控件只隐藏，不释放 current 快照；下一次展开直接复用。
         lv_obj_add_flag(g_controls_cache_image, LV_OBJ_FLAG_HIDDEN);
     }
+    cassette_view_apply_aux_visibility();
 
-    // Controls 打开时仍冻结真实机械层。缓存命中时屏幕只重绘预暗 RGB565；
-    // 缓存未就绪则保留原来的实时半透明 Backdrop 作为兼容兜底。
+    // Controls 打开时冻结真实机械层；静态快照 ready 前也保持冻结，
+    // 不让用户看到“先动着压暗、随后再冻结”的两阶段画面。
     const int64_t now_us = esp_timer_get_time();
     g_last_mechanics_frame_us = now_us;
     g_last_tape_glint_us = now_us;
@@ -3765,8 +4034,8 @@ void cassette_view_set_controls_visible(bool visible)
     }
 
     if (g_active && !visible) {
-        // 控件关闭后先刷新封面/文字，再按当前真实播放进度同步一次机械层；
-        // 因时间基准刚重置，不会补跑控件显示期间漏掉的卷轴帧。
+        // 控件关闭后先刷新封面/文字/歌词，再按当前真实播放进度同步机械层；
+        // 时间基准已重置，不补跑控件显示期间漏掉的卷轴帧。
         cassette_view_update();
         cassette_view_update_mechanics();
     }
@@ -3778,7 +4047,9 @@ void cassette_view_set_controls_visible(bool visible)
 
     ESP_LOGI(TAG, "控件机械动画：%s cache=%s",
         visible ? "冻结" : "恢复",
-        visible && cassette_view_controls_cache_active() ? "PSRAM" : "live");
+        visible && cassette_view_controls_cache_active() ? "PSRAM直显" :
+            (visible ? "准备中" : "预存保留"));
+    cassette_view_log_psram_ledger(visible ? "controls_open" : "controls_close");
 }
 
 bool cassette_view_controls_cache_active()
@@ -3813,6 +4084,7 @@ void cassette_view_set_launcher_suspended(bool suspended)
     }
 
     ESP_LOGI(TAG, "Launcher机械动画：%s", suspended ? "冻结" : "恢复");
+    cassette_view_log_psram_ledger(suspended ? "launcher_open" : "launcher_close");
 }
 
 void cassette_view_set_seek_frozen(bool frozen)

@@ -7,6 +7,7 @@
 #include "esp_heap_caps.h"
 #include "esp_jpeg_dec.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
 
 #include "storage_io.h"
 #include "system_paths.h"
@@ -35,6 +36,7 @@ struct FallbackCoverSlot
 
 static FallbackCoverSlot g_slots[kSlotCount] = {};
 static uint32_t g_next_revision = 1U;
+static portMUX_TYPE g_slots_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static uint8_t kind_to_slot(FallbackCoverImageKind kind)
 {
@@ -51,15 +53,6 @@ static const char *kind_path(FallbackCoverImageKind kind)
 static const char *kind_name(FallbackCoverImageKind kind)
 {
     return kind == FallbackCoverImageKind::Cassette ? "磁带标签" : "封面视图";
-}
-
-static void free_slot(FallbackCoverSlot *slot)
-{
-    if (slot == nullptr) return;
-    if (slot->rgb565 != nullptr) {
-        heap_caps_free(slot->rgb565);
-    }
-    *slot = {};
 }
 
 static bool read_file_to_psram(const char *path, uint8_t **out_data, size_t *out_size)
@@ -188,11 +181,10 @@ static bool decode_jpeg_460(const uint8_t *data, size_t size, uint8_t **out_rgb5
     return true;
 }
 
-static bool ensure_slot_loaded(FallbackCoverImageKind kind)
+static bool load_kind_rgb565(FallbackCoverImageKind kind, uint8_t **out_rgb565)
 {
-    const uint8_t slot_index = kind_to_slot(kind);
-    FallbackCoverSlot &slot = g_slots[slot_index];
-    if (slot.rgb565 != nullptr) return true;
+    if (out_rgb565 == nullptr) return false;
+    *out_rgb565 = nullptr;
 
     const char *path = kind_path(kind);
     uint8_t *compressed = nullptr;
@@ -211,17 +203,11 @@ static bool ensure_slot_loaded(FallbackCoverImageKind kind)
         return false;
     }
 
-    slot.rgb565 = rgb565;
-    slot.data_size = kFallbackRgb565Bytes;
-    slot.width = kFallbackWidth;
-    slot.height = kFallbackHeight;
-    slot.revision = g_next_revision++;
-    if (g_next_revision == 0U) g_next_revision = 1U;
-
+    *out_rgb565 = rgb565;
     ESP_LOGI(TAG, "%s替补JPG已准备：%s compressed=%uB RGB565=%uB PSRAM",
         kind_name(kind), path,
         static_cast<unsigned>(compressed_size),
-        static_cast<unsigned>(slot.data_size));
+        static_cast<unsigned>(kFallbackRgb565Bytes));
     return true;
 }
 
@@ -233,38 +219,108 @@ bool fallback_cover_image_acquire(FallbackCoverImageKind kind, FallbackCoverImag
     *out_lease = {};
 
     const uint8_t slot_index = kind_to_slot(kind);
-    if (slot_index >= kSlotCount || !ensure_slot_loaded(kind)) return false;
+    if (slot_index >= kSlotCount) return false;
 
+    // 快路径只在短临界区内增加 pin；JPEG 读盘/解码绝不持锁。
+    portENTER_CRITICAL(&g_slots_mux);
     FallbackCoverSlot &slot = g_slots[slot_index];
-    if (slot.pin_count == UINT16_MAX) return false;
-    ++slot.pin_count;
+    if (slot.rgb565 != nullptr) {
+        if (slot.pin_count == UINT16_MAX) {
+            portEXIT_CRITICAL(&g_slots_mux);
+            return false;
+        }
+        ++slot.pin_count;
+        out_lease->rgb565 = slot.rgb565;
+        out_lease->data_size = slot.data_size;
+        out_lease->width = slot.width;
+        out_lease->height = slot.height;
+        out_lease->revision = slot.revision;
+        out_lease->slot_index = slot_index;
+        portEXIT_CRITICAL(&g_slots_mux);
+        return true;
+    }
+    portEXIT_CRITICAL(&g_slots_mux);
 
-    out_lease->rgb565 = slot.rgb565;
-    out_lease->data_size = slot.data_size;
-    out_lease->width = slot.width;
-    out_lease->height = slot.height;
-    out_lease->revision = slot.revision;
-    out_lease->slot_index = slot_index;
-    return true;
+    uint8_t *loaded_rgb565 = nullptr;
+    if (!load_kind_rgb565(kind, &loaded_rgb565) || loaded_rgb565 == nullptr) return false;
+
+    // 两个 Core 可能同时发现空槽并各自解码。只允许第一个结果安装；
+    // 后到者复用已安装槽并释放自己的临时副本。
+    uint8_t *redundant_rgb565 = nullptr;
+    bool acquired = false;
+    portENTER_CRITICAL(&g_slots_mux);
+    FallbackCoverSlot &install_slot = g_slots[slot_index];
+    if (install_slot.rgb565 == nullptr) {
+        install_slot.rgb565 = loaded_rgb565;
+        install_slot.data_size = kFallbackRgb565Bytes;
+        install_slot.width = kFallbackWidth;
+        install_slot.height = kFallbackHeight;
+        install_slot.revision = g_next_revision++;
+        if (g_next_revision == 0U) g_next_revision = 1U;
+        loaded_rgb565 = nullptr;
+    }
+    if (install_slot.pin_count != UINT16_MAX) {
+        ++install_slot.pin_count;
+        out_lease->rgb565 = install_slot.rgb565;
+        out_lease->data_size = install_slot.data_size;
+        out_lease->width = install_slot.width;
+        out_lease->height = install_slot.height;
+        out_lease->revision = install_slot.revision;
+        out_lease->slot_index = slot_index;
+        acquired = true;
+    }
+    redundant_rgb565 = loaded_rgb565;
+    portEXIT_CRITICAL(&g_slots_mux);
+
+    if (redundant_rgb565 != nullptr) heap_caps_free(redundant_rgb565);
+    return acquired;
 }
 
 void fallback_cover_image_release(FallbackCoverImageLease *lease)
 {
     if (lease == nullptr) return;
+    portENTER_CRITICAL(&g_slots_mux);
     if (lease->slot_index < kSlotCount) {
         FallbackCoverSlot &slot = g_slots[lease->slot_index];
         if (slot.revision == lease->revision && slot.pin_count > 0U) {
             --slot.pin_count;
         }
     }
+    portEXIT_CRITICAL(&g_slots_mux);
     *lease = {};
 }
 
 void fallback_cover_image_discard_unpinned()
 {
+    uint8_t *detached[kSlotCount] = {};
+    size_t detached_count = 0U;
+
+    // 只在临界区内摘掉指针；heap free 放到锁外，避免长时间关中断。
+    portENTER_CRITICAL(&g_slots_mux);
     for (uint8_t i = 0U; i < kSlotCount; ++i) {
-        if (g_slots[i].pin_count == 0U) {
-            free_slot(&g_slots[i]);
+        if (g_slots[i].pin_count == 0U && g_slots[i].rgb565 != nullptr) {
+            detached[detached_count++] = g_slots[i].rgb565;
+            g_slots[i] = {};
         }
     }
+    portEXIT_CRITICAL(&g_slots_mux);
+
+    for (size_t i = 0U; i < detached_count; ++i) {
+        heap_caps_free(detached[i]);
+    }
+}
+
+void fallback_cover_image_get_debug_snapshot(FallbackCoverImageDebugSnapshot *out_snapshot)
+{
+    if (out_snapshot == nullptr) return;
+    *out_snapshot = {};
+
+    portENTER_CRITICAL(&g_slots_mux);
+    const FallbackCoverSlot &artwork = g_slots[kind_to_slot(FallbackCoverImageKind::Artwork)];
+    const FallbackCoverSlot &cassette = g_slots[kind_to_slot(FallbackCoverImageKind::Cassette)];
+    out_snapshot->artwork_bytes = artwork.rgb565 != nullptr ? artwork.data_size : 0U;
+    out_snapshot->cassette_bytes = cassette.rgb565 != nullptr ? cassette.data_size : 0U;
+    out_snapshot->artwork_pins = artwork.pin_count;
+    out_snapshot->cassette_pins = cassette.pin_count;
+    portEXIT_CRITICAL(&g_slots_mux);
 }
