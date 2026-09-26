@@ -29,6 +29,7 @@ static DeviceSettingsSnapshot make_defaults()
     defaults.ready = false;
     defaults.loaded_from_nvs = false;
     defaults.usb_mode = DeviceUsbMode::Serial;
+    defaults.ble_enabled = false;
     defaults.audio_output_mode = DeviceAudioOutputMode::NormalHeadphones;
     defaults.brightness_level = 60U;
     defaults.aux_key_mode = DeviceAuxKeyMode::Volume;
@@ -160,6 +161,9 @@ esp_err_t device_settings_init()
     if (nvs_get_u8(handle, "usb", &u8) == ESP_OK && usb_mode_valid(u8)) {
         g_settings.usb_mode = static_cast<DeviceUsbMode>(u8);
     }
+    if (nvs_get_u8(handle, "ble", &u8) == ESP_OK && u8 <= 1U) {
+        g_settings.ble_enabled = u8 != 0U;
+    }
     if (nvs_get_u8(handle, "audioout", &u8) == ESP_OK && audio_output_mode_valid(u8)) {
         g_settings.audio_output_mode = static_cast<DeviceAudioOutputMode>(u8);
     }
@@ -216,8 +220,9 @@ esp_err_t device_settings_init()
     nvs_close(handle);
     g_settings.ready = true;
     g_settings.loaded_from_nvs = true;
-    ESP_LOGI(TAG, "Settings V1加载完成：USB=%s audio=%s bright=%u aux=%s cassette=%s motion=%s nsfgain=+%udB",
+    ESP_LOGI(TAG, "Settings V1加载完成：USB=%s BLE=%s audio=%s bright=%u aux=%s cassette=%s motion=%s nsfgain=+%udB",
         device_settings_usb_mode_name(g_settings.usb_mode),
+        g_settings.ble_enabled ? "开" : "关",
         device_settings_audio_output_mode_name(g_settings.audio_output_mode),
         static_cast<unsigned>(g_settings.brightness_level),
         device_settings_aux_key_mode_name(g_settings.aux_key_mode),
@@ -247,6 +252,16 @@ esp_err_t device_settings_set_usb_mode(DeviceUsbMode mode)
     const esp_err_t ret = commit_u8("usb", static_cast<uint8_t>(mode));
     if (ret != ESP_OK) g_settings.usb_mode = old;
     log_commit_failure("usb", ret);
+    return ret;
+}
+
+esp_err_t device_settings_set_ble_enabled(bool enabled)
+{
+    const bool old = g_settings.ble_enabled;
+    g_settings.ble_enabled = enabled;
+    const esp_err_t ret = commit_u8("ble", enabled ? 1U : 0U);
+    if (ret != ESP_OK) g_settings.ble_enabled = old;
+    log_commit_failure("ble", ret);
     return ret;
 }
 

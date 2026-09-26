@@ -19,6 +19,7 @@
 #include "power_service.h"
 #include "gpio0_service.h"
 #include "device_settings.h"
+#include "ble_remote_service.h"
 #include "battery_service.h"
 #include "motion_service.h"
 #include "screen_lock_simple.h"
@@ -116,6 +117,7 @@ void system_runtime_update()
         return;
     }
     if (g_background_start_attempted) {
+        ble_remote_service_update();
         runtime_optional_service_health_update();
         return;
     }
@@ -157,6 +159,11 @@ void system_runtime_update()
     }
 
     const esp_err_t device_settings_ret = device_settings_init();
+    const esp_err_t ble_ret = ble_remote_service_init();
+    if (ble_ret != ESP_OK && ble_ret != ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGW(TAG, "BLE Foundation初始化失败：%s；保持关闭并由运行期恢复",
+            esp_err_to_name(ble_ret));
+    }
     if (device_settings_ret != ESP_OK) {
         ESP_LOGW(TAG, "设备设置NVS初始化失败：%s；Settings仍使用RAM默认值",
             esp_err_to_name(device_settings_ret));
@@ -164,6 +171,8 @@ void system_runtime_update()
     if (device_settings_ret == ESP_OK) {
         DeviceSettingsSnapshot settings_snapshot = {};
         if (device_settings_get_snapshot(&settings_snapshot)) {
+            ble_remote_service_set_enabled(settings_snapshot.ble_enabled);
+
             const esp_err_t brightness_ret =
                 screen_lock_simple_set_normal_brightness(settings_snapshot.brightness_level);
             if (brightness_ret != ESP_OK) {
@@ -188,6 +197,8 @@ void system_runtime_update()
             }
         }
     }
+
+    ble_remote_service_update();
 
     const esp_err_t settings_ret = app_ret == ESP_OK
         ? settings_app_register()
@@ -249,13 +260,14 @@ void system_runtime_update()
 
     ESP_LOGI(
         TAG,
-        "READY 后台服务：Apps=%s MusicAdapter=%s Ebook=%s VisualMusic=%s Video=%s DeviceSettings=%s Settings=%s Battery=%s Motion=%s PowerKey=%s AuxKey=%s Spectrum=%s Artwork=%s CoverSurface=%s Lyrics=%s",
+        "READY 后台服务：Apps=%s MusicAdapter=%s Ebook=%s VisualMusic=%s Video=%s DeviceSettings=%s BLE=%s Settings=%s Battery=%s Motion=%s PowerKey=%s AuxKey=%s Spectrum=%s Artwork=%s CoverSurface=%s Lyrics=%s",
         esp_err_to_name(app_ret),
         esp_err_to_name(music_adapter_ret),
         esp_err_to_name(ebook_ret),
         esp_err_to_name(visual_music_ret),
         esp_err_to_name(video_ret),
         esp_err_to_name(device_settings_ret),
+        ble_ret == ESP_ERR_NOT_SUPPORTED ? "SDKCONFIG_OFF" : esp_err_to_name(ble_ret),
         esp_err_to_name(settings_ret),
         esp_err_to_name(battery_ret),
         esp_err_to_name(motion_ret),

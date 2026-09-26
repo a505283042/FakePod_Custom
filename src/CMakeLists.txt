@@ -25,6 +25,7 @@ idf_component_register(
         "system/system_runtime.cpp"
         "system/persistent_state.cpp"
         "system/device_settings.cpp"
+        "system/ble_remote_service.cpp"
         "system/battery_service.cpp"
         "system/motion_service.cpp"
         "system/usb_storage_service.cpp"
@@ -161,6 +162,7 @@ idf_component_register(
         esp_partition
         nvs_flash
         fatfs
+        bt
 
 )
 

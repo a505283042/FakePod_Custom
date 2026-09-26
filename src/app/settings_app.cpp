@@ -16,6 +16,7 @@
 #include "app_build_info.h"
 #include "app_manager.h"
 #include "audio_service.h"
+#include "ble_remote_service.h"
 #include "device_settings.h"
 #include "font/font_manager.h"
 #include "font/usb_service_font.h"
@@ -1532,6 +1533,31 @@ static void usb_tf_storage_return_click_cb(lv_event_t *event)
     }
 }
 
+static void ble_mode_click_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event) || g_page != SettingsPage::Connection) return;
+
+    DeviceSettingsSnapshot settings = {};
+    if (!device_settings_get_snapshot(&settings)) return;
+
+    const bool requested = !settings.ble_enabled;
+    const esp_err_t persist_ret = device_settings_set_ble_enabled(requested);
+    if (persist_ret != ESP_OK) {
+        ESP_LOGW(TAG, "保存BLE开关失败：%s", esp_err_to_name(persist_ret));
+        return;
+    }
+
+    ble_remote_service_set_enabled(requested);
+    ble_remote_service_update();
+
+    BleRemoteSnapshot ble = {};
+    if (g_detail_values[2] != nullptr && ble_remote_service_get_snapshot(&ble)) {
+        lv_label_set_text(g_detail_values[2], ble_remote_service_state_name(ble.state));
+        lv_obj_invalidate(g_detail_values[2]);
+    }
+    ESP_LOGI(TAG, "BLE模式切换：目标=%s", requested ? "开启" : "关闭");
+}
+
 static void create_connection_page(const DeviceSettingsSnapshot &settings)
 {
     // USB模式仅显示当前启动配置；真正的高风险TF owner切换只允许从下一行显式触发，
@@ -1547,7 +1573,12 @@ static void create_connection_page(const DeviceSettingsSnapshot &settings)
         "进入",
         SettingsDetailIcon::TfFiles,
         usb_tf_storage_enter_click_cb);
-    add_detail_row(2, "BLE模式", "待接入", SettingsDetailIcon::Bluetooth, false);
+    BleRemoteSnapshot ble = {};
+    const char *ble_value = settings.ble_enabled ? "启动中" : "关闭";
+    if (ble_remote_service_get_snapshot(&ble)) {
+        ble_value = ble_remote_service_state_name(ble.state);
+    }
+    add_clickable_detail_row(2, "BLE模式", ble_value, SettingsDetailIcon::Bluetooth, ble_mode_click_cb);
     add_detail_row(3, "飞行模式", "待接入", SettingsDetailIcon::Airplane, false);
 }
 
@@ -2156,6 +2187,12 @@ static void refresh_timer_cb(lv_timer_t *timer)
     if (g_page == SettingsPage::Main) return;
 
     char value[64] = {};
+    if (g_page == SettingsPage::Connection && g_detail_values[2] != nullptr) {
+        BleRemoteSnapshot ble = {};
+        if (ble_remote_service_get_snapshot(&ble)) {
+            lv_label_set_text(g_detail_values[2], ble_remote_service_state_name(ble.state));
+        }
+    }
     if (g_page == SettingsPage::About) {
         if (g_detail_values[2] != nullptr) {
             format_mb(value, sizeof(value),

@@ -148,6 +148,7 @@ struct FlacPrefetchContext
     volatile bool stop_requested = false;
     volatile bool eof = false;
     volatile bool io_error = false;
+    volatile esp_err_t io_error_code = ESP_OK;
 
     // P1.5R.2 Adaptive Prefetch QoS。起播预充完成前保持 P1.2.15 固定批次，
     // 正式播放后才按 ring 水位动态决定下一次 cooperative block 的批次。
@@ -747,6 +748,7 @@ static void flac_prefetch_task(void *arg)
     ) {
         if (context != nullptr) {
             context->io_error = true;
+            context->io_error_code = ESP_ERR_INVALID_STATE;
 #if APP_DIAG_FLAC_PERFORMANCE
             context->stack_hwm = uxTaskGetStackHighWaterMark(nullptr);
 #endif
@@ -761,6 +763,7 @@ static void flac_prefetch_task(void *arg)
     context->core_id = xPortGetCoreID();
     if (context->core_id != FLAC_PREFETCH_TASK_CORE) {
         context->io_error = true;
+        context->io_error_code = ESP_ERR_INVALID_STATE;
 #if APP_DIAG_FLAC_PERFORMANCE
         context->stack_hwm = uxTaskGetStackHighWaterMark(nullptr);
 #endif
@@ -890,6 +893,7 @@ static void flac_prefetch_task(void *arg)
         if (source_ret != ESP_OK) {
             if (!context->stop_requested) {
                 context->io_error = true;
+                context->io_error_code = source_ret;
                 ESP_LOGE(TAG, "FLAC 预取任务读取 Source 失败：source=%s ret=%s",
                     audio_source_name(context->source), esp_err_to_name(source_ret));
             }
@@ -900,6 +904,7 @@ static void flac_prefetch_task(void *arg)
                 context->eof = true;
             } else if (!context->stop_requested) {
                 context->io_error = true;
+                context->io_error_code = ESP_ERR_INVALID_STATE;
                 ESP_LOGE(TAG, "FLAC 预取任务发生非 EOF 短读");
             }
             break;
@@ -1047,11 +1052,14 @@ static esp_err_t flac_prefetch_start(FlacDecoder *decoder)
     flac_storage_window_publish(context);
     if (context->io_error || primed < minimum) {
         const bool io_error = context->io_error;
+        const esp_err_t io_error_code = context->io_error_code;
         ESP_LOGE(TAG, "FLAC 预取启动失败：已缓存=%uB，最低需要=%uB",
             static_cast<unsigned>(primed),
             static_cast<unsigned>(minimum));
         flac_prefetch_destroy(decoder);
-        return io_error ? ESP_FAIL : ESP_ERR_TIMEOUT;
+        return io_error
+            ? (io_error_code != ESP_OK ? io_error_code : ESP_ERR_INVALID_STATE)
+            : ESP_ERR_TIMEOUT;
     }
 
     // 起播预充已经达到最低要求后才启用自适应 QoS，避免改变已经验证过的启动路径。
@@ -2095,8 +2103,10 @@ static esp_err_t flac_prepare_input_window(FlacDecoder *decoder, bool *out_recei
         }
 
         if (context->io_error) {
-            ESP_LOGE(TAG, "FLAC 预取层报告 SD 读取失败");
-            return ESP_FAIL;
+            const esp_err_t io_error_code = context->io_error_code;
+            const esp_err_t error = io_error_code != ESP_OK ? io_error_code : ESP_ERR_INVALID_STATE;
+            ESP_LOGE(TAG, "FLAC 预取层报告 SD 读取失败：%s", esp_err_to_name(error));
+            return error;
         }
         if (context->eof) {
             decoder->input_chunk_eos = true;

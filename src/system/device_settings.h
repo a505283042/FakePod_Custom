@@ -48,6 +48,7 @@ struct DeviceSettingsSnapshot {
     bool ready = false;
     bool loaded_from_nvs = false;
     DeviceUsbMode usb_mode = DeviceUsbMode::Serial;
+    bool ble_enabled = false;
     DeviceAudioOutputMode audio_output_mode = DeviceAudioOutputMode::NormalHeadphones;
     uint8_t brightness_level = 60U;          // CO5300 正常显示亮度 5~100%；0 保留给熄屏。
     DeviceAuxKeyMode aux_key_mode = DeviceAuxKeyMode::Volume;
@@ -70,6 +71,7 @@ bool device_settings_remember_volume_enabled();
 
 // 后续功能模块统一通过这些 setter 修改设置；每次只提交一个很小的 NVS 事务。
 esp_err_t device_settings_set_usb_mode(DeviceUsbMode mode);
+esp_err_t device_settings_set_ble_enabled(bool enabled);
 esp_err_t device_settings_set_audio_output_mode(DeviceAudioOutputMode mode);
 esp_err_t device_settings_set_brightness_level(uint8_t level);
 esp_err_t device_settings_set_aux_key_mode(DeviceAuxKeyMode mode);

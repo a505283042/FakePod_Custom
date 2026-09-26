@@ -23,7 +23,9 @@ static esp_err_t sd_file_read(void *context, void *buffer, size_t bytes, size_t 
     }
     *out_bytes = fread(buffer, 1, bytes, source->file);
     if (*out_bytes < bytes && ferror(source->file)) {
-        return ESP_FAIL;
+        // stdio ferror 表示底层存储 I/O 已失败；损坏码流应由解码器在成功读到字节后判定。
+        // 使用 INVALID_STATE 让播放层把它归为 System，避免 SD/NO_MEM 故障被当成坏曲自动跳过。
+        return ESP_ERR_INVALID_STATE;
     }
     return ESP_OK;
 }

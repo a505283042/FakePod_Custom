@@ -44,6 +44,7 @@ struct BufferedSdContext
     volatile bool stop_requested = false;
     volatile bool eof = false;
     volatile bool io_error = false;
+    volatile esp_err_t io_error_code = ESP_OK;
 };
 
 static BufferedSdContext *buffered_context(void *context)
@@ -58,6 +59,7 @@ static void buffered_sd_task(void *arg)
         context->stream == nullptr || context->read_buffer == nullptr) {
         if (context != nullptr) {
             context->io_error = true;
+            context->io_error_code = ESP_ERR_INVALID_STATE;
             if (context->done != nullptr) {
                 xSemaphoreGive(context->done);
             }
@@ -69,6 +71,7 @@ static void buffered_sd_task(void *arg)
     context->core_id = xPortGetCoreID();
     if (context->core_id != BUFFERED_SD_TASK_CORE) {
         context->io_error = true;
+        context->io_error_code = ESP_ERR_INVALID_STATE;
         ESP_LOGE(TAG, "预读任务核心绑定异常：当前=%d，期望=%d",
             static_cast<int>(context->core_id),
             static_cast<int>(BUFFERED_SD_TASK_CORE));
@@ -124,6 +127,7 @@ static void buffered_sd_task(void *arg)
         if (read_ret != ESP_OK) {
             if (!context->stop_requested) {
                 context->io_error = true;
+                context->io_error_code = read_ret;
                 ESP_LOGE(TAG, "顺序预读失败：ret=%s", esp_err_to_name(read_ret));
             }
             break;
@@ -133,6 +137,7 @@ static void buffered_sd_task(void *arg)
                 context->eof = true;
             } else if (!context->stop_requested) {
                 context->io_error = true;
+                context->io_error_code = ESP_ERR_INVALID_STATE;
                 ESP_LOGE(TAG, "顺序预读发生非 EOF 短读");
             }
             break;
@@ -172,7 +177,9 @@ static esp_err_t buffered_sd_read(void *raw_context, void *buffer, size_t bytes,
 
         if (context->io_error) {
             *out_bytes = total;
-            return ESP_FAIL;
+            return context->io_error_code != ESP_OK
+                ? context->io_error_code
+                : ESP_ERR_INVALID_STATE;
         }
         if (context->eof) {
             break;
@@ -363,11 +370,14 @@ esp_err_t buffered_sd_audio_source_open(
     const size_t primed = xStreamBufferBytesAvailable(context->stream);
     if (context->io_error || primed < minimum) {
         const bool io_error = context->io_error;
+        const esp_err_t io_error_code = context->io_error_code;
         ESP_LOGE(TAG, "顺序预读启动失败：已缓存=%uB，最低需要=%uB",
             static_cast<unsigned>(primed),
             static_cast<unsigned>(minimum));
         buffered_sd_destroy_context(context);
-        return io_error ? ESP_FAIL : ESP_ERR_TIMEOUT;
+        return io_error
+            ? (io_error_code != ESP_OK ? io_error_code : ESP_ERR_INVALID_STATE)
+            : ESP_ERR_TIMEOUT;
     }
 
     out_source->ops = &BUFFERED_SD_OPS;
