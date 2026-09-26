@@ -1083,7 +1083,19 @@ static void usb_library_scan_event(
     uint32_t value,
     void *)
 {
-    if (event == MediaLibraryScanEvent::ChangesDetected) {
+    if (event == MediaLibraryScanEvent::InitialBuild) {
+        char status[96] = {};
+        const int written = value == 0U
+            ? snprintf(status, sizeof(status), "正在重新建立音乐库...")
+            : snprintf(
+                status,
+                sizeof(status),
+                "正在重新建立音乐库...\n已扫描到 %lu 首音乐",
+                static_cast<unsigned long>(value));
+        if (written > 0 && static_cast<size_t>(written) < sizeof(status)) {
+            usb_runtime_overlay_set_status(status, 0xC7D5E8);
+        }
+    } else if (event == MediaLibraryScanEvent::ChangesDetected) {
         usb_runtime_overlay_set_status("正在更新音乐库...", 0xC7D5E8);
     } else if (event == MediaLibraryScanEvent::IncrementalAddedProgress) {
         char status[96] = {};
@@ -1101,7 +1113,13 @@ static void usb_library_scan_event(
 static void usb_runtime_overlay_show_library_summary(const MediaLibraryChangeSummary &changes)
 {
     char status[384] = {};
-    size_t used = static_cast<size_t>(snprintf(status, sizeof(status), "音乐库已更新"));
+    size_t used = changes.had_previous_catalog
+        ? static_cast<size_t>(snprintf(status, sizeof(status), "音乐库已更新"))
+        : static_cast<size_t>(snprintf(
+            status,
+            sizeof(status),
+            "音乐库建立完成\n共 %lu 首歌曲",
+            static_cast<unsigned long>(changes.current_count)));
     const auto append_count = [&](const char *label, uint32_t count) {
         if (count == 0U || used >= sizeof(status) - 1U) {
             return;
@@ -1437,7 +1455,8 @@ static void usb_tf_runtime_return_task(void *)
             static_cast<unsigned long>(library_changes.added_count),
             static_cast<unsigned long>(library_changes.removed_count),
             static_cast<unsigned long>(library_changes.updated_count));
-        if (library_changes.changed || library_changes.issue_count > 0U) {
+        if (!library_changes.had_previous_catalog ||
+            library_changes.changed || library_changes.issue_count > 0U) {
             usb_runtime_overlay_show_library_summary(library_changes);
             vTaskDelay(pdMS_TO_TICKS(800));
         }
