@@ -49,18 +49,6 @@ struct CoverSurfaceLease
     bool dimmed_pinned = false;
 };
 
-// 仅用于定位 PSRAM 常驻项；不改变缓存生命周期。
-struct CoverSurfaceDebugSnapshot
-{
-    size_t normal_bytes = 0U;
-    size_t dimmed_bytes = 0U;
-    uint16_t valid_slots = 0U;
-    uint16_t normal_slots = 0U;
-    uint16_t dimmed_slots = 0U;
-    uint16_t normal_pins = 0U;
-    uint16_t dimmed_pins = 0U;
-};
-
 esp_err_t cover_surface_cache_start();
 bool cover_surface_cache_is_ready();
 
@@ -80,6 +68,3 @@ bool cover_surface_cache_restore_dimmed(uint32_t track_index);
 
 // R.36：新当前曲已经安全绑定后，清理所有其它未 pin Surface。稳态只留下当前曲。
 void cover_surface_cache_retain_track(uint32_t track_index);
-
-// 诊断快照只读取槽位统计；获取失败时返回 false，不影响正常缓存。
-bool cover_surface_cache_get_debug_snapshot(CoverSurfaceDebugSnapshot *out_snapshot);

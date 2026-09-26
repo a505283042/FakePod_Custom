@@ -301,6 +301,15 @@ static lv_timer_t *g_artwork_timer = nullptr;
 static lv_timer_t *g_gesture_timer = nullptr;
 static bool g_background_timers_running = true;
 static bool g_app_foreground = true;
+// PreserveBackground 必须回到离开前的 Music 子页面，而不是固定落回 Home。
+enum class MusicBackgroundPage : uint8_t
+{
+    Home = 0,
+    Library,
+    Lyrics,
+    Spectrum,
+};
+static MusicBackgroundPage g_background_page = MusicBackgroundPage::Home;
 // 设置页只覆盖 Music，不需要牺牲已经完成的磁带 next 预读；电子书/视频/NSF 才主动释放。
 static bool g_keep_cassette_prefetch_in_background = false;
 static bool g_launcher_open_after_foreground = false;
@@ -4231,15 +4240,23 @@ esp_err_t player_home_app_leave_background()
     g_keep_cassette_prefetch_in_background =
         target != AppId::Nsf && target != AppId::Video && target != AppId::Ebook;
 
-    // Music 的子页面必须先静默收口，不能调用 HomeResume；否则会在 Manager 已准备切 APP 时
-    // 重新 acquire Artwork lease / 恢复 timer。
-    library_view_suspend_for_app_switch();
-    lyrics_view_close();
-    spectrum_view_close();
+    // PreserveBackground 记录当前 Music 子页面。页面只隐藏/暂停，不走 close/open 重置路径。
+    if (library_view_is_visible()) {
+        g_background_page = MusicBackgroundPage::Library;
+        library_view_suspend_for_app_switch();
+    } else if (lyrics_view_is_visible()) {
+        g_background_page = MusicBackgroundPage::Lyrics;
+        lyrics_view_suspend_for_app_switch();
+    } else if (spectrum_view_is_visible()) {
+        g_background_page = MusicBackgroundPage::Spectrum;
+        spectrum_view_suspend_for_app_switch();
+    } else {
+        g_background_page = MusicBackgroundPage::Home;
+    }
     player_home_launcher_abort_for_app_switch(g_keep_cassette_prefetch_in_background);
 
-    // 控件若正停在压暗静态磁带页，先正常收起 Overlay；这会释放按需快照，
-    // 再由既有 Background QoS 决定保留 next 预取还是完整回收磁带资源。
+    // 控件若正停在压暗静态磁带页，先正常收起 Overlay；
+    // Music 运行态（播放列表/歌词文档/频谱服务/磁带预取）由各自模块继续保留。
     player_home_overlay_hide();
     player_home_cancel_progress_interaction();
     g_volume_dragging = false;
@@ -4256,7 +4273,7 @@ esp_err_t player_home_app_leave_background()
     }
     player_home_update_background_timer_qos();
 
-    ESP_LOGI(TAG, "Music前台已挂起：AudioTask继续运行，Home/Artwork/手势timer暂停");
+    ESP_LOGI(TAG, "Music前台已挂起：保持子页面/列表/歌词/频谱运行态，暂停前台UI timer");
     return ESP_OK;
 }
 
@@ -4272,27 +4289,53 @@ esp_err_t player_home_app_enter_foreground()
 
     g_app_foreground = true;
     g_keep_cassette_prefetch_in_background = false;
-    now_playing_artwork_set_bounded_present_allowed(
-        g_music_visual_mode == MusicVisualMode::Artwork);
     if (g_gesture_timer != nullptr) {
         lv_timer_reset(g_gesture_timer);
         lv_timer_resume(g_gesture_timer);
     }
 
-    // APP 返回 Music 固定落到 Home；歌词/频谱/曲库下次由用户重新打开。
-    player_home_refresh();
-    lv_obj_t *screen = lv_screen_active();
-    if (screen != nullptr) {
-        lv_obj_invalidate(screen);
-    }
-
     const bool open_launcher = g_launcher_open_after_foreground;
     g_launcher_open_after_foreground = false;
     if (open_launcher) {
+        // 显式请求 Launcher 时仍回 Home 再展开，避免把 Launcher 叠到歌词/频谱/曲库上。
+        g_background_page = MusicBackgroundPage::Home;
+    }
+
+    switch (g_background_page) {
+        case MusicBackgroundPage::Library:
+            now_playing_artwork_set_bounded_present_allowed(false);
+            library_view_resume_after_app_switch();
+            player_home_update_background_timer_qos();
+            ESP_LOGI(TAG, "Music恢复前台：恢复原曲库页");
+            break;
+        case MusicBackgroundPage::Lyrics:
+            now_playing_artwork_set_bounded_present_allowed(false);
+            lyrics_view_resume_after_app_switch();
+            player_home_update_background_timer_qos();
+            ESP_LOGI(TAG, "Music恢复前台：恢复原歌词页");
+            break;
+        case MusicBackgroundPage::Spectrum:
+            now_playing_artwork_set_bounded_present_allowed(false);
+            spectrum_view_resume_after_app_switch();
+            player_home_update_background_timer_qos();
+            ESP_LOGI(TAG, "Music恢复前台：恢复原频谱页");
+            break;
+        case MusicBackgroundPage::Home:
+        default:
+            now_playing_artwork_set_bounded_present_allowed(
+                g_music_visual_mode == MusicVisualMode::Artwork);
+            player_home_refresh();
+            ESP_LOGI(TAG, "Music恢复前台：Home/Artwork/手势timer恢复");
+            break;
+    }
+    g_background_page = MusicBackgroundPage::Home;
+
+    lv_obj_t *screen = lv_screen_active();
+    if (screen != nullptr) lv_obj_invalidate(screen);
+
+    if (open_launcher) {
         player_home_launcher_show();
         ESP_LOGI(TAG, "Music恢复前台：复用原生Launcher自动展开");
-    } else {
-        ESP_LOGI(TAG, "Music恢复前台：Home/Artwork/手势timer恢复");
     }
     return ESP_OK;
 }
@@ -4393,6 +4436,7 @@ void player_home_create(lv_obj_t *screen)
     g_gesture_timer = nullptr;
     g_background_timers_running = true;
     g_app_foreground = true;
+    g_background_page = MusicBackgroundPage::Home;
     g_keep_cassette_prefetch_in_background = false;
     g_launcher_open_after_foreground = false;
     g_artwork_resume_without_invalidation = false;

@@ -1094,33 +1094,3 @@ void cover_surface_cache_retain_track(uint32_t track_index)
     if (track_index == UINT32_MAX) return;
     cover_cache_release_unpinned_except(media_catalog_v2_generation(), track_index);
 }
-
-bool cover_surface_cache_get_debug_snapshot(CoverSurfaceDebugSnapshot *out_snapshot)
-{
-    if (out_snapshot == nullptr) return false;
-    *out_snapshot = {};
-    if (g_cache_mutex == nullptr ||
-        xSemaphoreTake(g_cache_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
-        return false;
-    }
-
-    for (size_t i = 0U; i < COVER_CACHE_SLOT_COUNT; ++i) {
-        const CoverCacheEntry &entry = g_cache[i];
-        if (!entry.valid) continue;
-        ++out_snapshot->valid_slots;
-        if (entry.normal != nullptr) {
-            ++out_snapshot->normal_slots;
-            out_snapshot->normal_bytes += entry.size;
-        }
-        if (entry.dimmed != nullptr) {
-            ++out_snapshot->dimmed_slots;
-            out_snapshot->dimmed_bytes += COVER_SURFACE_BYTES;
-        }
-        out_snapshot->normal_pins = static_cast<uint16_t>(
-            out_snapshot->normal_pins + entry.pin_count);
-        out_snapshot->dimmed_pins = static_cast<uint16_t>(
-            out_snapshot->dimmed_pins + entry.dimmed_pin_count);
-    }
-    xSemaphoreGive(g_cache_mutex);
-    return true;
-}

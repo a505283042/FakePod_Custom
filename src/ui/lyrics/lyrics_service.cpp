@@ -930,6 +930,21 @@ bool lyrics_service_request_track(uint32_t track_index)
     if (xSemaphoreTake(g_mutex, portMAX_DELAY) != pdTRUE) {
         return false;
     }
+
+    // 同一 Catalog 的同一首歌词若已经得到稳定结果，直接复用现有文档/状态。
+    // Failed 仍允许重试；Loading 不在这里去重，因为 USB/TF 存储接管可能取消正在读取的请求，
+    // 此时必须允许恢复后重新提交，而不能被一个已经失效的 Loading 状态永久挡住。
+    const bool same_track =
+        g_loading_generation == request.catalog_generation &&
+        g_loading_track == request.track_index;
+    if (same_track &&
+        (g_state == LyricsLoadState::Ready ||
+         g_state == LyricsLoadState::NoLyrics ||
+         g_state == LyricsLoadState::Unsupported)) {
+        xSemaphoreGive(g_mutex);
+        return true;
+    }
+
     request.request_id = g_next_request_id++;
     if (g_next_request_id == 0U) {
         g_next_request_id = 1U;

@@ -1248,6 +1248,40 @@ void spectrum_view_close()
     UI_PAGE_INTERACTION_LOGI("关闭频谱页，返回主页");
 }
 
+void spectrum_view_suspend_for_app_switch()
+{
+    if (g_root == nullptr || !g_visible) return;
+
+    // 只暂停 LVGL 绘制；FFT Task/双帧槽继续工作，返回时直接消费最新快照。
+    g_visible = false;
+    if (g_delayed_start_timer != nullptr) {
+        lv_timer_del(g_delayed_start_timer);
+        g_delayed_start_timer = nullptr;
+    }
+    if (g_timer != nullptr) lv_timer_pause(g_timer);
+    lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
+    UI_PAGE_INTERACTION_LOGI("频谱页因APP切换挂起：保留FFT服务与视觉状态");
+}
+
+void spectrum_view_resume_after_app_switch()
+{
+    if (g_root == nullptr || g_visible) return;
+
+    g_visible = true;
+    lv_obj_remove_flag(g_root, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(g_root);
+    screen_lock_simple_raise();
+    audio_service_set_spectrum_enabled(true);
+
+    // 不清柱高/样式缓存，直接同步后台期间产生的最新 Audio/Spectrum Snapshot。
+    spectrum_timer_cb(nullptr);
+    if (g_timer != nullptr) {
+        lv_timer_reset(g_timer);
+        lv_timer_resume(g_timer);
+    }
+    UI_PAGE_INTERACTION_LOGI("频谱页恢复：复用FFT服务并同步最新频谱");
+}
+
 bool spectrum_view_is_visible()
 {
     return g_visible && g_root != nullptr && !lv_obj_has_flag(g_root, LV_OBJ_FLAG_HIDDEN);

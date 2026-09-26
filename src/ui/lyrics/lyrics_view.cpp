@@ -1377,6 +1377,45 @@ void lyrics_view_close()
     UI_PAGE_INTERACTION_LOGI("关闭歌词页，返回主页");
 }
 
+void lyrics_view_suspend_for_app_switch()
+{
+    if (g_root == nullptr || !g_visible) return;
+
+    // PreserveBackground 只冻结呈现；歌词文档、当前行和请求身份全部保留。
+    g_visible = false;
+    if (g_poll_timer != nullptr) lv_timer_pause(g_poll_timer);
+    if (g_motion_timer != nullptr) lv_timer_pause(g_motion_timer);
+    if (g_overlay_timer != nullptr) lv_timer_pause(g_overlay_timer);
+    gesture_router_set_vertical_adjust_enabled(false);
+    lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
+    UI_PAGE_INTERACTION_LOGI("歌词页因APP切换挂起：保留已解析歌词与当前行");
+}
+
+void lyrics_view_resume_after_app_switch()
+{
+    if (g_root == nullptr || g_visible) return;
+
+    g_visible = true;
+    lv_obj_remove_flag(g_root, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(g_root);
+    screen_lock_simple_raise();
+
+    // 先按当前播放位置同步一次；若后台期间切歌，既有 request_if_needed 会只请求新曲。
+    lyrics_view_timer_cb(nullptr);
+    if (g_poll_timer != nullptr) {
+        lv_timer_reset(g_poll_timer);
+        lv_timer_resume(g_poll_timer);
+    }
+    if (g_motion_active && g_motion_timer != nullptr) {
+        lv_timer_resume(g_motion_timer);
+    }
+    if (g_overlay_visible && g_overlay_timer != nullptr) {
+        lv_timer_reset(g_overlay_timer);
+        lv_timer_resume(g_overlay_timer);
+    }
+    UI_PAGE_INTERACTION_LOGI("歌词页恢复：复用已解析歌词并同步当前播放位置");
+}
+
 bool lyrics_view_is_visible()
 {
     return g_visible;

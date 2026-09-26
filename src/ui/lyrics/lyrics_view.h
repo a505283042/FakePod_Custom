@@ -9,6 +9,9 @@
 void lyrics_view_create(lv_obj_t *screen);
 void lyrics_view_open();
 void lyrics_view_close();
+// PreserveBackground 专用：只隐藏页面和暂停 UI timer，不清空已解析歌词/当前行状态。
+void lyrics_view_suspend_for_app_switch();
+void lyrics_view_resume_after_app_switch();
 bool lyrics_view_is_visible();
 
 // 由播放器唯一 GestureRouter 消费点调用；Overlay 显示时先处理纵向音量，页面级横滑由调用方锁定。

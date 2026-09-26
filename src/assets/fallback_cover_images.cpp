@@ -309,18 +309,3 @@ void fallback_cover_image_discard_unpinned()
         heap_caps_free(detached[i]);
     }
 }
-
-void fallback_cover_image_get_debug_snapshot(FallbackCoverImageDebugSnapshot *out_snapshot)
-{
-    if (out_snapshot == nullptr) return;
-    *out_snapshot = {};
-
-    portENTER_CRITICAL(&g_slots_mux);
-    const FallbackCoverSlot &artwork = g_slots[kind_to_slot(FallbackCoverImageKind::Artwork)];
-    const FallbackCoverSlot &cassette = g_slots[kind_to_slot(FallbackCoverImageKind::Cassette)];
-    out_snapshot->artwork_bytes = artwork.rgb565 != nullptr ? artwork.data_size : 0U;
-    out_snapshot->cassette_bytes = cassette.rgb565 != nullptr ? cassette.data_size : 0U;
-    out_snapshot->artwork_pins = artwork.pin_count;
-    out_snapshot->cassette_pins = cassette.pin_count;
-    portEXIT_CRITICAL(&g_slots_mux);
-}

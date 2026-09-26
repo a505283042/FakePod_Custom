@@ -9,6 +9,9 @@
 void spectrum_view_create(lv_obj_t *screen);
 void spectrum_view_open();
 void spectrum_view_close();
+// PreserveBackground 专用：隐藏页面但保留频谱服务和当前视觉状态。
+void spectrum_view_suspend_for_app_switch();
+void spectrum_view_resume_after_app_switch();
 bool spectrum_view_is_visible();
 
 // R.30 性能审计：返回当前自绘样式名。

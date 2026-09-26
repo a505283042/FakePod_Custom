@@ -324,7 +324,6 @@ static uint8_t *g_tape_amount_pixels = nullptr;
 static lv_image_dsc_t g_big_reel_dsc = {};
 static lv_image_dsc_t g_small_roller_dsc = {};
 static lv_image_dsc_t g_tape_amount_dsc = {};
-
 static bool g_mechanics_ready = false;
 static uint32_t g_big_reel_phase_q16[2] = {};
 static uint32_t g_small_roller_phase_q16 = 0U;
@@ -379,95 +378,6 @@ static int16_t g_pending_cover_y_offset_px = 0;
 static bool g_pending_cover_valid = false;
 // 从封面视图首次切到磁带时，先在隐藏状态准备完整视觉，防止粉色壳体闪现。
 static bool g_present_deferred = false;
-
-// 临时诊断：把磁带页能明确归属的 PSRAM 全部按实际指针计账。
-// 只在关键状态切换时打印，不进入20Hz机械热循环。
-static void cassette_view_log_psram_ledger(const char *reason)
-{
-    CoverSurfaceDebugSnapshot cover = {};
-    FallbackCoverImageDebugSnapshot fallback = {};
-    const bool cover_ok = cover_surface_cache_get_debug_snapshot(&cover);
-    fallback_cover_image_get_debug_snapshot(&fallback);
-
-    const size_t current_snapshot = g_controls_cache_pixels != nullptr ? kControlsCacheBytes : 0U;
-    const size_t back_snapshot = g_controls_cache_back_pixels != nullptr ? kControlsCacheBytes : 0U;
-    const size_t next_snapshot = g_next_controls_cache_pixels != nullptr ? kControlsCacheBytes : 0U;
-    const size_t next_shell = g_next_shell_rgb565 != nullptr ? kPrefetchShellBytes : 0U;
-
-    const size_t shell_native = g_shell_pixels != nullptr ? g_shell_dsc.data_size : 0U;
-    const size_t shell_base = g_shell_base_rgb565 != nullptr ? kPrefetchShellBytes : 0U;
-    const size_t shell_work = g_shell_tint_work_rgb565 != nullptr ? kPrefetchShellBytes : 0U;
-    const size_t shell_luma = g_shell_tint_luma != nullptr
-        ? static_cast<size_t>(kCassetteWidth) * kCassetteHeight : 0U;
-
-    const size_t big_reel = g_big_reel_pixels != nullptr ? g_big_reel_dsc.data_size : 0U;
-    const size_t small_roller = g_small_roller_pixels != nullptr ? g_small_roller_dsc.data_size : 0U;
-    const size_t small_pixels =
-        static_cast<size_t>(g_small_roller_dsc.header.w) * g_small_roller_dsc.header.h;
-    const size_t small_base = g_small_roller_base_rgb565 != nullptr ? small_pixels * 2U : 0U;
-    const size_t small_luma = g_small_roller_tint_luma != nullptr ? small_pixels : 0U;
-    const size_t tape_amount = g_tape_amount_pixels != nullptr ? g_tape_amount_dsc.data_size : 0U;
-
-    const size_t cassette_bytes = current_snapshot + back_snapshot + next_snapshot + next_shell +
-        shell_native + shell_base + shell_work + shell_luma + big_reel + small_roller +
-        small_base + small_luma + tape_amount;
-    const size_t cover_bytes = cover.normal_bytes + cover.dimmed_bytes;
-    const size_t fallback_bytes = fallback.artwork_bytes + fallback.cassette_bytes;
-    const size_t known_bytes = cassette_bytes + cover_bytes + fallback_bytes;
-    const size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
-
-    ESP_LOGI(TAG,
-        "PSRAM账本[%s]：free=%uB largest=%uB known=%uB cassette=%uB cover=%uB fallback=%uB",
-        reason != nullptr ? reason : "?",
-        static_cast<unsigned>(free_psram),
-        static_cast<unsigned>(largest),
-        static_cast<unsigned>(known_bytes),
-        static_cast<unsigned>(cassette_bytes),
-        static_cast<unsigned>(cover_bytes),
-        static_cast<unsigned>(fallback_bytes));
-    ESP_LOGI(TAG,
-        "PSRAM账本[%s] 快照：current=%u back=%u next=%u next_shell=%u cache_busy=%u next_state=%u",
-        reason != nullptr ? reason : "?",
-        static_cast<unsigned>(current_snapshot),
-        static_cast<unsigned>(back_snapshot),
-        static_cast<unsigned>(next_snapshot),
-        static_cast<unsigned>(next_shell),
-        static_cast<unsigned>(g_cache_build_busy),
-        static_cast<unsigned>(g_next_prefetch.state));
-    ESP_LOGI(TAG,
-        "PSRAM账本[%s] 磁带：shell=%u base=%u work=%u luma=%u big=%u small=%u small_base=%u small_luma=%u tape=%u",
-        reason != nullptr ? reason : "?",
-        static_cast<unsigned>(shell_native),
-        static_cast<unsigned>(shell_base),
-        static_cast<unsigned>(shell_work),
-        static_cast<unsigned>(shell_luma),
-        static_cast<unsigned>(big_reel),
-        static_cast<unsigned>(small_roller),
-        static_cast<unsigned>(small_base),
-        static_cast<unsigned>(small_luma),
-        static_cast<unsigned>(tape_amount));
-    ESP_LOGI(TAG,
-        "PSRAM账本[%s] 封面：ok=%u slots=%u normal=%uB/%u slots pins=%u dimmed=%uB/%u slots pins=%u",
-        reason != nullptr ? reason : "?",
-        static_cast<unsigned>(cover_ok),
-        static_cast<unsigned>(cover.valid_slots),
-        static_cast<unsigned>(cover.normal_bytes),
-        static_cast<unsigned>(cover.normal_slots),
-        static_cast<unsigned>(cover.normal_pins),
-        static_cast<unsigned>(cover.dimmed_bytes),
-        static_cast<unsigned>(cover.dimmed_slots),
-        static_cast<unsigned>(cover.dimmed_pins));
-    ESP_LOGI(TAG,
-        "PSRAM账本[%s] 替补：artwork=%uB pins=%u cassette=%uB pins=%u lease_cur=%u lease_next=%u",
-        reason != nullptr ? reason : "?",
-        static_cast<unsigned>(fallback.artwork_bytes),
-        static_cast<unsigned>(fallback.artwork_pins),
-        static_cast<unsigned>(fallback.cassette_bytes),
-        static_cast<unsigned>(fallback.cassette_pins),
-        static_cast<unsigned>(g_fallback_cover_lease.slot_index != 0xFFU),
-        static_cast<unsigned>(g_next_prefetch.promotion_fallback.slot_index != 0xFFU));
-}
 
 static void cassette_view_init_rgb565_dsc(
     lv_image_dsc_t *dsc,
@@ -1065,23 +975,32 @@ static void cassette_view_release_cover(bool preserve_visual_identity)
     if (g_cover_lease.slot_index != 0xFFU) {
         cover_surface_cache_release(&g_cover_lease);
     }
-    if (g_fallback_cover_lease.slot_index != 0xFFU) {
-        fallback_cover_image_release(&g_fallback_cover_lease);
-    }
     g_cover_lease = {};
-    g_fallback_cover_lease = {};
-    g_cover_dsc = {};
-    // Launcher 只是临时接管屏幕。释放 Surface lease 时保留上一套已提交视觉的身份，
-    // 恢复同一首歌时不能误判成“目标已切换”并取消仍有效的 next 预缓存。
-    // 真正离开磁带视图时仍清空身份，后续重新进入按正常绑定流程处理。
+
+    // Lyrics/Spectrum/曲库/Launcher/Settings 都只是临时覆盖 Music。
+    // 当前曲若使用固定缺省封面，保留唯一 fallback lease 和绑定描述符；父 root 已隐藏，
+    // 恢复时可直接重新显示，不再次读 SD + JPEG 解码，也不制造一帧黑标签。
+    const bool keep_current_fallback = preserve_visual_identity &&
+        g_cover_is_no_artwork_fallback &&
+        g_fallback_cover_lease.slot_index != 0xFFU &&
+        g_fallback_cover_lease.rgb565 != nullptr;
+    if (!keep_current_fallback) {
+        if (g_fallback_cover_lease.slot_index != 0xFFU) {
+            fallback_cover_image_release(&g_fallback_cover_lease);
+        }
+        g_fallback_cover_lease = {};
+        g_cover_dsc = {};
+        g_cover_scale_q8 = kLvImageScaleNone;
+        if (g_cover_image != nullptr) {
+            lv_obj_add_flag(g_cover_image, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    // 临时接管屏幕时保留上一套已提交视觉身份；真正离开磁带视图才清空。
     if (!preserve_visual_identity) {
         g_cover_generation = 0U;
         g_cover_track = UINT32_MAX;
-    }
-    g_cover_scale_q8 = kLvImageScaleNone;
-    g_cover_is_no_artwork_fallback = false;
-    if (g_cover_image != nullptr) {
-        lv_obj_add_flag(g_cover_image, LV_OBJ_FLAG_HIDDEN);
+        g_cover_is_no_artwork_fallback = false;
     }
     fallback_cover_image_discard_unpinned();
 }
@@ -2607,7 +2526,6 @@ static void cassette_view_handle_cache_result()
             static_cast<unsigned long>(result.track),
             static_cast<unsigned>(kControlsCacheBytes),
             static_cast<long long>(result.elapsed_us));
-        cassette_view_log_psram_ledger("current_snapshot_ready");
         return;
     }
 
@@ -2657,7 +2575,6 @@ static void cassette_view_handle_cache_result()
         static_cast<long long>(result.elapsed_us),
         result.no_artwork ? "缺省封面+粉色" :
             (result.dynamic_tint ? "动态配色" : "原装粉色"));
-    cassette_view_log_psram_ledger("next_prefetch_ready");
 }
 
 static bool cassette_view_wait_cache_idle_for_trim()
@@ -4049,7 +3966,6 @@ void cassette_view_set_controls_visible(bool visible)
         visible ? "冻结" : "恢复",
         visible && cassette_view_controls_cache_active() ? "PSRAM直显" :
             (visible ? "准备中" : "预存保留"));
-    cassette_view_log_psram_ledger(visible ? "controls_open" : "controls_close");
 }
 
 bool cassette_view_controls_cache_active()
@@ -4084,7 +4000,6 @@ void cassette_view_set_launcher_suspended(bool suspended)
     }
 
     ESP_LOGI(TAG, "Launcher机械动画：%s", suspended ? "冻结" : "恢复");
-    cassette_view_log_psram_ledger(suspended ? "launcher_open" : "launcher_close");
 }
 
 void cassette_view_set_seek_frozen(bool frozen)

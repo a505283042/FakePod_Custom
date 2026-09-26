@@ -13,6 +13,8 @@ bool library_view_is_visible();
 
 // APP 切换专用：仅隐藏曲库并停止惯性，不调用 HomeResume，避免 Music 已进入后台时反向唤醒主页。
 void library_view_suspend_for_app_switch();
+// PreserveBackground 返回 Music 时原样恢复浏览模式、搜索条件与滚动位置。
+void library_view_resume_after_app_switch();
 
 // 由 ui_manager 的 CST820 原始指针路径旁路观察：
 // 普通曲库负责横向分类 + 纵向直驱列表；搜索模式只允许结果区纵向滚动，键盘区域交给 LVGL Button。

@@ -2712,6 +2712,19 @@ void library_view_suspend_for_app_switch()
     UI_PAGE_INTERACTION_LOGI("曲库因APP切换挂起");
 }
 
+void library_view_resume_after_app_switch()
+{
+    if (g_root == nullptr || !lv_obj_has_flag(g_root, LV_OBJ_FLAG_HIDDEN)) return;
+
+    // 不重置 g_state/g_search；只按保存的滚动位置重绑虚拟行，顺便刷新当前歌曲高亮。
+    library_view_render(true);
+    lv_obj_remove_flag(g_root, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(g_root);
+    screen_lock_simple_raise();
+    UI_PAGE_INTERACTION_LOGI("曲库恢复：保留浏览/搜索状态 scroll=%ld",
+        static_cast<long>(library_view_saved_scroll_position()));
+}
+
 void library_view_open()
 {
     if (g_root == nullptr) {
