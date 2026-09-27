@@ -34,6 +34,13 @@ extern "C" void ble_store_config_init(void);
 #define FAKEPOD_BLE_FOUNDATION_ENABLED 0
 #endif
 
+#if FAKEPOD_BLE_FOUNDATION_ENABLED && \
+    defined(CONFIG_BT_NIMBLE_ROLE_OBSERVER) && CONFIG_BT_NIMBLE_ROLE_OBSERVER
+#define FAKEPOD_BLE_SCAN_MODE_ENABLED 1
+#else
+#define FAKEPOD_BLE_SCAN_MODE_ENABLED 0
+#endif
+
 static const char *TAG = "BLE服务";
 
 namespace {
@@ -48,6 +55,8 @@ static constexpr BaseType_t kTransitionTaskCore = 1;
 static portMUX_TYPE g_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool g_ready = false;
 static bool g_desired_enabled = false;
+static BleRemoteWorkMode g_desired_work_mode = BleRemoteWorkMode::Broadcast;
+static BleRemoteWorkMode g_stack_work_mode = BleRemoteWorkMode::Broadcast;
 static bool g_stack_initialized = false;
 static bool g_connected = false;
 static bool g_transition_running = false;
@@ -68,6 +77,12 @@ static constexpr size_t kStatusPacketSize = 20U;
 static constexpr size_t kMetadataChunkDataBytes = 14U;
 static constexpr size_t kMetadataMaxBytes = 196U;
 static constexpr TickType_t kStatusNotifyInterval = pdMS_TO_TICKS(500);
+#if FAKEPOD_BLE_SCAN_MODE_ENABLED
+static constexpr uint16_t kHidServiceUuid16 = 0x1812U;
+static constexpr TickType_t kScanLogInterval = pdMS_TO_TICKS(1000);
+static constexpr size_t kScanLogSlotCount = 16U;
+static constexpr size_t kScanHexPreviewBytes = 12U;
+#endif
 
 static const ble_uuid128_t kControlServiceUuid = BLE_UUID128_INIT(
     0x64, 0x6F, 0x50, 0x46, 0x6D, 0x0E, 0x3A, 0x8F,
@@ -95,6 +110,22 @@ static size_t g_metadata_size = 0U;
 static uint8_t g_metadata_chunk_index = 0U;
 static uint8_t g_metadata_chunk_count = 0U;
 
+#if FAKEPOD_BLE_SCAN_MODE_ENABLED
+struct ScanLogSlot {
+    bool used;
+    uint8_t addr_type;
+    uint8_t event_type;
+    uint8_t addr[6];
+    TickType_t last_log_tick;
+};
+
+static bool g_scan_active = false;
+static uint32_t g_scan_report_count = 0U;
+static uint32_t g_scan_hid_report_count = 0U;
+static ScanLogSlot g_scan_log_slots[kScanLogSlotCount] = {};
+static size_t g_scan_log_replace_index = 0U;
+#endif
+
 static struct ble_gatt_chr_def g_control_chrs[3] = {};
 static struct ble_gatt_svc_def g_control_svcs[2] = {};
 #endif
@@ -117,6 +148,14 @@ static bool desired_enabled()
     const bool enabled = g_desired_enabled;
     portEXIT_CRITICAL(&g_lock);
     return enabled;
+}
+
+static BleRemoteWorkMode stack_work_mode()
+{
+    portENTER_CRITICAL(&g_lock);
+    const BleRemoteWorkMode mode = g_stack_work_mode;
+    portEXIT_CRITICAL(&g_lock);
+    return mode;
 }
 
 #if FAKEPOD_BLE_FOUNDATION_ENABLED
@@ -443,18 +482,175 @@ static int register_control_service()
 static bool should_advertise()
 {
     portENTER_CRITICAL(&g_lock);
-    const bool allowed = g_desired_enabled && g_state != BleRemoteState::Stopping;
+    const bool allowed = g_desired_enabled &&
+        g_desired_work_mode == BleRemoteWorkMode::Broadcast &&
+        g_state != BleRemoteState::Stopping;
     portEXIT_CRITICAL(&g_lock);
     return allowed;
 }
 
 static int start_advertising();
 
+#if FAKEPOD_BLE_SCAN_MODE_ENABLED
+static bool adv_fields_has_hid_service(const struct ble_hs_adv_fields &fields)
+{
+    for (int i = 0; i < fields.num_uuids16; ++i) {
+        if (ble_uuid_u16(&fields.uuids16[i].u) == kHidServiceUuid16) return true;
+    }
+    return fields.svc_data_uuid16 != nullptr && fields.svc_data_uuid16_len >= 2U &&
+        fields.svc_data_uuid16[0] == static_cast<uint8_t>(kHidServiceUuid16 & 0xFFU) &&
+        fields.svc_data_uuid16[1] == static_cast<uint8_t>(kHidServiceUuid16 >> 8U);
+}
+
+static void format_ble_addr(const ble_addr_t &addr, char out[18])
+{
+    snprintf(
+        out,
+        18,
+        "%02X:%02X:%02X:%02X:%02X:%02X",
+        addr.val[5], addr.val[4], addr.val[3],
+        addr.val[2], addr.val[1], addr.val[0]);
+}
+
+static void format_hex_preview(const uint8_t *data, size_t size, char *out, size_t out_size)
+{
+    if (out == nullptr || out_size == 0U) return;
+    if (data == nullptr || size == 0U) {
+        snprintf(out, out_size, "-");
+        return;
+    }
+
+    const size_t preview_size = size > kScanHexPreviewBytes ? kScanHexPreviewBytes : size;
+    size_t pos = 0U;
+    for (size_t i = 0U; i < preview_size && pos + 2U < out_size; ++i) {
+        const int written = snprintf(out + pos, out_size - pos, "%02X", data[i]);
+        if (written <= 0) break;
+        pos += static_cast<size_t>(written);
+    }
+    if (size > preview_size && pos + 3U < out_size) {
+        snprintf(out + pos, out_size - pos, "...");
+    }
+}
+
+static bool should_log_scan_report(const struct ble_gap_disc_desc &disc)
+{
+    const TickType_t now = xTaskGetTickCount();
+    size_t free_slot = kScanLogSlotCount;
+
+    for (size_t i = 0U; i < kScanLogSlotCount; ++i) {
+        ScanLogSlot &slot = g_scan_log_slots[i];
+        if (!slot.used) {
+            if (free_slot == kScanLogSlotCount) free_slot = i;
+            continue;
+        }
+        if (slot.addr_type != disc.addr.type || slot.event_type != disc.event_type ||
+            memcmp(slot.addr, disc.addr.val, sizeof(slot.addr)) != 0) {
+            continue;
+        }
+        if (!tick_due(now, slot.last_log_tick + kScanLogInterval)) return false;
+        slot.last_log_tick = now;
+        return true;
+    }
+
+    const size_t index = free_slot < kScanLogSlotCount
+        ? free_slot
+        : g_scan_log_replace_index++ % kScanLogSlotCount;
+    ScanLogSlot &slot = g_scan_log_slots[index];
+    slot.used = true;
+    slot.addr_type = disc.addr.type;
+    slot.event_type = disc.event_type;
+    memcpy(slot.addr, disc.addr.val, sizeof(slot.addr));
+    slot.last_log_tick = now;
+    return true;
+}
+
+static void log_scan_report(const struct ble_gap_disc_desc &disc)
+{
+    struct ble_hs_adv_fields fields = {};
+    const int rc = ble_hs_adv_parse_fields(&fields, disc.data, disc.length_data);
+    if (rc != 0) return;
+
+    const bool hid = adv_fields_has_hid_service(fields);
+    ++g_scan_report_count;
+    if (hid) ++g_scan_hid_report_count;
+    if (!should_log_scan_report(disc)) return;
+
+    char addr[18] = {};
+    char mfg_hex[2U * kScanHexPreviewBytes + 4U] = {};
+    char svc16_hex[2U * kScanHexPreviewBytes + 4U] = {};
+    format_ble_addr(disc.addr, addr);
+    format_hex_preview(fields.mfg_data, fields.mfg_data_len, mfg_hex, sizeof(mfg_hex));
+    format_hex_preview(
+        fields.svc_data_uuid16,
+        fields.svc_data_uuid16_len,
+        svc16_hex,
+        sizeof(svc16_hex));
+
+    const unsigned appearance = fields.appearance_is_present
+        ? static_cast<unsigned>(fields.appearance)
+        : 0U;
+
+    if (fields.name != nullptr && fields.name_len > 0U) {
+        ESP_LOGI(
+            TAG,
+            "BLE扫描：name=%.*s addr=%s addr_type=%u rssi=%d hid1812=%s appearance=0x%04X evt=%u mfg=%s svc16=%s",
+            static_cast<int>(fields.name_len),
+            reinterpret_cast<const char *>(fields.name),
+            addr,
+            static_cast<unsigned>(disc.addr.type),
+            static_cast<int>(disc.rssi),
+            hid ? "YES" : "NO",
+            appearance,
+            static_cast<unsigned>(disc.event_type),
+            mfg_hex,
+            svc16_hex);
+    } else {
+        ESP_LOGI(
+            TAG,
+            "BLE扫描：name=(无名称) addr=%s addr_type=%u rssi=%d hid1812=%s appearance=0x%04X evt=%u mfg=%s svc16=%s",
+            addr,
+            static_cast<unsigned>(disc.addr.type),
+            static_cast<int>(disc.rssi),
+            hid ? "YES" : "NO",
+            appearance,
+            static_cast<unsigned>(disc.event_type),
+            mfg_hex,
+            svc16_hex);
+    }
+}
+#endif
+
 static int gap_event_cb(struct ble_gap_event *event, void *)
 {
     if (event == nullptr) return 0;
 
     switch (event->type) {
+#if FAKEPOD_BLE_SCAN_MODE_ENABLED
+        case BLE_GAP_EVENT_DISC:
+            log_scan_report(event->disc);
+            return 0;
+
+        case BLE_GAP_EVENT_DISC_COMPLETE: {
+            portENTER_CRITICAL(&g_lock);
+            g_scan_active = false;
+            const bool retry_scan = g_desired_enabled &&
+                g_desired_work_mode == BleRemoteWorkMode::Scan &&
+                g_state == BleRemoteState::Scanning;
+            if (retry_scan) {
+                set_state_locked(BleRemoteState::RetryWait, ESP_FAIL);
+                g_retry_due_tick = xTaskGetTickCount() + kRetryDelay;
+            }
+            portEXIT_CRITICAL(&g_lock);
+            ESP_LOGI(
+                TAG,
+                "BLE扫描结束：reason=%d reports=%u hid1812_reports=%u",
+                event->disc_complete.reason,
+                static_cast<unsigned>(g_scan_report_count),
+                static_cast<unsigned>(g_scan_hid_report_count));
+            return 0;
+        }
+#endif
+
         case BLE_GAP_EVENT_CONNECT:
             if (event->connect.status == 0) {
                 portENTER_CRITICAL(&g_lock);
@@ -482,7 +678,9 @@ static int gap_event_cb(struct ble_gap_event *event, void *)
             g_force_metadata_refresh = false;
             g_status_notify_due_tick = 0;
             if (g_desired_enabled && g_state != BleRemoteState::Stopping) {
-                set_state_locked(BleRemoteState::Advertising);
+                set_state_locked(g_desired_work_mode == BleRemoteWorkMode::Broadcast
+                    ? BleRemoteState::Advertising
+                    : BleRemoteState::Starting);
             }
             portEXIT_CRITICAL(&g_lock);
             ESP_LOGI(TAG, "BLE连接已断开：reason=%d", event->disconnect.reason);
@@ -550,6 +748,45 @@ static int gap_event_cb(struct ble_gap_event *event, void *)
             return 0;
     }
 }
+
+#if FAKEPOD_BLE_SCAN_MODE_ENABLED
+static int start_scan_mode()
+{
+    struct ble_gap_disc_params params = {};
+    // R46.0.14.2：关闭控制器重复过滤，才能直接观察设备开/关后的持续广播变化。
+    // 日志在 Host 侧按“地址 + 事件类型”每秒限频，避免串口被重复广播刷满。
+    params.filter_duplicates = 0;
+    params.passive = 0;
+    params.itvl = 0;
+    params.window = 0;
+    params.filter_policy = 0;
+    params.limited = 0;
+
+    g_scan_report_count = 0U;
+    g_scan_hid_report_count = 0U;
+    memset(g_scan_log_slots, 0, sizeof(g_scan_log_slots));
+    g_scan_log_replace_index = 0U;
+
+    const int rc = ble_gap_disc(
+        g_own_addr_type,
+        BLE_HS_FOREVER,
+        &params,
+        gap_event_cb,
+        nullptr);
+
+    portENTER_CRITICAL(&g_lock);
+    g_scan_active = rc == 0;
+    if (rc == 0) set_state_locked(BleRemoteState::Scanning);
+    portEXIT_CRITICAL(&g_lock);
+
+    if (rc == 0) {
+        ESP_LOGI(TAG, "BLE扫描模式已启动：active=1 duration=持续 duplicate_filter=OFF log_interval=1s HID_UUID=0x1812");
+    } else {
+        ESP_LOGW(TAG, "BLE扫描模式启动失败：rc=%d", rc);
+    }
+    return rc;
+}
+#endif
 
 static int start_advertising()
 {
@@ -626,10 +863,22 @@ static void host_sync_cb()
 
     int rc = ble_hs_util_ensure_addr(0);
     if (rc == 0) rc = ble_hs_id_infer_auto(0, &g_own_addr_type);
-    if (rc == 0) rc = start_advertising();
+
+    const BleRemoteWorkMode mode = stack_work_mode();
+    if (rc == 0 && mode == BleRemoteWorkMode::Scan) {
+#if FAKEPOD_BLE_SCAN_MODE_ENABLED
+        rc = start_scan_mode();
+#else
+        ESP_LOGW(TAG, "BLE扫描模式不可用：Observer角色未启用");
+        rc = BLE_HS_ENOTSUP;
+#endif
+    } else if (rc == 0) {
+        rc = start_advertising();
+    }
 
     if (rc != 0) {
-        ESP_LOGE(TAG, "BLE同步后启动广播失败：rc=%d", rc);
+        ESP_LOGE(TAG, "BLE工作模式启动失败：mode=%s rc=%d",
+            mode == BleRemoteWorkMode::Scan ? "扫描模式" : "广播模式", rc);
         portENTER_CRITICAL(&g_lock);
         if (g_desired_enabled) {
             set_state_locked(BleRemoteState::RetryWait, ESP_FAIL);
@@ -639,7 +888,9 @@ static void host_sync_cb()
         return;
     }
 
-    ESP_LOGI(TAG, "BLE广播已启动：name=%s interval≈500ms", kDeviceName);
+    if (mode == BleRemoteWorkMode::Broadcast) {
+        ESP_LOGI(TAG, "BLE广播模式已启动：name=%s interval≈500ms", kDeviceName);
+    }
 }
 
 static void host_task(void *)
@@ -676,12 +927,19 @@ static esp_err_t stop_stack()
     g_force_status_notify = false;
     g_force_metadata_refresh = false;
     g_status_notify_due_tick = 0;
+#if FAKEPOD_BLE_SCAN_MODE_ENABLED
+    g_scan_active = false;
+#endif
     portEXIT_CRITICAL(&g_lock);
     return ESP_OK;
 }
 
 static esp_err_t start_stack()
 {
+    portENTER_CRITICAL(&g_lock);
+    g_stack_work_mode = g_desired_work_mode;
+    portEXIT_CRITICAL(&g_lock);
+
     const int init_rc = nimble_port_init();
     if (init_rc != ESP_OK) {
         ESP_LOGW(TAG, "NimBLE初始化失败：rc=%d", init_rc);
@@ -696,6 +954,9 @@ static esp_err_t start_stack()
     g_force_status_notify = false;
     g_force_metadata_refresh = false;
     g_status_notify_due_tick = 0;
+#if FAKEPOD_BLE_SCAN_MODE_ENABLED
+    g_scan_active = false;
+#endif
     portEXIT_CRITICAL(&g_lock);
 
     g_control_event_val_handle = 0U;
@@ -712,6 +973,16 @@ static esp_err_t start_stack()
     ble_hs_cfg.reset_cb = host_reset_cb;
     ble_hs_cfg.sync_cb = host_sync_cb;
     ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+
+    // R46.0.14.3：显式启用 Bond，并交换加密键/身份键。
+    // 仅有 NVS 持久化并不等价于开启 Bond；手机后续重连要靠已保存的 LTK/IRK 恢复加密。
+    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
+    ble_hs_cfg.sm_bonding = 1;
+    ble_hs_cfg.sm_mitm = 0;
+    ble_hs_cfg.sm_sc = 1;
+    ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+
     ble_svc_gap_init();
     ble_svc_gatt_init();
 
@@ -740,6 +1011,7 @@ static esp_err_t start_stack()
     ble_store_config_init();
 
     ESP_LOGI(TAG, "BLE手机控制服务已注册：5命令 + 状态Notify V1");
+    ESP_LOGI(TAG, "BLE安全：Bond=ON SC=ON MITM=OFF KeyDist=ENC|ID");
     nimble_port_freertos_init(host_task);
     return ESP_OK;
 }
@@ -843,6 +1115,8 @@ esp_err_t ble_remote_service_init()
     }
     g_ready = true;
     g_desired_enabled = false;
+    g_desired_work_mode = BleRemoteWorkMode::Broadcast;
+    g_stack_work_mode = BleRemoteWorkMode::Broadcast;
     g_stack_initialized = false;
     g_connected = false;
     g_transition_running = false;
@@ -853,12 +1127,13 @@ esp_err_t ble_remote_service_init()
 #else
     set_state_locked(BleRemoteState::Unsupported, ESP_ERR_NOT_SUPPORTED);
 #endif
+#if !FAKEPOD_BLE_FOUNDATION_ENABLED
     const BleRemoteState state = g_state;
+#endif
     portEXIT_CRITICAL(&g_lock);
 
 #if FAKEPOD_BLE_FOUNDATION_ENABLED
-    (void)state;
-    ESP_LOGI(TAG, "BLE Foundation就绪：NimBLE Peripheral，默认关闭");
+    ESP_LOGI(TAG, "BLE Foundation就绪：NimBLE Peripheral + Observer，默认关闭，工作模式=广播模式");
     return ESP_OK;
 #else
     ESP_LOGW(TAG, "BLE Foundation代码已就绪，但 sdkconfig 尚未完整启用 NimBLE Peripheral/Broadcaster/GATT Server/GAP Service");
@@ -879,6 +1154,25 @@ void ble_remote_service_set_enabled(bool enabled)
     ESP_LOGI(TAG, "BLE用户意图：%s", enabled ? "开启" : "关闭");
 }
 
+void ble_remote_service_set_work_mode(BleRemoteWorkMode mode)
+{
+    if (mode != BleRemoteWorkMode::Broadcast && mode != BleRemoteWorkMode::Scan) return;
+
+    portENTER_CRITICAL(&g_lock);
+    if (!g_ready) {
+        portEXIT_CRITICAL(&g_lock);
+        return;
+    }
+    const bool changed = g_desired_work_mode != mode;
+    g_desired_work_mode = mode;
+    if (changed) g_retry_due_tick = 0;
+    portEXIT_CRITICAL(&g_lock);
+
+    if (changed) {
+        ESP_LOGI(TAG, "BLE工作模式：%s", ble_remote_service_work_mode_name(mode));
+    }
+}
+
 void ble_remote_service_update()
 {
     portENTER_CRITICAL(&g_lock);
@@ -887,15 +1181,31 @@ void ble_remote_service_update()
         return;
     }
     const bool desired = g_desired_enabled;
+    const bool stack_initialized = g_stack_initialized;
+    const BleRemoteWorkMode desired_mode = g_desired_work_mode;
+    const BleRemoteWorkMode active_mode = g_stack_work_mode;
     BleRemoteState state = g_state;
     const TickType_t retry_due = g_retry_due_tick;
     const TickType_t state_since = g_state_since_tick;
+#if FAKEPOD_BLE_SCAN_MODE_ENABLED
+    const bool scan_active = g_scan_active;
+#endif
     portEXIT_CRITICAL(&g_lock);
 
     if (state == BleRemoteState::Unsupported) return;
 
     const TickType_t now = xTaskGetTickCount();
     if (desired) {
+        // 广播/扫描互斥。工作模式变化时完整重启 NimBLE，复用既有安全停栈路径，
+        // 不在 HostTask 里手动 terminate / stop advertising。
+        if (stack_initialized && desired_mode != active_mode) {
+            (void)start_transition_task(BleRemoteState::Starting);
+            return;
+        }
+#if FAKEPOD_BLE_SCAN_MODE_ENABLED
+        if (desired_mode == BleRemoteWorkMode::Scan && scan_active) return;
+#endif
+        if (desired_mode == BleRemoteWorkMode::Scan && state == BleRemoteState::Scanning) return;
         if (state == BleRemoteState::Connected) {
 #if FAKEPOD_BLE_FOUNDATION_ENABLED
             update_phone_state_notify(now);
@@ -931,6 +1241,7 @@ bool ble_remote_service_get_snapshot(BleRemoteSnapshot *out_snapshot)
     out_snapshot->desired_enabled = g_desired_enabled;
     out_snapshot->stack_initialized = g_stack_initialized;
     out_snapshot->connected = g_connected;
+    out_snapshot->work_mode = g_desired_work_mode;
     out_snapshot->state = g_state;
     out_snapshot->last_error = g_last_error;
     portEXIT_CRITICAL(&g_lock);
@@ -943,10 +1254,20 @@ const char *ble_remote_service_state_name(BleRemoteState state)
         case BleRemoteState::Disabled: return "关闭";
         case BleRemoteState::Starting: return "启动中";
         case BleRemoteState::Advertising: return "广播中";
+        case BleRemoteState::Scanning: return "扫描中";
         case BleRemoteState::Connected: return "已连接";
         case BleRemoteState::Stopping: return "关闭中";
         case BleRemoteState::RetryWait: return "故障重试";
         case BleRemoteState::Unsupported: return "未启用NimBLE";
+        default: return "未知";
+    }
+}
+
+const char *ble_remote_service_work_mode_name(BleRemoteWorkMode mode)
+{
+    switch (mode) {
+        case BleRemoteWorkMode::Broadcast: return "广播模式";
+        case BleRemoteWorkMode::Scan: return "扫描模式";
         default: return "未知";
     }
 }
