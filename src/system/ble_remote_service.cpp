@@ -1,11 +1,16 @@
 #include "ble_remote_service.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "sdkconfig.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "audio_service.h"
+#include "battery_service.h"
+#include "media_catalog_v2.h"
+#include "player_control.h"
 
 #if defined(CONFIG_BT_NIMBLE_ENABLED) && CONFIG_BT_NIMBLE_ENABLED && \
     defined(CONFIG_BT_NIMBLE_ROLE_PERIPHERAL) && CONFIG_BT_NIMBLE_ROLE_PERIPHERAL && \
@@ -55,54 +60,43 @@ static TickType_t g_state_since_tick = 0;
 static uint8_t g_own_addr_type = BLE_OWN_ADDR_PUBLIC;
 static uint16_t g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 
-// R46.0.9：先建立最小 HID Consumer Control GATT 骨架，验证 Android 系统级 HID 枚举。
-// 暂不绑定实体按键/手势，也不伪造 PnP VID/PID；后续识别稳定后再补完整 HOGP 配套服务。
-static constexpr uint16_t kHidAppearance = 0x03C0U; // Generic Human Interface Device
-static constexpr uint8_t kHidConsumerReportId = 1U;
-static constexpr uint8_t kHidReportTypeInput = 1U;
+// R46.0.12：保留手机写命令，并增加 FakePod -> 手机状态 Notify。
+// Command/Event UUID 固定；Event 使用 20B Status + <=20B Metadata Chunk，默认 MTU=23 也可工作。
+static constexpr uint16_t kMediaPlayerAppearance = 0x0280U;
+static constexpr uint8_t kPhoneEventProtocolVersion = 1U;
+static constexpr size_t kStatusPacketSize = 20U;
+static constexpr size_t kMetadataChunkDataBytes = 14U;
+static constexpr size_t kMetadataMaxBytes = 196U;
+static constexpr TickType_t kStatusNotifyInterval = pdMS_TO_TICKS(500);
 
-static const ble_uuid16_t kHidServiceUuid = { BLE_UUID_TYPE_16, 0x1812 };
-static const ble_uuid16_t kHidInformationUuid = { BLE_UUID_TYPE_16, 0x2A4A };
-static const ble_uuid16_t kHidReportMapUuid = { BLE_UUID_TYPE_16, 0x2A4B };
-static const ble_uuid16_t kHidControlPointUuid = { BLE_UUID_TYPE_16, 0x2A4C };
-static const ble_uuid16_t kHidReportUuid = { BLE_UUID_TYPE_16, 0x2A4D };
-static const ble_uuid16_t kHidReportReferenceUuid = { BLE_UUID_TYPE_16, 0x2908 };
+static const ble_uuid128_t kControlServiceUuid = BLE_UUID128_INIT(
+    0x64, 0x6F, 0x50, 0x46, 0x6D, 0x0E, 0x3A, 0x8F,
+    0x68, 0x4B, 0x4F, 0x2B, 0x10, 0x9C, 0x7A, 0x7D);
+static const ble_uuid128_t kControlCommandUuid = BLE_UUID128_INIT(
+    0x64, 0x6F, 0x50, 0x46, 0x6D, 0x0E, 0x3A, 0x8F,
+    0x68, 0x4B, 0x4F, 0x2B, 0x11, 0x9C, 0x7A, 0x7D);
+static const ble_uuid128_t kControlEventUuid = BLE_UUID128_INIT(
+    0x64, 0x6F, 0x50, 0x46, 0x6D, 0x0E, 0x3A, 0x8F,
+    0x68, 0x4B, 0x4F, 0x2B, 0x12, 0x9C, 0x7A, 0x7D);
 
-// HID 1.11 / Country=0 / Normally Connectable；不宣称 Remote Wake。
-static const uint8_t kHidInformation[] = { 0x11, 0x01, 0x00, 0x02 };
+static uint16_t g_control_event_val_handle = 0U;
+static bool g_control_event_notify_enabled = false;
+static bool g_force_status_notify = false;
+static bool g_force_metadata_refresh = false;
+static TickType_t g_status_notify_due_tick = 0;
+static uint8_t g_last_status_packet[kStatusPacketSize] = {};
 
-// Consumer Control：Play/Pause、Next、Previous、Volume+、Volume-，1 字节位图。
-static const uint8_t kHidReportMap[] = {
-    0x05, 0x0C,       // Usage Page (Consumer)
-    0x09, 0x01,       // Usage (Consumer Control)
-    0xA1, 0x01,       // Collection (Application)
-    0x85, 0x01,       // Report ID (1)
-    0x15, 0x00,       // Logical Minimum (0)
-    0x25, 0x01,       // Logical Maximum (1)
-    0x09, 0xCD,       // Play/Pause
-    0x09, 0xB5,       // Scan Next Track
-    0x09, 0xB6,       // Scan Previous Track
-    0x09, 0xE9,       // Volume Increment
-    0x09, 0xEA,       // Volume Decrement
-    0x75, 0x01,       // Report Size (1)
-    0x95, 0x05,       // Report Count (5)
-    0x81, 0x02,       // Input (Data, Variable, Absolute)
-    0x75, 0x03,       // 3-bit padding
-    0x95, 0x01,
-    0x81, 0x03,       // Input (Constant)
-    0xC0,             // End Collection
-};
+static bool g_metadata_source_initialized = false;
+static uint32_t g_metadata_track_index = UINT32_MAX;
+static uint32_t g_metadata_catalog_generation = 0U;
+static uint16_t g_metadata_sequence = 0U;
+static char g_metadata_payload[kMetadataMaxBytes + 1U] = {};
+static size_t g_metadata_size = 0U;
+static uint8_t g_metadata_chunk_index = 0U;
+static uint8_t g_metadata_chunk_count = 0U;
 
-static const uint8_t kHidInputReportReference[] = {
-    kHidConsumerReportId,
-    kHidReportTypeInput,
-};
-
-static uint8_t g_hid_input_report = 0U;
-static uint16_t g_hid_input_val_handle = 0U;
-static struct ble_gatt_dsc_def g_hid_input_dscs[2] = {};
-static struct ble_gatt_chr_def g_hid_chrs[5] = {};
-static struct ble_gatt_svc_def g_hid_svcs[2] = {};
+static struct ble_gatt_chr_def g_control_chrs[3] = {};
+static struct ble_gatt_svc_def g_control_svcs[2] = {};
 #endif
 
 static bool tick_due(TickType_t now, TickType_t due)
@@ -127,42 +121,257 @@ static bool desired_enabled()
 
 #if FAKEPOD_BLE_FOUNDATION_ENABLED
 
-static int hid_append_read_value(struct ble_gatt_access_ctxt *ctxt, const void *data, size_t size)
+static const char *control_command_name(uint8_t command)
 {
-    if (ctxt == nullptr || ctxt->om == nullptr || data == nullptr) {
+    switch (command) {
+        case 0x01U: return "播放/暂停";
+        case 0x02U: return "下一曲";
+        case 0x03U: return "上一曲";
+        case 0x04U: return "音量+";
+        case 0x05U: return "音量-";
+        default: return "未知";
+    }
+}
+
+static bool execute_control_command(uint8_t command)
+{
+    switch (command) {
+        case 0x01U: return player_control_toggle_play_pause();
+        case 0x02U: return player_control_next();
+        case 0x03U: return player_control_previous();
+        case 0x04U: return player_control_volume_up(1U);
+        case 0x05U: return player_control_volume_down(1U);
+        default: return false;
+    }
+}
+
+static void write_u16_le(uint8_t *dst, uint16_t value)
+{
+    dst[0] = static_cast<uint8_t>(value & 0xFFU);
+    dst[1] = static_cast<uint8_t>((value >> 8U) & 0xFFU);
+}
+
+static void write_u32_le(uint8_t *dst, uint32_t value)
+{
+    dst[0] = static_cast<uint8_t>(value & 0xFFU);
+    dst[1] = static_cast<uint8_t>((value >> 8U) & 0xFFU);
+    dst[2] = static_cast<uint8_t>((value >> 16U) & 0xFFU);
+    dst[3] = static_cast<uint8_t>((value >> 24U) & 0xFFU);
+}
+
+static uint32_t clamp_u64_to_u32(uint64_t value)
+{
+    return value > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(value);
+}
+
+static size_t trim_truncated_utf8_tail(char *text, size_t size)
+{
+    // 只有 snprintf 真的发生截断时才调用；宁可丢掉最后一个完整多字节字符，
+    // 也不把半个 UTF-8 字符发给手机。
+    while (size > 0U && (static_cast<uint8_t>(text[size - 1U]) & 0xC0U) == 0x80U) {
+        --size;
+    }
+    if (size > 0U && (static_cast<uint8_t>(text[size - 1U]) & 0x80U) != 0U) {
+        --size;
+    }
+    text[size] = '\0';
+    return size;
+}
+
+static void queue_metadata(uint32_t track_index, uint32_t catalog_generation)
+{
+    const char *title = "";
+    const char *artist = "";
+    MediaTrackViewV2 view = {};
+    if (track_index != UINT32_MAX && media_catalog_v2_get_track_view(track_index, &view)) {
+        if (view.title != nullptr) title = view.title;
+        if (view.artist != nullptr) artist = view.artist;
+        catalog_generation = view.generation;
+    }
+
+    const int written = snprintf(
+        g_metadata_payload,
+        sizeof(g_metadata_payload),
+        "%s\n%s",
+        title,
+        artist);
+
+    if (written < 0) {
+        g_metadata_payload[0] = '\0';
+        g_metadata_size = 0U;
+    } else if (static_cast<size_t>(written) >= sizeof(g_metadata_payload)) {
+        g_metadata_size = trim_truncated_utf8_tail(g_metadata_payload, kMetadataMaxBytes);
+    } else {
+        g_metadata_size = static_cast<size_t>(written);
+    }
+
+    ++g_metadata_sequence;
+    g_metadata_track_index = track_index;
+    g_metadata_catalog_generation = catalog_generation;
+    g_metadata_source_initialized = true;
+    g_metadata_chunk_index = 0U;
+    g_metadata_chunk_count = static_cast<uint8_t>(
+        (g_metadata_size + kMetadataChunkDataBytes - 1U) / kMetadataChunkDataBytes);
+    if (g_metadata_chunk_count == 0U) g_metadata_chunk_count = 1U;
+}
+
+static void ensure_metadata_for_track(uint32_t track_index)
+{
+    uint32_t generation = 0U;
+    if (track_index != UINT32_MAX) {
+        MediaTrackViewV2 view = {};
+        if (media_catalog_v2_get_track_view(track_index, &view)) generation = view.generation;
+    }
+
+    if (!g_metadata_source_initialized ||
+        track_index != g_metadata_track_index ||
+        generation != g_metadata_catalog_generation) {
+        queue_metadata(track_index, generation);
+    }
+}
+
+static void build_status_packet(uint8_t *packet)
+{
+    memset(packet, 0, kStatusPacketSize);
+    packet[0] = 0x01U; // Status packet
+    packet[1] = kPhoneEventProtocolVersion;
+
+    AudioStateSnapshot audio = {};
+    const bool audio_valid = audio_service_get_snapshot(&audio) && audio.ready;
+    const uint32_t track_index = audio_valid ? audio.track_index : UINT32_MAX;
+    ensure_metadata_for_track(track_index);
+
+    packet[2] = audio_valid ? static_cast<uint8_t>(audio.state) : 0xFFU;
+    packet[3] = audio_valid ? audio.volume_percent : 0U;
+
+    BatterySnapshot battery = {};
+    const bool battery_valid = battery_service_get_snapshot(&battery) && battery.valid;
+    packet[4] = battery_valid ? battery.percent : 0xFFU;
+
+    uint8_t flags = 0U;
+    if (audio_valid && audio.user_muted) flags |= 0x01U;
+    if (battery_valid) flags |= 0x02U;
+    if (audio_valid && track_index != UINT32_MAX) flags |= 0x04U;
+    packet[5] = flags;
+
+    write_u32_le(&packet[6], track_index);
+    write_u32_le(&packet[10], audio_valid ? clamp_u64_to_u32(audio.position_ms) : 0U);
+
+    uint64_t duration_ms = 0ULL;
+    if (audio_valid && audio.sample_rate_hz > 0U && audio.total_frames > 0ULL) {
+        duration_ms = (audio.total_frames * 1000ULL) / audio.sample_rate_hz;
+    }
+    write_u32_le(&packet[14], clamp_u64_to_u32(duration_ms));
+    write_u16_le(&packet[18], g_metadata_sequence);
+}
+
+static int status_event_access(
+    uint16_t,
+    uint16_t,
+    struct ble_gatt_access_ctxt *ctxt,
+    void *)
+{
+    if (ctxt == nullptr || ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR || ctxt->om == nullptr) {
         return BLE_ATT_ERR_UNLIKELY;
     }
-    return os_mbuf_append(ctxt->om, data, size) == 0
+
+    uint8_t packet[kStatusPacketSize] = {};
+    portENTER_CRITICAL(&g_lock);
+    memcpy(packet, g_last_status_packet, sizeof(packet));
+    portEXIT_CRITICAL(&g_lock);
+    return os_mbuf_append(ctxt->om, packet, sizeof(packet)) == 0
         ? 0
         : BLE_ATT_ERR_INSUFFICIENT_RES;
 }
 
-static int hid_information_access(
-    uint16_t,
-    uint16_t,
-    struct ble_gatt_access_ctxt *ctxt,
-    void *)
+static bool connection_is_encrypted(uint16_t conn_handle)
 {
-    if (ctxt == nullptr || ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) {
-        return BLE_ATT_ERR_UNLIKELY;
-    }
-    return hid_append_read_value(ctxt, kHidInformation, sizeof(kHidInformation));
+    struct ble_gap_conn_desc desc = {};
+    return ble_gap_conn_find(conn_handle, &desc) == 0 && desc.sec_state.encrypted;
 }
 
-static int hid_report_map_access(
-    uint16_t,
-    uint16_t,
-    struct ble_gatt_access_ctxt *ctxt,
-    void *)
+static int notify_phone_event(uint16_t conn_handle, const void *data, size_t size)
 {
-    if (ctxt == nullptr || ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) {
-        return BLE_ATT_ERR_UNLIKELY;
-    }
-    return hid_append_read_value(ctxt, kHidReportMap, sizeof(kHidReportMap));
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(data, size);
+    if (om == nullptr) return BLE_HS_ENOMEM;
+    return ble_gatts_notify_custom(conn_handle, g_control_event_val_handle, om);
 }
 
-static int hid_control_point_access(
-    uint16_t,
+static bool send_next_metadata_chunk(uint16_t conn_handle)
+{
+    if (g_metadata_chunk_index >= g_metadata_chunk_count) return false;
+
+    uint8_t packet[6U + kMetadataChunkDataBytes] = {};
+    packet[0] = 0x02U; // Metadata chunk
+    packet[1] = kPhoneEventProtocolVersion;
+    write_u16_le(&packet[2], g_metadata_sequence);
+    packet[4] = g_metadata_chunk_index;
+    packet[5] = g_metadata_chunk_count;
+
+    const size_t offset = static_cast<size_t>(g_metadata_chunk_index) * kMetadataChunkDataBytes;
+    const size_t remaining = offset < g_metadata_size ? g_metadata_size - offset : 0U;
+    const size_t chunk_size = remaining > kMetadataChunkDataBytes
+        ? kMetadataChunkDataBytes
+        : remaining;
+    if (chunk_size > 0U) memcpy(&packet[6], &g_metadata_payload[offset], chunk_size);
+
+    const int rc = notify_phone_event(conn_handle, packet, 6U + chunk_size);
+    if (rc != 0) return true;
+
+    ++g_metadata_chunk_index;
+    return g_metadata_chunk_index < g_metadata_chunk_count;
+}
+
+static void update_phone_state_notify(TickType_t now)
+{
+    uint16_t conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    bool notify_enabled = false;
+    bool force_status = false;
+    bool force_metadata_refresh = false;
+    TickType_t due_tick = 0;
+
+    portENTER_CRITICAL(&g_lock);
+    conn_handle = g_conn_handle;
+    notify_enabled = g_control_event_notify_enabled;
+    force_status = g_force_status_notify;
+    force_metadata_refresh = g_force_metadata_refresh;
+    due_tick = g_status_notify_due_tick;
+    portEXIT_CRITICAL(&g_lock);
+
+    if (!notify_enabled || conn_handle == BLE_HS_CONN_HANDLE_NONE ||
+        g_control_event_val_handle == 0U || !connection_is_encrypted(conn_handle)) {
+        return;
+    }
+
+    if (force_metadata_refresh) {
+        portENTER_CRITICAL(&g_lock);
+        g_force_metadata_refresh = false;
+        portEXIT_CRITICAL(&g_lock);
+        // Metadata 缓冲只由 system loop 维护，避免 GAP HostTask 与 system loop 并发改写。
+        g_metadata_source_initialized = false;
+        g_metadata_chunk_index = 0U;
+        g_metadata_chunk_count = 0U;
+    }
+
+    if (force_status || due_tick == 0 || tick_due(now, due_tick)) {
+        uint8_t packet[kStatusPacketSize] = {};
+        build_status_packet(packet);
+        const int rc = notify_phone_event(conn_handle, packet, sizeof(packet));
+        if (rc == 0) {
+            portENTER_CRITICAL(&g_lock);
+            memcpy(g_last_status_packet, packet, sizeof(packet));
+            g_force_status_notify = false;
+            g_status_notify_due_tick = now + kStatusNotifyInterval;
+            portEXIT_CRITICAL(&g_lock);
+        }
+        return;
+    }
+
+    (void)send_next_metadata_chunk(conn_handle);
+}
+
+static int control_command_access(
+    uint16_t conn_handle,
     uint16_t,
     struct ble_gatt_access_ctxt *ctxt,
     void *)
@@ -178,83 +387,56 @@ static int hid_control_point_access(
     if (os_mbuf_copydata(ctxt->om, 0, sizeof(command), &command) != 0) {
         return BLE_ATT_ERR_UNLIKELY;
     }
-    if (command > 1U) {
+    if (command < 0x01U || command > 0x05U) {
+        ESP_LOGW(TAG, "BLE手机控制未知命令：0x%02X", static_cast<unsigned>(command));
         return BLE_ATT_ERR_UNLIKELY;
     }
 
-    // HID Control Point：0=Suspend，1=Exit Suspend；当前阶段没有主动 Report TX。
+    // player_control 已负责跨任务串行化；BLE HostTask 这里只复用现有本机控制入口。
+    const bool ok = execute_control_command(command);
+    if (!ok) {
+        ESP_LOGW(TAG, "BLE手机控制执行失败：handle=%u command=0x%02X %s",
+            static_cast<unsigned>(conn_handle),
+            static_cast<unsigned>(command),
+            control_command_name(command));
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    ESP_LOGI(TAG, "BLE手机控制：handle=%u command=0x%02X %s",
+        static_cast<unsigned>(conn_handle),
+        static_cast<unsigned>(command),
+        control_command_name(command));
     return 0;
 }
 
-static int hid_input_report_access(
-    uint16_t,
-    uint16_t,
-    struct ble_gatt_access_ctxt *ctxt,
-    void *)
+static void init_control_gatt_defs()
 {
-    if (ctxt == nullptr || ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) {
-        return BLE_ATT_ERR_UNLIKELY;
-    }
-    return hid_append_read_value(ctxt, &g_hid_input_report, sizeof(g_hid_input_report));
+    memset(g_control_chrs, 0, sizeof(g_control_chrs));
+    memset(g_control_svcs, 0, sizeof(g_control_svcs));
+
+    g_control_chrs[0].uuid = &kControlCommandUuid.u;
+    g_control_chrs[0].access_cb = control_command_access;
+    g_control_chrs[0].flags = BLE_GATT_CHR_F_WRITE |
+        BLE_GATT_CHR_F_WRITE_NO_RSP |
+        BLE_GATT_CHR_F_WRITE_ENC;
+
+    g_control_chrs[1].uuid = &kControlEventUuid.u;
+    g_control_chrs[1].access_cb = status_event_access;
+    g_control_chrs[1].flags = BLE_GATT_CHR_F_READ |
+        BLE_GATT_CHR_F_READ_ENC |
+        BLE_GATT_CHR_F_NOTIFY;
+    g_control_chrs[1].val_handle = &g_control_event_val_handle;
+
+    g_control_svcs[0].type = BLE_GATT_SVC_TYPE_PRIMARY;
+    g_control_svcs[0].uuid = &kControlServiceUuid.u;
+    g_control_svcs[0].characteristics = g_control_chrs;
 }
 
-static int hid_report_reference_access(
-    uint16_t,
-    uint16_t,
-    struct ble_gatt_access_ctxt *ctxt,
-    void *)
+static int register_control_service()
 {
-    if (ctxt == nullptr || ctxt->op != BLE_GATT_ACCESS_OP_READ_DSC) {
-        return BLE_ATT_ERR_UNLIKELY;
-    }
-    return hid_append_read_value(
-        ctxt,
-        kHidInputReportReference,
-        sizeof(kHidInputReportReference));
-}
-
-static void init_hid_gatt_defs()
-{
-    memset(g_hid_input_dscs, 0, sizeof(g_hid_input_dscs));
-    memset(g_hid_chrs, 0, sizeof(g_hid_chrs));
-    memset(g_hid_svcs, 0, sizeof(g_hid_svcs));
-
-    g_hid_input_report = 0U;
-    g_hid_input_val_handle = 0U;
-
-    g_hid_input_dscs[0].uuid = &kHidReportReferenceUuid.u;
-    g_hid_input_dscs[0].att_flags = BLE_ATT_F_READ | BLE_ATT_F_READ_ENC;
-    g_hid_input_dscs[0].access_cb = hid_report_reference_access;
-
-    g_hid_chrs[0].uuid = &kHidInformationUuid.u;
-    g_hid_chrs[0].access_cb = hid_information_access;
-    g_hid_chrs[0].flags = BLE_GATT_CHR_F_READ;
-
-    g_hid_chrs[1].uuid = &kHidReportMapUuid.u;
-    g_hid_chrs[1].access_cb = hid_report_map_access;
-    g_hid_chrs[1].flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC;
-
-    g_hid_chrs[2].uuid = &kHidControlPointUuid.u;
-    g_hid_chrs[2].access_cb = hid_control_point_access;
-    g_hid_chrs[2].flags = BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE_ENC;
-
-    g_hid_chrs[3].uuid = &kHidReportUuid.u;
-    g_hid_chrs[3].access_cb = hid_input_report_access;
-    g_hid_chrs[3].descriptors = g_hid_input_dscs;
-    g_hid_chrs[3].flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_READ_ENC;
-    g_hid_chrs[3].val_handle = &g_hid_input_val_handle;
-
-    g_hid_svcs[0].type = BLE_GATT_SVC_TYPE_PRIMARY;
-    g_hid_svcs[0].uuid = &kHidServiceUuid.u;
-    g_hid_svcs[0].characteristics = g_hid_chrs;
-}
-
-static int register_hid_service()
-{
-    init_hid_gatt_defs();
-
-    int rc = ble_gatts_count_cfg(g_hid_svcs);
-    if (rc == 0) rc = ble_gatts_add_svcs(g_hid_svcs);
+    init_control_gatt_defs();
+    int rc = ble_gatts_count_cfg(g_control_svcs);
+    if (rc == 0) rc = ble_gatts_add_svcs(g_control_svcs);
     return rc;
 }
 
@@ -278,6 +460,10 @@ static int gap_event_cb(struct ble_gap_event *event, void *)
                 portENTER_CRITICAL(&g_lock);
                 g_connected = true;
                 g_conn_handle = event->connect.conn_handle;
+                g_control_event_notify_enabled = false;
+                g_force_status_notify = false;
+                g_force_metadata_refresh = false;
+                g_status_notify_due_tick = 0;
                 set_state_locked(BleRemoteState::Connected);
                 portEXIT_CRITICAL(&g_lock);
                 ESP_LOGI(TAG, "手机已连接：handle=%u", static_cast<unsigned>(event->connect.conn_handle));
@@ -291,6 +477,10 @@ static int gap_event_cb(struct ble_gap_event *event, void *)
             portENTER_CRITICAL(&g_lock);
             g_connected = false;
             g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+            g_control_event_notify_enabled = false;
+            g_force_status_notify = false;
+            g_force_metadata_refresh = false;
+            g_status_notify_due_tick = 0;
             if (g_desired_enabled && g_state != BleRemoteState::Stopping) {
                 set_state_locked(BleRemoteState::Advertising);
             }
@@ -338,8 +528,14 @@ static int gap_event_cb(struct ble_gap_event *event, void *)
         }
 
         case BLE_GAP_EVENT_SUBSCRIBE:
-            if (event->subscribe.attr_handle == g_hid_input_val_handle) {
-                ESP_LOGI(TAG, "BLE HID订阅：Consumer Control notify=%u",
+            if (event->subscribe.attr_handle == g_control_event_val_handle) {
+                portENTER_CRITICAL(&g_lock);
+                g_control_event_notify_enabled = event->subscribe.cur_notify != 0U;
+                g_force_status_notify = g_control_event_notify_enabled;
+                g_force_metadata_refresh = g_control_event_notify_enabled;
+                g_status_notify_due_tick = 0;
+                portEXIT_CRITICAL(&g_lock);
+                ESP_LOGI(TAG, "BLE状态订阅：notify=%u",
                     static_cast<unsigned>(event->subscribe.cur_notify));
             }
             return 0;
@@ -362,13 +558,9 @@ static int start_advertising()
     fields.name = reinterpret_cast<uint8_t *>(const_cast<char *>(kDeviceName));
     fields.name_len = strlen(kDeviceName);
     fields.name_is_complete = 1;
-    fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
-    fields.tx_pwr_lvl_is_present = 1;
-    fields.appearance = kHidAppearance;
-    fields.appearance_is_present = 1;
-    fields.uuids16 = &kHidServiceUuid;
-    fields.num_uuids16 = 1;
-    fields.uuids16_is_complete = 1;
+    fields.uuids128 = const_cast<ble_uuid128_t *>(&kControlServiceUuid);
+    fields.num_uuids128 = 1;
+    fields.uuids128_is_complete = 1;
 
     int rc = ble_gap_adv_set_fields(&fields);
     if (rc != 0) return rc;
@@ -480,6 +672,10 @@ static esp_err_t stop_stack()
     g_stack_initialized = false;
     g_connected = false;
     g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    g_control_event_notify_enabled = false;
+    g_force_status_notify = false;
+    g_force_metadata_refresh = false;
+    g_status_notify_due_tick = 0;
     portEXIT_CRITICAL(&g_lock);
     return ESP_OK;
 }
@@ -496,7 +692,22 @@ static esp_err_t start_stack()
     g_stack_initialized = true;
     g_connected = false;
     g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    g_control_event_notify_enabled = false;
+    g_force_status_notify = false;
+    g_force_metadata_refresh = false;
+    g_status_notify_due_tick = 0;
     portEXIT_CRITICAL(&g_lock);
+
+    g_control_event_val_handle = 0U;
+    g_metadata_source_initialized = false;
+    g_metadata_chunk_index = 0U;
+    g_metadata_chunk_count = 0U;
+    memset(g_last_status_packet, 0, sizeof(g_last_status_packet));
+    g_last_status_packet[0] = 0x01U;
+    g_last_status_packet[1] = kPhoneEventProtocolVersion;
+    g_last_status_packet[2] = 0xFFU;
+    g_last_status_packet[4] = 0xFFU;
+    write_u32_le(&g_last_status_packet[6], UINT32_MAX);
 
     ble_hs_cfg.reset_cb = host_reset_cb;
     ble_hs_cfg.sync_cb = host_sync_cb;
@@ -504,16 +715,16 @@ static esp_err_t start_stack()
     ble_svc_gap_init();
     ble_svc_gatt_init();
 
-    const int appearance_rc = ble_svc_gap_device_appearance_set(kHidAppearance);
+    const int appearance_rc = ble_svc_gap_device_appearance_set(kMediaPlayerAppearance);
     if (appearance_rc != 0) {
-        ESP_LOGW(TAG, "BLE HID Appearance设置失败：rc=%d", appearance_rc);
+        ESP_LOGW(TAG, "BLE Media Player Appearance设置失败：rc=%d", appearance_rc);
         (void)stop_stack();
         return ESP_FAIL;
     }
 
-    const int hid_rc = register_hid_service();
-    if (hid_rc != 0) {
-        ESP_LOGW(TAG, "BLE HID服务注册失败：rc=%d", hid_rc);
+    const int control_rc = register_control_service();
+    if (control_rc != 0) {
+        ESP_LOGW(TAG, "BLE手机控制服务注册失败：rc=%d", control_rc);
         (void)stop_stack();
         return ESP_FAIL;
     }
@@ -528,8 +739,7 @@ static esp_err_t start_stack()
     // NimBLE 安全存储接入默认 NVS，使 Bond/LTK 在设备重启后仍可恢复。
     ble_store_config_init();
 
-    ESP_LOGI(TAG, "BLE HID Consumer Control已注册：ReportID=%u",
-        static_cast<unsigned>(kHidConsumerReportId));
+    ESP_LOGI(TAG, "BLE手机控制服务已注册：5命令 + 状态Notify V1");
     nimble_port_freertos_init(host_task);
     return ESP_OK;
 }
@@ -686,7 +896,13 @@ void ble_remote_service_update()
 
     const TickType_t now = xTaskGetTickCount();
     if (desired) {
-        if (state == BleRemoteState::Advertising || state == BleRemoteState::Connected) return;
+        if (state == BleRemoteState::Connected) {
+#if FAKEPOD_BLE_FOUNDATION_ENABLED
+            update_phone_state_notify(now);
+#endif
+            return;
+        }
+        if (state == BleRemoteState::Advertising) return;
         if (state == BleRemoteState::Stopping) return;
         if (state == BleRemoteState::Starting && !tick_due(now, state_since + kStartTimeout)) return;
         if (state == BleRemoteState::Starting) {

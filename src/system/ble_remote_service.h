@@ -4,8 +4,8 @@
 
 #include "esp_err.h"
 
-// R46.0：BLE Foundation 只负责蓝牙生命周期、广播和连接状态。
-// 后续 HID Host / 遥控协议都复用这里的生命周期，不让具体 APP 直接操作 NimBLE。
+// R46.0：BLE Foundation 负责蓝牙生命周期、广播和连接状态。
+// 手机遥控通过本服务的加密 GATT 写入入口调用现有 Player 控制，不让 APP 直接操作 NimBLE。
 enum class BleRemoteState : uint8_t {
     Disabled = 0,
     Starting,
