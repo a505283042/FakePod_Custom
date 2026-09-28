@@ -5,6 +5,7 @@
 
 #include "sdkconfig.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "audio_service.h"
@@ -76,7 +77,8 @@ static constexpr uint8_t kPhoneEventProtocolVersion = 1U;
 static constexpr size_t kStatusPacketSize = 20U;
 static constexpr size_t kMetadataChunkDataBytes = 14U;
 static constexpr size_t kMetadataMaxBytes = 196U;
-static constexpr TickType_t kStatusNotifyInterval = pdMS_TO_TICKS(500);
+static constexpr TickType_t kStatusResyncInterval = pdMS_TO_TICKS(15000);
+static constexpr TickType_t kStatusEventPollInterval = pdMS_TO_TICKS(250);
 #if FAKEPOD_BLE_SCAN_MODE_ENABLED
 static constexpr uint16_t kHidServiceUuid16 = 0x1812U;
 static constexpr TickType_t kScanLogInterval = pdMS_TO_TICKS(1000);
@@ -99,7 +101,10 @@ static bool g_control_event_notify_enabled = false;
 static bool g_force_status_notify = false;
 static bool g_force_metadata_refresh = false;
 static TickType_t g_status_notify_due_tick = 0;
+static TickType_t g_status_event_poll_due_tick = 0;
 static uint8_t g_last_status_packet[kStatusPacketSize] = {};
+static uint32_t g_last_status_playback_revision = 0U;
+static uint32_t g_last_status_seek_revision = 0U;
 
 static bool g_metadata_source_initialized = false;
 static uint32_t g_metadata_track_index = UINT32_MAX;
@@ -168,11 +173,12 @@ static const char *control_command_name(uint8_t command)
         case 0x03U: return "上一曲";
         case 0x04U: return "音量+";
         case 0x05U: return "音量-";
+        case 0x06U: return "音量设置";
         default: return "未知";
     }
 }
 
-static bool execute_control_command(uint8_t command)
+static bool execute_control_command(uint8_t command, uint8_t value = 0U)
 {
     switch (command) {
         case 0x01U: return player_control_toggle_play_pause();
@@ -180,6 +186,7 @@ static bool execute_control_command(uint8_t command)
         case 0x03U: return player_control_previous();
         case 0x04U: return player_control_volume_up(1U);
         case 0x05U: return player_control_volume_down(1U);
+        case 0x06U: return value <= 100U && player_control_set_volume(value);
         default: return false;
     }
 }
@@ -269,7 +276,10 @@ static void ensure_metadata_for_track(uint32_t track_index)
     }
 }
 
-static void build_status_packet(uint8_t *packet)
+static void build_status_packet(
+    uint8_t *packet,
+    uint32_t *out_playback_revision = nullptr,
+    uint32_t *out_seek_revision = nullptr)
 {
     memset(packet, 0, kStatusPacketSize);
     packet[0] = 0x01U; // Status packet
@@ -278,6 +288,12 @@ static void build_status_packet(uint8_t *packet)
     AudioStateSnapshot audio = {};
     const bool audio_valid = audio_service_get_snapshot(&audio) && audio.ready;
     const uint32_t track_index = audio_valid ? audio.track_index : UINT32_MAX;
+    if (out_playback_revision != nullptr) {
+        *out_playback_revision = audio_valid ? audio.playback_revision : 0U;
+    }
+    if (out_seek_revision != nullptr) {
+        *out_seek_revision = audio_valid ? audio.seek_revision : 0U;
+    }
     ensure_metadata_for_track(track_index);
 
     packet[2] = audio_valid ? static_cast<uint8_t>(audio.state) : 0xFFU;
@@ -336,6 +352,20 @@ static int notify_phone_event(uint16_t conn_handle, const void *data, size_t siz
     return ble_gatts_notify_custom(conn_handle, g_control_event_val_handle, om);
 }
 
+static bool status_semantic_changed(const uint8_t *packet)
+{
+    // position_ms(10..13) 由手机本地单调时钟推进，不参与事件变化判断。
+    // battery_percent(4) 与 battery_valid 标志位(5.bit1) 只随 15 秒校时或其它事件顺带同步，
+    // 避免电量 ADC 在百分比边界附近抖动时单独触发 BLE Notify。
+    const uint8_t flags_changed = static_cast<uint8_t>(
+        (packet[5] ^ g_last_status_packet[5]) & static_cast<uint8_t>(~0x02U));
+    return packet[2] != g_last_status_packet[2] ||
+        packet[3] != g_last_status_packet[3] ||
+        flags_changed != 0U ||
+        memcmp(&packet[6], &g_last_status_packet[6], 4U) != 0 ||
+        memcmp(&packet[14], &g_last_status_packet[14], 6U) != 0;
+}
+
 static bool send_next_metadata_chunk(uint16_t conn_handle)
 {
     if (g_metadata_chunk_index >= g_metadata_chunk_count) return false;
@@ -367,14 +397,16 @@ static void update_phone_state_notify(TickType_t now)
     bool notify_enabled = false;
     bool force_status = false;
     bool force_metadata_refresh = false;
-    TickType_t due_tick = 0;
+    TickType_t resync_due_tick = 0;
+    TickType_t poll_due_tick = 0;
 
     portENTER_CRITICAL(&g_lock);
     conn_handle = g_conn_handle;
     notify_enabled = g_control_event_notify_enabled;
     force_status = g_force_status_notify;
     force_metadata_refresh = g_force_metadata_refresh;
-    due_tick = g_status_notify_due_tick;
+    resync_due_tick = g_status_notify_due_tick;
+    poll_due_tick = g_status_event_poll_due_tick;
     portEXIT_CRITICAL(&g_lock);
 
     if (!notify_enabled || conn_handle == BLE_HS_CONN_HANDLE_NONE ||
@@ -392,18 +424,37 @@ static void update_phone_state_notify(TickType_t now)
         g_metadata_chunk_count = 0U;
     }
 
-    if (force_status || due_tick == 0 || tick_due(now, due_tick)) {
+    const bool resync_due = resync_due_tick == 0 || tick_due(now, resync_due_tick);
+    const bool poll_due = poll_due_tick == 0 || tick_due(now, poll_due_tick);
+    if (force_status || resync_due || poll_due) {
         uint8_t packet[kStatusPacketSize] = {};
-        build_status_packet(packet);
-        const int rc = notify_phone_event(conn_handle, packet, sizeof(packet));
-        if (rc == 0) {
-            portENTER_CRITICAL(&g_lock);
-            memcpy(g_last_status_packet, packet, sizeof(packet));
-            g_force_status_notify = false;
-            g_status_notify_due_tick = now + kStatusNotifyInterval;
-            portEXIT_CRITICAL(&g_lock);
+        uint32_t playback_revision = 0U;
+        uint32_t seek_revision = 0U;
+        build_status_packet(packet, &playback_revision, &seek_revision);
+        const bool semantic_changed = status_semantic_changed(packet);
+        const bool timeline_changed =
+            playback_revision != g_last_status_playback_revision ||
+            seek_revision != g_last_status_seek_revision;
+
+        portENTER_CRITICAL(&g_lock);
+        g_status_event_poll_due_tick = now + kStatusEventPollInterval;
+        portEXIT_CRITICAL(&g_lock);
+
+        // Stable Playing 时 position_ms 不再每 500ms 通过 BLE 推送；手机本地自走。
+        // Track/Seek revision 即使跨过短暂 Seeking 状态，也会触发一次准确时间同步。
+        if (force_status || resync_due || semantic_changed || timeline_changed) {
+            const int rc = notify_phone_event(conn_handle, packet, sizeof(packet));
+            if (rc == 0) {
+                portENTER_CRITICAL(&g_lock);
+                memcpy(g_last_status_packet, packet, sizeof(packet));
+                g_last_status_playback_revision = playback_revision;
+                g_last_status_seek_revision = seek_revision;
+                g_force_status_notify = false;
+                g_status_notify_due_tick = now + kStatusResyncInterval;
+                portEXIT_CRITICAL(&g_lock);
+            }
+            return;
         }
-        return;
     }
 
     (void)send_next_metadata_chunk(conn_handle);
@@ -418,21 +469,35 @@ static int control_command_access(
     if (ctxt == nullptr || ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR || ctxt->om == nullptr) {
         return BLE_ATT_ERR_UNLIKELY;
     }
-    if (OS_MBUF_PKTLEN(ctxt->om) != 1U) {
+
+    const size_t payload_len = OS_MBUF_PKTLEN(ctxt->om);
+    if (payload_len != 1U && payload_len != 2U) {
         return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     }
 
-    uint8_t command = 0U;
-    if (os_mbuf_copydata(ctxt->om, 0, sizeof(command), &command) != 0) {
-        return BLE_ATT_ERR_UNLIKELY;
-    }
-    if (command < 0x01U || command > 0x05U) {
-        ESP_LOGW(TAG, "BLE手机控制未知命令：0x%02X", static_cast<unsigned>(command));
+    uint8_t payload[2] = {};
+    if (os_mbuf_copydata(ctxt->om, 0, payload_len, payload) != 0) {
         return BLE_ATT_ERR_UNLIKELY;
     }
 
+    const uint8_t command = payload[0];
+    const bool absolute_volume = command == 0x06U;
+    if (absolute_volume) {
+        if (payload_len != 2U) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        if (payload[1] > 100U) {
+            ESP_LOGW(TAG, "BLE手机控制音量越界：%u%%", static_cast<unsigned>(payload[1]));
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+    } else if (payload_len != 1U || command < 0x01U || command > 0x05U) {
+        ESP_LOGW(TAG, "BLE手机控制未知命令：0x%02X len=%u",
+            static_cast<unsigned>(command),
+            static_cast<unsigned>(payload_len));
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    // R46.0.21：0x06 直接提交绝对音量；一次拖动松手只产生一次 GATT Write。
     // player_control 已负责跨任务串行化；BLE HostTask 这里只复用现有本机控制入口。
-    const bool ok = execute_control_command(command);
+    const bool ok = execute_control_command(command, payload[1]);
     if (!ok) {
         ESP_LOGW(TAG, "BLE手机控制执行失败：handle=%u command=0x%02X %s",
             static_cast<unsigned>(conn_handle),
@@ -441,10 +506,16 @@ static int control_command_access(
         return BLE_ATT_ERR_UNLIKELY;
     }
 
-    ESP_LOGI(TAG, "BLE手机控制：handle=%u command=0x%02X %s",
-        static_cast<unsigned>(conn_handle),
-        static_cast<unsigned>(command),
-        control_command_name(command));
+    if (absolute_volume) {
+        ESP_LOGI(TAG, "BLE手机控制：handle=%u command=0x06 音量=%u%%",
+            static_cast<unsigned>(conn_handle),
+            static_cast<unsigned>(payload[1]));
+    } else {
+        ESP_LOGI(TAG, "BLE手机控制：handle=%u command=0x%02X %s",
+            static_cast<unsigned>(conn_handle),
+            static_cast<unsigned>(command),
+            control_command_name(command));
+    }
     return 0;
 }
 
@@ -483,13 +554,47 @@ static bool should_advertise()
 {
     portENTER_CRITICAL(&g_lock);
     const bool allowed = g_desired_enabled &&
+        !g_connected &&
         g_desired_work_mode == BleRemoteWorkMode::Broadcast &&
         g_state != BleRemoteState::Stopping;
     portEXIT_CRITICAL(&g_lock);
     return allowed;
 }
 
+static void log_ble_ram(const char *stage)
+{
+    ESP_LOGI(
+        TAG,
+        "RAM_TRACE: %s internal=%u min=%u largest=%u dma=%u psram=%u",
+        stage,
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+        static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
+        static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+}
+
 static int start_advertising();
+
+static void retry_advertising_after_failure(const char *reason, int rc)
+{
+    portENTER_CRITICAL(&g_lock);
+    if (g_desired_enabled &&
+        g_desired_work_mode == BleRemoteWorkMode::Broadcast &&
+        g_state != BleRemoteState::Stopping) {
+        set_state_locked(BleRemoteState::RetryWait, ESP_FAIL);
+        g_retry_due_tick = xTaskGetTickCount() + kRetryDelay;
+    }
+    portEXIT_CRITICAL(&g_lock);
+    ESP_LOGW(TAG, "BLE广播恢复失败：source=%s rc=%d；2秒后完整重试", reason, rc);
+}
+
+static void restart_advertising_or_retry(const char *reason)
+{
+    if (!should_advertise()) return;
+    const int rc = start_advertising();
+    if (rc != 0) retry_advertising_after_failure(reason, rc);
+}
 
 #if FAKEPOD_BLE_SCAN_MODE_ENABLED
 static bool adv_fields_has_hid_service(const struct ble_hs_adv_fields &fields)
@@ -660,16 +765,18 @@ static int gap_event_cb(struct ble_gap_event *event, void *)
                 g_force_status_notify = false;
                 g_force_metadata_refresh = false;
                 g_status_notify_due_tick = 0;
+                g_status_event_poll_due_tick = 0;
                 set_state_locked(BleRemoteState::Connected);
                 portEXIT_CRITICAL(&g_lock);
                 ESP_LOGI(TAG, "手机已连接：handle=%u", static_cast<unsigned>(event->connect.conn_handle));
+                log_ble_ram("connected");
             } else {
-                ESP_LOGW(TAG, "BLE连接尝试失败：status=%d；继续广播", event->connect.status);
-                if (should_advertise()) (void)start_advertising();
+                ESP_LOGW(TAG, "BLE连接尝试失败：status=%d；恢复广播", event->connect.status);
+                restart_advertising_or_retry("connect_failed");
             }
             return 0;
 
-        case BLE_GAP_EVENT_DISCONNECT:
+        case BLE_GAP_EVENT_DISCONNECT: {
             portENTER_CRITICAL(&g_lock);
             g_connected = false;
             g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -677,18 +784,24 @@ static int gap_event_cb(struct ble_gap_event *event, void *)
             g_force_status_notify = false;
             g_force_metadata_refresh = false;
             g_status_notify_due_tick = 0;
+            g_status_event_poll_due_tick = 0;
+            const bool resume_broadcast = g_desired_enabled &&
+                g_desired_work_mode == BleRemoteWorkMode::Broadcast &&
+                g_state != BleRemoteState::Stopping;
             if (g_desired_enabled && g_state != BleRemoteState::Stopping) {
-                set_state_locked(g_desired_work_mode == BleRemoteWorkMode::Broadcast
-                    ? BleRemoteState::Advertising
-                    : BleRemoteState::Starting);
+                // 广播成功前不能提前标记 Advertising，否则一次 adv_start 失败后
+                // update() 会误以为广播仍在运行，造成断线后永久不再重试。
+                set_state_locked(BleRemoteState::Starting);
             }
             portEXIT_CRITICAL(&g_lock);
             ESP_LOGI(TAG, "BLE连接已断开：reason=%d", event->disconnect.reason);
-            if (should_advertise()) (void)start_advertising();
+            log_ble_ram("disconnected");
+            if (resume_broadcast) restart_advertising_or_retry("disconnect");
             return 0;
+        }
 
         case BLE_GAP_EVENT_ADV_COMPLETE:
-            if (should_advertise()) (void)start_advertising();
+            restart_advertising_or_retry("adv_complete");
             return 0;
 
         case BLE_GAP_EVENT_ENC_CHANGE:
@@ -732,9 +845,11 @@ static int gap_event_cb(struct ble_gap_event *event, void *)
                 g_force_status_notify = g_control_event_notify_enabled;
                 g_force_metadata_refresh = g_control_event_notify_enabled;
                 g_status_notify_due_tick = 0;
+                g_status_event_poll_due_tick = 0;
                 portEXIT_CRITICAL(&g_lock);
                 ESP_LOGI(TAG, "BLE状态订阅：notify=%u",
                     static_cast<unsigned>(event->subscribe.cur_notify));
+                if (event->subscribe.cur_notify != 0U) log_ble_ram("notify_subscribed");
             }
             return 0;
 
@@ -821,6 +936,7 @@ static int start_advertising()
         portENTER_CRITICAL(&g_lock);
         if (!g_connected && g_desired_enabled && g_state != BleRemoteState::Stopping) {
             set_state_locked(BleRemoteState::Advertising);
+            g_retry_due_tick = 0;
         }
         portEXIT_CRITICAL(&g_lock);
     }
@@ -927,10 +1043,12 @@ static esp_err_t stop_stack()
     g_force_status_notify = false;
     g_force_metadata_refresh = false;
     g_status_notify_due_tick = 0;
+    g_status_event_poll_due_tick = 0;
 #if FAKEPOD_BLE_SCAN_MODE_ENABLED
     g_scan_active = false;
 #endif
     portEXIT_CRITICAL(&g_lock);
+    log_ble_ram("after_stop");
     return ESP_OK;
 }
 
@@ -940,11 +1058,31 @@ static esp_err_t start_stack()
     g_stack_work_mode = g_desired_work_mode;
     portEXIT_CRITICAL(&g_lock);
 
+#if defined(CONFIG_BT_NIMBLE_ENABLE_CONN_REATTEMPT) && CONFIG_BT_NIMBLE_ENABLE_CONN_REATTEMPT
+    ESP_LOGW(TAG, "BLE GAP重连策略：NimBLE内建0x3E重试=ON（应为OFF，请清理旧sdkconfig后重编）");
+#else
+    ESP_LOGI(TAG, "BLE GAP重连策略：NimBLE内建0x3E重试=OFF，广播恢复由FakePod状态机接管");
+#endif
+    ESP_LOGI(TAG,
+        "BLE RAM配置：connections=%d activities=%d host_stack=%d ACL=%dx%d MSYS1=%dx%d MSYS2=%dx%d EVT=%d+%d",
+        CONFIG_BT_NIMBLE_MAX_CONNECTIONS,
+        CONFIG_BT_CTRL_BLE_MAX_ACT,
+        CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE,
+        CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT,
+        CONFIG_BT_NIMBLE_TRANSPORT_ACL_SIZE,
+        CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT,
+        CONFIG_BT_NIMBLE_MSYS_1_BLOCK_SIZE,
+        CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT,
+        CONFIG_BT_NIMBLE_MSYS_2_BLOCK_SIZE,
+        CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT,
+        CONFIG_BT_NIMBLE_TRANSPORT_EVT_DISCARD_COUNT);
+    log_ble_ram("before_start");
     const int init_rc = nimble_port_init();
     if (init_rc != ESP_OK) {
         ESP_LOGW(TAG, "NimBLE初始化失败：rc=%d", init_rc);
         return init_rc == ESP_ERR_NO_MEM ? ESP_ERR_NO_MEM : ESP_FAIL;
     }
+    log_ble_ram("after_nimble_init");
 
     portENTER_CRITICAL(&g_lock);
     g_stack_initialized = true;
@@ -954,6 +1092,7 @@ static esp_err_t start_stack()
     g_force_status_notify = false;
     g_force_metadata_refresh = false;
     g_status_notify_due_tick = 0;
+    g_status_event_poll_due_tick = 0;
 #if FAKEPOD_BLE_SCAN_MODE_ENABLED
     g_scan_active = false;
 #endif
@@ -964,6 +1103,8 @@ static esp_err_t start_stack()
     g_metadata_chunk_index = 0U;
     g_metadata_chunk_count = 0U;
     memset(g_last_status_packet, 0, sizeof(g_last_status_packet));
+    g_last_status_playback_revision = 0U;
+    g_last_status_seek_revision = 0U;
     g_last_status_packet[0] = 0x01U;
     g_last_status_packet[1] = kPhoneEventProtocolVersion;
     g_last_status_packet[2] = 0xFFU;
@@ -1010,9 +1151,10 @@ static esp_err_t start_stack()
     // NimBLE 安全存储接入默认 NVS，使 Bond/LTK 在设备重启后仍可恢复。
     ble_store_config_init();
 
-    ESP_LOGI(TAG, "BLE手机控制服务已注册：5命令 + 状态Notify V1");
+    ESP_LOGI(TAG, "BLE手机控制服务已注册：6命令 + 状态Notify V1（事件驱动 + 15秒校时）");
     ESP_LOGI(TAG, "BLE安全：Bond=ON SC=ON MITM=OFF KeyDist=ENC|ID");
     nimble_port_freertos_init(host_task);
+    log_ble_ram("host_started");
     return ESP_OK;
 }
 

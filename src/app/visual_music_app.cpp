@@ -122,7 +122,7 @@ static char *g_scratch_path = nullptr;
 static char *g_selected_path = nullptr;
 static VisualMusicNsf::Image g_nsf_image = {};
 static uint8_t g_nsf_track = 0U;
-static AudioNsfVisualEvent g_nsf_visual_window[kNsfVisualWindowCapacity] = {};
+static AudioNsfVisualEvent *g_nsf_visual_window = nullptr;
 static uint32_t g_last_waterfall_draw_tick = 0U;
 static size_t g_nsf_visual_window_count = 0U;
 static uint32_t g_last_nsf_visual_snapshot_tick = 0U;
@@ -1571,9 +1571,11 @@ static esp_err_t cleanup_create_failure(esp_err_t err)
     if (g_current_dir != nullptr) heap_caps_free(g_current_dir);
     if (g_scratch_path != nullptr) heap_caps_free(g_scratch_path);
     if (g_selected_path != nullptr) heap_caps_free(g_selected_path);
+    if (g_nsf_visual_window != nullptr) heap_caps_free(g_nsf_visual_window);
     g_current_dir = nullptr;
     g_scratch_path = nullptr;
     g_selected_path = nullptr;
+    g_nsf_visual_window = nullptr;
     g_page = VisualMusicPage::Browser;
     return err;
 }
@@ -1594,7 +1596,12 @@ static esp_err_t visual_music_create()
         VisualMusicBrowser::kPathBytes,
         1U,
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (g_current_dir == nullptr || g_scratch_path == nullptr || g_selected_path == nullptr) {
+    g_nsf_visual_window = static_cast<AudioNsfVisualEvent *>(heap_caps_calloc(
+        kNsfVisualWindowCapacity,
+        sizeof(AudioNsfVisualEvent),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (g_current_dir == nullptr || g_scratch_path == nullptr || g_selected_path == nullptr ||
+        g_nsf_visual_window == nullptr) {
         return cleanup_create_failure(ESP_ERR_NO_MEM);
     }
     snprintf(
@@ -1875,9 +1882,11 @@ static void visual_music_destroy()
     if (g_current_dir != nullptr) heap_caps_free(g_current_dir);
     if (g_scratch_path != nullptr) heap_caps_free(g_scratch_path);
     if (g_selected_path != nullptr) heap_caps_free(g_selected_path);
+    if (g_nsf_visual_window != nullptr) heap_caps_free(g_nsf_visual_window);
     g_current_dir = nullptr;
     g_scratch_path = nullptr;
     g_selected_path = nullptr;
+    g_nsf_visual_window = nullptr;
     g_first_index = 0U;
     g_selected_index = SIZE_MAX;
     g_loop_mode = PlayerLoopMode::Sequential;

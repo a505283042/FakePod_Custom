@@ -360,7 +360,31 @@ static uint32_t g_nsf_timeline_wait_count = 0U;
 static int64_t g_nsf_timeline_last_wait_log_us = 0LL;
 static uint16_t g_nsf_play_speed_us = 16666U;
 static uint64_t g_nsf_play_interval_q32 = 0ULL;
-static NsfSynthApuEvent g_nsf_render_event_block[NSF_RENDER_EVENT_BLOCK_CAPACITY] = {};
+static NsfSynthApuEvent *g_nsf_render_event_block = nullptr;
+
+static bool nsf_render_event_block_ensure()
+{
+    if (g_nsf_render_event_block != nullptr) return true;
+    g_nsf_render_event_block = static_cast<NsfSynthApuEvent *>(heap_caps_calloc(
+        NSF_RENDER_EVENT_BLOCK_CAPACITY,
+        sizeof(NsfSynthApuEvent),
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (g_nsf_render_event_block == nullptr) {
+        ESP_LOGE(TAG, "NSF渲染事件块分配失败：%uB internal",
+            static_cast<unsigned>(NSF_RENDER_EVENT_BLOCK_CAPACITY * sizeof(NsfSynthApuEvent)));
+        return false;
+    }
+    return true;
+}
+
+static void nsf_render_event_block_release()
+{
+    if (g_nsf_render_event_block != nullptr) {
+        heap_caps_free(g_nsf_render_event_block);
+        g_nsf_render_event_block = nullptr;
+    }
+    g_nsf_render_prepared_original_count = 0U;
+}
 
 // R.40.4.2：AudioTask 单写、Video Presenter/Decode 多读的 PCM 主时钟发布槽。
 // 不让 Video 直接读取 AudioTask 内部 decoder/clock，避免跨核撕裂 64-bit 计数。
@@ -3253,6 +3277,7 @@ static esp_err_t audio_task_stop_nsf_internal(bool restore_music_hardware, const
     audio_task_cancel_nsf_analysis();
     if (!g_nsf_active && !nsf_apu_renderer_is_open(&g_nsf_renderer)) {
         nsf_timeline_release_storage();
+        nsf_render_event_block_release();
         esp_err_t ret = ESP_OK;
         if (should_restore) ret = audio_task_restore_paused_music_hardware_for_nsf(reason);
         if (restore_music_hardware && ret == ESP_OK) {
@@ -3272,6 +3297,7 @@ static esp_err_t audio_task_stop_nsf_internal(bool restore_music_hardware, const
 
     nsf_apu_renderer_close(&g_nsf_renderer);
     nsf_timeline_release_storage();
+    nsf_render_event_block_release();
     g_nsf_active = false;
     g_nsf_paused = false;
     g_nsf_failed = false;
@@ -3316,6 +3342,11 @@ static void audio_task_handle_nsf_start(AudioRequest *request)
         return;
     }
 
+    if (!nsf_render_event_block_ensure()) {
+        audio_request_complete(request, false, ESP_ERR_NO_MEM);
+        return;
+    }
+
     g_nsf_restore_paused_music_hardware =
         g_task_state == AudioPlaybackState::Paused && pcm_decoder_is_open(&g_decoder);
 
@@ -3324,6 +3355,7 @@ static void audio_task_handle_nsf_start(AudioRequest *request)
         const uint32_t active_rate = g_task_sample_rate_hz > 0U ? g_task_sample_rate_hz : 48000U;
         const esp_err_t shutdown_ret = audio_task_shutdown_output_hardware(active_rate, "Music-Paused");
         if (shutdown_ret != ESP_OK) {
+            nsf_render_event_block_release();
             g_nsf_restore_paused_music_hardware = false;
             audio_request_complete(request, false, shutdown_ret);
             return;
@@ -3338,6 +3370,7 @@ static void audio_task_handle_nsf_start(AudioRequest *request)
     esp_err_t ret = nsf_apu_renderer_open_owned(
         &g_nsf_renderer, owned_prg, request->nsf_prg_size, &playback_config, 48000U);
     if (ret != ESP_OK) {
+        nsf_render_event_block_release();
         if (g_nsf_restore_paused_music_hardware) {
             const esp_err_t restore_ret =
                 audio_task_restore_paused_music_hardware_for_nsf("nsf_open_failed");
@@ -3352,6 +3385,7 @@ static void audio_task_handle_nsf_start(AudioRequest *request)
     if (!audio_task_start_nsf_analysis()) {
         nsf_apu_renderer_close(&g_nsf_renderer);
         nsf_timeline_release_storage();
+        nsf_render_event_block_release();
         if (g_nsf_restore_paused_music_hardware) {
             const esp_err_t restore_ret =
                 audio_task_restore_paused_music_hardware_for_nsf("nsf_sequencer_failed");
@@ -3383,6 +3417,7 @@ static void audio_task_handle_nsf_start(AudioRequest *request)
         }
         nsf_apu_renderer_close(&g_nsf_renderer);
         nsf_timeline_release_storage();
+        nsf_render_event_block_release();
         if (g_nsf_restore_paused_music_hardware) {
             const esp_err_t restore_ret =
                 audio_task_restore_paused_music_hardware_for_nsf("nsf_hw_failed");
@@ -3551,9 +3586,9 @@ static NsfTimelineReadStatus audio_task_prepare_nsf_timeline_block(
     size_t frames,
     size_t *out_event_count)
 {
-    if (out_event_count == nullptr || g_nsf_renderer.sample_rate_hz == 0U ||
-        g_nsf_play_speed_us == 0U || g_nsf_play_interval_q32 == 0ULL ||
-        g_nsf_timeline_mutex == nullptr) {
+    if (out_event_count == nullptr || g_nsf_render_event_block == nullptr ||
+        g_nsf_renderer.sample_rate_hz == 0U || g_nsf_play_speed_us == 0U ||
+        g_nsf_play_interval_q32 == 0ULL || g_nsf_timeline_mutex == nullptr) {
         return NsfTimelineReadStatus::Failed;
     }
     *out_event_count = 0U;

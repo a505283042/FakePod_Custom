@@ -229,9 +229,9 @@ static constexpr uint32_t kTeSyncForceFullFramePixels =
     (FAKEPOD_LCD_WIDTH * FAKEPOD_LCD_HEIGHT * 9U) / 10U;
 static uint32_t g_te_animation_bypass_count = 0U;
 
-// LVGL RGB565 DMA 条带固定为 24 行，为 BoundedSPI 和音频留出更多内部 DMA headroom。
-// 双缓冲总像素 RAM = 460 * 24 * 2B * 2 = 44,160B，相比 40 行配置回收 29,440B。
-static constexpr uint32_t kLvglDmaBufferLines = 24U;
+// LVGL RGB565 DMA 条带固定为 16 行，继续为 BoundedSPI 和音频保留内部 DMA headroom。
+// 双缓冲总像素 RAM = 460 * 16 * 2B * 2 = 29,440B，相比 24 行再回收 14,720B internal DMA。
+static constexpr uint32_t kLvglDmaBufferLines = 16U;
 
 static void ui_display_flush_sync_event_cb(lv_event_t *event)
 {
