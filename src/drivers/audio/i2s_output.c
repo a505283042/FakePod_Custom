@@ -14,17 +14,17 @@ static bool g_started = false;
 static uint32_t g_sample_rate_hz = 0;
 
 #define I2S_FRAMES_PER_BLOCK 256
-// DMA 描述符数量由统一 Rate Profile 按采样率选择。48kHz 保持已经实机验证的 8 块；
-// 88.2/96kHz 首轮验证使用 12 块，96kHz 下约 32ms，仅在高采样率播放时增加约 8KB 内部 DMA RAM。
-// 176.4/192kHz 当前处于受控实机验证，临时使用更长 DMA runway；
-// 最终仍以 FLAC refill 实测预算为依据回收内部 DMA RAM，不把堆 DMA 当作 Hi-Res 最终方案。
+#define I2S_VIDEO_DMA_DESC_NUM 8U
+// 普通 Music/FLAC/NSF 的 DMA 描述符数量继续由统一 Rate Profile 按采样率选择。
+// Video Exclusive 只在自身播放窗口使用 8×256 帧，避免 BLE 常驻后重新创建 16 块 DMA 时触发 NO_MEM；
+// 88.2/96/176.4kHz 等其它播放档位保持既有 Rate Profile，不扩大本轮改动范围。
 #define I2S_DMA_FRAME_NUM I2S_FRAMES_PER_BLOCK
 #define I2S_MAX_ZERO_PROGRESS_TIMEOUTS 3
 
 // 每帧两个 32bit 声道；正式播放和软切换统一复用这块静音缓冲。
 static uint32_t g_silence[I2S_FRAMES_PER_BLOCK * 2] = {0};
 
-static esp_err_t i2s_output_create_channel(uint32_t sample_rate_hz)
+static esp_err_t i2s_output_create_channel(uint32_t sample_rate_hz, uint8_t dma_desc_override)
 {
     if (g_started) {
         return g_sample_rate_hz == sample_rate_hz ? ESP_OK : ESP_ERR_INVALID_STATE;
@@ -41,8 +41,11 @@ static esp_err_t i2s_output_create_channel(uint32_t sample_rate_hz)
         FAKEPOD_I2S_BCLK, FAKEPOD_I2S_LRCK, FAKEPOD_I2S_DOUT);
 #endif
 
+    const uint8_t dma_desc_num = dma_desc_override != 0U
+        ? dma_desc_override
+        : rate_profile.i2s_dma_desc_num;
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = rate_profile.i2s_dma_desc_num;
+    chan_cfg.dma_desc_num = dma_desc_num;
     chan_cfg.dma_frame_num = I2S_DMA_FRAME_NUM;
 
     esp_err_t ret = i2s_new_channel(&chan_cfg, &g_tx, NULL);
@@ -96,10 +99,10 @@ static esp_err_t i2s_output_create_channel(uint32_t sample_rate_hz)
         (unsigned long)bclk_hz,
         (unsigned long)sample_rate_hz);
     const uint32_t dma_runway_us = (uint32_t)(
-        ((uint64_t)rate_profile.i2s_dma_desc_num * I2S_DMA_FRAME_NUM * 1000000ULL) / sample_rate_hz
+        ((uint64_t)dma_desc_num * I2S_DMA_FRAME_NUM * 1000000ULL) / sample_rate_hz
     );
     ESP_LOGI(TAG, "DMA配置：%d个描述符 × %d帧，单缓冲=%u字节，总缓冲约=%lu.%03lums",
-        rate_profile.i2s_dma_desc_num,
+        dma_desc_num,
         I2S_DMA_FRAME_NUM,
         (unsigned)sizeof(g_silence),
         (unsigned long)(dma_runway_us / 1000U),
@@ -164,7 +167,15 @@ static esp_err_t i2s_output_write_all(const void *data, size_t bytes, uint32_t t
 
 esp_err_t i2s_output_stream_start_32bit(uint32_t sample_rate_hz)
 {
-    return i2s_output_create_channel(sample_rate_hz);
+    return i2s_output_create_channel(sample_rate_hz, 0U);
+}
+
+esp_err_t i2s_output_stream_start_32bit_video(uint32_t sample_rate_hz)
+{
+    ESP_LOGI(TAG, "Video I2S DMA档：desc=%u frames=%u",
+        (unsigned)I2S_VIDEO_DMA_DESC_NUM,
+        (unsigned)I2S_DMA_FRAME_NUM);
+    return i2s_output_create_channel(sample_rate_hz, I2S_VIDEO_DMA_DESC_NUM);
 }
 
 esp_err_t i2s_output_stream_write_pcm32(

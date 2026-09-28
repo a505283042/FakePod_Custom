@@ -1063,8 +1063,15 @@ static esp_err_t start_stack()
 #else
     ESP_LOGI(TAG, "BLE GAP重连策略：NimBLE内建0x3E重试=OFF，广播恢复由FakePod状态机接管");
 #endif
+#if defined(CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL) && CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL
+    const char *nimble_alloc_mode = "PSRAM";
+#else
+    const char *nimble_alloc_mode = "INTERNAL/DEFAULT";
+    ESP_LOGW(TAG, "BLE RAM策略：NimBLE Host未使用PSRAM（应为PSRAM，请清理旧sdkconfig后重编）");
+#endif
     ESP_LOGI(TAG,
-        "BLE RAM配置：connections=%d activities=%d host_stack=%d ACL=%dx%d MSYS1=%dx%d MSYS2=%dx%d EVT=%d+%d",
+        "BLE RAM配置：alloc=%s connections=%d activities=%d host_stack=%d ACL=%dx%d MSYS1=%dx%d MSYS2=%dx%d EVT=%d+%d",
+        nimble_alloc_mode,
         CONFIG_BT_NIMBLE_MAX_CONNECTIONS,
         CONFIG_BT_CTRL_BLE_MAX_ACT,
         CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE,

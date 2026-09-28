@@ -36,6 +36,12 @@ static constexpr UBaseType_t kExtractTaskPriority = 2U;
 // Extractor=P2 固定在 Core0，主要等待 SD/I/O，优先级低于 AudioTask=P5，与 Presenter=P2 同级公平调度。
 static constexpr BaseType_t kTaskCore = 1;
 static constexpr BaseType_t kExtractTaskCore = 0;
+// R46.0.26: Decode/Extractor are video-only workers. Put only their stacks in PSRAM;
+// keep the 4KB Presenter stack internal because it directly drives TE/SPI timing.
+#if !defined(CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM) || !CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM
+#error "R46.0.26 requires CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y; regenerate sdkconfig from defaults"
+#endif
+static constexpr UBaseType_t kVideoWorkerStackCaps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
 static constexpr TickType_t kQueuePollTicks = pdMS_TO_TICKS(20);
 static constexpr uint32_t kPublishEveryFrames = 8U;
 static constexpr uint32_t kDecodeYieldEveryFrames = 8U;
@@ -145,6 +151,24 @@ static CompressedSlot g_compressed_slots[kCompressedSlotCount] = {};
 static uint8_t g_leased_mask = 0U;
 static PresentationClock g_presentation_clock = {};
 static AudioProbeStats g_audio_probe = {};
+
+static BaseType_t create_video_worker_task(
+    TaskFunction_t task,
+    const char *name,
+    uint32_t stack_bytes,
+    void *arg,
+    UBaseType_t priority,
+    TaskHandle_t *handle,
+    BaseType_t core)
+{
+    return xTaskCreatePinnedToCoreWithCaps(
+        task, name, stack_bytes, arg, priority, handle, core, kVideoWorkerStackCaps);
+}
+
+static void delete_video_worker_task_self()
+{
+    vTaskDeleteWithCaps(xTaskGetCurrentTaskHandle());
+}
 
 static void merge_audio_probe_unlocked(Snapshot *snapshot)
 {
@@ -494,7 +518,7 @@ static void extract_task(void *arg)
         portENTER_CRITICAL(&g_mux);
         g_extract_task = nullptr;
         portEXIT_CRITICAL(&g_mux);
-        vTaskDelete(nullptr);
+        delete_video_worker_task_self();
         return;
     }
 
@@ -626,7 +650,7 @@ static void extract_task(void *arg)
     portENTER_CRITICAL(&g_mux);
     g_extract_task = nullptr;
     portEXIT_CRITICAL(&g_mux);
-    vTaskDelete(nullptr);
+    delete_video_worker_task_self();
 }
 
 static PresentationClock presentation_clock_snapshot(uint32_t generation)
@@ -747,7 +771,7 @@ static void benchmark_task(void *arg)
         portENTER_CRITICAL(&g_mux);
         g_task = nullptr;
         portEXIT_CRITICAL(&g_mux);
-        vTaskDelete(nullptr);
+        delete_video_worker_task_self();
         return;
     }
 
@@ -822,7 +846,7 @@ static void benchmark_task(void *arg)
             extract_args->extractor = extractor;
             extract_args->io = &io;
             extract_args->generation = args->generation;
-            const BaseType_t created = xTaskCreatePinnedToCore(
+            const BaseType_t created = create_video_worker_task(
                 extract_task, "VideoExtractTask", kExtractTaskStack, extract_args,
                 kExtractTaskPriority, &g_extract_task, kExtractTaskCore);
             if (created != pdPASS) {
@@ -1110,7 +1134,7 @@ static void benchmark_task(void *arg)
     publish_task_exit(result);
     heap_caps_free(args->path);
     heap_caps_free(args);
-    vTaskDelete(nullptr);
+    delete_video_worker_task_self();
 }
 
 static void free_resources_unlocked()
@@ -1208,7 +1232,10 @@ esp_err_t start(const char *path, bool allow_fullcanvas_over20)
     portEXIT_CRITICAL(&g_mux);
 
     // 直接让 FreeRTOS 写入全局 handle，避免 task 极快退出后 caller 再把过期 handle 写回 g_task。
-    const BaseType_t created = xTaskCreatePinnedToCore(
+    ESP_LOGI(TAG, "Video worker栈：Decode=%uB PSRAM Extract=%uB PSRAM；Presenter保持INTERNAL",
+        static_cast<unsigned>(kTaskStack),
+        static_cast<unsigned>(kExtractTaskStack));
+    const BaseType_t created = create_video_worker_task(
         benchmark_task, "VideoDecodeTask", kTaskStack, args, kTaskPriority, &g_task, kTaskCore);
     if (created != pdPASS) {
         heap_caps_free(path_copy);

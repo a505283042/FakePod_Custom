@@ -1275,7 +1275,8 @@ static esp_err_t audio_task_start_output_hardware(
     const char *owner,
     const AudioRequest *transport_request,
     bool arm_unmute,
-    const char *fade_reason)
+    const char *fade_reason,
+    bool video_i2s_profile = false)
 {
     if (sample_rate_hz == 0U || channels == 0U) return ESP_ERR_INVALID_ARG;
     const char *label = owner != nullptr ? owner : "PCM";
@@ -1299,7 +1300,9 @@ static esp_err_t audio_task_start_output_hardware(
         return ESP_ERR_INVALID_STATE;
     }
 
-    ret = i2s_output_stream_start_32bit(sample_rate_hz);
+    ret = video_i2s_profile
+        ? i2s_output_stream_start_32bit_video(sample_rate_hz)
+        : i2s_output_stream_start_32bit(sample_rate_hz);
     if (ret != ESP_OK) {
         audio_task_shutdown_output_hardware(sample_rate_hz, label);
         return ret;
@@ -2026,6 +2029,7 @@ static void audio_task_handle_video_mp3_start(AudioRequest *request)
     if (g_pipeline_headphone_enabled || g_pipeline_clock_prepared ||
         g_pipeline_i2s_started || i2s_output_is_started()) {
         const uint32_t active_rate = g_task_sample_rate_hz > 0U ? g_task_sample_rate_hz : 48000U;
+        audio_task_log_ram("video_before_music_hw_release");
         const esp_err_t shutdown_ret = audio_task_shutdown_output_hardware(active_rate, "Music-Paused");
         if (shutdown_ret != ESP_OK) {
             g_video_restore_paused_music_hardware = false;
@@ -2077,6 +2081,7 @@ static void audio_task_handle_video_mp3_start(AudioRequest *request)
     audio_playback_clock_reset(&g_video_playback_clock, g_video_mp3_sample_rate_hz);
     g_video_mp3_eof = false;
 
+    audio_task_log_ram("video_before_i2s_start");
     ret = audio_task_start_output_hardware(
         g_video_mp3_sample_rate_hz,
         g_video_mp3_bits_per_sample,
@@ -2084,7 +2089,8 @@ static void audio_task_handle_video_mp3_start(AudioRequest *request)
         "AVI-MP3",
         nullptr,
         true,
-        "video");
+        "video",
+        true);
     if (ret != ESP_OK) {
         audio_task_video_mp3_close_decoder();
         if (g_video_restore_paused_music_hardware) {
@@ -2095,6 +2101,7 @@ static void audio_task_handle_video_mp3_start(AudioRequest *request)
         return;
     }
 
+    audio_task_log_ram("video_i2s_ready");
     ++g_video_clock_revision;
     if (g_video_clock_revision == 0U) ++g_video_clock_revision;
     g_video_mp3_active = true;
