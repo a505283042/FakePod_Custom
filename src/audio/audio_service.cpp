@@ -104,6 +104,8 @@ enum class AudioCommandType : uint8_t
     SetMute,
     VideoMp3Start,
     VideoMp3ReleaseStart,
+    VideoMp3Pause,
+    VideoMp3Resume,
     VideoMp3Stop,
     NsfStart,
     NsfPause,
@@ -217,6 +219,7 @@ static AudioPlaybackClock g_video_playback_clock = {};
 static bool g_video_mp3_active = false;
 static bool g_video_mp3_eof = false;
 static bool g_video_mp3_start_released = true;
+static bool g_video_mp3_paused = false;
 static bool g_video_restore_paused_music_hardware = false;
 static uint32_t g_video_mp3_sample_rate_hz = 0U;
 static uint16_t g_video_mp3_channels = 0U;
@@ -445,6 +448,7 @@ static void audio_task_publish_video_clock_snapshot()
     snapshot.active = g_video_mp3_active;
     snapshot.eof = g_video_mp3_eof;
     snapshot.start_released = g_video_mp3_start_released;
+    snapshot.paused = g_video_mp3_paused;
     snapshot.revision = g_video_clock_revision;
     snapshot.sample_rate_hz = g_video_playback_clock.sample_rate_hz;
     snapshot.submitted_frames = g_video_playback_clock.submitted_frames;
@@ -802,6 +806,8 @@ static const char *audio_command_name(AudioCommandType type)
         case AudioCommandType::SetMute: return "MUTE";
         case AudioCommandType::VideoMp3Start: return "VIDEO_MP3_START";
         case AudioCommandType::VideoMp3ReleaseStart: return "VIDEO_MP3_RELEASE_START";
+        case AudioCommandType::VideoMp3Pause: return "VIDEO_MP3_PAUSE";
+        case AudioCommandType::VideoMp3Resume: return "VIDEO_MP3_RESUME";
         case AudioCommandType::VideoMp3Stop: return "VIDEO_MP3_STOP";
         case AudioCommandType::NsfStart: return "NSF_START";
         case AudioCommandType::NsfPause: return "NSF_PAUSE";
@@ -1982,6 +1988,7 @@ static esp_err_t audio_task_stop_video_mp3_internal(bool restore_music_hardware,
     g_video_mp3_active = false;
     g_video_mp3_eof = false;
     g_video_mp3_start_released = true;
+    g_video_mp3_paused = false;
     g_video_mp3_sample_rate_hz = 0U;
     g_video_mp3_channels = 0U;
     g_video_mp3_bits_per_sample = 0U;
@@ -2080,6 +2087,7 @@ static void audio_task_handle_video_mp3_start(AudioRequest *request)
     g_video_mp3_bits_per_sample = g_video_mp3_decoder.bits_per_sample;
     audio_playback_clock_reset(&g_video_playback_clock, g_video_mp3_sample_rate_hz);
     g_video_mp3_eof = false;
+    g_video_mp3_paused = false;
 
     audio_task_log_ram("video_before_i2s_start");
     ret = audio_task_start_output_hardware(
@@ -2133,6 +2141,42 @@ static void audio_task_handle_video_mp3_release_start(AudioRequest *request)
     audio_request_complete(request, true, ESP_OK);
 }
 
+static void audio_task_handle_video_mp3_pause(AudioRequest *request)
+{
+    if (request == nullptr) return;
+    g_task_last_request_id = request->request_id;
+    if (!g_video_mp3_active || !mp3_decoder_is_open(&g_video_mp3_decoder)) {
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+    if (!g_video_mp3_paused) {
+        g_video_mp3_paused = true;
+        ++g_video_clock_revision;
+        if (g_video_clock_revision == 0U) ++g_video_clock_revision;
+        audio_task_publish_video_clock_snapshot();
+        ESP_LOGI(TAG, "视频音频已暂停：PCM时钟冻结，I2S继续发送静音");
+    }
+    audio_request_complete(request, true, ESP_OK);
+}
+
+static void audio_task_handle_video_mp3_resume(AudioRequest *request)
+{
+    if (request == nullptr) return;
+    g_task_last_request_id = request->request_id;
+    if (!g_video_mp3_active || !mp3_decoder_is_open(&g_video_mp3_decoder)) {
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+    if (g_video_mp3_paused) {
+        g_video_mp3_paused = false;
+        ++g_video_clock_revision;
+        if (g_video_clock_revision == 0U) ++g_video_clock_revision;
+        audio_task_publish_video_clock_snapshot();
+        ESP_LOGI(TAG, "视频音频已恢复：PCM时钟继续推进");
+    }
+    audio_request_complete(request, true, ESP_OK);
+}
+
 static void audio_task_handle_video_mp3_stop(AudioRequest *request)
 {
     if (request == nullptr) return;
@@ -2150,8 +2194,8 @@ static void audio_task_service_video_mp3()
 {
     if (!g_video_mp3_active || !mp3_decoder_is_open(&g_video_mp3_decoder)) return;
 
-    if (!g_video_mp3_start_released) {
-        // Start Barrier期间只维持稳定的静音I2S时钟，不读取Bridge、不推进decoder/submitted clock。
+    if (!g_video_mp3_start_released || g_video_mp3_paused) {
+        // Start Barrier或Video暂停期间只维持稳定的静音I2S时钟，不读取Bridge、不推进decoder/submitted clock。
         // 这样Video可以先准备首张RGB和BoundedSPI窗口，同时避免AudioTask零等待自旋。
         const esp_err_t silence_ret =
             i2s_output_stream_write_silence(AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
@@ -4527,6 +4571,12 @@ static void audio_task_process_request(AudioRequest *request)
         case AudioCommandType::VideoMp3ReleaseStart:
             audio_task_handle_video_mp3_release_start(request);
             break;
+        case AudioCommandType::VideoMp3Pause:
+            audio_task_handle_video_mp3_pause(request);
+            break;
+        case AudioCommandType::VideoMp3Resume:
+            audio_task_handle_video_mp3_resume(request);
+            break;
         case AudioCommandType::VideoMp3Stop:
             audio_task_handle_video_mp3_stop(request);
             break;
@@ -5204,6 +5254,18 @@ bool audio_service_video_mp3_prepare(
 bool audio_service_video_mp3_release_start(bool wait)
 {
     AudioRequest *request = audio_request_create(AudioCommandType::VideoMp3ReleaseStart, wait);
+    return audio_service_submit(request, wait);
+}
+
+bool audio_service_video_mp3_pause(bool wait)
+{
+    AudioRequest *request = audio_request_create(AudioCommandType::VideoMp3Pause, wait);
+    return audio_service_submit(request, wait);
+}
+
+bool audio_service_video_mp3_resume(bool wait)
+{
+    AudioRequest *request = audio_request_create(AudioCommandType::VideoMp3Resume, wait);
     return audio_service_submit(request, wait);
 }
 

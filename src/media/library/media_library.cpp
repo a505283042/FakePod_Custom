@@ -12,7 +12,6 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "sdcard.h"
@@ -45,31 +44,12 @@ static constexpr int64_t SLOW_SCAN_STAGE_WARN_US = 500000LL;
 static constexpr size_t SCAN_YIELD_INTERVAL_TRACKS = 8U;
 static constexpr TickType_t LIBRARY_SD_LOCK_TIMEOUT = pdMS_TO_TICKS(2000);
 
-// 正常开机的“新增歌曲快扫”先用一个极轻量的 TF 变更戳判断介质是否可能变化。
-// 命中时直接复用已经通过 CRC/semantic 校验的 V2 Catalog，不再枚举 /MUSIC 的千个长文件名。
-// 正常开机和 USB MSC 归还都先走这条快判定；只有变更戳不一致才进入完整增量扫描。
+// 目录扫描期间文件可能被外部操作瞬间删除；ENOENT/ENOTDIR 按“本轮不存在”处理。
 static bool media_library_errno_is_missing(int error_code)
 {
     return error_code == ENOENT || error_code == ENOTDIR;
 }
 
-static constexpr uint32_t LIBRARY_QUICK_STAMP_MAGIC = 0x46505331U; // "FPS1"
-static constexpr uint16_t LIBRARY_QUICK_STAMP_VERSION = 1U;
-
-struct MediaLibraryQuickStamp
-{
-    uint32_t magic = LIBRARY_QUICK_STAMP_MAGIC;
-    uint16_t version = LIBRARY_QUICK_STAMP_VERSION;
-    uint16_t struct_size = 0U;
-    uint32_t index_crc32 = 0U;
-    uint32_t track_count = 0U;
-    uint64_t total_bytes = 0U;
-    uint64_t free_bytes = 0U;
-    int64_t music_root_mtime = 0;
-    int64_t music_root_ctime = 0;
-    uint64_t music_root_size = 0U;
-    uint32_t checksum = 0U;
-};
 #if APP_DIAG_LIBRARY_ITEMS || APP_DIAG_LIBRARY_METADATA || APP_DIAG_LIBRARY_ARTWORK
 static constexpr size_t LOG_TRACK_LIMIT = 10;
 #endif
@@ -95,166 +75,6 @@ struct DirectoryLrcIndex
     size_t count = 0U;
     size_t capacity = 0U;
 };
-
-static esp_err_t media_library_query_quick_stamp_inputs(
-    uint64_t *out_total_bytes,
-    uint64_t *out_free_bytes,
-    int64_t *out_music_root_mtime,
-    int64_t *out_music_root_ctime,
-    uint64_t *out_music_root_size)
-{
-    if (out_total_bytes == nullptr || out_free_bytes == nullptr || out_music_root_mtime == nullptr ||
-        out_music_root_ctime == nullptr || out_music_root_size == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
-    if (!sd_lock.locked()) {
-        return ESP_ERR_TIMEOUT;
-    }
-
-    uint64_t total_bytes = 0U;
-    uint64_t free_bytes = 0U;
-    const esp_err_t info_ret = esp_vfs_fat_info("/sdcard", &total_bytes, &free_bytes);
-    if (info_ret != ESP_OK) {
-        return info_ret;
-    }
-
-    struct stat root_info = {};
-    if (stat(MUSIC_ROOT, &root_info) != 0 || !S_ISDIR(root_info.st_mode)) {
-        return ESP_FAIL;
-    }
-
-    *out_total_bytes = total_bytes;
-    *out_free_bytes = free_bytes;
-    *out_music_root_mtime = static_cast<int64_t>(root_info.st_mtime);
-    *out_music_root_ctime = static_cast<int64_t>(root_info.st_ctime);
-    *out_music_root_size = static_cast<uint64_t>(root_info.st_size);
-    return ESP_OK;
-}
-
-static uint32_t media_library_quick_stamp_checksum(const MediaLibraryQuickStamp *stamp)
-{
-    if (stamp == nullptr) return 0U;
-    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(stamp);
-    const size_t length = offsetof(MediaLibraryQuickStamp, checksum);
-    uint32_t hash = 2166136261U;
-    for (size_t i = 0U; i < length; ++i) {
-        hash ^= bytes[i];
-        hash *= 16777619U;
-    }
-    return hash;
-}
-
-static bool media_library_quick_stamp_matches(
-    const MediaCatalogSnapshotV2 *snapshot,
-    const char *source_label)
-{
-    if (snapshot == nullptr || snapshot->source != MediaCatalogLoadSourceV2::Final ||
-        snapshot->catalog.track_count == 0U) {
-        return false;
-    }
-
-    MediaLibraryQuickStamp stamp = {};
-    {
-        StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
-        if (!sd_lock.locked()) {
-            return false;
-        }
-        FILE *file = fopen(SystemPaths::kMusicQuickStamp, "rb");
-        if (file == nullptr) {
-            return false;
-        }
-        const size_t read_bytes = fread(&stamp, 1U, sizeof(stamp), file);
-        fclose(file);
-        if (read_bytes != sizeof(stamp)) {
-            return false;
-        }
-    }
-
-    if (stamp.magic != LIBRARY_QUICK_STAMP_MAGIC ||
-        stamp.version != LIBRARY_QUICK_STAMP_VERSION ||
-        stamp.struct_size != sizeof(MediaLibraryQuickStamp) ||
-        stamp.index_crc32 != snapshot->index_crc32 ||
-        stamp.track_count != snapshot->catalog.track_count ||
-        stamp.checksum != media_library_quick_stamp_checksum(&stamp)) {
-        return false;
-    }
-
-    const int64_t check_started_us = esp_timer_get_time();
-    uint64_t total_bytes = 0U;
-    uint64_t free_bytes = 0U;
-    int64_t music_root_mtime = 0;
-    int64_t music_root_ctime = 0;
-    uint64_t music_root_size = 0U;
-    if (media_library_query_quick_stamp_inputs(
-            &total_bytes, &free_bytes, &music_root_mtime,
-            &music_root_ctime, &music_root_size) != ESP_OK) {
-        return false;
-    }
-
-    const bool matches = stamp.total_bytes == total_bytes &&
-        stamp.free_bytes == free_bytes &&
-        stamp.music_root_mtime == music_root_mtime &&
-        stamp.music_root_ctime == music_root_ctime &&
-        stamp.music_root_size == music_root_size;
-    ESP_LOGI(TAG, "曲库快速变更戳：来源=%s 结果=%s 耗时=%u ms free=%llu",
-        source_label != nullptr ? source_label : "?",
-        matches ? "命中" : "变化",
-        static_cast<unsigned>((esp_timer_get_time() - check_started_us) / 1000LL),
-        static_cast<unsigned long long>(free_bytes));
-    return matches;
-}
-
-static esp_err_t media_library_write_quick_stamp(uint32_t index_crc32, uint32_t track_count)
-{
-    // 首次创建 stamp 文件本身可能分配一个 FAT cluster。先确保文件已经存在，
-    // 再查询 free_bytes，避免把“创建 stamp 消耗的空间”误判成下一次介质变化。
-    {
-        StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
-        if (!sd_lock.locked()) {
-            return ESP_ERR_TIMEOUT;
-        }
-        struct stat stamp_info = {};
-        if (stat(SystemPaths::kMusicQuickStamp, &stamp_info) != 0) {
-            FILE *seed = fopen(SystemPaths::kMusicQuickStamp, "wb");
-            if (seed == nullptr) {
-                return ESP_FAIL;
-            }
-            MediaLibraryQuickStamp empty_stamp = {};
-            empty_stamp.struct_size = static_cast<uint16_t>(sizeof(MediaLibraryQuickStamp));
-            const size_t written = fwrite(&empty_stamp, 1U, sizeof(empty_stamp), seed);
-            fclose(seed);
-            if (written != sizeof(empty_stamp)) {
-                return ESP_FAIL;
-            }
-        }
-    }
-
-    MediaLibraryQuickStamp stamp = {};
-    stamp.struct_size = static_cast<uint16_t>(sizeof(MediaLibraryQuickStamp));
-    stamp.index_crc32 = index_crc32;
-    stamp.track_count = track_count;
-    const esp_err_t query_ret = media_library_query_quick_stamp_inputs(
-        &stamp.total_bytes, &stamp.free_bytes, &stamp.music_root_mtime,
-        &stamp.music_root_ctime, &stamp.music_root_size);
-    if (query_ret != ESP_OK) {
-        return query_ret;
-    }
-    stamp.checksum = media_library_quick_stamp_checksum(&stamp);
-
-    StorageSdLockGuard sd_lock(LIBRARY_SD_LOCK_TIMEOUT);
-    if (!sd_lock.locked()) {
-        return ESP_ERR_TIMEOUT;
-    }
-    FILE *file = fopen(SystemPaths::kMusicQuickStamp, "wb");
-    if (file == nullptr) {
-        return ESP_FAIL;
-    }
-    const size_t written = fwrite(&stamp, 1U, sizeof(stamp), file);
-    fclose(file);
-    return written == sizeof(stamp) ? ESP_OK : ESP_FAIL;
-}
 
 // Stage 12.0.1：扫描事务会嵌套 Catalog 写盘/回读校验。
 // 这些对象生命周期长、体积明显大于普通控制变量，不能继续压在 ESP-IDF main task 栈上。
@@ -824,47 +644,11 @@ static esp_err_t media_library_scan_with_scratch(
     // 首次建库没有 previous_v2，因此完全不受这条快路径影响。
     const bool fast_boot_incremental = have_previous_v2 && !replace_runtime_catalog;
 
-    // 已有正式 V2 Catalog 时，正常开机和 USB MSC 归还都先检查轻量变更戳。
-    // 命中时完全跳过 /MUSIC 千文件目录枚举：
-    // - 正常开机需要把磁盘 V2 Catalog 发布为运行时 Catalog；
-    // - USB 归还时旧运行时 Catalog 本来就有效，因此无需替换 generation，只返回“无变化”。
-    const bool quick_stamp_eligible =
-        have_previous_v2 && previous_v2.source == MediaCatalogLoadSourceV2::Final;
-    if (quick_stamp_eligible && media_library_quick_stamp_matches(
-            &previous_v2, replace_runtime_catalog ? "USB归还" : "启动")) {
-        const uint32_t final_track_count = previous_v2.catalog.track_count;
-        if (out_changes != nullptr) {
-            out_changes->previous_count = final_track_count;
-            out_changes->current_count = final_track_count;
-            out_changes->had_previous_catalog = true;
-            out_changes->changed = false;
-        }
+    // R46.0.28: 正常启动不再允许轻量 quick stamp 跳过 /MUSIC。
+    // 已有 V2 Catalog 时仍使用“启动新增快扫”：完整递归枚举目录确认实际路径集合，
+    // 对 readdir 已确认存在的旧普通媒体文件直接复用 Manifest，不逐首 stat、不重新解析。
+    // 因此每次冷启动都能可靠发现新增/删除/改名；USB MSC 归还继续逐首 stat(size+mtime) 严格校验。
 
-        if (!replace_runtime_catalog) {
-            next_catalog = previous_v2.catalog;
-            previous_v2.catalog = {};
-            const uint32_t source_crc = previous_v2.index_crc32;
-            const esp_err_t publish_ret = media_catalog_v2_publish(&next_catalog, source_crc);
-            if (publish_ret != ESP_OK) {
-                media_catalog_v2_release(&next_catalog);
-                media_catalog_store_v2_release(&previous_v2);
-                media_index_store_release(&previous_v1);
-                media_library_reset_build_state(replace_runtime_catalog);
-                return publish_ret;
-            }
-            g_ready = true;
-        }
-
-        media_catalog_store_v2_release(&previous_v2);
-        media_index_store_release(&previous_v1);
-        media_library_release_build_buffers();
-        const uint32_t elapsed_ms = static_cast<uint32_t>((esp_timer_get_time() - start_us) / 1000LL);
-        ESP_LOGI(TAG, "%s快速变更戳命中：跳过/MUSIC目录枚举，直接复用V2 Catalog tracks=%u 耗时=%u ms",
-            replace_runtime_catalog ? "USB归还" : "启动",
-            static_cast<unsigned>(final_track_count),
-            static_cast<unsigned>(elapsed_ms));
-        return ESP_OK;
-    }
     const size_t previous_track_count =
         have_previous_v2 ? static_cast<size_t>(previous_v2.catalog.track_count) : 0U;
     size_t existing_path_count = 0U;
@@ -1907,11 +1691,6 @@ static esp_err_t media_library_scan_with_scratch(
         media_index_store_release(&previous_v1);
         media_library_release_build_buffers();
         g_ready = true;
-        const esp_err_t quick_stamp_ret = media_library_write_quick_stamp(source_crc, final_track_count);
-        if (quick_stamp_ret != ESP_OK) {
-            ESP_LOGW(TAG, "更新曲库快速变更戳失败，下次启动回退完整增量扫描：%s",
-                esp_err_to_name(quick_stamp_ret));
-        }
 
         const uint32_t elapsed_ms = static_cast<uint32_t>((esp_timer_get_time() - start_us) / 1000);
         if (have_previous_v2) {
@@ -2250,14 +2029,6 @@ static esp_err_t media_library_scan_with_scratch(
     media_index_store_release(&previous_v1);
     media_library_release_build_buffers();
     g_ready = true;
-    if (index_ret == ESP_OK) {
-        const esp_err_t quick_stamp_ret = media_library_write_quick_stamp(catalog_crc, final_track_count);
-        if (quick_stamp_ret != ESP_OK) {
-            ESP_LOGW(TAG, "更新曲库快速变更戳失败，下次启动回退完整增量扫描：%s",
-                esp_err_to_name(quick_stamp_ret));
-        }
-    }
-
     const uint32_t elapsed_ms = static_cast<uint32_t>((esp_timer_get_time() - start_us) / 1000);
     if (have_previous_v2) {
         const uint32_t walk_ms = static_cast<uint32_t>((scan_walk_finished_us - start_us) / 1000LL);
@@ -2376,7 +2147,7 @@ esp_err_t media_library_hot_reload_quiesced(
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "开始USB归还后的Catalog事务热刷新：old_generation=%lu tracks=%u",
+    ESP_LOGI(TAG, "R46.0.28 USB归还Catalog事务热刷新：严格增量对账 old_generation=%lu tracks=%u",
         static_cast<unsigned long>(media_catalog_v2_generation()),
         static_cast<unsigned>(media_library_get_count()));
     const esp_err_t ret = media_library_scan_with_scratch(

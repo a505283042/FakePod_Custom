@@ -12,6 +12,7 @@
 #include "battery_service.h"
 #include "media_catalog_v2.h"
 #include "player_control.h"
+#include "app/video_app.h"
 
 #if defined(CONFIG_BT_NIMBLE_ENABLED) && CONFIG_BT_NIMBLE_ENABLED && \
     defined(CONFIG_BT_NIMBLE_ROLE_PERIPHERAL) && CONFIG_BT_NIMBLE_ROLE_PERIPHERAL && \
@@ -107,8 +108,10 @@ static uint32_t g_last_status_playback_revision = 0U;
 static uint32_t g_last_status_seek_revision = 0U;
 
 static bool g_metadata_source_initialized = false;
+static bool g_metadata_video_context = false;
 static uint32_t g_metadata_track_index = UINT32_MAX;
 static uint32_t g_metadata_catalog_generation = 0U;
+static uint32_t g_metadata_video_revision = 0U;
 static uint16_t g_metadata_sequence = 0U;
 static char g_metadata_payload[kMetadataMaxBytes + 1U] = {};
 static size_t g_metadata_size = 0U;
@@ -180,6 +183,13 @@ static const char *control_command_name(uint8_t command)
 
 static bool execute_control_command(uint8_t command, uint8_t value = 0U)
 {
+    if (command >= 0x01U && command <= 0x03U && video_app_remote_control_active()) {
+        const VideoRemoteCommand video_command = command == 0x01U
+            ? VideoRemoteCommand::TogglePlayPause
+            : (command == 0x02U ? VideoRemoteCommand::Next : VideoRemoteCommand::Previous);
+        return video_app_remote_submit(video_command);
+    }
+
     switch (command) {
         case 0x01U: return player_control_toggle_play_pause();
         case 0x02U: return player_control_next();
@@ -224,23 +234,20 @@ static size_t trim_truncated_utf8_tail(char *text, size_t size)
     return size;
 }
 
-static void queue_metadata(uint32_t track_index, uint32_t catalog_generation)
+static void queue_metadata_text(
+    const char *title,
+    const char *artist,
+    uint32_t track_index,
+    uint32_t catalog_generation,
+    bool video_context,
+    uint32_t video_revision)
 {
-    const char *title = "";
-    const char *artist = "";
-    MediaTrackViewV2 view = {};
-    if (track_index != UINT32_MAX && media_catalog_v2_get_track_view(track_index, &view)) {
-        if (view.title != nullptr) title = view.title;
-        if (view.artist != nullptr) artist = view.artist;
-        catalog_generation = view.generation;
-    }
-
     const int written = snprintf(
         g_metadata_payload,
         sizeof(g_metadata_payload),
         "%s\n%s",
-        title,
-        artist);
+        title != nullptr ? title : "",
+        artist != nullptr ? artist : "");
 
     if (written < 0) {
         g_metadata_payload[0] = '\0';
@@ -254,11 +261,26 @@ static void queue_metadata(uint32_t track_index, uint32_t catalog_generation)
     ++g_metadata_sequence;
     g_metadata_track_index = track_index;
     g_metadata_catalog_generation = catalog_generation;
+    g_metadata_video_context = video_context;
+    g_metadata_video_revision = video_revision;
     g_metadata_source_initialized = true;
     g_metadata_chunk_index = 0U;
     g_metadata_chunk_count = static_cast<uint8_t>(
         (g_metadata_size + kMetadataChunkDataBytes - 1U) / kMetadataChunkDataBytes);
     if (g_metadata_chunk_count == 0U) g_metadata_chunk_count = 1U;
+}
+
+static void queue_metadata(uint32_t track_index, uint32_t catalog_generation)
+{
+    const char *title = "";
+    const char *artist = "";
+    MediaTrackViewV2 view = {};
+    if (track_index != UINT32_MAX && media_catalog_v2_get_track_view(track_index, &view)) {
+        if (view.title != nullptr) title = view.title;
+        if (view.artist != nullptr) artist = view.artist;
+        catalog_generation = view.generation;
+    }
+    queue_metadata_text(title, artist, track_index, catalog_generation, false, 0U);
 }
 
 static void ensure_metadata_for_track(uint32_t track_index)
@@ -269,10 +291,20 @@ static void ensure_metadata_for_track(uint32_t track_index)
         if (media_catalog_v2_get_track_view(track_index, &view)) generation = view.generation;
     }
 
-    if (!g_metadata_source_initialized ||
+    if (!g_metadata_source_initialized || g_metadata_video_context ||
         track_index != g_metadata_track_index ||
         generation != g_metadata_catalog_generation) {
         queue_metadata(track_index, generation);
+    }
+}
+
+static void ensure_metadata_for_video(const VideoRemoteSnapshot &video)
+{
+    if (!g_metadata_source_initialized || !g_metadata_video_context ||
+        video.item_index != g_metadata_track_index ||
+        video.metadata_revision != g_metadata_video_revision) {
+        queue_metadata_text(
+            video.title, "视频", video.item_index, 0U, true, video.metadata_revision);
     }
 }
 
@@ -287,16 +319,27 @@ static void build_status_packet(
 
     AudioStateSnapshot audio = {};
     const bool audio_valid = audio_service_get_snapshot(&audio) && audio.ready;
-    const uint32_t track_index = audio_valid ? audio.track_index : UINT32_MAX;
+    VideoRemoteSnapshot video = {};
+    const bool video_valid = video_app_get_remote_snapshot(&video) && video.active;
+    const uint32_t track_index = video_valid
+        ? video.item_index
+        : (audio_valid ? audio.track_index : UINT32_MAX);
     if (out_playback_revision != nullptr) {
-        *out_playback_revision = audio_valid ? audio.playback_revision : 0U;
+        *out_playback_revision = video_valid
+            ? video.playback_revision
+            : (audio_valid ? audio.playback_revision : 0U);
     }
     if (out_seek_revision != nullptr) {
-        *out_seek_revision = audio_valid ? audio.seek_revision : 0U;
+        *out_seek_revision = video_valid ? 0U : (audio_valid ? audio.seek_revision : 0U);
     }
-    ensure_metadata_for_track(track_index);
+    if (video_valid) ensure_metadata_for_video(video);
+    else ensure_metadata_for_track(track_index);
 
-    packet[2] = audio_valid ? static_cast<uint8_t>(audio.state) : 0xFFU;
+    packet[2] = video_valid
+        ? static_cast<uint8_t>(video.paused
+            ? AudioPlaybackState::Paused
+            : (video.playing ? AudioPlaybackState::Playing : AudioPlaybackState::Preparing))
+        : (audio_valid ? static_cast<uint8_t>(audio.state) : 0xFFU);
     packet[3] = audio_valid ? audio.volume_percent : 0U;
 
     BatterySnapshot battery = {};
@@ -306,14 +349,17 @@ static void build_status_packet(
     uint8_t flags = 0U;
     if (audio_valid && audio.user_muted) flags |= 0x01U;
     if (battery_valid) flags |= 0x02U;
-    if (audio_valid && track_index != UINT32_MAX) flags |= 0x04U;
+    if (track_index != UINT32_MAX) flags |= 0x04U;
+    if (video_valid) flags |= 0x08U; // R46.0.29: media context = VIDEO
     packet[5] = flags;
 
     write_u32_le(&packet[6], track_index);
-    write_u32_le(&packet[10], audio_valid ? clamp_u64_to_u32(audio.position_ms) : 0U);
+    write_u32_le(&packet[10], video_valid
+        ? video.position_ms
+        : (audio_valid ? clamp_u64_to_u32(audio.position_ms) : 0U));
 
-    uint64_t duration_ms = 0ULL;
-    if (audio_valid && audio.sample_rate_hz > 0U && audio.total_frames > 0ULL) {
+    uint64_t duration_ms = video_valid ? video.duration_ms : 0ULL;
+    if (!video_valid && audio_valid && audio.sample_rate_hz > 0U && audio.total_frames > 0ULL) {
         duration_ms = (audio.total_frames * 1000ULL) / audio.sample_rate_hz;
     }
     write_u32_le(&packet[14], clamp_u64_to_u32(duration_ms));
@@ -511,10 +557,11 @@ static int control_command_access(
             static_cast<unsigned>(conn_handle),
             static_cast<unsigned>(payload[1]));
     } else {
-        ESP_LOGI(TAG, "BLE手机控制：handle=%u command=0x%02X %s",
+        ESP_LOGI(TAG, "BLE手机控制：handle=%u command=0x%02X %s context=%s",
             static_cast<unsigned>(conn_handle),
             static_cast<unsigned>(command),
-            control_command_name(command));
+            control_command_name(command),
+            (command <= 0x03U && video_app_remote_control_active()) ? "VIDEO" : "MUSIC");
     }
     return 0;
 }

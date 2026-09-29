@@ -25,6 +25,7 @@ enum class State : uint8_t
 struct Snapshot
 {
     State state = State::Idle;
+    bool paused = false;
     uint32_t generation = 0U;
     esp_err_t result = ESP_OK;
     uint32_t duration_ms = 0U;
@@ -90,6 +91,8 @@ struct FrameView
 // UI 提示用户后可用 true 再启动一次。运行期不做 24->20 自动降帧。
 esp_err_t start(const char *path, bool allow_fullcanvas_over20 = false);
 void stop();
+bool set_paused(bool paused);
+bool is_paused();
 
 bool get_snapshot(Snapshot *out_snapshot);
 // UI 在取得第一张帧时发布唯一 Presentation Clock；DecodeTask 只消费该时钟，不再自行锚定。

@@ -193,8 +193,88 @@ static bool g_risk_prompt_active = false;
 static size_t g_selected_index = kInvalidEntryIndex;
 static EofTransition g_eof_transition = EofTransition::None;
 
+// R46.0.29：BLE 只提交媒体意图；Video timer 在 LVGL/Presenter 所属上下文中串行执行。
+static portMUX_TYPE g_remote_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool g_remote_context_active = false;
+static VideoRemoteCommand g_remote_pending = VideoRemoteCommand::TogglePlayPause;
+static bool g_remote_pending_valid = false;
+static uint32_t g_remote_playback_revision = 1U;
+static uint32_t g_remote_metadata_revision = 1U;
+static uint32_t g_remote_item_index = UINT32_MAX;
+static char g_remote_title[128] = {};
+
 static bool start_profile_probe_selected();
 static void benchmark_show_terminal(const VideoBenchmark::Snapshot &snapshot);
+static const char *basename_of(const char *path);
+
+static void remote_bump_revision(uint32_t *revision)
+{
+    if (revision == nullptr) return;
+    ++(*revision);
+    if (*revision == 0U) ++(*revision);
+}
+
+static void remote_context_begin()
+{
+    char title[sizeof(g_remote_title)] = {};
+    snprintf(title, sizeof(title), "%s", basename_of(g_selected_path));
+    const uint32_t item_index = g_selected_index == kInvalidEntryIndex
+        ? UINT32_MAX : static_cast<uint32_t>(g_selected_index);
+    portENTER_CRITICAL(&g_remote_mux);
+    g_remote_context_active = true;
+    g_remote_item_index = item_index;
+    memcpy(g_remote_title, title, sizeof(g_remote_title));
+    remote_bump_revision(&g_remote_playback_revision);
+    remote_bump_revision(&g_remote_metadata_revision);
+    portEXIT_CRITICAL(&g_remote_mux);
+}
+
+static void remote_identity_changed()
+{
+    char title[sizeof(g_remote_title)] = {};
+    snprintf(title, sizeof(title), "%s", basename_of(g_selected_path));
+    const uint32_t item_index = g_selected_index == kInvalidEntryIndex
+        ? UINT32_MAX : static_cast<uint32_t>(g_selected_index);
+    portENTER_CRITICAL(&g_remote_mux);
+    g_remote_item_index = item_index;
+    memcpy(g_remote_title, title, sizeof(g_remote_title));
+    remote_bump_revision(&g_remote_playback_revision);
+    remote_bump_revision(&g_remote_metadata_revision);
+    portEXIT_CRITICAL(&g_remote_mux);
+}
+
+static void remote_playback_changed()
+{
+    portENTER_CRITICAL(&g_remote_mux);
+    remote_bump_revision(&g_remote_playback_revision);
+    portEXIT_CRITICAL(&g_remote_mux);
+}
+
+static void remote_context_end()
+{
+    portENTER_CRITICAL(&g_remote_mux);
+    if (g_remote_context_active) {
+        g_remote_context_active = false;
+        g_remote_pending_valid = false;
+        remote_bump_revision(&g_remote_playback_revision);
+        remote_bump_revision(&g_remote_metadata_revision);
+    }
+    portEXIT_CRITICAL(&g_remote_mux);
+}
+
+static bool remote_take_pending(VideoRemoteCommand *out_command)
+{
+    if (out_command == nullptr) return false;
+    bool have = false;
+    portENTER_CRITICAL(&g_remote_mux);
+    if (g_remote_pending_valid) {
+        *out_command = g_remote_pending;
+        g_remote_pending_valid = false;
+        have = true;
+    }
+    portEXIT_CRITICAL(&g_remote_mux);
+    return have;
+}
 
 static esp_err_t cleanup_create_failure(esp_err_t err)
 {
@@ -484,6 +564,7 @@ static void browser_load_tick()
 
 static void show_browser()
 {
+    remote_context_end();
     g_page = VideoPage::Browser;
     g_fullcanvas_risk_authorized = false;
     g_risk_prompt_active = false;
@@ -688,6 +769,28 @@ static int64_t benchmark_audio_master_target_us(uint32_t video_pts_ms, uint32_t 
             static_cast<int64_t>(audio_first_pts_ms)) * 1000LL;
 }
 
+static bool benchmark_presenter_wait_if_paused(bool clock_started, int64_t *clock_base_us)
+{
+    if (!VideoBenchmark::is_paused()) return !benchmark_presenter_should_stop();
+
+    const int64_t paused_at_us = esp_timer_get_time();
+    while (VideoBenchmark::is_paused() && !benchmark_presenter_should_stop()) {
+        vTaskDelay(1);
+    }
+    if (benchmark_presenter_should_stop()) return false;
+
+    if (clock_started && clock_base_us != nullptr) {
+        const int64_t paused_us = esp_timer_get_time() - paused_at_us;
+        if (paused_us > 0LL) {
+            *clock_base_us += paused_us;
+            portENTER_CRITICAL(&g_benchmark_ui_mux);
+            g_benchmark_ui.clock_base_us = *clock_base_us;
+            portEXIT_CRITICAL(&g_benchmark_ui_mux);
+        }
+    }
+    return true;
+}
+
 static void benchmark_presenter_task(void *arg)
 {
     (void)arg;
@@ -706,6 +809,7 @@ static void benchmark_presenter_task(void *arg)
     ESP_LOGI(TAG, "视频显示任务已启动");
 
     while (!benchmark_presenter_should_stop()) {
+        if (!benchmark_presenter_wait_if_paused(clock_started, &clock_base_us)) break;
         VideoBenchmark::FrameView frame = {};
         const bool got_frame = VideoBenchmark::wait_frame(&frame, kPresenterFrameWaitMs);
         const int64_t acquired_us = esp_timer_get_time();
@@ -733,7 +837,8 @@ static void benchmark_presenter_task(void *arg)
             continue;
         }
 
-        if (benchmark_presenter_should_stop()) {
+        if (benchmark_presenter_should_stop() ||
+            !benchmark_presenter_wait_if_paused(clock_started, &clock_base_us)) {
             VideoBenchmark::release_frame(frame.slot);
             break;
         }
@@ -792,6 +897,7 @@ static void benchmark_presenter_task(void *arg)
 
         bool pts_waited = false;
         while (!benchmark_presenter_should_stop()) {
+            if (!benchmark_presenter_wait_if_paused(clock_started, &clock_base_us)) break;
             int64_t wait_us = 0LL;
             if (use_audio_master) {
                 AudioVideoClockSnapshot latest_clock = {};
@@ -1092,25 +1198,51 @@ static esp_err_t benchmark_wait_cleanup(uint32_t timeout_ms)
     }
 }
 
-static bool select_next_video_in_current_directory()
+static bool find_adjacent_video_index(int direction, size_t *out_index)
 {
-    if (g_selected_index == kInvalidEntryIndex || g_directory.entries == nullptr ||
-        g_selected_index >= g_directory.count || g_current_dir == nullptr ||
-        g_selected_path == nullptr || g_scratch_path == nullptr) return false;
+    if (out_index == nullptr || (direction != 1 && direction != -1) ||
+        g_selected_index == kInvalidEntryIndex || g_directory.entries == nullptr ||
+        g_selected_index >= g_directory.count) return false;
 
-    for (size_t index = g_selected_index + 1U; index < g_directory.count; ++index) {
+    size_t index = g_selected_index;
+    while (true) {
+        if (direction > 0) {
+            if (index + 1U >= g_directory.count) break;
+            ++index;
+        } else {
+            if (index == 0U) break;
+            --index;
+        }
         const VideoBrowser::EntryIndex *entry = VideoBrowser::entry_at(&g_directory, index);
-        const char *name = VideoBrowser::entry_name(&g_directory, index);
-        if (entry == nullptr || name == nullptr || VideoBrowser::entry_is_directory(entry)) continue;
-        if (VideoBrowser::join_child_path(
-                g_current_dir, name, g_scratch_path, VideoBrowser::kPathBytes) != ESP_OK) continue;
-        snprintf(g_selected_path, VideoBrowser::kPathBytes, "%s", g_scratch_path);
-        g_selected_index = index;
-        ESP_LOGI(TAG, "自动下一视频：已选择目录项 %u/%u：%s",
-            static_cast<unsigned>(index + 1U), static_cast<unsigned>(g_directory.count), name);
-        return true;
+        if (entry != nullptr && !VideoBrowser::entry_is_directory(entry)) {
+            *out_index = index;
+            return true;
+        }
     }
     return false;
+}
+
+static bool select_video_in_current_directory(int direction, const char *reason)
+{
+    if (g_current_dir == nullptr || g_selected_path == nullptr || g_scratch_path == nullptr) return false;
+    size_t index = kInvalidEntryIndex;
+    if (!find_adjacent_video_index(direction, &index)) return false;
+
+    const char *name = VideoBrowser::entry_name(&g_directory, index);
+    if (name == nullptr || VideoBrowser::join_child_path(
+            g_current_dir, name, g_scratch_path, VideoBrowser::kPathBytes) != ESP_OK) return false;
+    snprintf(g_selected_path, VideoBrowser::kPathBytes, "%s", g_scratch_path);
+    g_selected_index = index;
+    remote_identity_changed();
+    ESP_LOGI(TAG, "%s：已选择目录项 %u/%u：%s",
+        reason != nullptr ? reason : "视频切换",
+        static_cast<unsigned>(index + 1U), static_cast<unsigned>(g_directory.count), name);
+    return true;
+}
+
+static bool select_next_video_in_current_directory()
+{
+    return select_video_in_current_directory(+1, "自动下一视频");
 }
 
 static void eof_transition_begin(const VideoBenchmark::Snapshot &snapshot)
@@ -1264,6 +1396,82 @@ static void benchmark_show_terminal(const VideoBenchmark::Snapshot &snapshot)
         static_cast<unsigned long>(fps_milli % 1000U));
 }
 
+static bool remote_switch_video(int direction)
+{
+    size_t target_index = kInvalidEntryIndex;
+    if (!find_adjacent_video_index(direction, &target_index)) {
+        ESP_LOGI(TAG, "BLE视频切换到达目录边界：direction=%d，保持当前视频", direction);
+        return true;
+    }
+    (void)target_index;
+
+    benchmark_presenter_request_stop();
+    VideoBenchmark::stop();
+    const bool audio_stopped = benchmark_stop_avi_audio(direction > 0 ? "ble_next" : "ble_previous");
+    const bool presenter_stopped = benchmark_presenter_wait_stopped(kPresenterStopWaitMs);
+    if (!audio_stopped || !presenter_stopped) {
+        ESP_LOGW(TAG, "BLE视频切换失败：direction=%d audio=%u presenter=%u",
+            direction, static_cast<unsigned>(audio_stopped), static_cast<unsigned>(presenter_stopped));
+        return false;
+    }
+    g_benchmark_ui.cleanup_pending = true;
+    const esp_err_t cleanup_ret = benchmark_wait_cleanup(kDestroyCleanupWaitMs);
+    if (cleanup_ret != ESP_OK) {
+        ESP_LOGW(TAG, "BLE视频切换资源回收失败：%s", esp_err_to_name(cleanup_ret));
+        return false;
+    }
+    if (!select_video_in_current_directory(
+            direction, direction > 0 ? "BLE下一视频" : "BLE上一视频")) {
+        ESP_LOGW(TAG, "BLE视频切换：目标项解析失败 direction=%d", direction);
+        benchmark_restore_music_after_exclusive("ble_video_select_failed");
+        show_browser();
+        return false;
+    }
+
+    g_page = VideoPage::Browser;
+    if (g_timer != nullptr) lv_timer_set_period(g_timer, kBrowserTimerPeriodMs);
+    set_visible(g_root, false);
+    g_fullcanvas_risk_authorized = false;
+    g_risk_prompt_active = false;
+    if (!start_profile_probe_selected()) {
+        ESP_LOGW(TAG, "BLE视频切换：下一条规格预检启动失败");
+        return false;
+    }
+    return true;
+}
+
+static void process_remote_command()
+{
+    VideoRemoteCommand command = VideoRemoteCommand::TogglePlayPause;
+    if (!remote_take_pending(&command)) return;
+
+    if (command == VideoRemoteCommand::TogglePlayPause) {
+        const bool pause = !VideoBenchmark::is_paused();
+        AudioVideoClockSnapshot audio_clock = {};
+        const bool has_video_audio =
+            audio_service_video_mp3_get_clock(&audio_clock) && audio_clock.active;
+        bool ok = false;
+        if (pause) {
+            ok = VideoBenchmark::set_paused(true);
+            if (ok && has_video_audio) ok = audio_service_video_mp3_pause(true);
+            if (!ok) (void)VideoBenchmark::set_paused(false);
+        } else {
+            ok = !has_video_audio || audio_service_video_mp3_resume(true);
+            if (ok) ok = VideoBenchmark::set_paused(false);
+            if (!ok && has_video_audio) (void)audio_service_video_mp3_pause(true);
+        }
+        if (ok) {
+            remote_playback_changed();
+            ESP_LOGI(TAG, "BLE视频控制：%s", pause ? "暂停" : "继续播放");
+        } else {
+            ESP_LOGW(TAG, "BLE视频控制播放/暂停失败：target=%s", pause ? "pause" : "resume");
+        }
+        return;
+    }
+
+    (void)remote_switch_video(command == VideoRemoteCommand::Next ? +1 : -1);
+}
+
 static void benchmark_tick()
 {
     benchmark_cleanup_tick();
@@ -1352,6 +1560,7 @@ static bool benchmark_start_selected(bool allow_fullcanvas_over20)
         return false;
     }
 
+    remote_context_begin();
     g_page = VideoPage::Benchmark;
     if (g_timer != nullptr) lv_timer_set_period(g_timer, kBenchmarkTimerPeriodMs);
     set_visible(g_browser_host, false);
@@ -1376,6 +1585,7 @@ static bool benchmark_start_selected(bool allow_fullcanvas_over20)
         g_benchmark_ui.cleanup_pending = true;
         (void)benchmark_stop_avi_audio("benchmark_start_failed");
         benchmark_restore_music_after_exclusive("benchmark_start_failed");
+        remote_context_end();
         set_visible(g_root, true);
         if (g_timer != nullptr) lv_timer_set_period(g_timer, kBrowserTimerPeriodMs);
         return false;
@@ -1389,6 +1599,7 @@ static bool benchmark_start_selected(bool allow_fullcanvas_over20)
         if (benchmark_stop_avi_audio("presenter_start_failed")) {
             benchmark_restore_music_after_exclusive("presenter_start_failed");
         }
+        remote_context_end();
         char line[128] = {};
         snprintf(line, sizeof(line), "Presenter启动失败：%s", esp_err_to_name(presenter_ret));
         lv_label_set_text(g_probe_video, line);
@@ -1594,6 +1805,7 @@ static void timer_cb(lv_timer_t *timer)
 {
     (void)timer;
     if (g_root == nullptr || app_manager_foreground() != AppId::Video) return;
+    process_remote_command();
     browser_load_tick();
     profile_probe_tick();
     benchmark_tick();
@@ -1803,6 +2015,7 @@ static esp_err_t video_enter()
 static esp_err_t video_leave(AppRunState next_state)
 {
     (void)next_state;
+    remote_context_end();
     if (g_profile_probe_pending) {
         VideoProbe::cancel();
         g_profile_probe_pending = false;
@@ -1835,6 +2048,7 @@ static esp_err_t video_leave(AppRunState next_state)
 
 static void video_destroy()
 {
+    remote_context_end();
     VideoProbe::cancel();
     g_profile_probe_pending = false;
     if ((g_page == VideoPage::Benchmark && !g_risk_prompt_active) || g_benchmark_ui.cleanup_pending) {
@@ -1881,6 +2095,60 @@ static void video_destroy()
 }
 
 } // namespace
+
+bool video_app_remote_control_active()
+{
+    bool active = false;
+    portENTER_CRITICAL(&g_remote_mux);
+    active = g_remote_context_active;
+    portEXIT_CRITICAL(&g_remote_mux);
+    return active;
+}
+
+bool video_app_remote_submit(VideoRemoteCommand command)
+{
+    bool accepted = false;
+    portENTER_CRITICAL(&g_remote_mux);
+    if (g_remote_context_active && !g_remote_pending_valid) {
+        g_remote_pending = command;
+        g_remote_pending_valid = true;
+        accepted = true;
+    }
+    portEXIT_CRITICAL(&g_remote_mux);
+    return accepted;
+}
+
+bool video_app_get_remote_snapshot(VideoRemoteSnapshot *out_snapshot)
+{
+    if (out_snapshot == nullptr) return false;
+    VideoRemoteSnapshot snapshot = {};
+    portENTER_CRITICAL(&g_remote_mux);
+    snapshot.active = g_remote_context_active;
+    snapshot.item_index = g_remote_item_index;
+    snapshot.playback_revision = g_remote_playback_revision;
+    snapshot.metadata_revision = g_remote_metadata_revision;
+    memcpy(snapshot.title, g_remote_title, sizeof(snapshot.title));
+    portEXIT_CRITICAL(&g_remote_mux);
+    if (!snapshot.active) {
+        *out_snapshot = snapshot;
+        return true;
+    }
+
+    VideoBenchmark::Snapshot video = {};
+    if (VideoBenchmark::get_snapshot(&video)) {
+        snapshot.paused = video.paused;
+        snapshot.playing = video.state == VideoBenchmark::State::Running && !video.paused;
+        snapshot.duration_ms = video.duration_ms;
+    }
+    AudioVideoClockSnapshot clock = {};
+    if (audio_service_video_mp3_get_clock(&clock) && clock.active) {
+        snapshot.position_ms = static_cast<uint32_t>(clock.position_us / 1000ULL);
+        snapshot.paused = clock.paused || snapshot.paused;
+        snapshot.playing = !snapshot.paused && !clock.eof;
+    }
+    *out_snapshot = snapshot;
+    return true;
+}
 
 esp_err_t video_app_register()
 {

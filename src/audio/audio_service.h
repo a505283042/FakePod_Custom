@@ -68,6 +68,8 @@ bool audio_service_video_mp3_prepare(
     bool wait = true
 );
 bool audio_service_video_mp3_release_start(bool wait = true);
+bool audio_service_video_mp3_pause(bool wait = true);
+bool audio_service_video_mp3_resume(bool wait = true);
 bool audio_service_video_mp3_stop(bool wait = true);
 
 // R.40.4.2：Video Presenter / PreDecode 只读的 AVI MP3 PCM 主时钟快照。
@@ -78,6 +80,7 @@ struct AudioVideoClockSnapshot
     bool active = false;
     bool eof = false;
     bool start_released = true;
+    bool paused = false;
     uint32_t revision = 0U;
     uint32_t sample_rate_hz = 0U;
     uint64_t submitted_frames = 0ULL;

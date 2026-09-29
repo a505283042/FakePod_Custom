@@ -142,6 +142,10 @@ static uint32_t g_generation = 1U;
 static TaskHandle_t g_task = nullptr;
 static TaskHandle_t g_extract_task = nullptr;
 static uint32_t g_stop_generation = 0U;
+static bool g_pause_requested = false;
+static bool g_paused = false;
+static bool g_extract_pause_ack = false;
+static int64_t g_pause_started_us = 0LL;
 static QueueHandle_t g_free_queue = nullptr;
 static QueueHandle_t g_ready_queue = nullptr;
 static QueueHandle_t g_compressed_free_queue = nullptr;
@@ -236,11 +240,46 @@ static bool generation_current(uint32_t generation)
     return current;
 }
 
+static bool generation_paused(uint32_t generation)
+{
+    bool paused = false;
+    portENTER_CRITICAL(&g_mux);
+    paused = generation == g_generation && g_stop_generation != generation && g_paused;
+    portEXIT_CRITICAL(&g_mux);
+    return paused;
+}
+
+static bool wait_while_paused(uint32_t generation)
+{
+    while (generation_current(generation)) {
+        if (!generation_paused(generation)) return true;
+        vTaskDelay(1);
+    }
+    return false;
+}
+
+static bool extract_pause_gate(uint32_t generation)
+{
+    while (generation_current(generation)) {
+        bool requested = false;
+        portENTER_CRITICAL(&g_mux);
+        if (generation == g_generation && g_stop_generation != generation) {
+            requested = g_pause_requested;
+            if (requested) g_extract_pause_ack = true;
+        }
+        portEXIT_CRITICAL(&g_mux);
+        if (!requested) return true;
+        vTaskDelay(1);
+    }
+    return false;
+}
+
 static void publish(const Snapshot &snapshot)
 {
     portENTER_CRITICAL(&g_mux);
     if (snapshot.generation == g_generation) {
         g_snapshot = snapshot;
+        g_snapshot.paused = g_paused && snapshot.state == State::Running;
         merge_audio_probe_unlocked(&g_snapshot);
     }
     portEXIT_CRITICAL(&g_mux);
@@ -251,8 +290,13 @@ static void publish_task_exit(const Snapshot &snapshot)
     portENTER_CRITICAL(&g_mux);
     if (snapshot.generation == g_generation) {
         g_snapshot = snapshot;
+        g_snapshot.paused = false;
         merge_audio_probe_unlocked(&g_snapshot);
     }
+    g_pause_requested = false;
+    g_paused = false;
+    g_extract_pause_ack = false;
+    g_pause_started_us = 0LL;
     g_task = nullptr;
     portEXIT_CRITICAL(&g_mux);
 }
@@ -325,7 +369,13 @@ static bool receive_pipeline_message(PipelineMessage *message, uint32_t generati
 static void stop_generation(uint32_t generation)
 {
     portENTER_CRITICAL(&g_mux);
-    if (generation == g_generation) g_stop_generation = generation;
+    if (generation == g_generation) {
+        g_stop_generation = generation;
+        g_pause_requested = false;
+        g_paused = false;
+        g_extract_pause_ack = false;
+        g_pause_started_us = 0LL;
+    }
     portEXIT_CRITICAL(&g_mux);
 }
 
@@ -523,6 +573,7 @@ static void extract_task(void *arg)
     }
 
     while (generation_current(args->generation)) {
+        if (!extract_pause_gate(args->generation)) break;
         uint8_t compressed_slot_index = 0U;
         if (!take_compressed_free(&compressed_slot_index, args->generation)) break;
 
@@ -903,6 +954,7 @@ static void benchmark_task(void *arg)
 
         bool done = false;
         while (!done && generation_current(args->generation)) {
+            if (!wait_while_paused(args->generation)) break;
             PipelineMessage message = {};
             if (!receive_pipeline_message(&message, args->generation)) break;
 
@@ -999,6 +1051,12 @@ static void benchmark_task(void *arg)
                 return_compressed_to_free(message.slot);
                 if ((result.frames_read % kPublishEveryFrames) == 0U) publish(result);
                 continue;
+            }
+
+            if (!wait_while_paused(args->generation)) {
+                return_slot_to_free(slot_index);
+                return_compressed_to_free(message.slot);
+                break;
             }
 
             esp_extractor_frame_info_t frame = {};
@@ -1224,6 +1282,10 @@ esp_err_t start(const char *path, bool allow_fullcanvas_over20)
     g_snapshot.state = State::Starting;
     g_snapshot.generation = g_generation;
     g_stop_generation = 0U;
+    g_pause_requested = false;
+    g_paused = false;
+    g_extract_pause_ack = false;
+    g_pause_started_us = 0LL;
     g_extract_task = nullptr;
     g_leased_mask = 0U;
     g_presentation_clock = {};
@@ -1259,10 +1321,90 @@ void stop()
         // 不推进 generation：让正在退出的 task 仍可发布最终统计；只用 stop_generation
         // 让 custom I/O/read loop 立刻看见取消。下一次 start 才创建新 generation。
         g_stop_generation = g_generation;
+        g_pause_requested = false;
+        g_paused = false;
+        g_extract_pause_ack = false;
+        g_pause_started_us = 0LL;
         g_snapshot.state = State::Stopped;
+        g_snapshot.paused = false;
         g_snapshot.result = ESP_OK;
     }
     portEXIT_CRITICAL(&g_mux);
+}
+
+bool set_paused(bool paused)
+{
+    const int64_t now_us = esp_timer_get_time();
+    uint32_t generation = 0U;
+    bool running = false;
+
+    portENTER_CRITICAL(&g_mux);
+    running = g_task != nullptr && g_stop_generation != g_generation &&
+        g_snapshot.state == State::Running;
+    generation = g_generation;
+    if (running && paused && !g_paused) {
+        // 两阶段暂停：先只关 Extractor 入口，让已开始的 AVI/Bridge 写完整结束；
+        // 等生产者到达帧边界后，再冻结 Decode/Presenter，避免半个 MP3 packet 留在 Bridge。
+        g_pause_requested = true;
+        g_extract_pause_ack = false;
+    } else if (running && !paused && g_paused) {
+        const int64_t paused_us = g_pause_started_us > 0LL ? now_us - g_pause_started_us : 0LL;
+        if (paused_us > 0LL && g_presentation_clock.started &&
+            g_presentation_clock.generation == g_generation) {
+            g_presentation_clock.base_us += paused_us;
+        }
+        g_pause_requested = false;
+        g_paused = false;
+        g_extract_pause_ack = false;
+        g_pause_started_us = 0LL;
+        g_snapshot.paused = false;
+    }
+    const bool already_target = running && (g_paused == paused) &&
+        (!paused || g_pause_requested);
+    portEXIT_CRITICAL(&g_mux);
+
+    if (!running) return false;
+    if (!paused) return true;
+    if (already_target) return true;
+
+    const int64_t deadline_us = now_us + 500000LL;
+    while (generation_current(generation)) {
+        bool ack = false;
+        portENTER_CRITICAL(&g_mux);
+        ack = generation == g_generation && g_extract_pause_ack;
+        portEXIT_CRITICAL(&g_mux);
+        if (ack) break;
+        if (esp_timer_get_time() >= deadline_us) {
+            portENTER_CRITICAL(&g_mux);
+            if (generation == g_generation) {
+                g_pause_requested = false;
+                g_extract_pause_ack = false;
+            }
+            portEXIT_CRITICAL(&g_mux);
+            return false;
+        }
+        vTaskDelay(1);
+    }
+
+    portENTER_CRITICAL(&g_mux);
+    const bool same_generation = generation == g_generation && g_stop_generation != generation;
+    if (same_generation && g_extract_pause_ack) {
+        g_paused = true;
+        g_pause_started_us = esp_timer_get_time();
+        g_snapshot.paused = true;
+    }
+    const bool success = same_generation && g_paused;
+    portEXIT_CRITICAL(&g_mux);
+    return success;
+}
+
+bool is_paused()
+{
+    bool paused = false;
+    portENTER_CRITICAL(&g_mux);
+    paused = g_task != nullptr && g_stop_generation != g_generation && g_paused;
+    portEXIT_CRITICAL(&g_mux);
+    return paused;
 }
 
 bool get_snapshot(Snapshot *out_snapshot)

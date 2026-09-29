@@ -1439,8 +1439,8 @@ static void usb_tf_runtime_return_task(void *)
     if (reload_ret == ESP_OK) {
         const uint32_t new_generation = media_catalog_v2_generation();
         const bool catalog_replaced = new_generation != old_generation;
-        // 快速变更戳命中时 Catalog generation 没有变化，不必重建播放列表；
-        // 真正发生热替换时才按旧路径/索引重绑 Player。
+        // R46.0.27: USB 归还始终走严格增量对账。热刷新发布新 generation 时，
+        // 按旧路径/索引重绑 Player；若未替换 generation 则保持原状。
         const bool player_rebound = catalog_replaced
             ? player_state_rebind_after_catalog_reload(preferred_track_path, preferred_track_index)
             : true;
