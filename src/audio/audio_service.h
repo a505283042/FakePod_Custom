@@ -48,9 +48,21 @@ bool audio_service_stop(bool wait = true);
 bool audio_service_pause(bool wait = true);
 bool audio_service_resume(bool wait = true);
 
+// R46.0.30：Video Exclusive 可在 Music 已由 Video 暂停后做深度挂起。
+// 仅对当前实例可安全 Seek 回原位置的曲目启用；关闭 Music decoder/read-ahead 并释放共享 decode workspace，
+// 但保持 track/revision/position 语义不变。restore 只重建到 Paused，不会自行恢复播放。
+bool audio_service_video_music_suspend(
+    uint32_t track_index,
+    const char *path,
+    MediaFormat format,
+    const MediaTechnicalInfo *technical_info,
+    bool wait = true
+);
+bool audio_service_video_music_restore(bool wait = true);
+
 // R.40.4.1：AVI 内 MP3 临时接管 AudioTask 的 PCM/I2S/CS43131 输出。
-// 调用前 Video Exclusive 已暂停当前 Music；Video MP3 stop 后会恢复 Paused Music 硬件，
-// 真正的 Music resume 仍由 Video 生命周期决定。Video/Extractor 从不直接操作 I2S/DAC。
+// 浅暂停路径在 Video MP3 stop 后恢复 Paused Music 硬件；R46.0.30 深度挂起路径则由
+// Video 生命周期先重建 Music decoder/硬件再 resume。Video/Extractor 从不直接操作 I2S/DAC。
 bool audio_service_video_mp3_start(
     uint32_t sample_rate_hz,
     uint8_t channels,

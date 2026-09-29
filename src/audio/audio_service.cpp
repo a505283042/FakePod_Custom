@@ -102,6 +102,8 @@ enum class AudioCommandType : uint8_t
     SetVolume,
     SetOutputMode,
     SetMute,
+    VideoMusicSuspend,
+    VideoMusicRestore,
     VideoMp3Start,
     VideoMp3ReleaseStart,
     VideoMp3Pause,
@@ -209,6 +211,24 @@ static int64_t g_flac_starve_grace_started_us = 0;
 // WAV/FLAC/MP3/Ogg Opus 都通过统一 PcmDecoder 产出 32bit stereo PCM，I2S/DAC 不关心源格式。
 static PcmDecoder g_decoder = {};
 static AudioDecodeWorkspace g_decode_workspace = {};
+
+// R46.0.30：Video Exclusive 深度挂起只保存恢复所需的小型描述；Music decoder/source/read-ahead
+// 和共享 decode workspace 在视频窗口内全部释放。无可靠 Seek 的实例继续沿用原“Paused decoder 常驻”路径。
+struct VideoMusicSuspendContext
+{
+    bool active = false;
+    uint32_t track_index = UINT32_MAX;
+    uint32_t playback_revision = 0U;
+    MediaFormat format = MediaFormat::Unknown;
+    bool has_technical_info = false;
+    MediaTechnicalInfo technical_info = {};
+    uint64_t position_ms = 0ULL;
+    char *path = nullptr;
+};
+static VideoMusicSuspendContext g_video_music_suspend = {};
+
+static PcmDecoderType audio_decoder_type_for_format(MediaFormat format);
+static bool audio_task_request_matches_playback_context(const AudioRequest *request);
 
 // R.40.4.1：AVI MP3 是 AudioTask 内的临时第二 decoder。Music decoder/source 保持暂停原位，
 // Video 结束后重新配置硬件并恢复原 Music pipeline，不重新打开文件、不丢播放位置。
@@ -804,6 +824,8 @@ static const char *audio_command_name(AudioCommandType type)
         case AudioCommandType::SetVolume: return "VOLUME";
         case AudioCommandType::SetOutputMode: return "OUTPUT_MODE";
         case AudioCommandType::SetMute: return "MUTE";
+        case AudioCommandType::VideoMusicSuspend: return "VIDEO_MUSIC_SUSPEND";
+        case AudioCommandType::VideoMusicRestore: return "VIDEO_MUSIC_RESTORE";
         case AudioCommandType::VideoMp3Start: return "VIDEO_MP3_START";
         case AudioCommandType::VideoMp3ReleaseStart: return "VIDEO_MP3_RELEASE_START";
         case AudioCommandType::VideoMp3Pause: return "VIDEO_MP3_PAUSE";
@@ -1429,7 +1451,8 @@ static esp_err_t audio_task_start_pcm_pipeline(
     bool apply_seek = false,
     uint64_t seek_target_ms = 0,
     PcmSeekResult *out_seek_result = nullptr,
-    AudioFailureScope *out_failure_scope = nullptr
+    AudioFailureScope *out_failure_scope = nullptr,
+    bool check_transport_intent = true
 )
 {
     if (out_failure_scope != nullptr) {
@@ -1504,7 +1527,8 @@ static esp_err_t audio_task_start_pcm_pipeline(
 
     // decoder/source open 可能需要几十到数百毫秒。若用户在这期间又选择了更新目标，
     // 立即关闭旧 decoder，不再为已经过期的 Track 启动 I2S/DAC。
-    if (request != nullptr && audio_task_transport_request_superseded(request, "after_decoder_open")) {
+    if (check_transport_intent && request != nullptr &&
+        audio_task_transport_request_superseded(request, "after_decoder_open")) {
         pcm_decoder_close(&g_decoder);
         audio_decode_workspace_trim(
             &g_decode_workspace,
@@ -1522,7 +1546,8 @@ static esp_err_t audio_task_start_pcm_pipeline(
         pcm_decoder_close(&g_decoder);
         return ret;
     }
-    if (request != nullptr && audio_task_transport_request_superseded(request, "after_read_ahead")) {
+    if (check_transport_intent && request != nullptr &&
+        audio_task_transport_request_superseded(request, "after_read_ahead")) {
         pcm_decoder_close(&g_decoder);
         audio_decode_workspace_trim(
             &g_decode_workspace,
@@ -1588,7 +1613,7 @@ static esp_err_t audio_task_start_pcm_pipeline(
         g_task_bits_per_sample,
         g_task_channels,
         pcm_decoder_type_name(decoder_type),
-        request,
+        check_transport_intent ? request : nullptr,
         true,
         "start");
     if (ret != ESP_OK) {
@@ -1905,6 +1930,164 @@ static void audio_task_service_pause_silence()
     if (ret != ESP_OK) {
         audio_task_fail_stream(ret, "暂停静音");
     }
+}
+
+static void audio_task_release_video_music_suspend_context()
+{
+    if (g_video_music_suspend.path != nullptr) {
+        heap_caps_free(g_video_music_suspend.path);
+    }
+    g_video_music_suspend = {};
+}
+
+static void audio_task_handle_video_music_suspend(AudioRequest *request)
+{
+    if (request == nullptr) return;
+    g_task_last_request_id = request->request_id;
+
+    if (!audio_task_request_matches_playback_context(request) ||
+        g_task_state != AudioPlaybackState::Paused ||
+        !pcm_decoder_is_open(&g_decoder) ||
+        g_video_mp3_active || g_nsf_active ||
+        request->format != g_task_format) {
+        ESP_LOGW(TAG, "Video Music深度挂起被拒绝：state=%s track=%lu/%lu format=%s/%s",
+            audio_playback_state_name_cn(g_task_state),
+            static_cast<unsigned long>(request->track_index),
+            static_cast<unsigned long>(g_task_track_index),
+            media_format_name(request->format), media_format_name(g_task_format));
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+
+    const uint64_t target_frame = g_playback_clock.submitted_frames;
+    if (!pcm_decoder_seek_supported(&g_decoder, target_frame)) {
+        ESP_LOGI(TAG,
+            "Video Music保持浅暂停：当前实例不能可靠Seek恢复 format=%s position=%llums",
+            media_format_name(g_task_format),
+            static_cast<unsigned long long>(audio_playback_clock_position_ms(&g_playback_clock)));
+        audio_request_complete(request, false, ESP_ERR_NOT_SUPPORTED);
+        return;
+    }
+    if (g_task_format == MediaFormat::MP3 &&
+        (!request->has_technical_info ||
+         (request->technical_info.flags & MEDIA_TECH_PARSED) == 0U)) {
+        ESP_LOGI(TAG, "Video Music保持浅暂停：MP3缺少已解析技术索引，拒绝深度挂起");
+        audio_request_complete(request, false, ESP_ERR_NOT_SUPPORTED);
+        return;
+    }
+
+    const char *path = audio_request_path(request);
+    if (path == nullptr || path[0] == '\0') {
+        audio_request_complete(request, false, ESP_ERR_INVALID_ARG);
+        return;
+    }
+    const size_t path_bytes = strlen(path) + 1U;
+    char *saved_path = static_cast<char *>(
+        heap_caps_malloc(path_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (saved_path == nullptr) {
+        ESP_LOGW(TAG, "Video Music深度挂起路径缓存分配失败：%uB，保持浅暂停",
+            static_cast<unsigned>(path_bytes));
+        audio_request_complete(request, false, ESP_ERR_NO_MEM);
+        return;
+    }
+    memcpy(saved_path, path, path_bytes);
+
+    audio_task_release_video_music_suspend_context();
+    g_video_music_suspend.active = true;
+    g_video_music_suspend.track_index = g_task_track_index;
+    g_video_music_suspend.playback_revision = g_task_playback_revision;
+    g_video_music_suspend.format = g_task_format;
+    g_video_music_suspend.has_technical_info = request->has_technical_info;
+    if (request->has_technical_info) {
+        g_video_music_suspend.technical_info = request->technical_info;
+    }
+    g_video_music_suspend.position_ms = audio_playback_clock_position_ms(&g_playback_clock);
+    g_video_music_suspend.path = saved_path;
+
+    audio_task_log_ram("video_music_suspend_before");
+    const esp_err_t shutdown_ret = audio_task_shutdown_pipeline();
+    // 常规 shutdown 会为下一首保留小型共享 workspace；Video Exclusive 要真正把它归还 PSRAM。
+    audio_decode_workspace_destroy(&g_decode_workspace);
+    audio_task_set_state(AudioPlaybackState::Paused, ESP_OK);
+    audio_task_log_ram("video_music_suspend_ready");
+    if (shutdown_ret != ESP_OK) {
+        ESP_LOGW(TAG,
+            "Video Music深度挂起收尾出现瞬态错误：%s；decoder/workspace已释放，保留恢复上下文",
+            esp_err_to_name(shutdown_ret));
+    }
+    ESP_LOGI(TAG,
+        "Video Music深度挂起完成：track=%lu format=%s position=%llums；Music decoder/read-ahead/workspace已释放",
+        static_cast<unsigned long>(g_task_track_index), media_format_name(g_task_format),
+        static_cast<unsigned long long>(g_video_music_suspend.position_ms));
+    audio_request_complete(request, true, ESP_OK);
+}
+
+static void audio_task_handle_video_music_restore(AudioRequest *request)
+{
+    if (request == nullptr) return;
+    g_task_last_request_id = request->request_id;
+    if (!g_video_music_suspend.active || g_video_music_suspend.path == nullptr) {
+        audio_request_complete(request, true, ESP_OK);
+        return;
+    }
+    if (g_video_mp3_active || g_nsf_active ||
+        g_task_state != AudioPlaybackState::Paused ||
+        g_task_track_index != g_video_music_suspend.track_index ||
+        g_task_playback_revision != g_video_music_suspend.playback_revision) {
+        ESP_LOGW(TAG,
+            "Video Music恢复被拒绝：video=%u nsf=%u state=%s track=%lu/%lu revision=%lu/%lu",
+            static_cast<unsigned>(g_video_mp3_active), static_cast<unsigned>(g_nsf_active),
+            audio_playback_state_name_cn(g_task_state),
+            static_cast<unsigned long>(g_task_track_index),
+            static_cast<unsigned long>(g_video_music_suspend.track_index),
+            static_cast<unsigned long>(g_task_playback_revision),
+            static_cast<unsigned long>(g_video_music_suspend.playback_revision));
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+
+    const PcmDecoderType decoder_type = audio_decoder_type_for_format(g_video_music_suspend.format);
+    if (decoder_type == PcmDecoderType::None) {
+        audio_request_complete(request, false, ESP_ERR_NOT_SUPPORTED);
+        return;
+    }
+
+    AudioRequest restore = {};
+    restore.type = AudioCommandType::Play;
+    restore.track_index = g_video_music_suspend.track_index;
+    restore.format = g_video_music_suspend.format;
+    restore.has_technical_info = g_video_music_suspend.has_technical_info;
+    if (restore.has_technical_info) restore.technical_info = g_video_music_suspend.technical_info;
+
+    audio_task_log_ram("video_music_restore_begin");
+    PcmSeekResult seek = {};
+    const esp_err_t ret = audio_task_start_pcm_pipeline(
+        decoder_type,
+        g_video_music_suspend.path,
+        &restore,
+        true,
+        g_video_music_suspend.position_ms,
+        &seek,
+        nullptr,
+        false);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Video Music恢复失败：position=%llums ret=%s；保留上下文供后续重试",
+            static_cast<unsigned long long>(g_video_music_suspend.position_ms), esp_err_to_name(ret));
+        audio_task_set_state(AudioPlaybackState::Paused, ret);
+        audio_request_complete(request, false, ret);
+        return;
+    }
+
+    const uint64_t requested_ms = g_video_music_suspend.position_ms;
+    audio_task_set_state(AudioPlaybackState::Paused, ESP_OK);
+    audio_task_release_video_music_suspend_context();
+    audio_task_log_ram("video_music_restore_ready");
+    ESP_LOGI(TAG,
+        "Video Music深度恢复完成：requested=%llums actual=%llums method=%s；保持Paused等待Video生命周期resume",
+        static_cast<unsigned long long>(requested_ms),
+        static_cast<unsigned long long>(audio_playback_clock_position_ms(&g_playback_clock)),
+        pcm_seek_method_name(seek.method));
+    audio_request_complete(request, true, ESP_OK);
 }
 
 static void audio_task_video_mp3_close_decoder()
@@ -3889,6 +4072,8 @@ static PcmDecoderType audio_decoder_type_for_format(MediaFormat format)
 
 static void audio_task_handle_play(AudioRequest *request)
 {
+    // 新 Music Play 覆盖任何尚未恢复的 Video 深度挂起上下文。
+    audio_task_release_video_music_suspend_context();
     if (g_video_mp3_active || mp3_decoder_is_open(&g_video_mp3_decoder)) {
         (void)audio_task_stop_video_mp3_internal(false, "music_play_override");
     }
@@ -4264,6 +4449,7 @@ static void audio_task_handle_seek(AudioRequest *request)
 static void audio_task_handle_stop(AudioRequest *request)
 {
     g_task_last_request_id = request->request_id;
+    audio_task_release_video_music_suspend_context();
     if (g_video_mp3_active || mp3_decoder_is_open(&g_video_mp3_decoder)) {
         (void)audio_task_stop_video_mp3_internal(false, "global_stop");
     }
@@ -4564,6 +4750,12 @@ static void audio_task_process_request(AudioRequest *request)
             break;
         case AudioCommandType::SetMute:
             audio_task_handle_set_mute(request);
+            break;
+        case AudioCommandType::VideoMusicSuspend:
+            audio_task_handle_video_music_suspend(request);
+            break;
+        case AudioCommandType::VideoMusicRestore:
+            audio_task_handle_video_music_restore(request);
             break;
         case AudioCommandType::VideoMp3Start:
             audio_task_handle_video_mp3_start(request);
@@ -5135,6 +5327,42 @@ bool audio_service_resume(bool wait)
         audio_request_release(request);
         return false;
     }
+    return audio_service_submit(request, wait);
+}
+
+bool audio_service_video_music_suspend(
+    uint32_t track_index,
+    const char *path,
+    MediaFormat format,
+    const MediaTechnicalInfo *technical_info,
+    bool wait)
+{
+    AudioStateSnapshot snapshot = {};
+    if (!audio_service_get_snapshot(&snapshot) || !snapshot.ready ||
+        snapshot.state != AudioPlaybackState::Paused ||
+        snapshot.track_index != track_index || snapshot.playback_revision == 0U) {
+        return false;
+    }
+
+    AudioRequest *request = audio_request_create(AudioCommandType::VideoMusicSuspend, wait);
+    if (request == nullptr) return false;
+    request->track_index = track_index;
+    request->format = format;
+    request->expected_playback_revision = snapshot.playback_revision;
+    if (technical_info != nullptr) {
+        request->technical_info = *technical_info;
+        request->has_technical_info = true;
+    }
+    if (!audio_request_set_path(request, path)) {
+        audio_request_release(request);
+        return false;
+    }
+    return audio_service_submit(request, wait);
+}
+
+bool audio_service_video_music_restore(bool wait)
+{
+    AudioRequest *request = audio_request_create(AudioCommandType::VideoMusicRestore, wait);
     return audio_service_submit(request, wait);
 }
 

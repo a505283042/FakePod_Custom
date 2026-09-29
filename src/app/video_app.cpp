@@ -18,6 +18,8 @@
 #include "font/font_manager.h"
 #include "gesture/gesture_router.h"
 #include "lvgl.h"
+#include "media_library.h"
+#include "player_state.h"
 #include "ui_common.h"
 #include "video_benchmark.h"
 #include "video_browser_model.h"
@@ -187,6 +189,7 @@ static TaskHandle_t g_present_task = nullptr;
 static bool g_present_running = false;
 static bool g_present_stop_requested = false;
 static bool g_music_paused_for_benchmark = false;
+static bool g_music_deep_suspended_for_benchmark = false;
 static bool g_fullcanvas_risk_authorized = false;
 static bool g_profile_probe_pending = false;
 static bool g_risk_prompt_active = false;
@@ -360,6 +363,41 @@ static bool benchmark_pause_music_for_exclusive()
         return false;
     }
     g_music_paused_for_benchmark = true;
+    g_music_deep_suspended_for_benchmark = false;
+
+    // R46.0.30：只有当前 decoder 已证明能可靠回到非零位置时才深度挂起。
+    // FLAC 无 SEEKTABLE、或 Player/Catalog 上下文不一致时继续沿用浅暂停，不牺牲恢复正确性。
+    const size_t player_track = player_state_get_index();
+    const char *path = player_state_get_path();
+    MediaTechnicalInfo technical = {};
+    const bool has_technical = media_library_get_technical_info(player_track, &technical);
+    const bool mp3_index_safe = snapshot.format != MediaFormat::MP3 ||
+        (has_technical && (technical.flags & MEDIA_TECH_PARSED) != 0U);
+    const bool context_matches = player_state_is_ready() && path != nullptr && path[0] != '\0' &&
+        player_track == snapshot.track_index && player_state_get_format() == snapshot.format;
+
+    if (snapshot.seek_supported && mp3_index_safe && context_matches) {
+        if (audio_service_video_music_suspend(
+                snapshot.track_index,
+                path,
+                snapshot.format,
+                has_technical ? &technical : nullptr,
+                true)) {
+            g_music_deep_suspended_for_benchmark = true;
+            ESP_LOGI(TAG, "Video Exclusive：Music已深度挂起；decoder/read-ahead/workspace RAM已回收");
+        } else {
+            // suspend 的失败路径都发生在释放 decoder 之前，因此可安全回退到原浅暂停。
+            ESP_LOGW(TAG, "Video Exclusive：Music深度挂起不可用，本次保持浅暂停继续播放Video");
+        }
+    } else {
+        ESP_LOGI(TAG,
+            "Video Exclusive：Music保持浅暂停 seek=%u context=%u mp3_index=%u format=%s",
+            static_cast<unsigned>(snapshot.seek_supported),
+            static_cast<unsigned>(context_matches),
+            static_cast<unsigned>(mp3_index_safe),
+            media_format_name(snapshot.format));
+    }
+
     ESP_LOGI(TAG, "Video Exclusive：Music已暂停；AVI独占TF/Decode/Presenter性能窗口");
     return true;
 }
@@ -367,6 +405,14 @@ static bool benchmark_pause_music_for_exclusive()
 static void benchmark_restore_music_after_exclusive(const char *reason)
 {
     if (!g_music_paused_for_benchmark) return;
+    if (g_music_deep_suspended_for_benchmark) {
+        if (!audio_service_video_music_restore(true)) {
+            ESP_LOGW(TAG, "Video Exclusive：深度恢复Music失败 reason=%s；保留上下文等待生命周期重试",
+                reason != nullptr ? reason : "unknown");
+            return;
+        }
+        g_music_deep_suspended_for_benchmark = false;
+    }
     if (!audio_service_resume(false)) {
         ESP_LOGW(TAG, "Video Exclusive：恢复Music请求失败 reason=%s；保留暂停标记等待后续生命周期重试",
             reason != nullptr ? reason : "unknown");
