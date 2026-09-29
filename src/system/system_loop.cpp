@@ -47,6 +47,78 @@ static TickType_t g_last_persistent_observe_tick = 0;
 static TickType_t g_last_diag_tick = 0;
 #endif
 
+#if APP_DIAG_AUDIO_RAM
+// R46.0.31: ESP-IDF minimum_free_size 是开机以来历史低水位，掉下去后不会回升。
+// 这里额外维护 60 秒窗口低水位和 <12KB 进入次数，避免把很早以前的一次峰值误判成当前泄漏。
+// 每秒采样一次；<12KB 只在“进入低水位”时计数，恢复到 >=14KB 后才重新武装，避免阈值附近抖动重复计数。
+static constexpr TickType_t RAM_MON_SAMPLE_INTERVAL = pdMS_TO_TICKS(1000);
+static constexpr TickType_t RAM_MON_REPORT_INTERVAL = pdMS_TO_TICKS(60000);
+static constexpr size_t RAM_MON_LOW_THRESHOLD_BYTES = 12U * 1024U;
+static constexpr size_t RAM_MON_REARM_THRESHOLD_BYTES = 14U * 1024U;
+static TickType_t g_ram_mon_last_sample_tick = 0;
+static TickType_t g_ram_mon_window_start_tick = 0;
+static size_t g_ram_mon_min_60s = 0U;
+static uint32_t g_ram_mon_below_12k_total = 0U;
+static uint32_t g_ram_mon_below_12k_60s = 0U;
+static bool g_ram_mon_low_latched = false;
+static bool g_ram_mon_initialized = false;
+
+static void system_ram_low_water_monitor_update()
+{
+    const TickType_t now = xTaskGetTickCount();
+
+    if (g_ram_mon_initialized &&
+        now - g_ram_mon_last_sample_tick < RAM_MON_SAMPLE_INTERVAL) {
+        return;
+    }
+
+    g_ram_mon_last_sample_tick = now;
+
+    const size_t internal_free =
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+    if (!g_ram_mon_initialized) {
+        g_ram_mon_initialized = true;
+        g_ram_mon_window_start_tick = now;
+        g_ram_mon_min_60s = internal_free;
+    } else if (internal_free < g_ram_mon_min_60s) {
+        g_ram_mon_min_60s = internal_free;
+    }
+
+    if (!g_ram_mon_low_latched && internal_free < RAM_MON_LOW_THRESHOLD_BYTES) {
+        g_ram_mon_low_latched = true;
+        g_ram_mon_below_12k_total++;
+        g_ram_mon_below_12k_60s++;
+        ESP_LOGW(TAG,
+            "RAM_MON: Internal低水位进入 free=%uB largest=%uB dma=%uB event=%lu",
+            static_cast<unsigned>(internal_free),
+            static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+            static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA)),
+            static_cast<unsigned long>(g_ram_mon_below_12k_total));
+    } else if (g_ram_mon_low_latched && internal_free >= RAM_MON_REARM_THRESHOLD_BYTES) {
+        g_ram_mon_low_latched = false;
+    }
+
+    if (now - g_ram_mon_window_start_tick >= RAM_MON_REPORT_INTERVAL) {
+        ESP_LOGI(TAG,
+            "RAM_MON: 60s internal_now=%uB min_60s=%uB below12k_60s=%lu below12k_total=%lu boot_min=%uB largest=%uB dma=%uB",
+            static_cast<unsigned>(internal_free),
+            static_cast<unsigned>(g_ram_mon_min_60s),
+            static_cast<unsigned long>(g_ram_mon_below_12k_60s),
+            static_cast<unsigned long>(g_ram_mon_below_12k_total),
+            static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+            static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+            static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA)));
+
+        g_ram_mon_window_start_tick = now;
+        g_ram_mon_min_60s = internal_free;
+        g_ram_mon_below_12k_60s = 0U;
+    }
+}
+#else
+static inline void system_ram_low_water_monitor_update() {}
+#endif
+
 #if APP_DIAG_FLAC_PERFORMANCE
 static uint32_t g_last_flac_perf_sequence =
     0;
@@ -496,6 +568,10 @@ void system_loop_update()
 
     // 电池ADC完全不依赖TF/Catalog；放在USB owner闸门之前，MSC服务期也可继续采样。
     battery_service_update();
+
+    // R46.0.31：每秒采样 Internal RAM；每 60 秒滚动一次窗口，并统计 <12KB 的进入次数。
+    // 放在 USB owner 闸门前，运行期 TF/MSC 切换造成的低水位也能被记录。
+    system_ram_low_water_monitor_update();
 
     // USB MSC 运行时切换一旦开始，就停止所有可能重新触发本地文件/Catalog访问的业务调度。
     // MSC真正 active 时仍保留电源键轮询；归还/热刷新阶段 g_active 已清除，此时连电源短按
