@@ -13,8 +13,11 @@ extern "C" {
 // 当前 44.1~192kHz 播放统一复用这一 PCM 输出层。
 esp_err_t i2s_output_stream_start_32bit(uint32_t sample_rate_hz);
 
+// NSF 专用稳定档：固定 16×256，避免普通 Music 降低 DMA 后影响电子音流渲染余量。
+esp_err_t i2s_output_stream_start_32bit_nsf(uint32_t sample_rate_hz);
+
 // Video Exclusive 专用低内存 I2S 档：保持 256 帧/块，仅把 DMA 描述符固定为 8。
-// 普通 Music/FLAC/NSF 仍使用统一 Rate Profile，不受 Video 的临时内存策略影响。
+// 普通 Music 使用统一 Rate Profile，NSF 使用独立 16-desc 档，不受 Video 的临时内存策略影响。
 esp_err_t i2s_output_stream_start_32bit_video(uint32_t sample_rate_hz);
 
 // 写入已经转换成 32bit slot 的双声道交错 PCM。

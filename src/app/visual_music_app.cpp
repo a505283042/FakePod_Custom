@@ -13,6 +13,8 @@
 #include "font/font_manager.h"
 #include "gesture/gesture_router.h"
 #include "lvgl.h"
+#include "media_library.h"
+#include "player_state.h"
 #include "ui_common.h"
 #include "visual_music_browser_model.h"
 #include "visual_music_nsf.h"
@@ -56,23 +58,30 @@ static constexpr uint32_t kFlacSafePercent = 90U;
 static constexpr size_t kScanBatchNoFlac = 8U;
 static constexpr size_t kScanBatchWithFlac = 1U;
 static constexpr uint32_t kWaitLogIntervalMs = 1000U;
-// R6.8：时长分析阶段优先保证 Sequencer/音频连续，保持接近 R6.6 的安全刷新率；
-// Final 后 Sequencer 已停止重分析，再切 10ms UI timer + 20fps 瀑布。
-static constexpr uint32_t kNsfWaterfallAnalyzingFramePeriodMs = 120U; // ~8.3fps
-static constexpr uint32_t kNsfWaterfallFinalFramePeriodMs = 50U;      // 20fps
+// R46.0.47：时长分析期回退到约8.3fps，优先保证Sequencer/Timeline；Final仍保持PSRAM双帧25fps。
+static constexpr uint32_t kNsfWaterfallAnalyzingFramePeriodMs = 120U; // ~8.3fps，分析期统一限速
+static constexpr uint32_t kNsfWaterfallFinalFramePeriodMs = 50U;      // 20fps fallback
+static constexpr uint32_t kNsfWaterfallDoubleBufferFinalFramePeriodMs = 40U; // 25fps
 static constexpr uint32_t kNsfVisualSnapshotHoldMs = 300U;
 static constexpr uint32_t kWaterfallTimeLabelPeriodMs = 250U;
-// NSF 预读受 Core1 CPU 限制，无法持续领先 4s；缩小到预读能喂饱的尺寸，保证满窗且平滑。
+// R46.0.49：播放页隐藏超过2s后释放557KiB双帧；短暂返回列表则直接复用，避免频繁申请。
+static constexpr uint32_t kWaterfallHiddenReleaseDelayMs = 2000U;
+// R46.0.41：恢复 R46.0.38 的钢琴窗时间范围，降低音符屏幕移动速度。
 static constexpr uint32_t kWaterfallNsfFutureMs = 2000U;
-static constexpr uint32_t kWaterfallNsfPastMs = 1800U;  // 历史区：下落适中，避免音符叠成糊
+static constexpr uint32_t kWaterfallNsfPastMs = 1800U;  // 历史区恢复到原来的1.8s
 static constexpr int32_t kWaterfallPastPixels = 70;   // 播放线距控件底部的历史区高度
 static constexpr uint8_t kWaterfallPitchMin = 36U; // C2以下统一折叠到左侧低频区
 static constexpr uint8_t kWaterfallPitchMax = 96U; // C7以上夹到最右列
 static constexpr int32_t kWaterfallLowAreaWidth = 44;
-static constexpr size_t kNsfVisualWindowCapacity = 512U; // 覆盖整个4s未来窗（约260+事件）并留余量，避免顶部截断
+static constexpr size_t kNsfVisualWindowCapacity = 512U; // 恢复原钢琴窗密度，缓存位于PSRAM
 static constexpr int32_t kPlayerTitleHeight = 68;
 static constexpr int32_t kPlayerControlHeight = 82;
 static constexpr int32_t kPlayerWaterfallHeight = 460 - kPlayerTitleHeight - kPlayerControlHeight;
+static constexpr int32_t kWaterfallFrameWidth = 460;
+static constexpr int32_t kWaterfallFrameHeight = kPlayerWaterfallHeight;
+static constexpr size_t kWaterfallFramePixels =
+    static_cast<size_t>(kWaterfallFrameWidth) * kWaterfallFrameHeight;
+static constexpr size_t kWaterfallFrameBytes = kWaterfallFramePixels * sizeof(uint16_t);
 
 struct RowUi
 {
@@ -102,6 +111,10 @@ static lv_obj_t *g_player_title = nullptr;
 static lv_obj_t *g_player_message = nullptr;
 static lv_obj_t *g_player_hint = nullptr;
 static lv_obj_t *g_waterfall_widget = nullptr;
+static lv_obj_t *g_waterfall_frame_image = nullptr;
+static uint16_t *g_waterfall_frames[2] = {nullptr, nullptr};
+static lv_image_dsc_t g_waterfall_frame_dsc[2] = {};
+static uint8_t g_waterfall_front_index = 0U;
 static lv_obj_t *g_player_time = nullptr;
 static lv_obj_t *g_player_controls = nullptr;
 static lv_obj_t *g_loop_button = nullptr;
@@ -127,6 +140,8 @@ static uint32_t g_last_waterfall_draw_tick = 0U;
 static size_t g_nsf_visual_window_count = 0U;
 static uint32_t g_last_nsf_visual_snapshot_tick = 0U;
 static bool g_nsf_final_high_fps = false;
+static bool g_waterfall_hidden_release_pending = false;
+static uint32_t g_waterfall_hidden_since_tick = 0U;
 static bool g_nsf_paused = true;
 static bool g_nsf_audio_active = false;
 static bool g_nsf_eof = false;
@@ -135,6 +150,7 @@ static bool g_nsf_eof = false;
 static uint32_t g_last_nsf_eof_revision = 0U;
 static bool g_nsf_failed = false;
 static bool g_music_paused_for_nsf = false;
+static bool g_music_deep_suspended_for_nsf = false;
 static uint32_t g_last_nsf_time_label_tick = 0U;
 static PlayerLoopMode g_loop_mode = PlayerLoopMode::Sequential;
 
@@ -291,23 +307,64 @@ static void update_header()
 
 static bool pause_music_for_nsf_exclusive()
 {
-    if (g_music_paused_for_nsf) return true;
+    // 同一 NSF Session 内返回列表/换文件不恢复 Music；已经深度挂起时直接复用该上下文。
+    if (g_music_deep_suspended_for_nsf || g_music_paused_for_nsf) return true;
 
     AudioStateSnapshot snapshot = {};
     if (!audio_service_get_snapshot(&snapshot) || !snapshot.ready) {
         ESP_LOGI(TAG, "NSF Exclusive：AudioTask未就绪，无活动Music需要暂停");
         return true;
     }
-    if (snapshot.state != AudioPlaybackState::Playing) {
-        ESP_LOGI(TAG, "NSF Exclusive：Music当前非Playing(state=%u)，保持原状态",
+
+    if (snapshot.state == AudioPlaybackState::Playing) {
+        if (!audio_service_pause(true)) {
+            ESP_LOGE(TAG, "NSF Exclusive：暂停Music失败");
+            return false;
+        }
+        g_music_paused_for_nsf = true;
+        if (!audio_service_get_snapshot(&snapshot)) {
+            ESP_LOGW(TAG, "NSF Exclusive：暂停后读取Music状态失败，本次保持浅暂停");
+            return true;
+        }
+    } else if (snapshot.state != AudioPlaybackState::Paused) {
+        ESP_LOGI(TAG, "NSF Exclusive：Music当前非Playing/Paused(state=%u)，保持原状态",
             static_cast<unsigned>(snapshot.state));
         return true;
     }
-    if (!audio_service_pause(true)) {
-        ESP_LOGE(TAG, "NSF Exclusive：暂停Music失败");
-        return false;
+
+    // R46.0.37：和 Video 共用 AudioTask 的 Deep Suspend 核心。
+    // 进入电子音流列表时不触发；只有 NSF 已解析通过、真正准备启动 2A03 时才尝试。
+    const size_t player_track = player_state_get_index();
+    const char *path = player_state_get_path();
+    MediaTechnicalInfo technical = {};
+    const bool has_technical = media_library_get_technical_info(player_track, &technical);
+    const bool mp3_index_safe = snapshot.format != MediaFormat::MP3 ||
+        (has_technical && (technical.flags & MEDIA_TECH_PARSED) != 0U);
+    const bool context_matches = player_state_is_ready() && path != nullptr && path[0] != '\0' &&
+        player_track == snapshot.track_index && player_state_get_format() == snapshot.format;
+
+    if (snapshot.seek_supported && mp3_index_safe && context_matches) {
+        if (audio_service_music_deep_suspend(
+                AudioMusicSuspendOwner::Nsf,
+                snapshot.track_index,
+                path,
+                snapshot.format,
+                has_technical ? &technical : nullptr,
+                true)) {
+            g_music_deep_suspended_for_nsf = true;
+            ESP_LOGI(TAG, "NSF Exclusive：Music已深度挂起；decoder/read-ahead/workspace RAM已回收");
+        } else {
+            ESP_LOGW(TAG, "NSF Exclusive：Music深度挂起不可用，本次保持浅暂停继续NSF");
+        }
+    } else {
+        ESP_LOGI(TAG,
+            "NSF Exclusive：Music保持浅暂停 seek=%u context=%u mp3_index=%u format=%s",
+            static_cast<unsigned>(snapshot.seek_supported),
+            static_cast<unsigned>(context_matches),
+            static_cast<unsigned>(mp3_index_safe),
+            media_format_name(snapshot.format));
     }
-    g_music_paused_for_nsf = true;
+
     ESP_LOGI(TAG, "NSF Exclusive：Music已暂停；AudioTask切换到6502/2A03");
     return true;
 }
@@ -315,7 +372,10 @@ static bool pause_music_for_nsf_exclusive()
 static bool stop_nsf_audio(bool restore_music, const char *reason, bool force_hardware_stop = false)
 {
     if (g_nsf_audio_active || restore_music || force_hardware_stop) {
-        if (!audio_service_nsf_stop(restore_music, true)) {
+        // 深度挂起时 Music decoder 已不存在，NSF stop 只负责释放 NSF 自己的硬件；
+        // 随后再由共用 Deep Restore 重建 Music。浅暂停路径仍沿用原硬件恢复。
+        const bool restore_shallow_music_hardware = restore_music && !g_music_deep_suspended_for_nsf;
+        if (!audio_service_nsf_stop(restore_shallow_music_hardware, true)) {
             ESP_LOGE(TAG, "NSF停止/恢复Music硬件失败：reason=%s",
                 reason != nullptr ? reason : "unknown");
             return false;
@@ -331,6 +391,16 @@ static bool stop_nsf_audio(bool restore_music, const char *reason, bool force_ha
         if (g_timer != nullptr) lv_timer_set_period(g_timer, kBrowserTimerPeriodMs);
     }
 
+    if (restore_music && g_music_deep_suspended_for_nsf) {
+        if (!audio_service_music_deep_restore(AudioMusicSuspendOwner::Nsf, true)) {
+            ESP_LOGW(TAG, "NSF Exclusive深度恢复Music失败：reason=%s；保留上下文等待生命周期重试",
+                reason != nullptr ? reason : "unknown");
+            return false;
+        }
+        g_music_deep_suspended_for_nsf = false;
+    }
+
+    // 只有进入 NSF 前原本是 Playing 才恢复播放；原本就是 Paused 则只重建到 Paused。
     if (restore_music && g_music_paused_for_nsf) {
         if (!audio_service_resume(false)) {
             ESP_LOGW(TAG, "NSF Exclusive恢复Music请求失败：reason=%s；保留暂停标记等待生命周期重试",
@@ -375,6 +445,299 @@ static uint32_t nsf_waterfall_color(AudioNsfVisualVoice voice)
         case AudioNsfVisualVoice::Noise:
         case AudioNsfVisualVoice::Dmc: return 0xF4A62A;
         default: return 0xD7E4F5;
+    }
+}
+
+static uint16_t waterfall_rgb565(uint32_t color)
+{
+    const uint8_t r = static_cast<uint8_t>((color >> 16U) & 0xFFU);
+    const uint8_t g = static_cast<uint8_t>((color >> 8U) & 0xFFU);
+    const uint8_t b = static_cast<uint8_t>(color & 0xFFU);
+    return static_cast<uint16_t>(
+        ((static_cast<uint16_t>(r) & 0xF8U) << 8U) |
+        ((static_cast<uint16_t>(g) & 0xFCU) << 3U) |
+        (static_cast<uint16_t>(b) >> 3U));
+}
+
+static void waterfall_frame_fill_rect(
+    uint16_t *frame, int32_t x1, int32_t y1, int32_t x2, int32_t y2, uint16_t color)
+{
+    if (frame == nullptr) return;
+    if (x1 > x2 || y1 > y2 || x2 < 0 || y2 < 0 ||
+        x1 >= kWaterfallFrameWidth || y1 >= kWaterfallFrameHeight) return;
+    if (x1 < 0) x1 = 0;
+    if (y1 < 0) y1 = 0;
+    if (x2 >= kWaterfallFrameWidth) x2 = kWaterfallFrameWidth - 1;
+    if (y2 >= kWaterfallFrameHeight) y2 = kWaterfallFrameHeight - 1;
+    for (int32_t y = y1; y <= y2; ++y) {
+        uint16_t *row = frame + static_cast<size_t>(y) * kWaterfallFrameWidth + x1;
+        for (int32_t x = x1; x <= x2; ++x) *row++ = color;
+    }
+}
+
+static void waterfall_frame_draw_grid(uint16_t *frame)
+{
+    if (frame == nullptr) return;
+    const uint16_t bg = waterfall_rgb565(0x071425);
+    for (size_t i = 0U; i < kWaterfallFramePixels; ++i) frame[i] = bg;
+
+    const int32_t main_x1 = kWaterfallLowAreaWidth;
+    const int32_t main_width = kWaterfallFrameWidth - main_x1;
+    const int32_t pitch_span = kWaterfallPitchMax - kWaterfallPitchMin;
+    for (uint8_t note = kWaterfallPitchMin; note <= kWaterfallPitchMax; ++note) {
+        const int32_t x = main_x1 +
+            (static_cast<int32_t>(note - kWaterfallPitchMin) * (main_width - 1)) / pitch_span;
+        waterfall_frame_fill_rect(
+            frame, x, 0, x, kWaterfallFrameHeight - 1,
+            waterfall_rgb565((note % 12U) == 0U ? 0x263A55 : 0x16263A));
+    }
+    waterfall_frame_fill_rect(
+        frame, main_x1 - 1, 0, main_x1, kWaterfallFrameHeight - 1,
+        waterfall_rgb565(0x31475F));
+    waterfall_frame_fill_rect(
+        frame, kWaterfallLowAreaWidth / 2, 0, kWaterfallLowAreaWidth / 2,
+        kWaterfallFrameHeight - 1, waterfall_rgb565(0x122033));
+}
+
+static void waterfall_frame_init_dsc(lv_image_dsc_t *dsc, const uint16_t *pixels)
+{
+    if (dsc == nullptr) return;
+    *dsc = {};
+    dsc->header.magic = LV_IMAGE_HEADER_MAGIC;
+    dsc->header.cf = LV_COLOR_FORMAT_RGB565;
+    dsc->header.flags = 0U;
+    dsc->header.w = kWaterfallFrameWidth;
+    dsc->header.h = kWaterfallFrameHeight;
+    dsc->header.stride = static_cast<uint32_t>(kWaterfallFrameWidth) * 2U;
+    dsc->data_size = static_cast<uint32_t>(kWaterfallFrameBytes);
+    dsc->data = reinterpret_cast<const uint8_t *>(pixels);
+}
+
+static void waterfall_frame_buffers_release()
+{
+    for (size_t i = 0U; i < 2U; ++i) {
+        if (g_waterfall_frames[i] != nullptr) heap_caps_free(g_waterfall_frames[i]);
+        g_waterfall_frames[i] = nullptr;
+        g_waterfall_frame_dsc[i] = {};
+    }
+    g_waterfall_front_index = 0U;
+}
+
+static bool waterfall_frame_buffers_prepare()
+{
+    waterfall_frame_buffers_release();
+    for (size_t i = 0U; i < 2U; ++i) {
+        g_waterfall_frames[i] = static_cast<uint16_t *>(heap_caps_malloc(
+            kWaterfallFrameBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (g_waterfall_frames[i] == nullptr) {
+            waterfall_frame_buffers_release();
+            return false;
+        }
+        waterfall_frame_draw_grid(g_waterfall_frames[i]);
+        waterfall_frame_init_dsc(&g_waterfall_frame_dsc[i], g_waterfall_frames[i]);
+    }
+    g_waterfall_front_index = 0U;
+    return true;
+}
+
+static size_t waterfall_refresh_visual_window(uint32_t now_ms)
+{
+    const uint32_t history_start = now_ms > kWaterfallNsfPastMs
+        ? now_ms - kWaterfallNsfPastMs
+        : 0U;
+    const uint32_t future_end = UINT32_MAX - now_ms < kWaterfallNsfFutureMs
+        ? UINT32_MAX
+        : now_ms + kWaterfallNsfFutureMs;
+    const size_t fresh_count = audio_service_nsf_copy_visual_events(
+        g_nsf_track, history_start, future_end,
+        g_nsf_visual_window, kNsfVisualWindowCapacity);
+    const uint32_t snapshot_tick = lv_tick_get();
+    if (fresh_count > 0U) {
+        g_nsf_visual_window_count = fresh_count;
+        g_last_nsf_visual_snapshot_tick = snapshot_tick;
+    } else if (g_last_nsf_visual_snapshot_tick == 0U ||
+               snapshot_tick - g_last_nsf_visual_snapshot_tick > kNsfVisualSnapshotHoldMs) {
+        g_nsf_visual_window_count = 0U;
+    }
+    return g_nsf_visual_window_count;
+}
+
+static void waterfall_frame_draw_event(
+    uint16_t *frame, int32_t current_line_y, int32_t future_pixels, int32_t past_pixels,
+    uint32_t now_ms, const AudioNsfVisualEvent &note)
+{
+    if (frame == nullptr || note.end_ms < note.start_ms) return;
+    auto time_to_y = [current_line_y, future_pixels, past_pixels, now_ms](uint32_t time_ms) -> int32_t {
+        if (time_ms == now_ms) return current_line_y;
+        if (time_ms < now_ms) {
+            const uint64_t delta_ms = static_cast<uint64_t>(now_ms) - time_ms;
+            if (delta_ms >= kWaterfallNsfPastMs) return current_line_y + past_pixels;
+            return current_line_y + static_cast<int32_t>(
+                delta_ms * static_cast<uint64_t>(past_pixels) / kWaterfallNsfPastMs);
+        }
+        const uint64_t delta_ms = static_cast<uint64_t>(time_ms) - now_ms;
+        if (delta_ms >= kWaterfallNsfFutureMs) return current_line_y - future_pixels;
+        return current_line_y - static_cast<int32_t>(
+            delta_ms * static_cast<uint64_t>(future_pixels) / kWaterfallNsfFutureMs);
+    };
+
+    int32_t y1 = time_to_y(note.end_ms);
+    int32_t y2 = time_to_y(note.start_ms);
+    if (y1 > y2) { const int32_t swap = y1; y1 = y2; y2 = swap; }
+    if (y2 - y1 < 3) y2 = y1 + 3;
+    if (y2 < 0 || y1 >= kWaterfallFrameHeight) return;
+    if (y1 < 0) y1 = 0;
+    if (y2 >= kWaterfallFrameHeight) y2 = kWaterfallFrameHeight - 1;
+
+    int8_t low_lane = -1;
+    if (note.voice == AudioNsfVisualVoice::Noise) low_lane = 0;
+    else if (note.voice == AudioNsfVisualVoice::Dmc || note.note < kWaterfallPitchMin) low_lane = 1;
+
+    int32_t center_x = 0;
+    int32_t note_width = 6;
+    if (low_lane >= 0) {
+        const int32_t lane_width = kWaterfallLowAreaWidth / 2;
+        center_x = lane_width * low_lane + lane_width / 2;
+        note_width = 9;
+    } else {
+        const int32_t main_x1 = kWaterfallLowAreaWidth;
+        const int32_t main_width = kWaterfallFrameWidth - main_x1;
+        uint8_t clamped_note = note.note;
+        if (clamped_note < kWaterfallPitchMin) clamped_note = kWaterfallPitchMin;
+        if (clamped_note > kWaterfallPitchMax) clamped_note = kWaterfallPitchMax;
+        center_x = main_x1 +
+            (static_cast<int32_t>(clamped_note - kWaterfallPitchMin) * (main_width - 1)) /
+            (kWaterfallPitchMax - kWaterfallPitchMin);
+    }
+    int32_t x1 = center_x - note_width / 2;
+    int32_t x2 = x1 + note_width - 1;
+
+    const uint32_t base_color = low_lane >= 0 ? 0xF4A62A : nsf_waterfall_color(note.voice);
+    const uint16_t bright = waterfall_rgb565(waterfall_level_color(base_color, note.level));
+    const uint16_t dim = waterfall_rgb565(waterfall_dim_color(base_color));
+    const int32_t bright_y2 = y2 < current_line_y ? y2 : current_line_y;
+    if (bright_y2 >= y1) waterfall_frame_fill_rect(frame, x1, y1, x2, bright_y2, bright);
+    const int32_t dim_y1 = y1 > current_line_y ? y1 : current_line_y;
+    if (y2 >= dim_y1) waterfall_frame_fill_rect(frame, x1, dim_y1, x2, y2, dim);
+}
+
+static bool waterfall_render_psram_frame(uint32_t now_ms)
+{
+    if (g_waterfall_frame_image == nullptr || g_waterfall_frames[0] == nullptr ||
+        g_waterfall_frames[1] == nullptr) return false;
+    const uint8_t back = static_cast<uint8_t>(g_waterfall_front_index ^ 1U);
+    uint16_t *frame = g_waterfall_frames[back];
+    waterfall_frame_draw_grid(frame);
+
+    const int32_t top = 4;
+    const int32_t current_line_y = kWaterfallFrameHeight - 1 - kWaterfallPastPixels - 2;
+    const int32_t future_pixels = current_line_y - top;
+    const int32_t past_pixels = kWaterfallFrameHeight - 1 - current_line_y;
+    const uint32_t history_start = now_ms > kWaterfallNsfPastMs
+        ? now_ms - kWaterfallNsfPastMs : 0U;
+    const uint32_t future_end = UINT32_MAX - now_ms < kWaterfallNsfFutureMs
+        ? UINT32_MAX : now_ms + kWaterfallNsfFutureMs;
+    const size_t count = waterfall_refresh_visual_window(now_ms);
+    for (size_t i = 0U; i < count; ++i) {
+        const AudioNsfVisualEvent &note = g_nsf_visual_window[i];
+        if (note.end_ms < note.start_ms || note.end_ms < history_start ||
+            note.start_ms > future_end) continue;
+        waterfall_frame_draw_event(frame, current_line_y, future_pixels, past_pixels, now_ms, note);
+    }
+    waterfall_frame_fill_rect(
+        frame, 2, current_line_y, kWaterfallFrameWidth - 3, current_line_y + 1,
+        waterfall_rgb565(0x30D7FF));
+
+    // lv_image_set_src()本身登记失效；不要再额外invalidate同一区域。
+    lv_image_set_src(g_waterfall_frame_image, &g_waterfall_frame_dsc[back]);
+    g_waterfall_front_index = back;
+    return true;
+}
+
+static void waterfall_cancel_hidden_release()
+{
+    g_waterfall_hidden_release_pending = false;
+    g_waterfall_hidden_since_tick = 0U;
+}
+
+static void waterfall_release_double_buffer(const char *reason)
+{
+    waterfall_cancel_hidden_release();
+    if (g_waterfall_frame_image == nullptr &&
+        g_waterfall_frames[0] == nullptr && g_waterfall_frames[1] == nullptr) {
+        return;
+    }
+
+    const size_t psram_before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    if (g_waterfall_frame_image != nullptr) {
+        lv_obj_delete(g_waterfall_frame_image);
+        g_waterfall_frame_image = nullptr;
+    }
+    waterfall_frame_buffers_release();
+    const size_t psram_after = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    const size_t psram_net = psram_after >= psram_before ? psram_after - psram_before : 0U;
+    ESP_LOGI(TAG,
+        "NSF瀑布隐藏回收：frames=%uB psram_net=%uB reason=%s；音频/Timeline继续",
+        static_cast<unsigned>(kWaterfallFrameBytes * 2U),
+        static_cast<unsigned>(psram_net),
+        reason != nullptr ? reason : "unknown");
+}
+
+static void waterfall_schedule_hidden_release()
+{
+    if (g_waterfall_frame_image == nullptr &&
+        g_waterfall_frames[0] == nullptr && g_waterfall_frames[1] == nullptr) {
+        waterfall_cancel_hidden_release();
+        return;
+    }
+    g_waterfall_hidden_release_pending = true;
+    g_waterfall_hidden_since_tick = static_cast<uint32_t>(lv_tick_get());
+    ESP_LOGI(TAG, "NSF瀑布已隐藏：%lums后回收双帧，期间返回播放页直接复用",
+        static_cast<unsigned long>(kWaterfallHiddenReleaseDelayMs));
+}
+
+static void waterfall_hidden_release_tick()
+{
+    if (!g_waterfall_hidden_release_pending || g_page != VisualMusicPage::Browser) return;
+    const uint32_t now = static_cast<uint32_t>(lv_tick_get());
+    if (now - g_waterfall_hidden_since_tick < kWaterfallHiddenReleaseDelayMs) return;
+    waterfall_release_double_buffer("browser_hidden_2s");
+}
+
+static bool waterfall_enable_double_buffer_if_possible()
+{
+    waterfall_cancel_hidden_release();
+    if (g_waterfall_frame_image != nullptr) return true;
+    if (g_waterfall_widget == nullptr) return false;
+    if (g_waterfall_frames[0] == nullptr || g_waterfall_frames[1] == nullptr) {
+        if (!waterfall_frame_buffers_prepare()) {
+            ESP_LOGW(TAG, "NSF瀑布PSRAM双帧申请失败：本次回退LVGL即时绘制");
+            return false;
+        }
+    }
+    g_waterfall_frame_image = lv_image_create(g_waterfall_widget);
+    if (g_waterfall_frame_image == nullptr) {
+        waterfall_frame_buffers_release();
+        ESP_LOGW(TAG, "NSF瀑布Image创建失败：本次回退LVGL即时绘制");
+        return false;
+    }
+    ui_common_lock_object(g_waterfall_frame_image);
+    lv_image_set_src(g_waterfall_frame_image, &g_waterfall_frame_dsc[0]);
+    lv_image_set_antialias(g_waterfall_frame_image, false);
+    lv_obj_set_pos(g_waterfall_frame_image, 0, 0);
+    ESP_LOGI(TAG, "NSF瀑布PSRAM双帧已准备：2x%uB total=%uB window=-%lums/+%lums events=%u",
+        static_cast<unsigned>(kWaterfallFrameBytes),
+        static_cast<unsigned>(kWaterfallFrameBytes * 2U),
+        static_cast<unsigned long>(kWaterfallNsfPastMs),
+        static_cast<unsigned long>(kWaterfallNsfFutureMs),
+        static_cast<unsigned>(kNsfVisualWindowCapacity));
+    return true;
+}
+
+static void waterfall_request_frame(uint32_t now_ms)
+{
+    if (!waterfall_render_psram_frame(now_ms) && g_waterfall_widget != nullptr) {
+        lv_obj_invalidate(g_waterfall_widget);
     }
 }
 
@@ -507,6 +870,7 @@ static void waterfall_draw_event(
 
 static void waterfall_draw_cb(lv_event_t *event)
 {
+    if (g_waterfall_frame_image != nullptr) return;
     if (event == nullptr || lv_event_get_code(event) != LV_EVENT_DRAW_MAIN ||
         g_page != VisualMusicPage::NsfReady) {
         return;
@@ -552,23 +916,7 @@ static void waterfall_draw_cb(lv_event_t *event)
         : now_ms + future_ms;
     // R6：PCM、当前音符和未来音符全部消费同一个 Sequencer Timeline。
     // 一次复制覆盖历史+未来窗口，避免 UI 对同一份大时间线做两次扫描。
-    const size_t fresh_count = audio_service_nsf_copy_visual_events(
-        g_nsf_track,
-        history_start,
-        future_end,
-        g_nsf_visual_window,
-        kNsfVisualWindowCapacity);
-    const uint32_t snapshot_tick = lv_tick_get();
-    if (fresh_count > 0U) {
-        g_nsf_visual_window_count = fresh_count;
-        g_last_nsf_visual_snapshot_tick = snapshot_tick;
-    } else if (g_last_nsf_visual_snapshot_tick == 0U ||
-               snapshot_tick - g_last_nsf_visual_snapshot_tick > kNsfVisualSnapshotHoldMs) {
-        // 分析期发布/读取 mutex 偶发冲突时不要把单帧 0 events 当成真实空白；
-        // 最多沿用 300ms 的绝对时间戳快照，超过后再清空。
-        g_nsf_visual_window_count = 0U;
-    }
-    const size_t count = g_nsf_visual_window_count;
+    const size_t count = waterfall_refresh_visual_window(now_ms);
     for (size_t i = 0U; i < count; ++i) {
         const AudioNsfVisualEvent &note = g_nsf_visual_window[i];
         if (note.end_ms < note.start_ms || note.end_ms < history_start ||
@@ -725,6 +1073,47 @@ static void update_nsf_ready_ui()
     update_player_controls();
 }
 
+static bool show_active_nsf_player()
+{
+    if (!g_nsf_audio_active || g_nsf_image.track_count == 0U) return false;
+
+    AudioNsfClockSnapshot clock = {};
+    if (!audio_service_nsf_get_clock(&clock) || !clock.active || clock.failed) return false;
+
+    waterfall_cancel_hidden_release();
+    g_page = VisualMusicPage::NsfReady;
+    set_visible(g_browser_host, false);
+    set_browser_header_visible(false);
+    set_visible(g_player_host, true);
+
+    const bool waterfall_double_buffer = waterfall_enable_double_buffer_if_possible();
+    g_nsf_paused = clock.paused || clock.eof;
+    g_nsf_eof = clock.eof;
+    g_nsf_failed = false;
+    g_nsf_final_high_fps = clock.duration_state == AudioNsfDurationState::Final;
+    g_last_nsf_time_label_tick = 0U;
+    g_last_waterfall_draw_tick = 0U;
+    g_nsf_visual_window_count = 0U;
+    g_last_nsf_visual_snapshot_tick = 0U;
+    if (g_timer != nullptr) {
+        lv_timer_set_period(
+            g_timer,
+            g_nsf_final_high_fps ? kNsfFinalTimerPeriodMs : kNsfAnalyzingTimerPeriodMs);
+    }
+    update_nsf_ready_ui();
+    const uint32_t frame_now = clock.position_ms > UINT32_MAX
+        ? UINT32_MAX : static_cast<uint32_t>(clock.position_ms);
+    waterfall_request_frame(frame_now);
+    gesture_router_reset();
+    ESP_LOGI(TAG,
+        "NSF继续播放页：track=%u/%u position=%lums waterfall=%s",
+        static_cast<unsigned>(g_nsf_track + 1U),
+        static_cast<unsigned>(g_nsf_image.track_count),
+        static_cast<unsigned long>(frame_now),
+        waterfall_double_buffer ? "PSRAM双帧" : "LVGL即时绘制");
+    return true;
+}
+
 static bool start_nsf_audio_from_image()
 {
     if (g_nsf_image.prg_data == nullptr || g_nsf_image.prg_size == 0U ||
@@ -740,6 +1129,9 @@ static bool start_nsf_audio_from_image()
         set_player_loading_ui("无法暂停后台Music", "返回列表后可继续浏览文件");
         return false;
     }
+
+    // Music Deep Suspend已先回收大块PSRAM；此刻再申请钢琴窗双帧，避免仅浏览列表时占内存。
+    const bool waterfall_double_buffer = waterfall_enable_double_buffer_if_possible();
 
     NsfSynthConfig config = {};
     config.load_address = g_nsf_image.load_address;
@@ -780,15 +1172,19 @@ static bool start_nsf_audio_from_image()
     g_nsf_final_high_fps = false;
     if (g_timer != nullptr) lv_timer_set_period(g_timer, kNsfAnalyzingTimerPeriodMs);
     update_nsf_ready_ui();
-    if (g_waterfall_widget != nullptr) lv_obj_invalidate(g_waterfall_widget);
-    ESP_LOGI(TAG, "NSF 2A03音频启动：track=%u/%u 48000Hz 基础5通道 waterfall=~8->20fps(final)",
+    waterfall_request_frame(0U);
+    ESP_LOGI(TAG, "NSF 2A03音频启动：track=%u/%u 48000Hz 基础5通道 waterfall=%s analyzing=%ufps final=%ufps",
         static_cast<unsigned>(g_nsf_track + 1U),
-        static_cast<unsigned>(g_nsf_image.track_count));
+        static_cast<unsigned>(g_nsf_image.track_count),
+        waterfall_double_buffer ? "PSRAM双帧" : "LVGL即时绘制",
+        8U,
+        static_cast<unsigned>(waterfall_double_buffer ? 25U : 20U));
     return true;
 }
 
 static void begin_nsf_load()
 {
+    waterfall_cancel_hidden_release();
     if (g_selected_path == nullptr || g_selected_path[0] == '\0') return;
     // 切换到新的 NSF 文件时只停止旧 NSF；普通 Music 始终保持进入 NSF 前的暂停状态。
     // 只有真正离开电子音流 APP 时，visual_music_leave() 才恢复普通 Music。
@@ -898,9 +1294,7 @@ static bool select_nsf_subsong(int direction, bool allow_wrap)
                 : kBrowserTimerPeriodMs);
     }
     update_nsf_ready_ui();
-    if (g_page == VisualMusicPage::NsfReady && g_waterfall_widget != nullptr) {
-        lv_obj_invalidate(g_waterfall_widget);
-    }
+    if (g_page == VisualMusicPage::NsfReady) waterfall_request_frame(0U);
     ESP_LOGI(
         TAG,
         "NSF Subsong选择：track=%u/%u",
@@ -1259,14 +1653,17 @@ static void show_browser()
     set_visible(g_browser_host, true);
     set_browser_header_visible(true);
     set_visible(g_player_host, false);
+    if (g_nsf_audio_active) waterfall_schedule_hidden_release();
+    else waterfall_release_double_buffer("browser_no_active_nsf");
     update_header();
     update_rows();
     gesture_router_reset();
     ESP_LOGI(
         TAG,
-        "电子音流返回文件列表：NSF=%s Music=%s；离开APP后才恢复Music",
+        "电子音流返回文件列表：NSF=%s Music=%s%s；离开APP后才恢复Music",
         g_nsf_audio_active ? "继续播放" : "未播放",
-        g_music_paused_for_nsf ? "保持暂停" : "保持原状态");
+        (g_music_paused_for_nsf || g_music_deep_suspended_for_nsf) ? "保持暂停" : "保持原状态",
+        g_music_deep_suspended_for_nsf ? "/DeepSuspend" : "");
 }
 
 static void show_launcher()
@@ -1339,7 +1736,10 @@ static void row_clicked_cb(lv_event_t *event)
         return;
     }
 
+    const bool reopen_active_nsf = g_nsf_audio_active && g_nsf_image.track_count > 0U &&
+        g_selected_path != nullptr && strcmp(g_selected_path, g_scratch_path) == 0;
     g_selected_index = index;
+    if (reopen_active_nsf && show_active_nsf_player()) return;
     snprintf(g_selected_path, VisualMusicBrowser::kPathBytes, "%s", g_scratch_path);
     begin_nsf_load();
 }
@@ -1360,6 +1760,7 @@ static void timer_cb(lv_timer_t *timer)
 
     browser_load_tick();
     nsf_result_tick();
+    waterfall_hidden_release_tick();
     // NSF 音频会话与页面显示解耦：Browser 中仍持续消费 Clock/EOF/循环状态。
     if (g_nsf_audio_active) {
         const bool player_visible = g_page == VisualMusicPage::NsfReady;
@@ -1394,9 +1795,7 @@ static void timer_cb(lv_timer_t *timer)
                             g_nsf_eof = false;
                             g_last_nsf_time_label_tick = 0U;
                             g_last_waterfall_draw_tick = 0U;
-                            if (player_visible && g_waterfall_widget != nullptr) {
-                                lv_obj_invalidate(g_waterfall_widget);
-                            }
+                            if (player_visible) waterfall_request_frame(0U);
                             ESP_LOGI(TAG, "NSF RepeatOne已重启：track=%u/%u",
                                 static_cast<unsigned>(g_nsf_track + 1U),
                                 static_cast<unsigned>(g_nsf_image.track_count));
@@ -1419,9 +1818,11 @@ static void timer_cb(lv_timer_t *timer)
             } else {
                 if (paused_changed) {
                     if (player_visible) update_player_controls();
-                    if (player_visible && clock.paused && g_waterfall_widget != nullptr) {
+                    if (player_visible && clock.paused) {
                         // Pause 只在状态切换瞬间补一帧，之后不再持续刷新瀑布。
-                        lv_obj_invalidate(g_waterfall_widget);
+                        const uint32_t frame_now = clock.position_ms > UINT32_MAX
+                            ? UINT32_MAX : static_cast<uint32_t>(clock.position_ms);
+                        waterfall_request_frame(frame_now);
                     }
                 }
                 const bool want_final_high_fps =
@@ -1439,7 +1840,9 @@ static void timer_cb(lv_timer_t *timer)
                     }
                     g_last_waterfall_draw_tick = 0U;
                     if (player_visible && want_final_high_fps) {
-                        ESP_LOGI(TAG, "NSF时长Final：瀑布切换20fps");
+                        ESP_LOGI(TAG, "NSF时长Final：瀑布切换%ufps（%s）",
+                            static_cast<unsigned>(g_waterfall_frame_image != nullptr ? 25U : 20U),
+                            g_waterfall_frame_image != nullptr ? "PSRAM双帧" : "LVGL即时绘制");
                     }
                 }
                 if (player_visible &&
@@ -1449,14 +1852,20 @@ static void timer_cb(lv_timer_t *timer)
                     update_nsf_time_label();
                 }
                 if (player_visible && !clock.paused) {
+                    const bool waterfall_double_buffer =
+                        g_waterfall_frame_image != nullptr;
                     const uint32_t waterfall_period_ms =
                         clock.duration_state == AudioNsfDurationState::Final
-                            ? kNsfWaterfallFinalFramePeriodMs
+                            ? (waterfall_double_buffer
+                                ? kNsfWaterfallDoubleBufferFinalFramePeriodMs
+                                : kNsfWaterfallFinalFramePeriodMs)
                             : kNsfWaterfallAnalyzingFramePeriodMs;
                     if (g_last_waterfall_draw_tick == 0U ||
                         now_tick - g_last_waterfall_draw_tick >= waterfall_period_ms) {
                         g_last_waterfall_draw_tick = now_tick;
-                        if (g_waterfall_widget != nullptr) lv_obj_invalidate(g_waterfall_widget);
+                        const uint32_t frame_now = clock.position_ms > UINT32_MAX
+                            ? UINT32_MAX : static_cast<uint32_t>(clock.position_ms);
+                        waterfall_request_frame(frame_now);
                     }
                 }
             }
@@ -1559,6 +1968,7 @@ static esp_err_t cleanup_create_failure(esp_err_t err)
     g_player_message = nullptr;
     g_player_hint = nullptr;
     g_waterfall_widget = nullptr;
+    g_waterfall_frame_image = nullptr;
     g_player_time = nullptr;
     g_player_controls = nullptr;
     g_loop_button = nullptr;
@@ -1572,6 +1982,7 @@ static esp_err_t cleanup_create_failure(esp_err_t err)
     if (g_scratch_path != nullptr) heap_caps_free(g_scratch_path);
     if (g_selected_path != nullptr) heap_caps_free(g_selected_path);
     if (g_nsf_visual_window != nullptr) heap_caps_free(g_nsf_visual_window);
+    waterfall_frame_buffers_release();
     g_current_dir = nullptr;
     g_scratch_path = nullptr;
     g_selected_path = nullptr;
@@ -1728,6 +2139,8 @@ static esp_err_t visual_music_create()
     lv_obj_set_style_bg_opa(g_waterfall_widget, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(g_waterfall_widget, 0, 0);
     lv_obj_remove_flag(g_waterfall_widget, LV_OBJ_FLAG_SCROLLABLE);
+    // 双帧只在真正启动NSF后申请：浏览文件列表时不额外常驻约557KB PSRAM。
+    // 回调始终保留，双帧启用后会在入口快速返回；PSRAM不足时自然回退原即时绘制。
     lv_obj_add_event_cb(g_waterfall_widget, waterfall_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
 
     g_player_message = make_label(g_player_host, "", 0xBFC9D6, LV_TEXT_ALIGN_CENTER);
@@ -1799,6 +2212,8 @@ static esp_err_t visual_music_enter()
     g_nsf_paused = true;
     g_nsf_failed = false;
     g_music_paused_for_nsf = false;
+    g_music_deep_suspended_for_nsf = false;
+    waterfall_cancel_hidden_release();
     cancel_nsf_player();
     g_page = VisualMusicPage::Browser;
     g_selected_path[0] = '\0';
@@ -1830,6 +2245,7 @@ static esp_err_t visual_music_leave(AppRunState next_state)
     (void)next_state;
     cancel_browser_load();
     if (!stop_nsf_audio(true, "app_leave")) return ESP_ERR_INVALID_STATE;
+    waterfall_release_double_buffer("app_leave");
     cancel_nsf_player();
     if (g_timer != nullptr) lv_timer_pause(g_timer);
     gesture_router_reset();
@@ -1842,6 +2258,7 @@ static esp_err_t visual_music_leave(AppRunState next_state)
 
 static void visual_music_destroy()
 {
+    waterfall_cancel_hidden_release();
     cancel_browser_load();
     (void)stop_nsf_audio(true, "app_destroy");
     cancel_nsf_player();
@@ -1865,6 +2282,7 @@ static void visual_music_destroy()
     g_player_message = nullptr;
     g_player_hint = nullptr;
     g_waterfall_widget = nullptr;
+    g_waterfall_frame_image = nullptr;
     g_player_time = nullptr;
     g_player_controls = nullptr;
     g_loop_button = nullptr;
@@ -1883,6 +2301,7 @@ static void visual_music_destroy()
     if (g_scratch_path != nullptr) heap_caps_free(g_scratch_path);
     if (g_selected_path != nullptr) heap_caps_free(g_selected_path);
     if (g_nsf_visual_window != nullptr) heap_caps_free(g_nsf_visual_window);
+    waterfall_frame_buffers_release();
     g_current_dir = nullptr;
     g_scratch_path = nullptr;
     g_selected_path = nullptr;
@@ -1894,8 +2313,9 @@ static void visual_music_destroy()
     g_nsf_paused = true;
     g_nsf_failed = false;
     g_music_paused_for_nsf = false;
+    g_music_deep_suspended_for_nsf = false;
     g_page = VisualMusicPage::Browser;
-    ESP_LOGI(TAG, "电子音流 destroy完成：LVGL/目录索引/路径PSRAM已释放");
+    ESP_LOGI(TAG, "电子音流 destroy完成：LVGL/目录索引/路径/瀑布双帧PSRAM已释放");
 }
 
 } // namespace

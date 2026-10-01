@@ -106,6 +106,10 @@ esp_err_t nsf_synth_analyze_play_calls(
     size_t max_calls,
     size_t *out_calls);
 
+// Strict Loop 已确认后切到 Event-only：保留6502/APU/Event Timeline，
+// 关闭并释放Loop历史与可视Tick采集。返回释放的PSRAM请求字节数。
+size_t nsf_synth_enter_event_only_mode(NsfSynth *synth);
+
 bool nsf_synth_is_open(const NsfSynth *synth);
 bool nsf_synth_has_failed(const NsfSynth *synth);
 uint64_t nsf_synth_position_frames(const NsfSynth *synth);

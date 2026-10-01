@@ -48,21 +48,32 @@ bool audio_service_stop(bool wait = true);
 bool audio_service_pause(bool wait = true);
 bool audio_service_resume(bool wait = true);
 
-// R46.0.30：Video Exclusive 可在 Music 已由 Video 暂停后做深度挂起。
-// 仅对当前实例可安全 Seek 回原位置的曲目启用；关闭 Music decoder/read-ahead 并释放共享 decode workspace，
-// 但保持 track/revision/position 语义不变。restore 只重建到 Paused，不会自行恢复播放。
-bool audio_service_video_music_suspend(
+// R46.0.37：Video / NSF 共用同一套 Music Deep Suspend。
+// owner 只用于保护“谁挂起谁恢复”；仅对当前实例可安全 Seek 回原位置的曲目启用。
+// suspend 会关闭 Music decoder/read-ahead/source 并释放共享 decode workspace；
+// restore 只重建到 Paused，不会自行恢复播放，由各 APP 生命周期决定是否 resume。
+enum class AudioMusicSuspendOwner : uint8_t
+{
+    Video = 1U,
+    Nsf,
+};
+
+bool audio_service_music_deep_suspend(
+    AudioMusicSuspendOwner owner,
     uint32_t track_index,
     const char *path,
     MediaFormat format,
     const MediaTechnicalInfo *technical_info,
     bool wait = true
 );
-bool audio_service_video_music_restore(bool wait = true);
+bool audio_service_music_deep_restore(
+    AudioMusicSuspendOwner owner,
+    bool wait = true
+);
 
 // R.40.4.1：AVI 内 MP3 临时接管 AudioTask 的 PCM/I2S/CS43131 输出。
-// 浅暂停路径在 Video MP3 stop 后恢复 Paused Music 硬件；R46.0.30 深度挂起路径则由
-// Video 生命周期先重建 Music decoder/硬件再 resume。Video/Extractor 从不直接操作 I2S/DAC。
+// 浅暂停路径在 Video MP3 stop 后恢复 Paused Music 硬件；Deep Suspend 路径则由
+// Video 生命周期先通过共用恢复核心重建 Music decoder/硬件再 resume。Video/Extractor 不直接操作 I2S/DAC。
 bool audio_service_video_mp3_start(
     uint32_t sample_rate_hz,
     uint8_t channels,
@@ -112,7 +123,8 @@ bool audio_service_nsf_start(
 bool audio_service_nsf_pause(bool wait = true);
 bool audio_service_nsf_resume(bool wait = true);
 bool audio_service_nsf_set_track(uint8_t track, bool wait = true);
-// restore_music_hardware=false 用于同一 NSF 内切 Subsong，正常列表/退出路径应传 true。
+// restore_music_hardware=false 用于同一 NSF Session 内切文件/Subsong。
+// Deep Suspend 时 NSF stop 只释放自己的硬件，Music 由共用 Deep Restore 在真正离开 APP 时重建。
 bool audio_service_nsf_stop(bool restore_music_hardware = true, bool wait = true);
 
 // NSF 专用数字衰减补偿。0~6dB，仅减少 CS43131 PCM 衰减并在 0dB 封顶；
@@ -123,6 +135,7 @@ enum class AudioNsfDurationState : uint8_t
 {
     Unknown = 0U,
     Estimated,
+    Confirmed, // Strict Loop已确认显示时长；Audio Timeline仍可在后台线性构建
     Final,
 };
 
@@ -137,7 +150,8 @@ struct AudioNsfClockSnapshot
     uint64_t submitted_frames = 0ULL;
     uint64_t position_ms = 0ULL;
     uint64_t duration_ms = 0ULL;
-    // Estimated 只用于提前显示，不能据此判断 EOF；Final 表示 AudioTask 已采用明确结束计划。
+    // Estimated=估算；Confirmed=Strict Loop已确认、UI可立即显示精确时长；
+    // Final=AudioTask已采用结束计划。只有 Final 可用于 EOF 判断。
     AudioNsfDurationState duration_state = AudioNsfDurationState::Unknown;
     uint8_t track = 0U;       // 0-based
     uint8_t track_count = 0U;

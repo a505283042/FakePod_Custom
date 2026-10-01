@@ -269,7 +269,7 @@ static void detail_apply_scroll_y(int32_t y)
 static uint16_t detail_row_count_for_page(SettingsPage page)
 {
     switch (page) {
-        case SettingsPage::Connection: return 5U;
+        case SettingsPage::Connection: return 4U;
         case SettingsPage::Applications: return 5U;
         case SettingsPage::MusicPlayer: return 3U;
         case SettingsPage::ElectronicFlow: return 1U;
@@ -1533,7 +1533,7 @@ static void usb_tf_storage_return_click_cb(lv_event_t *event)
     }
 }
 
-static void ble_mode_click_cb(lv_event_t *event)
+static void bluetooth_switch_click_cb(lv_event_t *event)
 {
     if (!click_is_valid(event) || g_page != SettingsPage::Connection) return;
 
@@ -1555,31 +1555,7 @@ static void ble_mode_click_cb(lv_event_t *event)
         lv_label_set_text(g_detail_values[2], ble_remote_service_state_name(ble.state));
         lv_obj_invalidate(g_detail_values[2]);
     }
-    ESP_LOGI(TAG, "BLE模式切换：目标=%s", requested ? "开启" : "关闭");
-}
-
-static void ble_work_mode_click_cb(lv_event_t *event)
-{
-    if (!click_is_valid(event) || g_page != SettingsPage::Connection) return;
-
-    BleRemoteSnapshot ble = {};
-    if (!ble_remote_service_get_snapshot(&ble)) return;
-
-    const BleRemoteWorkMode requested = ble.work_mode == BleRemoteWorkMode::Broadcast
-        ? BleRemoteWorkMode::Scan
-        : BleRemoteWorkMode::Broadcast;
-    ble_remote_service_set_work_mode(requested);
-    ble_remote_service_update();
-
-    if (g_detail_values[3] != nullptr) {
-        lv_label_set_text(g_detail_values[3], ble_remote_service_work_mode_name(requested));
-        lv_obj_invalidate(g_detail_values[3]);
-    }
-    if (g_detail_values[2] != nullptr && ble_remote_service_get_snapshot(&ble)) {
-        lv_label_set_text(g_detail_values[2], ble_remote_service_state_name(ble.state));
-        lv_obj_invalidate(g_detail_values[2]);
-    }
-    ESP_LOGI(TAG, "BLE工作模式切换：目标=%s", ble_remote_service_work_mode_name(requested));
+    ESP_LOGI(TAG, "蓝牙开关：目标=%s", requested ? "开启" : "关闭");
 }
 
 static void create_connection_page(const DeviceSettingsSnapshot &settings)
@@ -1602,14 +1578,8 @@ static void create_connection_page(const DeviceSettingsSnapshot &settings)
     if (ble_remote_service_get_snapshot(&ble)) {
         ble_value = ble_remote_service_state_name(ble.state);
     }
-    add_clickable_detail_row(2, "BLE模式", ble_value, SettingsDetailIcon::Bluetooth, ble_mode_click_cb);
-    add_clickable_detail_row(
-        3,
-        "BLE工作模式",
-        ble_remote_service_work_mode_name(ble.work_mode),
-        SettingsDetailIcon::Bluetooth,
-        ble_work_mode_click_cb);
-    add_detail_row(4, "飞行模式", "待接入", SettingsDetailIcon::Airplane, false);
+    add_clickable_detail_row(2, "蓝牙开关", ble_value, SettingsDetailIcon::Bluetooth, bluetooth_switch_click_cb);
+    add_detail_row(3, "飞行模式", "待接入", SettingsDetailIcon::Airplane, false);
 }
 
 static PlayerFolderScope player_folder_scope_from_setting(DeviceMusicListScope scope)
@@ -2222,9 +2192,6 @@ static void refresh_timer_cb(lv_timer_t *timer)
         if (ble_remote_service_get_snapshot(&ble)) {
             if (g_detail_values[2] != nullptr) {
                 lv_label_set_text(g_detail_values[2], ble_remote_service_state_name(ble.state));
-            }
-            if (g_detail_values[3] != nullptr) {
-                lv_label_set_text(g_detail_values[3], ble_remote_service_work_mode_name(ble.work_mode));
             }
         }
     }

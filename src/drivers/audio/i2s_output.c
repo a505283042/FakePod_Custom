@@ -15,9 +15,10 @@ static uint32_t g_sample_rate_hz = 0;
 
 #define I2S_FRAMES_PER_BLOCK 256
 #define I2S_VIDEO_DMA_DESC_NUM 8U
-// 普通 Music/FLAC/NSF 的 DMA 描述符数量继续由统一 Rate Profile 按采样率选择。
-// Video Exclusive 只在自身播放窗口使用 8×256 帧，避免 BLE 常驻后重新创建 16 块 DMA 时触发 NO_MEM；
-// 88.2/96/176.4kHz 等其它播放档位保持既有 Rate Profile，不扩大本轮改动范围。
+#define I2S_NSF_DMA_DESC_NUM 16U
+// 普通 Music 的 DMA 描述符数量由统一 Rate Profile 按采样率选择。
+// NSF 单独保持 16×256，保留渲染与瀑布 SPI 争用时的既有余量；Video Exclusive 固定 8×256。
+// 这样 44.1/48kHz 普通 Music 可降到 12×256，而不回退 NSF 的稳定性保护。
 #define I2S_DMA_FRAME_NUM I2S_FRAMES_PER_BLOCK
 #define I2S_MAX_ZERO_PROGRESS_TIMEOUTS 3
 
@@ -167,7 +168,22 @@ static esp_err_t i2s_output_write_all(const void *data, size_t bytes, uint32_t t
 
 esp_err_t i2s_output_stream_start_32bit(uint32_t sample_rate_hz)
 {
+    AudioRateProfile rate_profile = {0};
+    if (!audio_rate_profile_get(sample_rate_hz, &rate_profile)) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    ESP_LOGI(TAG, "Music I2S DMA档：desc=%u frames=%u",
+        (unsigned)rate_profile.i2s_dma_desc_num,
+        (unsigned)I2S_DMA_FRAME_NUM);
     return i2s_output_create_channel(sample_rate_hz, 0U);
+}
+
+esp_err_t i2s_output_stream_start_32bit_nsf(uint32_t sample_rate_hz)
+{
+    ESP_LOGI(TAG, "NSF I2S DMA档：desc=%u frames=%u",
+        (unsigned)I2S_NSF_DMA_DESC_NUM,
+        (unsigned)I2S_DMA_FRAME_NUM);
+    return i2s_output_create_channel(sample_rate_hz, I2S_NSF_DMA_DESC_NUM);
 }
 
 esp_err_t i2s_output_stream_start_32bit_video(uint32_t sample_rate_hz)

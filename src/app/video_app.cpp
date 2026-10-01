@@ -377,7 +377,8 @@ static bool benchmark_pause_music_for_exclusive()
         player_track == snapshot.track_index && player_state_get_format() == snapshot.format;
 
     if (snapshot.seek_supported && mp3_index_safe && context_matches) {
-        if (audio_service_video_music_suspend(
+        if (audio_service_music_deep_suspend(
+                AudioMusicSuspendOwner::Video,
                 snapshot.track_index,
                 path,
                 snapshot.format,
@@ -406,7 +407,7 @@ static void benchmark_restore_music_after_exclusive(const char *reason)
 {
     if (!g_music_paused_for_benchmark) return;
     if (g_music_deep_suspended_for_benchmark) {
-        if (!audio_service_video_music_restore(true)) {
+        if (!audio_service_music_deep_restore(AudioMusicSuspendOwner::Video, true)) {
             ESP_LOGW(TAG, "Video Exclusive：深度恢复Music失败 reason=%s；保留上下文等待生命周期重试",
                 reason != nullptr ? reason : "unknown");
             return;

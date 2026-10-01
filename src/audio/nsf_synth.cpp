@@ -397,6 +397,7 @@ static bool loop_window_equal(
     uint32_t first,
     uint32_t second,
     uint32_t ticks,
+    bool strict,
     uint16_t *out_transitions)
 {
     if (out_transitions != nullptr) *out_transitions = 0U;
@@ -435,8 +436,12 @@ static bool loop_window_equal(
     }
 
     bool accepted = false;
-    if (present_voices >= 3U) {
-        // 三个旋律通道中允许一个伴奏拥有更长 super-loop；另外两个必须稳定重复。
+    if (strict) {
+        // Playback/Final 必须所有实际出现的旋律声部都重复，同时 Noise/DMC 粗粒度节奏也匹配。
+        // Hint 仍可容忍一个更长 super-loop 声部，但这种“2/3 共识”绝不能再当作最终播放周期。
+        accepted = matched_voices == present_voices && rhythm_mismatches <= allowed_mismatch;
+    } else if (present_voices >= 3U) {
+        // Hint：三个旋律通道中允许一个伴奏拥有更长 super-loop；另外两个稳定重复即可快速估时长。
         accepted = matched_voices >= 2U;
     } else if (present_voices == 2U) {
         accepted = matched_voices == 2U;
@@ -516,6 +521,7 @@ static bool find_unified_loop_candidate(
                     first,
                     first + static_cast<uint32_t>(r) * period,
                     coverage_ticks,
+                    final_search,
                     &local_transitions)) {
                 same = false;
                 break;
@@ -548,8 +554,8 @@ static bool find_unified_loop_candidate(
             continue;
         }
 
-        // Final：优先验证次数更多的短周期；同级时取更短的 canonical period，
-        // 避免把真实 Loop 的2倍/3倍当成周期。
+        // Final 已要求全旋律声部 + Noise/DMC 节奏通过严格窗口验证；
+        // 同级时仍取更短的 canonical period，避免把真实 Loop 的2倍/3倍当成周期。
         if (candidate.repeats > best.repeats ||
             (candidate.repeats == best.repeats && candidate.period < best.period)) {
             best = candidate;
@@ -620,7 +626,7 @@ static bool try_detect_unified_loop_final(NsfSynthImpl *impl, uint32_t current)
     impl->loop_detected = impl->loop_length_frames > 0ULL;
     if (impl->loop_detected) {
         ESP_LOGI(TAG,
-            "NSF循环已识别：start=%llums loop=%llums verified=unified_multi_window coverage=%lums repeats=%u signature=melodic_consensus signatures=%lu",
+            "NSF严格循环已识别：start=%llums loop=%llums verified=full_voice_rhythm coverage=%lums repeats=%u signatures=%lu",
             static_cast<unsigned long long>(
                 impl->loop_start_frame * 1000ULL / impl->sample_rate_hz),
             static_cast<unsigned long long>(
@@ -1999,7 +2005,7 @@ esp_err_t nsf_synth_open_owned(
     }
 
     ESP_LOGI(TAG,
-        "NSF 2A03已打开：track=%u/%u prg=%uB bank=%u speed=%uus rate=%luHz workram=%s loop_history=%uKB loop_signature=melodic_consensus",
+        "NSF 2A03已打开：track=%u/%u prg=%uB bank=%u speed=%uus rate=%luHz workram=%s loop_history=%uKB loop_signature=hint_consensus/final_full_voice_rhythm",
         static_cast<unsigned>(synth->track + 1U),
         static_cast<unsigned>(synth->track_count),
         static_cast<unsigned>(prg_size),
@@ -2039,9 +2045,10 @@ esp_err_t nsf_synth_analyze_play_calls(
     }
 
     NsfSynthImpl *impl = static_cast<NsfSynthImpl *>(synth->impl);
-    // R6：唯一 PLAY-driven Sequencer 同时产出 APU Event、可视事件与 Loop/静音分析。
-    // 这里只推进控制状态并执行6502 PLAY，不生成任何 PCM。
-    if (!impl->config.enable_loop_detection && !impl->config.enable_visual_capture) {
+    // 唯一 PLAY-driven Sequencer 至少承担一种输出。Strict Loop确认后允许只保留
+    // event capture，继续线性生成真实APU Timeline，不再维护Loop/可视分析状态。
+    if (!impl->config.enable_loop_detection && !impl->config.enable_visual_capture &&
+        !impl->config.enable_event_capture) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -2082,10 +2089,38 @@ esp_err_t nsf_synth_analyze_play_calls(
         }
 
         ++calls;
-        if (impl->loop_detected) break;
+        // Loop Final 只决定时长/可视周期；真实音频 Timeline 仍继续由唯一6502 Sequencer线性生成，
+        // 不能在检测到 Loop 后停掉 producer，否则 AudioTask 只能重复旧 APU 写事件并累积隐藏状态误差。
     }
     *out_calls = calls;
     return ESP_OK;
+}
+
+size_t nsf_synth_enter_event_only_mode(NsfSynth *synth)
+{
+    if (synth == nullptr || !synth->open || synth->impl == nullptr) return 0U;
+    NsfSynthImpl *impl = static_cast<NsfSynthImpl *>(synth->impl);
+    if (!impl->config.enable_event_capture) return 0U;
+
+    size_t released = 0U;
+    impl->config.enable_loop_detection = false;
+    impl->config.enable_visual_capture = false;
+    impl->play_write_mask = 0U;
+
+    if (impl->loop_history != nullptr) {
+        heap_caps_free(impl->loop_history);
+        impl->loop_history = nullptr;
+        impl->loop_history_count = 0U;
+        released += kLoopHistoryCapacity * sizeof(uint32_t);
+    }
+    if (impl->visual_ticks != nullptr) {
+        heap_caps_free(impl->visual_ticks);
+        impl->visual_ticks = nullptr;
+        impl->visual_tick_read = 0U;
+        impl->visual_tick_count = 0U;
+        released += kVisualTickCapacity * sizeof(NsfSynthVisualTick);
+    }
+    return released;
 }
 
 bool nsf_synth_is_open(const NsfSynth *synth)
@@ -2155,6 +2190,7 @@ size_t nsf_synth_take_visual_ticks(
         return 0U;
     }
     NsfSynthImpl *impl = static_cast<NsfSynthImpl *>(synth->impl);
+    if (impl->visual_ticks == nullptr) return 0U;
     size_t count = impl->visual_tick_count < capacity ? impl->visual_tick_count : capacity;
     for (size_t i = 0U; i < count; ++i) {
         out_ticks[i] = impl->visual_ticks[impl->visual_tick_read];
