@@ -84,6 +84,8 @@ static constexpr size_t AUDIO_DECODE_WORKSPACE_RETAIN_INPUT_BYTES = 32 * 1024;
 static constexpr size_t AUDIO_DECODE_WORKSPACE_RETAIN_PCM_BYTES = 128 * 1024;
 static constexpr TickType_t AUDIO_QUEUE_SEND_TIMEOUT = pdMS_TO_TICKS(50);
 static constexpr TickType_t AUDIO_SYNC_WAIT_TIMEOUT = pdMS_TO_TICKS(1500);
+// R46.0.51：NSF Start/SetTrack内部允许Sequencer INIT最多2s，调用方等待必须覆盖该窗口。
+static constexpr TickType_t AUDIO_NSF_SYNC_WAIT_TIMEOUT = pdMS_TO_TICKS(3000);
 static constexpr TickType_t AUDIO_START_WAIT_TIMEOUT = pdMS_TO_TICKS(1500);
 
 // 默认模拟输出保持实机验证的普通耳机安全档 0.5Vrms；Settings 可由 AudioTask 安全切换高阻/线路档。
@@ -4975,11 +4977,24 @@ static bool audio_service_finish_submit_caller(AudioRequest *request, bool wait)
         return false;
     }
 
-    const bool completed = xSemaphoreTake(request->done, AUDIO_SYNC_WAIT_TIMEOUT) == pdTRUE;
+    const bool nsf_long_wait =
+        request->type == AudioCommandType::NsfStart ||
+        request->type == AudioCommandType::NsfSetTrack ||
+        request->type == AudioCommandType::NsfStop;
+    const TickType_t wait_timeout =
+        nsf_long_wait ? AUDIO_NSF_SYNC_WAIT_TIMEOUT : AUDIO_SYNC_WAIT_TIMEOUT;
+    const bool completed = xSemaphoreTake(request->done, wait_timeout) == pdTRUE;
     const bool success = completed && request->success;
     if (!completed) {
-        ESP_LOGE(TAG, "等待音频命令完成超时：请求=%lu",
-            static_cast<unsigned long>(request->request_id));
+        const char *type_name = request->type == AudioCommandType::NsfStart
+            ? "NSF_START"
+            : (request->type == AudioCommandType::NsfSetTrack
+                ? "NSF_SET_TRACK"
+                : (request->type == AudioCommandType::NsfStop ? "NSF_STOP" : "GENERIC"));
+        ESP_LOGE(TAG, "等待音频命令完成超时：请求=%lu type=%s timeout=%lums",
+            static_cast<unsigned long>(request->request_id),
+            type_name,
+            static_cast<unsigned long>(nsf_long_wait ? 3000U : 1500U));
     }
     audio_request_release(request);
     return success;
