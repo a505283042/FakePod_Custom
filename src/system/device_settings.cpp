@@ -15,6 +15,7 @@ static constexpr const char *kNamespace = "device_cfg";
 
 static DeviceSettingsSnapshot g_settings = {};
 static DeviceMusicListSelection g_music_selection = {};
+static bool g_wifi_setting_explicit = false;
 
 static DeviceMusicListSelection make_music_selection_defaults()
 {
@@ -30,6 +31,7 @@ static DeviceSettingsSnapshot make_defaults()
     defaults.loaded_from_nvs = false;
     defaults.usb_mode = DeviceUsbMode::Serial;
     defaults.ble_enabled = false;
+    defaults.wifi_enabled = false;
     defaults.audio_output_mode = DeviceAudioOutputMode::NormalHeadphones;
     defaults.brightness_level = 60U;
     defaults.aux_key_mode = DeviceAuxKeyMode::Volume;
@@ -134,6 +136,7 @@ esp_err_t device_settings_init()
     if (g_settings.ready) return ESP_OK;
     g_settings = make_defaults();
     g_music_selection = make_music_selection_defaults();
+    g_wifi_setting_explicit = false;
 
     nvs_handle_t handle = 0;
     esp_err_t ret = nvs_open(kNamespace, NVS_READONLY, &handle);
@@ -163,6 +166,10 @@ esp_err_t device_settings_init()
     }
     if (nvs_get_u8(handle, "ble", &u8) == ESP_OK && u8 <= 1U) {
         g_settings.ble_enabled = u8 != 0U;
+    }
+    if (nvs_get_u8(handle, "wifi", &u8) == ESP_OK && u8 <= 1U) {
+        g_settings.wifi_enabled = u8 != 0U;
+        g_wifi_setting_explicit = true;
     }
     if (nvs_get_u8(handle, "audioout", &u8) == ESP_OK && audio_output_mode_valid(u8)) {
         g_settings.audio_output_mode = static_cast<DeviceAudioOutputMode>(u8);
@@ -220,9 +227,16 @@ esp_err_t device_settings_init()
     nvs_close(handle);
     g_settings.ready = true;
     g_settings.loaded_from_nvs = true;
-    ESP_LOGI(TAG, "Settings V1加载完成：USB=%s BLE=%s audio=%s bright=%u aux=%s cassette=%s motion=%s nsfgain=+%udB",
+    if (g_settings.ble_enabled && g_settings.wifi_enabled) {
+        // 异常/手工修改的 NVS 也不能破坏单无线互斥；冲突时固定收敛到 Wi-Fi。
+        g_settings.ble_enabled = false;
+        ESP_LOGW(TAG, "无线设置冲突：BLE/Wi-Fi同时为开，运行期收敛为Wi-Fi=开 BLE=关");
+    }
+
+    ESP_LOGI(TAG, "Settings V1加载完成：USB=%s BLE=%s WiFi=%s audio=%s bright=%u aux=%s cassette=%s motion=%s nsfgain=+%udB",
         device_settings_usb_mode_name(g_settings.usb_mode),
         g_settings.ble_enabled ? "开" : "关",
+        g_settings.wifi_enabled ? "开" : "关",
         device_settings_audio_output_mode_name(g_settings.audio_output_mode),
         static_cast<unsigned>(g_settings.brightness_level),
         device_settings_aux_key_mode_name(g_settings.aux_key_mode),
@@ -244,6 +258,11 @@ bool device_settings_remember_volume_enabled()
     return !g_settings.ready || g_settings.remember_volume;
 }
 
+bool device_settings_wifi_enabled_is_explicit()
+{
+    return g_settings.ready && g_wifi_setting_explicit;
+}
+
 esp_err_t device_settings_set_usb_mode(DeviceUsbMode mode)
 {
     if (!usb_mode_valid(static_cast<uint8_t>(mode))) return ESP_ERR_INVALID_ARG;
@@ -255,14 +274,39 @@ esp_err_t device_settings_set_usb_mode(DeviceUsbMode mode)
     return ret;
 }
 
+esp_err_t device_settings_set_wireless_enabled(bool ble_enabled, bool wifi_enabled)
+{
+    if (ble_enabled && wifi_enabled) return ESP_ERR_INVALID_ARG;
+    if (!g_settings.ready) return ESP_ERR_INVALID_STATE;
+
+    const bool old_ble = g_settings.ble_enabled;
+    const bool old_wifi = g_settings.wifi_enabled;
+    const bool old_explicit = g_wifi_setting_explicit;
+    g_settings.ble_enabled = ble_enabled;
+    g_settings.wifi_enabled = wifi_enabled;
+    g_wifi_setting_explicit = true;
+
+    nvs_handle_t handle = 0;
+    esp_err_t ret = open_rw(&handle);
+    if (ret == ESP_OK) ret = nvs_set_u16(handle, "schema", kSchemaVersion);
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, "ble", ble_enabled ? 1U : 0U);
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, "wifi", wifi_enabled ? 1U : 0U);
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    if (handle != 0) nvs_close(handle);
+
+    if (ret != ESP_OK) {
+        g_settings.ble_enabled = old_ble;
+        g_settings.wifi_enabled = old_wifi;
+        g_wifi_setting_explicit = old_explicit;
+        log_commit_failure("wireless", ret);
+    }
+    return ret;
+}
+
 esp_err_t device_settings_set_ble_enabled(bool enabled)
 {
-    const bool old = g_settings.ble_enabled;
-    g_settings.ble_enabled = enabled;
-    const esp_err_t ret = commit_u8("ble", enabled ? 1U : 0U);
-    if (ret != ESP_OK) g_settings.ble_enabled = old;
-    log_commit_failure("ble", ret);
-    return ret;
+    return device_settings_set_wireless_enabled(
+        enabled, enabled ? false : g_settings.wifi_enabled);
 }
 
 esp_err_t device_settings_set_audio_output_mode(DeviceAudioOutputMode mode)
@@ -459,11 +503,15 @@ esp_err_t device_settings_reset_defaults()
     if (ret != ESP_OK) return ret;
     ret = nvs_erase_all(handle);
     if (ret == ESP_OK) ret = nvs_set_u16(handle, "schema", kSchemaVersion);
+    // 恢复默认值明确表示两种无线都关闭；同时写入两个 key，避免下次启动又触发旧版 Wi-Fi 迁移。
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, "ble", 0U);
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, "wifi", 0U);
     if (ret == ESP_OK) ret = nvs_commit(handle);
     nvs_close(handle);
     if (ret == ESP_OK) {
         g_settings = make_defaults();
         g_music_selection = make_music_selection_defaults();
+        g_wifi_setting_explicit = true;
         g_settings.ready = true;
         g_settings.loaded_from_nvs = true;
         ESP_LOGI(TAG, "Settings V1已恢复默认值");

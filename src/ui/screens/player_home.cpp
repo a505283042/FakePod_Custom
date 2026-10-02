@@ -30,7 +30,10 @@
 #include "lyrics/lyrics_view.h"
 #include "spectrum/spectrum_view.h"
 #include "system/battery_service.h"
+#include "system/ble_remote_service.h"
+#include "system/device_settings.h"
 #include "system/screen_lock_simple.h"
+#include "system/wifi_service.h"
 #include "system/system_loop.h"
 #include "ui_common.h"
 
@@ -348,6 +351,15 @@ static lv_obj_t *g_battery_label = nullptr;
 static uint32_t g_last_battery_sequence = UINT32_MAX;
 static uint8_t g_last_battery_percent = 0U;
 static bool g_last_battery_valid = false;
+
+enum class WirelessIndicator : uint8_t {
+    None = 0,
+    Ble,
+    Wifi,
+};
+static lv_obj_t *g_wireless_status = nullptr;
+static WirelessIndicator g_wireless_indicator = WirelessIndicator::None;
+static bool g_wireless_runtime_ready = false;
 
 // Stage 11.2：进度条使用 0~10000 的归一化范围，避免把超长音频毫秒数直接塞进 LVGL int32_t range。
 // 拖动期间只做 UI 本地预览；松手时才向 Player 提交一次 Seek。
@@ -864,6 +876,120 @@ static void player_home_refresh_battery_status()
         player_home_label_set_text_if_changed(g_battery_label, "--%");
     }
     lv_obj_invalidate(g_battery_status);
+}
+
+static void player_home_wireless_status_draw_cb(lv_event_t *event)
+{
+    if (event == nullptr || lv_event_get_code(event) != LV_EVENT_DRAW_MAIN ||
+        g_wireless_indicator == WirelessIndicator::None) {
+        return;
+    }
+
+    lv_layer_t *layer = lv_event_get_layer(event);
+    lv_obj_t *obj = lv_event_get_current_target_obj(event);
+    if (layer == nullptr || obj == nullptr) return;
+
+    lv_area_t coords = {};
+    lv_obj_get_coords(obj, &coords);
+    const int32_t cx = (coords.x1 + coords.x2) / 2;
+    const int32_t cy = (coords.y1 + coords.y2) / 2;
+    const lv_opa_t opa = g_wireless_runtime_ready ? LV_OPA_COVER : LV_OPA_50;
+
+    if (g_wireless_indicator == WirelessIndicator::Wifi) {
+        // 标准 Wi-Fi 轮廓：两层向上的同心弧 + 底部圆点。
+        // LVGL 屏幕坐标 Y 向下，因此使用 210..330 度绘制上半弧。
+        const int32_t radii[] = {10, 6};
+        for (const int32_t radius : radii) {
+            lv_draw_arc_dsc_t arc = {};
+            lv_draw_arc_dsc_init(&arc);
+            arc.color = lv_color_hex(0xF5F7FA);
+            arc.width = 2;
+            arc.start_angle = 210;
+            arc.end_angle = 330;
+            arc.center.x = cx;
+            arc.center.y = cy + 8;
+            arc.radius = radius;
+            arc.opa = opa;
+            arc.rounded = 1U;
+            lv_draw_arc(layer, &arc);
+        }
+        lv_draw_rect_dsc_t dot = {};
+        lv_draw_rect_dsc_init(&dot);
+        dot.bg_color = lv_color_hex(0xF5F7FA);
+        dot.bg_opa = opa;
+        dot.border_width = 0;
+        dot.radius = LV_RADIUS_CIRCLE;
+        lv_area_t dot_area = {cx - 2, cy + 6, cx + 2, cy + 10};
+        lv_draw_rect(layer, &dot, &dot_area);
+        return;
+    }
+
+    lv_draw_line_dsc_t line = {};
+    lv_draw_line_dsc_init(&line);
+    line.color = lv_color_hex(0xF5F7FA);
+    line.width = 2;
+    line.opa = opa;
+    line.round_start = 1U;
+    line.round_end = 1U;
+    auto draw = [&](int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
+        line.p1.x = x0; line.p1.y = y0;
+        line.p2.x = x1; line.p2.y = y1;
+        lv_draw_line(layer, &line);
+    };
+    // Bluetooth rune，完全自绘，避免依赖额外字体 glyph。
+    draw(cx, cy - 11, cx, cy + 11);
+    draw(cx, cy - 11, cx + 7, cy - 5);
+    draw(cx + 7, cy - 5, cx - 6, cy + 6);
+    draw(cx - 6, cy - 6, cx + 7, cy + 5);
+    draw(cx + 7, cy + 5, cx, cy + 11);
+}
+
+static lv_obj_t *player_home_create_wireless_status(lv_obj_t *parent)
+{
+    lv_obj_t *status = lv_obj_create(parent);
+    ui_common_lock_object(status);
+    lv_obj_set_size(status, 28, 28);
+    lv_obj_set_style_bg_opa(status, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(status, 0, 0);
+    lv_obj_set_style_shadow_width(status, 0, 0);
+    lv_obj_set_style_pad_all(status, 0, 0);
+    lv_obj_remove_flag(status, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(status, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(status, player_home_wireless_status_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
+    lv_obj_add_flag(status, LV_OBJ_FLAG_HIDDEN);
+    return status;
+}
+
+static void player_home_refresh_wireless_status()
+{
+    if (g_wireless_status == nullptr) return;
+
+    DeviceSettingsSnapshot settings = {};
+    WirelessIndicator indicator = WirelessIndicator::None;
+    bool runtime_ready = false;
+    if (device_settings_get_snapshot(&settings)) {
+        if (settings.wifi_enabled) {
+            indicator = WirelessIndicator::Wifi;
+            WifiServiceSnapshot wifi = {};
+            runtime_ready = wifi_service_get_snapshot(&wifi) && wifi.connected;
+        } else if (settings.ble_enabled) {
+            indicator = WirelessIndicator::Ble;
+            BleRemoteSnapshot ble = {};
+            runtime_ready = ble_remote_service_get_snapshot(&ble) &&
+                (ble.state == BleRemoteState::Advertising || ble.state == BleRemoteState::Connected);
+        }
+    }
+
+    if (indicator == g_wireless_indicator && runtime_ready == g_wireless_runtime_ready) return;
+    g_wireless_indicator = indicator;
+    g_wireless_runtime_ready = runtime_ready;
+    // 无线状态属于控件层：封面纯展示态绝不单独露出无线图标。
+    if (indicator == WirelessIndicator::None || !g_overlay_visible) {
+        lv_obj_add_flag(g_wireless_status, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_remove_flag(g_wireless_status, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_invalidate(g_wireless_status);
+    }
 }
 
 static void player_home_launcher_draw_line(
@@ -3140,6 +3266,7 @@ static void player_home_repaint_controls_after_bounded_present()
         g_visual_mode_button,
         g_volume_mode_button,
         g_battery_status,
+        g_wireless_status,
     };
     for (lv_obj_t *obj : objects) {
         if (obj != nullptr) {
@@ -3949,6 +4076,7 @@ static void player_home_audio_timer_cb(lv_timer_t *timer)
     // BatteryService 每2秒才更新一次 sequence；100ms Home timer 只做轻量快照比较，
     // 不会重复重绘电池胶囊。它必须独立于 Audio state_revision，否则暂停时电量不会更新。
     player_home_refresh_battery_status();
+    player_home_refresh_wireless_status();
 
     AudioStateSnapshot snapshot = {};
     if (!audio_service_get_snapshot(&snapshot)) {
@@ -4495,6 +4623,9 @@ void player_home_create(lv_obj_t *screen)
     g_last_battery_sequence = UINT32_MAX;
     g_last_battery_percent = 0U;
     g_last_battery_valid = false;
+    g_wireless_status = nullptr;
+    g_wireless_indicator = WirelessIndicator::None;
+    g_wireless_runtime_ready = false;
     g_audio_timer = nullptr;
     g_artwork_timer = nullptr;
     g_gesture_timer = nullptr;
@@ -4767,11 +4898,11 @@ void player_home_create(lv_obj_t *screen)
     lv_obj_set_ext_click_area(g_visual_mode_button, 15);
     lv_obj_add_event_cb(g_visual_mode_button, player_home_visual_mode_cb, LV_EVENT_CLICKED, nullptr);
 
-    // 音量与电量使用等宽胶囊并排显示。音量左侧自绘小扬声器，右侧保留百分比/静音文本。
-    // 音量胶囊扩为 94x28，并把实际点击范围再向四周额外扩大 8px，提升静音点击命中率；
-    // 两个胶囊之间保留 8px 间距，扩展后的命中区不会覆盖电池区域。
+    // 同一状态行显示音量 / 无线状态 / 电量。无线图标只反映保存的开关意图：
+    // BLE 或 Wi-Fi 开启时显示对应图标，运行期尚未 Ready 时用半透明提示；两者都关闭则隐藏。
+    // 音量胶囊保持 94x28，并把实际点击范围再向四周额外扩大 8px。
     lv_obj_t *volume_status = player_home_create_pill_button(g_overlay, 94, 28, "80%", &g_volume_label);
-    lv_obj_set_pos(volume_status, 132, 319);
+    lv_obj_set_pos(volume_status, 112, 319);
     lv_obj_set_ext_click_area(volume_status, 8);
     lv_obj_add_event_cb(volume_status, player_home_volume_status_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
     lv_obj_set_size(g_volume_label, 54, 28);
@@ -4779,8 +4910,11 @@ void player_home_create(lv_obj_t *screen)
     lv_obj_align(g_volume_label, LV_ALIGN_RIGHT_MID, -3, 0);
     lv_obj_add_event_cb(volume_status, player_home_mute_cb, LV_EVENT_CLICKED, nullptr);
 
+    g_wireless_status = player_home_create_wireless_status(g_overlay);
+    lv_obj_set_pos(g_wireless_status, 216, 319);
+
     g_battery_status = player_home_create_battery_status(g_overlay);
-    lv_obj_set_pos(g_battery_status, 234, 319);
+    lv_obj_set_pos(g_battery_status, 254, 319);
 
     g_volume_mode_button = player_home_create_volume_mode_button(g_overlay);
     lv_obj_set_pos(g_volume_mode_button, 352, 346);
@@ -4790,6 +4924,7 @@ void player_home_create(lv_obj_t *screen)
     audio_service_get_snapshot(&snapshot);
     player_home_apply_audio_snapshot(snapshot);
     player_home_refresh_battery_status();
+    player_home_refresh_wireless_status();
     g_last_audio_state_revision = snapshot.state_revision;
 
     g_audio_timer = lv_timer_create(player_home_audio_timer_cb, 100, nullptr);

@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "ble_remote_service.h"
+#include "device_settings.h"
 #include "wifi_remote_service.h"
 
 #include "esp_event.h"
@@ -50,6 +51,7 @@ enum class WorkerMode : uint8_t {
     ConnectSaved = 0,
     Provision,
     Recover,
+    Stop,
 };
 
 static portMUX_TYPE g_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -210,7 +212,7 @@ static void wifi_event_handler(void *, esp_event_base_t base, int32_t event_id, 
         } else if (fail && g_wifi_events != nullptr) {
             xEventGroupSetBits(g_wifi_events, kFailedBit);
         } else if (request_recovery) {
-            ESP_LOGW(TAG, "Wi-Fi连接已丢失：进入10秒重连窗口，失败后恢复BLE");
+            ESP_LOGW(TAG, "Wi-Fi连接已丢失：进入10秒重连窗口，失败后按BLE保存状态收口");
         }
         return;
     }
@@ -396,6 +398,16 @@ static void worker_finish(bool connected, esp_err_t error)
     portEXIT_CRITICAL(&g_lock);
 }
 
+static void worker_finish_idle(esp_err_t error = ESP_OK)
+{
+    portENTER_CRITICAL(&g_lock);
+    g_connected = false;
+    g_last_error = error;
+    g_state = g_configured ? WifiServiceState::ConfiguredIdle : WifiServiceState::Unconfigured;
+    g_transition_running = false;
+    portEXIT_CRITICAL(&g_lock);
+}
+
 static void wifi_worker(void *)
 {
     WorkerMode mode = WorkerMode::ConnectSaved;
@@ -409,10 +421,22 @@ static void wifi_worker(void *)
         vTaskDelay(kProvisionAckGrace);
     }
 
+    if (mode == WorkerMode::Stop) {
+        ESP_LOGI(TAG, "Wi-Fi用户意图：关闭；释放Remote/STA后按BLE保存状态收口");
+        if (g_wifi_initialized || g_wifi_started || g_sta_netif != nullptr ||
+            g_wifi_events != nullptr || wifi_remote_service_is_running()) {
+            cleanup_wifi();
+        }
+        restore_ble_fallback();
+        worker_finish_idle();
+        vTaskDeleteWithCaps(xTaskGetCurrentTaskHandle());
+        return;
+    }
+
     if (mode != WorkerMode::Recover) {
         set_state(WifiServiceState::WaitingBleOff);
         ESP_LOGI(TAG, "%s：先完整停止BLE，再启动Wi-Fi",
-            mode == WorkerMode::Provision ? "手机配网" : "开机自动连接");
+            mode == WorkerMode::Provision ? "手机配网" : "Wi-Fi开关恢复");
         ble_remote_service_set_enabled(false);
         ble_remote_service_update();
         if (!wait_ble_disabled(kBleStopTimeout)) {
@@ -461,7 +485,7 @@ static void wifi_worker(void *)
             vTaskDeleteWithCaps(xTaskGetCurrentTaskHandle());
             return;
         }
-        ESP_LOGW(TAG, "Wi-Fi重连失败：%s；释放Wi-Fi后恢复BLE", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "Wi-Fi重连失败：%s；释放Wi-Fi后按BLE保存状态收口", esp_err_to_name(ret));
         cleanup_wifi();
         restore_ble_fallback();
         worker_finish(false, ret);
@@ -482,6 +506,17 @@ static void wifi_worker(void *)
         goto failed;
     }
 
+    if (mode == WorkerMode::Provision) {
+        // BLE 配网只有在 Wi-Fi + Remote 真正 Ready 后才提交无线开关，失败时仍可按旧 BLE 偏好回退。
+        const esp_err_t persist_ret = device_settings_set_wireless_enabled(false, true);
+        if (persist_ret == ESP_OK) {
+            portENTER_CRITICAL(&g_lock);
+            g_ble_fallback_enabled = false;
+            portEXIT_CRITICAL(&g_lock);
+        } else {
+            ESP_LOGW(TAG, "Wi-Fi已接管但保存无线开关失败：%s", esp_err_to_name(persist_ret));
+        }
+    }
     ESP_LOGI(TAG, "Wi-Fi接管成功：ssid=%s；BLE保持关闭；Wi-Fi遥控=READY", g_saved.ssid);
     worker_finish(true, ESP_OK);
     vTaskDeleteWithCaps(xTaskGetCurrentTaskHandle());
@@ -491,7 +526,7 @@ failed:
     if (g_wifi_initialized || g_wifi_started || g_sta_netif != nullptr || g_wifi_events != nullptr) {
         cleanup_wifi();
     }
-    ESP_LOGE(TAG, "Wi-Fi启动/连接失败：%s；恢复BLE回退链路", esp_err_to_name(ret));
+    ESP_LOGE(TAG, "Wi-Fi启动/连接失败：%s；按BLE保存状态收口", esp_err_to_name(ret));
     restore_ble_fallback();
     worker_finish(false, ret);
     vTaskDeleteWithCaps(xTaskGetCurrentTaskHandle());
@@ -504,7 +539,8 @@ static esp_err_t start_worker(WorkerMode mode)
         portEXIT_CRITICAL(&g_lock);
         return ESP_ERR_INVALID_STATE;
     }
-    if (mode != WorkerMode::Recover && !g_configured && mode != WorkerMode::Provision) {
+    if (mode != WorkerMode::Recover && mode != WorkerMode::Stop &&
+        !g_configured && mode != WorkerMode::Provision) {
         portEXIT_CRITICAL(&g_lock);
         return ESP_ERR_NOT_FOUND;
     }
@@ -565,7 +601,7 @@ esp_err_t wifi_service_init()
         ESP_LOGI(TAG, "Wi-Fi尚未配置：等待手机通过BLE下发SSID/密码");
         return ESP_OK;
     }
-    ESP_LOGW(TAG, "读取Wi-Fi配置失败：%s；保持BLE模式", esp_err_to_name(ret));
+    ESP_LOGW(TAG, "读取Wi-Fi配置失败：%s；无线启动按设备保存状态处理", esp_err_to_name(ret));
     return ret;
 }
 
@@ -602,6 +638,27 @@ esp_err_t wifi_service_connect_saved()
     portEXIT_CRITICAL(&g_lock);
     if (!configured) return ESP_ERR_NOT_FOUND;
     return start_worker(WorkerMode::ConnectSaved);
+}
+
+esp_err_t wifi_service_stop()
+{
+    bool active = false;
+    portENTER_CRITICAL(&g_lock);
+    if (!g_ready || g_transition_running) {
+        portEXIT_CRITICAL(&g_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    active = g_connected || g_recovery_requested || g_wifi_initialized || g_wifi_started ||
+        g_sta_netif != nullptr || g_wifi_events != nullptr || wifi_remote_service_is_running();
+    if (!active) {
+        g_recovery_requested = false;
+        g_last_error = ESP_OK;
+        g_state = g_configured ? WifiServiceState::ConfiguredIdle : WifiServiceState::Unconfigured;
+        portEXIT_CRITICAL(&g_lock);
+        return ESP_OK;
+    }
+    portEXIT_CRITICAL(&g_lock);
+    return start_worker(WorkerMode::Stop);
 }
 
 esp_err_t wifi_service_submit_credentials(const char *ssid, const char *password)

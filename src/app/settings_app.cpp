@@ -1538,31 +1538,91 @@ static void bluetooth_switch_click_cb(lv_event_t *event)
 {
     if (!click_is_valid(event) || g_page != SettingsPage::Connection) return;
 
-    if (wifi_service_owns_radio()) {
-        ESP_LOGW(TAG, "Wi-Fi正在接管无线链路，暂不允许手动切换BLE");
+    DeviceSettingsSnapshot settings = {};
+    if (!device_settings_get_snapshot(&settings)) return;
+    WifiServiceSnapshot wifi = {};
+    (void)wifi_service_get_snapshot(&wifi);
+    if (wifi.transition_running) {
+        ESP_LOGW(TAG, "Wi-Fi正在切换中，暂不允许切换BLE");
         return;
     }
 
-    DeviceSettingsSnapshot settings = {};
-    if (!device_settings_get_snapshot(&settings)) return;
-
     const bool requested = !settings.ble_enabled;
-    const esp_err_t persist_ret = device_settings_set_ble_enabled(requested);
+    const bool old_ble = settings.ble_enabled;
+    const bool old_wifi = settings.wifi_enabled;
+    const esp_err_t persist_ret = device_settings_set_wireless_enabled(
+        requested, requested ? false : old_wifi);
     if (persist_ret != ESP_OK) {
-        ESP_LOGW(TAG, "保存BLE开关失败：%s", esp_err_to_name(persist_ret));
+        ESP_LOGW(TAG, "保存无线开关失败：%s", esp_err_to_name(persist_ret));
         return;
     }
 
     wifi_service_set_ble_fallback_enabled(requested);
-    ble_remote_service_set_enabled(requested);
-    ble_remote_service_update();
-
-    BleRemoteSnapshot ble = {};
-    if (g_detail_values[2] != nullptr && ble_remote_service_get_snapshot(&ble)) {
-        lv_label_set_text(g_detail_values[2], ble_remote_service_state_name(ble.state));
-        lv_obj_invalidate(g_detail_values[2]);
+    if (requested && wifi_service_owns_radio()) {
+        const esp_err_t stop_ret = wifi_service_stop();
+        if (stop_ret != ESP_OK) {
+            (void)device_settings_set_wireless_enabled(old_ble, old_wifi);
+            wifi_service_set_ble_fallback_enabled(old_ble);
+            ESP_LOGW(TAG, "关闭Wi-Fi以启动BLE失败：%s", esp_err_to_name(stop_ret));
+            return;
+        }
+    } else {
+        ble_remote_service_set_enabled(requested);
+        ble_remote_service_update();
     }
-    ESP_LOGI(TAG, "蓝牙开关：目标=%s", requested ? "开启" : "关闭");
+
+    ESP_LOGI(TAG, "蓝牙开关：BLE=%s Wi-Fi=%s",
+        requested ? "开" : "关", requested ? "关" : (old_wifi ? "开" : "关"));
+}
+
+static void wifi_switch_click_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event) || g_page != SettingsPage::Connection) return;
+
+    DeviceSettingsSnapshot settings = {};
+    if (!device_settings_get_snapshot(&settings)) return;
+    WifiServiceSnapshot wifi = {};
+    (void)wifi_service_get_snapshot(&wifi);
+    if (wifi.transition_running) {
+        ESP_LOGW(TAG, "Wi-Fi正在切换中，请等待当前操作完成");
+        return;
+    }
+
+    const bool requested = !settings.wifi_enabled;
+    const bool old_ble = settings.ble_enabled;
+    const bool old_wifi = settings.wifi_enabled;
+    if (requested && !wifi_service_has_credentials()) {
+        ESP_LOGW(TAG, "Wi-Fi尚未配置：请先开启BLE并由手机下发SSID/密码");
+        return;
+    }
+
+    const esp_err_t persist_ret = device_settings_set_wireless_enabled(
+        requested ? false : old_ble, requested);
+    if (persist_ret != ESP_OK) {
+        ESP_LOGW(TAG, "保存无线开关失败：%s", esp_err_to_name(persist_ret));
+        return;
+    }
+
+    wifi_service_set_ble_fallback_enabled(requested ? false : old_ble);
+    esp_err_t runtime_ret = ESP_OK;
+    if (requested) {
+        runtime_ret = wifi_service_connect_saved();
+    } else {
+        runtime_ret = wifi_service_stop();
+    }
+    if (runtime_ret != ESP_OK) {
+        (void)device_settings_set_wireless_enabled(old_ble, old_wifi);
+        wifi_service_set_ble_fallback_enabled(old_ble);
+        if (old_ble) {
+            ble_remote_service_set_enabled(true);
+            ble_remote_service_update();
+        }
+        ESP_LOGW(TAG, "Wi-Fi开关运行期切换失败：%s", esp_err_to_name(runtime_ret));
+        return;
+    }
+
+    ESP_LOGI(TAG, "Wi-Fi开关：Wi-Fi=%s BLE=%s",
+        requested ? "开" : "关", requested ? "关" : (old_ble ? "开" : "关"));
 }
 
 static void create_connection_page(const DeviceSettingsSnapshot &settings)
@@ -1582,23 +1642,25 @@ static void create_connection_page(const DeviceSettingsSnapshot &settings)
         usb_tf_storage_enter_click_cb);
     BleRemoteSnapshot ble = {};
     const char *ble_value = settings.ble_enabled ? "启动中" : "关闭";
-    if (ble_remote_service_get_snapshot(&ble)) {
+    if (settings.ble_enabled && ble_remote_service_get_snapshot(&ble)) {
         ble_value = ble_remote_service_state_name(ble.state);
     }
     add_clickable_detail_row(2, "蓝牙开关", ble_value, SettingsDetailIcon::Bluetooth, bluetooth_switch_click_cb);
+
     WifiServiceSnapshot wifi = {};
-    char wifi_value[64] = "未配置";
-    if (wifi_service_get_snapshot(&wifi)) {
-        if (wifi.connected && wifi.ssid[0] != '\0') {
-            snprintf(wifi_value, sizeof(wifi_value), "已连接 %.40s", wifi.ssid);
-        } else if (wifi.configured && wifi.ssid[0] != '\0' &&
-            wifi.state == WifiServiceState::ConfiguredIdle) {
-            snprintf(wifi_value, sizeof(wifi_value), "已保存 %.40s", wifi.ssid);
+    char wifi_value[64] = "关闭";
+    if (settings.wifi_enabled && wifi_service_get_snapshot(&wifi)) {
+        if (wifi.connected) {
+            snprintf(wifi_value, sizeof(wifi_value), "已连接");
+        } else if (wifi.configured && wifi.state == WifiServiceState::ConfiguredIdle) {
+            snprintf(wifi_value, sizeof(wifi_value), "已保存");
         } else {
             snprintf(wifi_value, sizeof(wifi_value), "%s", wifi_service_state_name(wifi.state));
         }
+    } else if (!settings.wifi_enabled && !wifi_service_has_credentials()) {
+        snprintf(wifi_value, sizeof(wifi_value), "关闭·未配置");
     }
-    add_detail_row(3, "Wi-Fi", wifi_value, SettingsDetailIcon::Airplane);
+    add_clickable_detail_row(3, "Wi-Fi开关", wifi_value, SettingsDetailIcon::Wifi, wifi_switch_click_cb);
 }
 
 static PlayerFolderScope player_folder_scope_from_setting(DeviceMusicListScope scope)
@@ -2207,23 +2269,38 @@ static void refresh_timer_cb(lv_timer_t *timer)
 
     char value[64] = {};
     if (g_page == SettingsPage::Connection) {
-        BleRemoteSnapshot ble = {};
-        if (ble_remote_service_get_snapshot(&ble)) {
-            if (g_detail_values[2] != nullptr) {
-                lv_label_set_text(g_detail_values[2], ble_remote_service_state_name(ble.state));
+        DeviceSettingsSnapshot settings = {};
+        if (!device_settings_get_snapshot(&settings)) return;
+
+        if (g_detail_values[2] != nullptr) {
+            if (!settings.ble_enabled) {
+                lv_label_set_text(g_detail_values[2], "关闭");
+            } else {
+                BleRemoteSnapshot ble = {};
+                lv_label_set_text(g_detail_values[2],
+                    ble_remote_service_get_snapshot(&ble)
+                        ? ble_remote_service_state_name(ble.state)
+                        : "启动中");
             }
         }
-        WifiServiceSnapshot wifi = {};
-        if (g_detail_values[3] != nullptr && wifi_service_get_snapshot(&wifi)) {
-            if (wifi.connected && wifi.ssid[0] != '\0') {
-                snprintf(value, sizeof(value), "已连接 %.40s", wifi.ssid);
-            } else if (wifi.configured && wifi.ssid[0] != '\0' &&
-                wifi.state == WifiServiceState::ConfiguredIdle) {
-                snprintf(value, sizeof(value), "已保存 %.40s", wifi.ssid);
+
+        if (g_detail_values[3] != nullptr) {
+            if (!settings.wifi_enabled) {
+                lv_label_set_text(g_detail_values[3],
+                    wifi_service_has_credentials() ? "关闭" : "关闭·未配置");
             } else {
-                snprintf(value, sizeof(value), "%s", wifi_service_state_name(wifi.state));
+                WifiServiceSnapshot wifi = {};
+                if (wifi_service_get_snapshot(&wifi)) {
+                    if (wifi.connected) {
+                        snprintf(value, sizeof(value), "已连接");
+                    } else if (wifi.configured && wifi.state == WifiServiceState::ConfiguredIdle) {
+                        snprintf(value, sizeof(value), "已保存");
+                    } else {
+                        snprintf(value, sizeof(value), "%s", wifi_service_state_name(wifi.state));
+                    }
+                    lv_label_set_text(g_detail_values[3], value);
+                }
             }
-            lv_label_set_text(g_detail_values[3], value);
         }
     }
     if (g_page == SettingsPage::About) {
