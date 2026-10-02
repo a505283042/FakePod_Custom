@@ -1326,7 +1326,6 @@ void spectrum_view_close()
     }
 
     g_visible = false;
-    audio_service_set_spectrum_enabled(false);
     if (g_delayed_start_timer != nullptr) {
         lv_timer_del(g_delayed_start_timer);
         g_delayed_start_timer = nullptr;
@@ -1336,14 +1335,17 @@ void spectrum_view_close()
     }
     spectrum_clear_current_lyric(true);
     lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
-    UI_PAGE_INTERACTION_LOGI("关闭频谱页，返回主页");
+    // R46.0.67：先完成UI隐藏，再让FFT进入Grace；这里不等待后台Task回收。
+    audio_service_set_spectrum_enabled(false);
+    UI_PAGE_INTERACTION_LOGI("关闭频谱页，立即返回主页；FFT进入2秒复用窗口");
 }
 
 void spectrum_view_suspend_for_app_switch()
 {
     if (g_root == nullptr || !g_visible) return;
 
-    // 只暂停 LVGL 绘制；FFT Task/双帧槽继续工作，返回时直接消费最新快照。
+    // R46.0.67：APP切换后频谱立即隐藏；FFT进入2秒Grace，快速返回可直接复用。
+    // 柱高/样式缓存仍保留；超过Grace后后台任务自行释放。
     g_visible = false;
     if (g_delayed_start_timer != nullptr) {
         lv_timer_del(g_delayed_start_timer);
@@ -1351,7 +1353,8 @@ void spectrum_view_suspend_for_app_switch()
     }
     if (g_timer != nullptr) lv_timer_pause(g_timer);
     lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
-    UI_PAGE_INTERACTION_LOGI("频谱页因APP切换挂起：保留FFT服务与视觉状态");
+    audio_service_set_spectrum_enabled(false);
+    UI_PAGE_INTERACTION_LOGI("频谱页因APP切换挂起：FFT进入2秒复用窗口，保留视觉状态");
 }
 
 void spectrum_view_resume_after_app_switch()

@@ -3,7 +3,6 @@
 #include "esp_err.h"
 #include "esp_log.h"
 
-#include "audio_spectrum_snapshot.h"
 #include "audio_service.h"
 #include "app_manager.h"
 #include "music_app_adapter.h"
@@ -20,6 +19,7 @@
 #include "gpio0_service.h"
 #include "device_settings.h"
 #include "ble_remote_service.h"
+#include "wifi_service.h"
 #include "battery_service.h"
 #include "motion_service.h"
 #include "screen_lock_simple.h"
@@ -51,7 +51,6 @@ static void runtime_optional_service_health_update()
 
     esp_err_t battery_ret = ESP_OK;
     esp_err_t motion_ret = ESP_OK;
-    esp_err_t spectrum_ret = ESP_OK;
     esp_err_t lyrics_ret = ESP_OK;
     bool attempted = false;
 
@@ -63,10 +62,6 @@ static void runtime_optional_service_health_update()
         attempted = true;
         motion_ret = motion_service_init();
     }
-    if (!audio_spectrum_snapshot_is_ready()) {
-        attempted = true;
-        spectrum_ret = audio_spectrum_snapshot_start();
-    }
     if (!usb_storage_service_blocks_normal_runtime() &&
         sdcard_is_mounted() && media_catalog_v2_ready() && !lyrics_service_is_ready()) {
         attempted = true;
@@ -77,18 +72,16 @@ static void runtime_optional_service_health_update()
         return;
     }
 
-    if (battery_ret != ESP_OK || motion_ret != ESP_OK ||
-        spectrum_ret != ESP_OK || lyrics_ret != ESP_OK) {
+    if (battery_ret != ESP_OK || motion_ret != ESP_OK || lyrics_ret != ESP_OK) {
         ESP_LOGW(TAG,
-            "可选服务补启动未完成：Battery=%s Motion=%s Spectrum=%s Lyrics=%s；2秒后重试",
+            "可选服务补启动未完成：Battery=%s Motion=%s Lyrics=%s；2秒后重试",
             esp_err_to_name(battery_ret),
             esp_err_to_name(motion_ret),
-            esp_err_to_name(spectrum_ret),
             esp_err_to_name(lyrics_ret));
         return;
     }
 
-    ESP_LOGI(TAG, "可选服务健康恢复完成：Battery/Motion/Spectrum/Lyrics 已按当前可用依赖补齐");
+    ESP_LOGI(TAG, "可选服务健康恢复完成：Battery/Motion/Lyrics 已按当前可用依赖补齐");
 }
 
 static AudioOutputMode runtime_audio_output_mode(DeviceAudioOutputMode mode)
@@ -117,6 +110,7 @@ void system_runtime_update()
         return;
     }
     if (g_background_start_attempted) {
+        wifi_service_update();
         ble_remote_service_update();
         runtime_optional_service_health_update();
         return;
@@ -160,6 +154,7 @@ void system_runtime_update()
 
     const esp_err_t device_settings_ret = device_settings_init();
     const esp_err_t ble_ret = ble_remote_service_init();
+    const esp_err_t wifi_ret = wifi_service_init();
     if (ble_ret != ESP_OK && ble_ret != ESP_ERR_NOT_SUPPORTED) {
         ESP_LOGW(TAG, "BLE Foundation初始化失败：%s；保持关闭并由运行期恢复",
             esp_err_to_name(ble_ret));
@@ -168,10 +163,27 @@ void system_runtime_update()
         ESP_LOGW(TAG, "设备设置NVS初始化失败：%s；Settings仍使用RAM默认值",
             esp_err_to_name(device_settings_ret));
     }
+    if (wifi_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi服务初始化失败：%s；保持BLE模式", esp_err_to_name(wifi_ret));
+    }
     if (device_settings_ret == ESP_OK) {
         DeviceSettingsSnapshot settings_snapshot = {};
         if (device_settings_get_snapshot(&settings_snapshot)) {
-            ble_remote_service_set_enabled(settings_snapshot.ble_enabled);
+            wifi_service_set_ble_fallback_enabled(settings_snapshot.ble_enabled);
+            bool wifi_boot_requested = false;
+            if (wifi_ret == ESP_OK && wifi_service_has_credentials()) {
+                const esp_err_t connect_ret = wifi_service_connect_saved();
+                wifi_boot_requested = connect_ret == ESP_OK;
+                if (wifi_boot_requested) {
+                    ESP_LOGI(TAG, "开机无线策略：已有Wi-Fi配置，跳过BLE启动并直接连接Wi-Fi");
+                } else {
+                    ESP_LOGW(TAG, "开机Wi-Fi任务启动失败：%s；恢复BLE启动路径",
+                        esp_err_to_name(connect_ret));
+                }
+            }
+            if (!wifi_boot_requested) {
+                ble_remote_service_set_enabled(settings_snapshot.ble_enabled);
+            }
 
             const esp_err_t brightness_ret =
                 screen_lock_simple_set_normal_brightness(settings_snapshot.brightness_level);
@@ -198,6 +210,7 @@ void system_runtime_update()
         }
     }
 
+    wifi_service_update();
     ble_remote_service_update();
 
     const esp_err_t settings_ret = app_ret == ESP_OK
@@ -228,10 +241,8 @@ void system_runtime_update()
         ESP_LOGW(TAG, "GPIO0 辅助键（音量/切歌 + 锁/AOD/熄屏长按）不可用：%s", esp_err_to_name(auxkey_ret));
     }
 
-    const esp_err_t spectrum_ret = audio_spectrum_snapshot_start();
-    if (spectrum_ret != ESP_OK) {
-        ESP_LOGW(TAG, "SpectrumFFTTask 启动失败，频谱功能降级：%s", esp_err_to_name(spectrum_ret));
-    }
+    // R46.0.67：SpectrumFFT 继续按需创建；离开频谱页后进入2秒 Grace 复用窗口，
+    // UI立即返回主视图，快速重进直接复用；超时后后台自行释放4KB Internal栈。
 
     esp_err_t artwork_ret = ESP_ERR_INVALID_STATE;
     esp_err_t surface_ret = ESP_ERR_INVALID_STATE;
@@ -260,7 +271,7 @@ void system_runtime_update()
 
     ESP_LOGI(
         TAG,
-        "READY 后台服务：Apps=%s MusicAdapter=%s Ebook=%s VisualMusic=%s Video=%s DeviceSettings=%s BLE=%s Settings=%s Battery=%s Motion=%s PowerKey=%s AuxKey=%s Spectrum=%s Artwork=%s CoverSurface=%s Lyrics=%s",
+        "READY 后台服务：Apps=%s MusicAdapter=%s Ebook=%s VisualMusic=%s Video=%s DeviceSettings=%s BLE=%s WiFi=%s Settings=%s Battery=%s Motion=%s PowerKey=%s AuxKey=%s Spectrum=ON_DEMAND Artwork=%s CoverSurface=%s Lyrics=%s",
         esp_err_to_name(app_ret),
         esp_err_to_name(music_adapter_ret),
         esp_err_to_name(ebook_ret),
@@ -268,12 +279,12 @@ void system_runtime_update()
         esp_err_to_name(video_ret),
         esp_err_to_name(device_settings_ret),
         ble_ret == ESP_ERR_NOT_SUPPORTED ? "SDKCONFIG_OFF" : esp_err_to_name(ble_ret),
+        esp_err_to_name(wifi_ret),
         esp_err_to_name(settings_ret),
         esp_err_to_name(battery_ret),
         esp_err_to_name(motion_ret),
         esp_err_to_name(power_ret),
         esp_err_to_name(auxkey_ret),
-        esp_err_to_name(spectrum_ret),
         storage_services_available ? esp_err_to_name(artwork_ret) : "SKIPPED",
         storage_services_available && artwork_ret == ESP_OK ? esp_err_to_name(surface_ret) : "SKIPPED",
         storage_services_available ? esp_err_to_name(lyrics_ret) : "SKIPPED"

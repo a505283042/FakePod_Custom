@@ -31,6 +31,7 @@
 #include "spectrum/spectrum_view.h"
 #include "system/battery_service.h"
 #include "system/screen_lock_simple.h"
+#include "system/system_loop.h"
 #include "ui_common.h"
 
 static const char *TAG = "首页";
@@ -261,11 +262,17 @@ static uint32_t g_launcher_surface_lease_us = 0U;
 // index=0 直接保留从 dimmed Surface lease 拷入 DMA strip 的背景，8..14 仅在稀疏 AA 边缘 blend。
 static uint16_t g_launcher_index_color565[16] = {};
 static uint8_t g_launcher_index_alpha[16] = {};
-static uint32_t g_launcher_color_pair_lut[256] = {};
-static uint32_t g_launcher_color_pair_wire_lut[256] = {};
-// R.36.6.1：把每个 packed pair 预分类，热路径不再每 pair 重复查两次 alpha。
+// R46.0.65：pair LUT 只在 Launcher 展开期间需要。旧实现三张静态表常驻 2304B Internal；
+// 其中 native pair LUT 仅用于初始化 wire LUT，本身完全冗余。现在只按需申请 wire+mode=1280B，
+// 收起/降级/切 APP 立即释放，平时不占 Internal。
+static constexpr size_t kLauncherPairWireLutBytes = 256U * sizeof(uint32_t);
+static constexpr size_t kLauncherPairModeBytes = 256U * sizeof(uint8_t);
+static constexpr size_t kLauncherPairLutStorageBytes =
+    kLauncherPairWireLutBytes + kLauncherPairModeBytes;
+static uint8_t *g_launcher_pair_lut_storage = nullptr;
+static uint32_t *g_launcher_color_pair_wire_lut = nullptr;
 // 0=完全透明保留背景，1=双像素全不透明可32bit批量写，2=需要逐像素透明/AA处理。
-static uint8_t g_launcher_pair_mode[256] = {};
+static uint8_t *g_launcher_pair_mode = nullptr;
 static uint8_t g_launcher_frame_index = kLauncherFrameInvalid;
 static uint32_t g_launcher_frame_decode_count = 0U;
 static uint32_t g_launcher_frame_decode_us = 0U;
@@ -1365,8 +1372,44 @@ static bool player_home_launcher_prepare_surface_lease()
     return true;
 }
 
-static void player_home_launcher_update_frame_lut()
+static void player_home_launcher_release_frame_lut()
 {
+    heap_caps_free(g_launcher_pair_lut_storage);
+    g_launcher_pair_lut_storage = nullptr;
+    g_launcher_color_pair_wire_lut = nullptr;
+    g_launcher_pair_mode = nullptr;
+}
+
+static bool player_home_launcher_prepare_frame_lut()
+{
+    if (g_launcher_pair_lut_storage != nullptr) {
+        return true;
+    }
+
+    uint8_t *storage = static_cast<uint8_t *>(heap_caps_malloc(
+        kLauncherPairLutStorageBytes,
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (storage == nullptr) {
+        ESP_LOGW(TAG,
+            "Launcher LUT Internal申请失败：need=%uB，当前展开回退LVGL",
+            static_cast<unsigned>(kLauncherPairLutStorageBytes));
+        return false;
+    }
+
+    g_launcher_pair_lut_storage = storage;
+    g_launcher_color_pair_wire_lut =
+        reinterpret_cast<uint32_t *>(g_launcher_pair_lut_storage);
+    g_launcher_pair_mode =
+        g_launcher_pair_lut_storage + kLauncherPairWireLutBytes;
+    return true;
+}
+
+static bool player_home_launcher_update_frame_lut()
+{
+    if (g_launcher_color_pair_wire_lut == nullptr || g_launcher_pair_mode == nullptr) {
+        return false;
+    }
+
     memset(g_launcher_index_color565, 0, sizeof(g_launcher_index_color565));
     memset(g_launcher_index_alpha, 0, sizeof(g_launcher_index_alpha));
 
@@ -1383,16 +1426,15 @@ static void player_home_launcher_update_frame_lut()
     g_launcher_index_color565[15U] = lv_color_to_u16(lv_color_hex(0xF8FAFF));
     g_launcher_index_alpha[15U] = LV_OPA_COVER;
 
-    // 对完全不透明的 pair 继续使用 32bit LUT 快速写入；包含透明/AA 的 pair 在解码时
-    // 只处理真正需要覆盖的像素，透明 index=0 保留预合成 Base。
+    // native pair 只用于这一次 wire-order 转换，不再保留 1024B 冗余常驻 LUT。
     for (uint32_t packed = 0U; packed < 256U; ++packed) {
         const uint8_t left = static_cast<uint8_t>((packed >> 4) & 0x0FU);
         const uint8_t right = static_cast<uint8_t>(packed & 0x0FU);
-        g_launcher_color_pair_lut[packed] =
+        const uint32_t native_pair =
             static_cast<uint32_t>(g_launcher_index_color565[left]) |
             (static_cast<uint32_t>(g_launcher_index_color565[right]) << 16);
         g_launcher_color_pair_wire_lut[packed] =
-            player_home_launcher_wire565_pair(g_launcher_color_pair_lut[packed]);
+            player_home_launcher_wire565_pair(native_pair);
         const uint8_t left_alpha = g_launcher_index_alpha[left];
         const uint8_t right_alpha = g_launcher_index_alpha[right];
         if (left_alpha == 0U && right_alpha == 0U) {
@@ -1405,6 +1447,7 @@ static void player_home_launcher_update_frame_lut()
             g_launcher_pair_mode[packed] = 2U;
         }
     }
+    return true;
 }
 
 struct LauncherStripRasterTarget
@@ -1944,6 +1987,7 @@ static void player_home_launcher_switch_to_lvgl_fallback()
     }
     // R.36.6：没有整帧 Canvas。降级后直接启用 R.32 LVGL 实时圆弧绘制。
     g_launcher_frame_cache_active = false;
+    player_home_launcher_release_frame_lut();
     if (g_launcher_panel != nullptr) {
         lv_obj_invalidate(g_launcher_panel);
     }
@@ -2308,8 +2352,11 @@ static void player_home_launcher_panel_draw_cb(lv_event_t *event)
 static void player_home_launcher_apply_selection()
 {
     if (g_launcher_frame_cache_active) {
-        // R.36.6：选中项变化只更新 LUT 并重新流式提交当前离散帧；fallback 直接 invalidate panel。
-        player_home_launcher_update_frame_lut();
+        // 选中项变化只更新当前 Launcher 生命周期内的 LUT；若 LUT 异常丢失立即回退 LVGL。
+        if (!player_home_launcher_update_frame_lut()) {
+            player_home_launcher_switch_to_lvgl_fallback();
+            return;
+        }
         const uint8_t frame = g_launcher_frame_index == kLauncherFrameInvalid
             ? player_home_launcher_frame_for_progress(g_launcher_anim_progress)
             : g_launcher_frame_index;
@@ -2508,6 +2555,7 @@ static void player_home_launcher_leave_done(lv_anim_t *anim)
 #endif
     g_launcher_frame_cache_active = false;
     player_home_launcher_release_surface_lease();
+    player_home_launcher_release_frame_lut();
 }
 
 static void player_home_launcher_start_animation(
@@ -2584,8 +2632,10 @@ static void player_home_launcher_show()
             cassette_view_set_launcher_suspended(true);
         }
 
+        const bool launcher_lut_ready =
+            g_launcher_frame_cache_ready && player_home_launcher_prepare_frame_lut();
         const bool launcher_surface_ready =
-            g_launcher_frame_cache_ready && player_home_launcher_prepare_surface_lease();
+            launcher_lut_ready && player_home_launcher_prepare_surface_lease();
         const bool bounded_candidate =
             launcher_surface_ready && kLauncherBoundedSpiEnabled && display_launcher_bounded_spi_available();
 
@@ -2610,8 +2660,7 @@ static void player_home_launcher_show()
 
         // R.36.6：pin 当前 dimmed CoverSurface 后直接启动 BoundedSPI Strip Session。
         // 若 session 无法安全启动，不再创建 RGB565 Canvas，而是立即回退 R.32 LVGL 实时圆弧。
-        if (launcher_surface_ready) {
-            player_home_launcher_update_frame_lut();
+        if (launcher_surface_ready && player_home_launcher_update_frame_lut()) {
             g_launcher_frame_cache_active = true;
             bool bounded_scene_started = false;
             if (kLauncherBoundedSpiEnabled && display_launcher_bounded_spi_available()) {
@@ -2632,6 +2681,7 @@ static void player_home_launcher_show()
         // fallback 则由 R.32 panel DRAW_MAIN 实时绘制，不再维护 Canvas/center overlay。
         if (!g_launcher_frame_cache_active) {
             player_home_launcher_release_surface_lease();
+            player_home_launcher_release_frame_lut();
             ESP_LOGW(TAG,
                 "Launcher Strip/Surface lease 不可用：track=%u，当前展开回退 LVGL 实时圆弧",
                 static_cast<unsigned>(player_state_is_ready() ? player_state_get_index() : 0U));
@@ -4049,11 +4099,19 @@ static bool player_home_set_visual_mode(MusicVisualMode mode)
     // 已从当前 normal Surface 恢复并成功绑定。只有目标背景 ready 后才关闭 Cassette。
     cover_surface_cache_set_dimmed_retained(true);
     bool require_dimmed_surface = false;
+    bool use_default_fallback = false;
     if (player_state_is_ready() && media_library_get_count() > 0U) {
         const uint32_t track = static_cast<uint32_t>(player_state_get_index());
         MediaArtworkViewV2 artwork = {};
         require_dimmed_surface = media_library_get_artwork_view(track, &artwork);
-        if (require_dimmed_surface && !cover_surface_cache_restore_dimmed(track)) {
+        use_default_fallback =
+            require_dimmed_surface && system_artwork_current_uses_default_fallback(track);
+        if (use_default_fallback) {
+            // 当前曲的大封面已进入永久默认封面终态；不要再等待原图 dimmed Surface。
+            require_dimmed_surface = false;
+            ESP_LOGI(TAG, "切回封面模式：track=%lu 已降级默认封面，跳过dimmed Surface恢复",
+                static_cast<unsigned long>(track));
+        } else if (require_dimmed_surface && !cover_surface_cache_restore_dimmed(track)) {
             cover_surface_cache_set_dimmed_retained(false);
             ESP_LOGW(TAG, "切回封面模式失败：dimmed Surface暂未恢复，继续保持静态磁带 track=%lu",
                 static_cast<unsigned long>(track));
@@ -4091,7 +4149,11 @@ static bool player_home_set_visual_mode(MusicVisualMode mode)
     player_home_overlay_apply_dim_path();
     lv_obj_t *screen = lv_screen_active();
     if (screen != nullptr) lv_obj_invalidate(screen);
-    ESP_LOGI(TAG, "Music视觉模式：封面（压暗封面已就绪后原子交接）");
+    if (use_default_fallback) {
+        ESP_LOGI(TAG, "Music视觉模式：封面（大封面默认替补已就绪）");
+    } else {
+        ESP_LOGI(TAG, "Music视觉模式：封面（压暗封面已就绪后原子交接）");
+    }
     return true;
 }
 
@@ -4205,6 +4267,7 @@ static void player_home_launcher_abort_for_app_switch(bool preserve_cassette_pre
     }
     g_launcher_bounded_session_active = false;
     player_home_launcher_release_surface_lease();
+    player_home_launcher_release_frame_lut();
     g_launcher_frame_cache_active = false;
     g_launcher_frame_index = kLauncherFrameInvalid;
     if (g_music_visual_mode == MusicVisualMode::Cassette) {
@@ -4407,6 +4470,7 @@ void player_home_create(lv_obj_t *screen)
     g_launcher_frame_cache_ready = false;
     g_launcher_frame_cache_active = false;
     player_home_launcher_release_surface_lease();
+    player_home_launcher_release_frame_lut();
     g_launcher_surface_lease_us = 0U;
     g_launcher_frame_index = kLauncherFrameInvalid;
     g_launcher_frame_decode_count = 0U;
@@ -4549,7 +4613,6 @@ void player_home_create(lv_obj_t *screen)
     // R.36.6：不再分配 340x340 RGB565 PanelWork/Canvas。Flash I4 + 当前 dimmed Surface
     // 直接按 SPI staging strip 现场合成；LVGL fallback 继续使用 R.32 panel DRAW_MAIN。
     g_launcher_frame_cache_ready = true;
-    player_home_launcher_update_frame_lut();
 
     // R.33.1 fallback callback 常驻，但缓存激活时开头立即 return；这样某一首封面暂时拿不到
     // CoverSurface 时只回退这一次，不会永久关闭后续歌曲的纯 RGB565 快速动画路径。

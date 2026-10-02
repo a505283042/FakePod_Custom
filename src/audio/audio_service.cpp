@@ -58,9 +58,9 @@ static void audio_task_log_ram(const char *stage)
 static inline void audio_task_log_ram(const char *) {}
 #endif
 
-// 加入 Opus 后 8KB 已在实机触发 AudioTask stack overflow；R45.12 基于 24KB 实测峰值下调到 18KB，
-// 继续保留 RAM_TRACE 诊断，确认 Opus 正常播放与连续 Seek 下仍有足够栈余量。
-static constexpr uint32_t AUDIO_TASK_STACK_BYTES = 18U * 1024U;
+// 加入 Opus 后 8KB 曾实机触发 AudioTask stack overflow。R46.0.64 在 16KB 栈下
+// OPUS 最低 HWM=4140B，16KB 配置正式保留；不继续下调到14KB。
+static constexpr uint32_t AUDIO_TASK_STACK_BYTES = 16U * 1024U;
 static constexpr UBaseType_t AUDIO_TASK_PRIORITY = 5;
 static constexpr BaseType_t AUDIO_TASK_CORE = 0;
 static constexpr UBaseType_t AUDIO_COMMAND_QUEUE_LENGTH = 8;
@@ -197,8 +197,15 @@ static uint32_t g_task_seek_revision = 0;
 static uint32_t g_task_last_seek_request_id = 0;
 static uint64_t g_task_last_seek_target_ms = 0;
 static uint64_t g_last_progress_publish_frame = 0;
+#if APP_DIAG_AUDIO_CLOCK || APP_DIAG_AUDIO_RAM
 static bool g_ram_trace_first_pcm_done = false;
 static bool g_ram_trace_steady_5s_done = false;
+#endif
+#if APP_DIAG_AUDIO_RAM
+static UBaseType_t g_audio_stack_hwm_at_play_start = 0U;
+static UBaseType_t g_audio_stack_hwm_at_video_start = 0U;
+static UBaseType_t g_audio_stack_hwm_at_nsf_start = 0U;
+#endif
 static bool g_pcm_unmute_pending = false;
 static uint32_t g_pcm_fade_in_total_frames = 0;
 static uint32_t g_pcm_fade_in_done_frames = 0;
@@ -1163,7 +1170,6 @@ static esp_err_t audio_task_shutdown_pipeline(
 {
     audio_task_reset_flac_starve_grace();
     audio_task_log_ram("shutdown_begin");
-
     esp_err_t first_error = audio_task_shutdown_output_hardware(
         g_task_sample_rate_hz,
         "Music",
@@ -1179,6 +1185,19 @@ static esp_err_t audio_task_shutdown_pipeline(
 
     AUDIO_POP_TRACE_LOG("SHUTDOWN_END ret=%s", esp_err_to_name(first_error));
     audio_task_log_ram("shutdown_end");
+#if APP_DIAG_AUDIO_RAM
+    if (g_task_format != MediaFormat::Unknown) {
+        const UBaseType_t now_hwm = uxTaskGetStackHighWaterMark(nullptr);
+        ESP_LOGI(TAG,
+            "AUDIO_STACK: format=%s start_hwm=%u end_hwm=%u lowered=%u stack=%uB",
+            media_format_name(g_task_format),
+            static_cast<unsigned>(g_audio_stack_hwm_at_play_start),
+            static_cast<unsigned>(now_hwm),
+            static_cast<unsigned>(g_audio_stack_hwm_at_play_start > now_hwm
+                ? g_audio_stack_hwm_at_play_start - now_hwm : 0U),
+            static_cast<unsigned>(AUDIO_TASK_STACK_BYTES));
+    }
+#endif
     return first_error;
 }
 
@@ -1610,8 +1629,10 @@ static esp_err_t audio_task_start_pcm_pipeline(
 #endif
     }
     g_last_progress_publish_frame = g_playback_clock.submitted_frames;
+#if APP_DIAG_AUDIO_CLOCK || APP_DIAG_AUDIO_RAM
     g_ram_trace_first_pcm_done = false;
     g_ram_trace_steady_5s_done = false;
+#endif
     // P1.5.2R.3：新曲/Seek 建立新 PCM pipeline 时先清空旧 FFT 快照。
     // UI 会同时核对 playback_revision + track_index，绝不会把上一首的 PCM 当成当前频谱。
     audio_spectrum_snapshot_reset(
@@ -2247,6 +2268,18 @@ static esp_err_t audio_task_stop_video_mp3_internal(bool restore_music_hardware,
     }
     g_video_restore_paused_music_hardware = false;
 
+#if APP_DIAG_AUDIO_RAM
+    {
+        const UBaseType_t now_hwm = uxTaskGetStackHighWaterMark(nullptr);
+        ESP_LOGI(TAG,
+            "AUDIO_STACK: context=VIDEO start_hwm=%u end_hwm=%u lowered=%u stack=%uB",
+            static_cast<unsigned>(g_audio_stack_hwm_at_video_start),
+            static_cast<unsigned>(now_hwm),
+            static_cast<unsigned>(g_audio_stack_hwm_at_video_start > now_hwm
+                ? g_audio_stack_hwm_at_video_start - now_hwm : 0U),
+            static_cast<unsigned>(AUDIO_TASK_STACK_BYTES));
+    }
+#endif
     ESP_LOGI(TAG, "视频音频已停止：恢复Music硬件=%u 结果=%s",
         static_cast<unsigned>(should_restore), esp_err_to_name(first_error));
     return first_error;
@@ -2255,6 +2288,9 @@ static esp_err_t audio_task_stop_video_mp3_internal(bool restore_music_hardware,
 static void audio_task_handle_video_mp3_start(AudioRequest *request)
 {
     if (request == nullptr) return;
+#if APP_DIAG_AUDIO_RAM
+    g_audio_stack_hwm_at_video_start = uxTaskGetStackHighWaterMark(nullptr);
+#endif
     g_task_last_request_id = request->request_id;
 
     if (g_video_mp3_active || mp3_decoder_is_open(&g_video_mp3_decoder)) {
@@ -3632,6 +3668,18 @@ static esp_err_t audio_task_stop_nsf_internal(bool restore_music_hardware, const
         g_nsf_restore_paused_music_hardware = false;
     }
 
+#if APP_DIAG_AUDIO_RAM
+    {
+        const UBaseType_t now_hwm = uxTaskGetStackHighWaterMark(nullptr);
+        ESP_LOGI(TAG,
+            "AUDIO_STACK: context=NSF start_hwm=%u end_hwm=%u lowered=%u stack=%uB",
+            static_cast<unsigned>(g_audio_stack_hwm_at_nsf_start),
+            static_cast<unsigned>(now_hwm),
+            static_cast<unsigned>(g_audio_stack_hwm_at_nsf_start > now_hwm
+                ? g_audio_stack_hwm_at_nsf_start - now_hwm : 0U),
+            static_cast<unsigned>(AUDIO_TASK_STACK_BYTES));
+    }
+#endif
     ESP_LOGI(TAG, "NSF 2A03已停止：恢复Music硬件=%u 结果=%s",
         static_cast<unsigned>(should_restore), esp_err_to_name(first_error));
     return first_error;
@@ -3640,6 +3688,9 @@ static esp_err_t audio_task_stop_nsf_internal(bool restore_music_hardware, const
 static void audio_task_handle_nsf_start(AudioRequest *request)
 {
     if (request == nullptr) return;
+#if APP_DIAG_AUDIO_RAM
+    g_audio_stack_hwm_at_nsf_start = uxTaskGetStackHighWaterMark(nullptr);
+#endif
     g_task_last_request_id = request->request_id;
 
     if (g_nsf_active || nsf_apu_renderer_is_open(&g_nsf_renderer) || request->nsf_prg == nullptr ||
@@ -4137,6 +4188,9 @@ static void audio_task_handle_play(AudioRequest *request)
         return;
     }
 
+#if APP_DIAG_AUDIO_RAM
+    g_audio_stack_hwm_at_play_start = uxTaskGetStackHighWaterMark(nullptr);
+#endif
     g_task_last_request_id = request->request_id;
     g_task_track_index = request->track_index;
     g_task_format = request->format;

@@ -115,7 +115,6 @@ static constexpr uint8_t kTapeMiddleOpa = 232U;
 static constexpr uint8_t kTapeLineWidth = 2U;
 static constexpr int64_t kTapeGlintPeriodUs = 100000LL;  // 10 Hz，仅几个像素跳动
 static constexpr uint8_t kTapeGlintPhaseCount = 4U;
-static constexpr uint8_t kCassetteTintHueBins = 18U;
 static constexpr uint8_t kCassetteTintStrength = 200U;  // R17：约78%，动态亮色保持鲜明但不荧光
 static constexpr uint8_t kCassetteTintMinSaturation = 96U;
 static constexpr uint8_t kCassetteTintMaxSaturation = 190U;
@@ -132,7 +131,8 @@ static constexpr size_t kControlsCacheBytes =
     static_cast<size_t>(kControlsCacheWidth) * kControlsCacheHeight * sizeof(uint16_t);
 static constexpr size_t kPrefetchShellBytes =
     static_cast<size_t>(kCassetteWidth) * kCassetteHeight * sizeof(uint16_t);
-static constexpr uint32_t kCassetteCacheTaskStackBytes = 5120U;
+// R46.0.59: runtime HWM worst observed ~=2008B free on 5120B stack; keep ~1KB guard.
+static constexpr uint32_t kCassetteCacheTaskStackBytes = 4096U;
 static constexpr UBaseType_t kCassetteCacheTaskPriority = 1U;
 static constexpr BaseType_t kCassetteCacheTaskCore = 1;
 static constexpr uint32_t kCassetteTrimWaitMs = 1000U;
@@ -1748,100 +1748,20 @@ static CassetteTintColor cassette_view_normalize_dynamic_tint(
     return cassette_view_hsv_to_rgb(hue, saturation, value);
 }
 
-static bool cassette_view_extract_cover_tint(
+static bool cassette_view_get_cached_cover_tint(
     const CoverSurfaceLease &cover,
     CassetteTintColor *out_color,
     uint16_t *out_hue,
     uint32_t *out_samples)
 {
-    if (out_color == nullptr || cover.normal_rgb565 == nullptr ||
-        cover.width == 0U || cover.height == 0U || cover.data_size < 2U) {
-        return false;
-    }
+    if (out_color == nullptr || !cover.tint.ready) return false;
+    if (out_samples != nullptr) *out_samples = cover.tint.samples;
+    if (!cover.tint.chromatic) return false;
 
-    uint32_t weights[kCassetteTintHueBins] = {};
-    uint32_t red_sum[kCassetteTintHueBins] = {};
-    uint32_t green_sum[kCassetteTintHueBins] = {};
-    uint32_t blue_sum[kCassetteTintHueBins] = {};
-    uint32_t accepted = 0U;
-    uint32_t sampled = 0U;
-    uint32_t near_black_neutral = 0U;
-
-    const uint16_t x_begin = static_cast<uint16_t>(cover.width / 10U);
-    const uint16_t x_end = static_cast<uint16_t>(cover.width - cover.width / 10U);
-    const uint16_t y_begin = static_cast<uint16_t>(cover.height / 10U);
-    const uint16_t y_end = static_cast<uint16_t>(cover.height - cover.height / 10U);
-    const uint16_t step_x = cover.width >= 24U ? static_cast<uint16_t>(cover.width / 24U) : 1U;
-    const uint16_t step_y = cover.height >= 24U ? static_cast<uint16_t>(cover.height / 24U) : 1U;
-
-    for (uint16_t y = y_begin; y < y_end; y = static_cast<uint16_t>(y + step_y)) {
-        for (uint16_t x = x_begin; x < x_end; x = static_cast<uint16_t>(x + step_x)) {
-            const size_t pixel_index = static_cast<size_t>(y) * cover.width + x;
-            const size_t byte_index = pixel_index * 2U;
-            if (byte_index + 1U >= cover.data_size) continue;
-
-            const CassetteTintColor color = cassette_view_rgb565_to_rgb888(
-                cassette_view_load_rgb565(cover.normal_rgb565 + byte_index));
-            uint16_t hue = 0U;
-            uint8_t saturation = 0U;
-            uint8_t value = 0U;
-            cassette_view_rgb_to_hsv(color, &hue, &saturation, &value);
-            ++sampled;
-            if (value < 64U && saturation < 96U) ++near_black_neutral;
-
-            // 去掉近黑、近灰和接近白色的背景点，避免白边/黑底把主色拉灰。
-            if (value < 44U || saturation < 46U || (value > 244U && saturation < 90U)) {
-                continue;
-            }
-
-            const uint8_t bin = static_cast<uint8_t>(
-                (static_cast<uint32_t>(hue) * kCassetteTintHueBins) / 360U);
-            const uint32_t weight = 1U +
-                (static_cast<uint32_t>(saturation) * (128U + value)) / 384U;
-            weights[bin] += weight;
-            red_sum[bin] += static_cast<uint32_t>(color.r) * weight;
-            green_sum[bin] += static_cast<uint32_t>(color.g) * weight;
-            blue_sum[bin] += static_cast<uint32_t>(color.b) * weight;
-            ++accepted;
-        }
-    }
-
-    if (out_samples != nullptr) *out_samples = accepted;
-    // 大面积近黑/中性封面直接使用石墨灰壳体，避免少量彩色文字/Logo抢走主色。
-    if (sampled >= 24U && near_black_neutral * 100U >= sampled * 55U) return false;
-    if (accepted < 12U) return false;
-
-    uint8_t best_bin = 0U;
-    uint32_t best_score = 0U;
-    for (uint8_t bin = 0U; bin < kCassetteTintHueBins; ++bin) {
-        const uint8_t prev = bin == 0U ? kCassetteTintHueBins - 1U : bin - 1U;
-        const uint8_t next = static_cast<uint8_t>((bin + 1U) % kCassetteTintHueBins);
-        const uint32_t score = weights[bin] + (weights[prev] + weights[next]) / 2U;
-        if (score > best_score) {
-            best_score = score;
-            best_bin = bin;
-        }
-    }
-    if (best_score == 0U) return false;
-
-    const uint8_t prev = best_bin == 0U ? kCassetteTintHueBins - 1U : best_bin - 1U;
-    const uint8_t next = static_cast<uint8_t>((best_bin + 1U) % kCassetteTintHueBins);
-    const uint32_t total_weight =
-        weights[best_bin] + weights[prev] / 2U + weights[next] / 2U;
-    if (total_weight == 0U) return false;
-
-    CassetteTintColor dominant = {};
-    dominant.r = static_cast<uint8_t>((
-        red_sum[best_bin] + red_sum[prev] / 2U + red_sum[next] / 2U) / total_weight);
-    dominant.g = static_cast<uint8_t>((
-        green_sum[best_bin] + green_sum[prev] / 2U + green_sum[next] / 2U) / total_weight);
-    dominant.b = static_cast<uint8_t>((
-        blue_sum[best_bin] + blue_sum[prev] / 2U + blue_sum[next] / 2U) / total_weight);
-
-    *out_color = dominant;
-    if (out_hue != nullptr) {
-        cassette_view_rgb_to_hsv(*out_color, out_hue, nullptr, nullptr);
-    }
+    out_color->r = cover.tint.r;
+    out_color->g = cover.tint.g;
+    out_color->b = cover.tint.b;
+    if (out_hue != nullptr) *out_hue = cover.tint.hue;
     return true;
 }
 
@@ -2291,7 +2211,7 @@ static bool cassette_view_compose_cache_job(
     uint32_t samples = 0U;
     const bool apply_dynamic = job.dynamic_tint && !job.no_artwork;
     if (apply_dynamic) {
-        const bool chromatic = cassette_view_extract_cover_tint(
+        const bool chromatic = cassette_view_get_cached_cover_tint(
             job.cover_lease, &extracted, &source_hue, &samples);
         if (chromatic) {
             target = cassette_view_normalize_dynamic_tint(extracted, &target_hue);
@@ -2376,7 +2296,6 @@ static void cassette_view_cache_task_main(void *argument)
         const int64_t started_us = esp_timer_get_time();
         result.ok = cassette_view_compose_cache_job(job, &result);
         result.elapsed_us = esp_timer_get_time() - started_us;
-
         if (job.cover_lease.slot_index != 0xFFU) {
             CoverSurfaceLease release = job.cover_lease;
             cover_surface_cache_release(&release);
@@ -2837,7 +2756,21 @@ static void cassette_view_service_next_prefetch()
         if (!g_next_prefetch.no_artwork &&
             g_next_prefetch.promotion_cover.slot_index == 0xFFU) {
             CoverSurfaceLease promotion = {};
-            if (!cover_surface_cache_acquire_normal(next_track, &promotion)) return;
+            if (!cover_surface_cache_acquire_normal(next_track, &promotion)) {
+                CoverSurfaceSnapshot snapshot = {};
+                if (cover_surface_cache_get_snapshot(&snapshot) &&
+                    snapshot.catalog_generation == generation && snapshot.track_index == next_track &&
+                    snapshot.state == CoverSurfaceState::Failed &&
+                    snapshot.result == ESP_ERR_INVALID_SIZE) {
+                    // 下一首大封面已经确定无法进入 Surface 预算，直接预热默认磁带视觉。
+                    g_next_prefetch.no_artwork = true;
+                    artwork_loader_discard_unpinned();
+                    ESP_LOGW(TAG, "下一首大封面降级默认标签：track=%lu",
+                        static_cast<unsigned long>(next_track));
+                    (void)cassette_view_schedule_next_build();
+                }
+                return;
+            }
             g_next_prefetch.promotion_cover = promotion;
         }
         (void)cassette_view_schedule_next_build();
@@ -2986,7 +2919,7 @@ static bool cassette_view_start_shell_tint_job(
     uint16_t source_hue = 0U;
     uint16_t target_hue = 0U;
     uint32_t samples = 0U;
-    const bool chromatic = cassette_view_extract_cover_tint(
+    const bool chromatic = cassette_view_get_cached_cover_tint(
         cover, &extracted, &source_hue, &samples);
     const char *tint_mode = "中性灰";
     if (chromatic) {
@@ -3419,6 +3352,17 @@ static bool cassette_view_bind_current_cover()
     CoverSurfaceLease next = {};
     if (!cover_surface_cache_acquire_normal(track, &next) || next.normal_rgb565 == nullptr ||
         next.width == 0U || next.height == 0U || next.data_size == 0U) {
+        CoverSurfaceSnapshot snapshot = {};
+        if (cover_surface_cache_get_snapshot(&snapshot) &&
+            snapshot.catalog_generation == generation && snapshot.track_index == track &&
+            snapshot.state == CoverSurfaceState::Failed &&
+            snapshot.result == ESP_ERR_INVALID_SIZE) {
+            artwork_loader_discard_unpinned();
+            cassette_view_release_transition_hold();
+            ESP_LOGW(TAG, "磁带大封面降级默认标签：track=%lu",
+                static_cast<unsigned long>(track));
+            return cassette_view_bind_no_artwork_label(generation, track);
+        }
         return false;
     }
 

@@ -6,12 +6,14 @@
 #include "esp_err.h"
 #include "audio_types.h"
 
-// P1.5.2R.3：启动低优先级 SpectrumFFT 任务。任务常态阻塞，只有频谱页启用且
-// AudioTask 提交了新的 256 点分析窗时才被唤醒；失败不会改变 AudioTask ownership。
+// 低优先级 SpectrumFFT 任务由频谱页按需创建；离开后进入约2秒 Grace 复用窗口，
+// 快速返回频谱页直接复用，超时后任务自行退出并释放 Internal 栈。
+// start() 保留给 set_enabled(true) 使用；失败不会改变 AudioTask ownership。
 esp_err_t audio_spectrum_snapshot_start();
 bool audio_spectrum_snapshot_is_ready();
 
-// 频谱页显示时启用捕获；隐藏时关闭。这里只改变旁路分析开关，不控制 decoder/I2S。
+// 频谱页显示时创建/复用任务并启用捕获；隐藏时立即关闭旁路并进入 Grace，
+// UI 不等待 Task 回收；不控制 decoder/I2S。
 void audio_spectrum_snapshot_set_enabled(bool enabled);
 
 // 仅 AudioTask 调用 reset/publish；其它任务只能通过 audio_service_get_spectrum_snapshot() 读取。

@@ -14,6 +14,7 @@
 #include "esp_lv_decoder.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "lvgl.h"
 #include "app_diag_config.h"
 #include "board_pins.h"
@@ -56,6 +57,7 @@ static bool g_boot_reveal_pending = false;
 static int64_t g_boot_reveal_retry_started_us = 0;
 static uint8_t g_boot_reveal_retry_count = 0U;
 static lv_timer_t *g_display_visibility_guard_timer = nullptr;
+static constexpr uint32_t kLvglTaskStackBytes = 6144U;
 static bool g_ready = false;
 
 // 首次建库进度由扫描任务只写入轻量计数，真正的 LVGL 文本更新由
@@ -1175,6 +1177,7 @@ static void ui_manager_font_cache_write_started()
     lvgl_port_unlock();
 }
 
+
 static void ui_manager_boot_library_progress_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
@@ -1218,7 +1221,7 @@ esp_err_t ui_manager_bootstrap_init()
     lvgl_port_cfg_t lvgl_cfg = {};
     // Core1 实时优先级阶梯：FLAC 预取固定 P4，LVGL 保持 P3。
     lvgl_cfg.task_priority = 3;
-    lvgl_cfg.task_stack = 6144;
+    lvgl_cfg.task_stack = kLvglTaskStackBytes;
     lvgl_cfg.task_affinity = 1;
     lvgl_cfg.task_max_sleep_ms = 100;
     lvgl_cfg.timer_period_ms = 5;
@@ -1393,6 +1396,7 @@ esp_err_t ui_manager_bootstrap_init()
             ESP_LOGW(TAG, "创建显示可见性保护timer失败，揭屏/PresentHold将失去超时自愈");
         }
     }
+
 
     // 创建对象期间已经产生 invalidation；显式标记整屏，首轮 REFR_READY 才执行物理揭屏。
     g_boot_reveal_pending = true;

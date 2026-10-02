@@ -34,6 +34,7 @@ static constexpr size_t COVER_CACHE_SLOT_COUNT = 2U;
 static constexpr size_t COVER_SOURCE_DECODE_BUDGET_BYTES = 4U * 1024U * 1024U;
 static constexpr size_t COVER_PSRAM_SAFETY_RESERVE_BYTES = 512U * 1024U;
 static constexpr uint32_t COVER_COOPERATIVE_ROW_INTERVAL = 32U;
+static constexpr uint8_t COVER_TINT_HUE_BINS = 18U;
 static constexpr size_t COVER_SURFACE_BYTES =
     static_cast<size_t>(FAKEPOD_LCD_WIDTH) * static_cast<size_t>(FAKEPOD_LCD_HEIGHT) * 2U;
 
@@ -55,6 +56,7 @@ struct CoverCacheEntry
     uint32_t lru_stamp = 0;
     uint16_t pin_count = 0;
     uint16_t dimmed_pin_count = 0;
+    CoverSurfaceTint tint = {};
     bool valid = false;
 };
 
@@ -82,6 +84,24 @@ struct CoverRenderStats
 {
     uint32_t decode_ms = 0U;
     uint32_t resample_ms = 0U;
+};
+
+struct CoverTintColor
+{
+    uint8_t r = 0U;
+    uint8_t g = 0U;
+    uint8_t b = 0U;
+};
+
+struct CoverTintAccumulator
+{
+    uint32_t weights[COVER_TINT_HUE_BINS] = {};
+    uint32_t red_sum[COVER_TINT_HUE_BINS] = {};
+    uint32_t green_sum[COVER_TINT_HUE_BINS] = {};
+    uint32_t blue_sum[COVER_TINT_HUE_BINS] = {};
+    uint32_t accepted = 0U;
+    uint32_t sampled = 0U;
+    uint32_t near_black_neutral = 0U;
 };
 
 // R.20：旧 Overlay 黑层 opacity=150，等价于保留约 105/255 的原图亮度。
@@ -290,7 +310,8 @@ static void cover_cache_release_unpinned_except(uint32_t generation, uint32_t tr
 static bool cover_cache_insert(
     const CoverRequest &request,
     uint8_t *normal,
-    uint8_t *dimmed)
+    uint8_t *dimmed,
+    const CoverSurfaceTint &tint)
 {
     if (normal == nullptr || g_cache_mutex == nullptr ||
         xSemaphoreTake(g_cache_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
@@ -365,6 +386,7 @@ static bool cover_cache_insert(
     if (g_lru_counter == 0U) g_lru_counter = 1U;
     entry.pin_count = 0U;
     entry.dimmed_pin_count = 0U;
+    entry.tint = tint;
     entry.valid = true;
 
     xSemaphoreGive(g_cache_mutex);
@@ -400,7 +422,9 @@ static esp_err_t cover_decode_jpeg(
     config.rotate = JPEG_ROTATE_0D;
 
     jpeg_dec_handle_t decoder = nullptr;
-    if (jpeg_dec_open(&config, &decoder) != JPEG_ERR_OK || decoder == nullptr) return ESP_FAIL;
+    if (jpeg_dec_open(&config, &decoder) != JPEG_ERR_OK || decoder == nullptr) {
+        return ESP_FAIL;
+    }
 
     jpeg_dec_io_t io = {};
     jpeg_dec_header_info_t info = {};
@@ -419,8 +443,10 @@ static esp_err_t cover_decode_jpeg(
         return ESP_ERR_INVALID_SIZE;
     }
     if (!cover_psram_budget_ok(static_cast<size_t>(bytes64), need_dimmed)) {
+        // 预算拒绝不是 malloc 瞬态失败：同一张大图反复重试只会重复开关 decoder。
+        // 用 INVALID_SIZE 标记为确定性默认封面降级；真实分配失败仍返回 NO_MEM 允许重试。
         jpeg_dec_close(decoder);
-        return ESP_ERR_NO_MEM;
+        return ESP_ERR_INVALID_SIZE;
     }
 
     uint8_t *buffer = static_cast<uint8_t *>(heap_caps_aligned_alloc(
@@ -468,8 +494,9 @@ static esp_err_t cover_decode_png(
         return ESP_ERR_INVALID_SIZE;
     }
     if (!cover_psram_budget_ok(bytes, need_dimmed)) {
+        // 与 JPEG 一致：预算型失败直接进入默认封面，不做指数退避重试。
         png_image_free(&image);
-        return ESP_ERR_NO_MEM;
+        return ESP_ERR_INVALID_SIZE;
     }
 
     uint8_t *buffer = static_cast<uint8_t *>(heap_caps_aligned_alloc(
@@ -503,14 +530,10 @@ static uint16_t *cover_alloc_axis_map(size_t count)
     if (count == 0U || count > SIZE_MAX / sizeof(uint16_t)) return nullptr;
     const size_t bytes = count * sizeof(uint16_t);
 
-    // 映射表只有约 1.8 KiB，优先放内部 RAM，避免每个目标像素都额外访问 PSRAM。
-    uint16_t *map = static_cast<uint16_t *>(heap_caps_malloc(
-        bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    if (map == nullptr) {
-        map = static_cast<uint16_t *>(heap_caps_malloc(
-            bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    }
-    return map;
+    // R46.0.58：映射表约 1.8 KiB。磁带+Wi-Fi 场景优先保护 Internal RAM，
+    // 这里不再回退内部堆；PSRAM 不足时宁可本轮 Surface 失败并走压缩图 fallback。
+    return static_cast<uint16_t *>(heap_caps_malloc(
+        bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 }
 
 static void cover_build_axis_map(
@@ -546,6 +569,120 @@ static inline uint16_t cover_dim_rgb565(uint16_t pixel)
     return static_cast<uint16_t>((r << 11U) | (g << 5U) | b);
 }
 
+static CoverTintColor cover_tint_rgb565_to_rgb888(uint16_t rgb565)
+{
+    CoverTintColor color = {};
+    const uint8_t r5 = static_cast<uint8_t>((rgb565 >> 11U) & 0x1FU);
+    const uint8_t g6 = static_cast<uint8_t>((rgb565 >> 5U) & 0x3FU);
+    const uint8_t b5 = static_cast<uint8_t>(rgb565 & 0x1FU);
+    color.r = static_cast<uint8_t>((static_cast<uint16_t>(r5) * 255U + 15U) / 31U);
+    color.g = static_cast<uint8_t>((static_cast<uint16_t>(g6) * 255U + 31U) / 63U);
+    color.b = static_cast<uint8_t>((static_cast<uint16_t>(b5) * 255U + 15U) / 31U);
+    return color;
+}
+
+static void cover_tint_rgb_to_hsv(
+    const CoverTintColor &color, uint16_t *out_hue, uint8_t *out_saturation, uint8_t *out_value)
+{
+    const uint8_t max_value = color.r > color.g
+        ? (color.r > color.b ? color.r : color.b)
+        : (color.g > color.b ? color.g : color.b);
+    const uint8_t min_value = color.r < color.g
+        ? (color.r < color.b ? color.r : color.b)
+        : (color.g < color.b ? color.g : color.b);
+    const int32_t delta = static_cast<int32_t>(max_value) - min_value;
+
+    uint16_t hue = 0U;
+    if (delta > 0) {
+        int32_t hue_signed = 0;
+        if (max_value == color.r) {
+            hue_signed = 60 * (static_cast<int32_t>(color.g) - color.b) / delta;
+        } else if (max_value == color.g) {
+            hue_signed = 120 + 60 * (static_cast<int32_t>(color.b) - color.r) / delta;
+        } else {
+            hue_signed = 240 + 60 * (static_cast<int32_t>(color.r) - color.g) / delta;
+        }
+        while (hue_signed < 0) hue_signed += 360;
+        while (hue_signed >= 360) hue_signed -= 360;
+        hue = static_cast<uint16_t>(hue_signed);
+    }
+
+    const uint8_t saturation = max_value == 0U
+        ? 0U
+        : static_cast<uint8_t>((static_cast<uint32_t>(delta) * 255U + max_value / 2U) / max_value);
+    if (out_hue != nullptr) *out_hue = hue;
+    if (out_saturation != nullptr) *out_saturation = saturation;
+    if (out_value != nullptr) *out_value = max_value;
+}
+
+static void cover_tint_accumulate(CoverTintAccumulator *acc, uint16_t pixel)
+{
+    if (acc == nullptr) return;
+    const CoverTintColor color = cover_tint_rgb565_to_rgb888(pixel);
+    uint16_t hue = 0U;
+    uint8_t saturation = 0U;
+    uint8_t value = 0U;
+    cover_tint_rgb_to_hsv(color, &hue, &saturation, &value);
+    ++acc->sampled;
+    if (value < 64U && saturation < 96U) ++acc->near_black_neutral;
+    if (value < 44U || saturation < 46U || (value > 244U && saturation < 90U)) return;
+
+    const uint8_t bin = static_cast<uint8_t>(
+        (static_cast<uint32_t>(hue) * COVER_TINT_HUE_BINS) / 360U);
+    const uint32_t weight = 1U +
+        (static_cast<uint32_t>(saturation) * (128U + value)) / 384U;
+    acc->weights[bin] += weight;
+    acc->red_sum[bin] += static_cast<uint32_t>(color.r) * weight;
+    acc->green_sum[bin] += static_cast<uint32_t>(color.g) * weight;
+    acc->blue_sum[bin] += static_cast<uint32_t>(color.b) * weight;
+    ++acc->accepted;
+}
+
+static CoverSurfaceTint cover_tint_finalize(const CoverTintAccumulator &acc)
+{
+    CoverSurfaceTint result = {};
+    result.ready = true;
+    result.samples = acc.accepted;
+    if ((acc.sampled >= 24U && acc.near_black_neutral * 100U >= acc.sampled * 55U) ||
+        acc.accepted < 12U) {
+        return result;
+    }
+
+    uint8_t best_bin = 0U;
+    uint32_t best_score = 0U;
+    for (uint8_t bin = 0U; bin < COVER_TINT_HUE_BINS; ++bin) {
+        const uint8_t prev = bin == 0U ? COVER_TINT_HUE_BINS - 1U : bin - 1U;
+        const uint8_t next = static_cast<uint8_t>((bin + 1U) % COVER_TINT_HUE_BINS);
+        const uint32_t score = acc.weights[bin] + (acc.weights[prev] + acc.weights[next]) / 2U;
+        if (score > best_score) {
+            best_score = score;
+            best_bin = bin;
+        }
+    }
+    if (best_score == 0U) return result;
+
+    const uint8_t prev = best_bin == 0U ? COVER_TINT_HUE_BINS - 1U : best_bin - 1U;
+    const uint8_t next = static_cast<uint8_t>((best_bin + 1U) % COVER_TINT_HUE_BINS);
+    const uint32_t total_weight =
+        acc.weights[best_bin] + acc.weights[prev] / 2U + acc.weights[next] / 2U;
+    if (total_weight == 0U) return result;
+
+    CoverTintColor dominant = {};
+    dominant.r = static_cast<uint8_t>((
+        acc.red_sum[best_bin] + acc.red_sum[prev] / 2U + acc.red_sum[next] / 2U) / total_weight);
+    dominant.g = static_cast<uint8_t>((
+        acc.green_sum[best_bin] + acc.green_sum[prev] / 2U + acc.green_sum[next] / 2U) / total_weight);
+    dominant.b = static_cast<uint8_t>((
+        acc.blue_sum[best_bin] + acc.blue_sum[prev] / 2U + acc.blue_sum[next] / 2U) / total_weight);
+
+    result.chromatic = true;
+    result.r = dominant.r;
+    result.g = dominant.g;
+    result.b = dominant.b;
+    cover_tint_rgb_to_hsv(dominant, &result.hue, nullptr, nullptr);
+    return result;
+}
+
 static esp_err_t cover_render_surface(
     const ArtworkCacheLease &lease,
     bool need_dimmed,
@@ -553,6 +690,7 @@ static esp_err_t cover_render_surface(
     uint8_t **out_dimmed,
     uint16_t *out_source_width,
     uint16_t *out_source_height,
+    CoverSurfaceTint *out_tint,
     CoverRenderStats *out_stats)
 {
     if (out_normal == nullptr || out_dimmed == nullptr ||
@@ -563,6 +701,7 @@ static esp_err_t cover_render_surface(
     *out_dimmed = nullptr;
     *out_source_width = 0U;
     *out_source_height = 0U;
+    if (out_tint != nullptr) *out_tint = {};
     if (out_stats != nullptr) *out_stats = {};
 
     const int64_t decode_started_us = esp_timer_get_time();
@@ -631,6 +770,16 @@ static esp_err_t cover_render_surface(
     uint16_t *normal16 = reinterpret_cast<uint16_t *>(normal);
     uint16_t *dimmed16 = need_dimmed ? reinterpret_cast<uint16_t *>(dimmed) : nullptr;
 
+    // R46.0.58 Single-Pass：缩放写最终 RGB565 的同一轮，顺手完成磁带主色采样。
+    CoverTintAccumulator tint_acc = {};
+    const uint32_t tint_x_begin = FAKEPOD_LCD_WIDTH / 10U;
+    const uint32_t tint_x_end = FAKEPOD_LCD_WIDTH - FAKEPOD_LCD_WIDTH / 10U;
+    const uint32_t tint_y_begin = FAKEPOD_LCD_HEIGHT / 10U;
+    const uint32_t tint_y_end = FAKEPOD_LCD_HEIGHT - FAKEPOD_LCD_HEIGHT / 10U;
+    const uint32_t tint_step_x = FAKEPOD_LCD_WIDTH >= 24U ? FAKEPOD_LCD_WIDTH / 24U : 1U;
+    const uint32_t tint_step_y = FAKEPOD_LCD_HEIGHT >= 24U ? FAKEPOD_LCD_HEIGHT / 24U : 1U;
+    uint32_t next_tint_y = tint_y_begin;
+
     if (is_jpeg) {
         for (uint32_t y = 0; y < FAKEPOD_LCD_HEIGHT; ++y) {
             const uint16_t *src_row = jpeg.data + static_cast<size_t>(ymap[y]) * sw;
@@ -638,10 +787,17 @@ static esp_err_t cover_render_surface(
             uint16_t *dimmed_row = need_dimmed
                 ? dimmed16 + static_cast<size_t>(y) * FAKEPOD_LCD_WIDTH
                 : nullptr;
+            const bool tint_row = y == next_tint_y && y < tint_y_end;
+            if (tint_row) next_tint_y += tint_step_y;
+            uint32_t next_tint_x = tint_x_begin;
             for (uint32_t x = 0; x < FAKEPOD_LCD_WIDTH; ++x) {
                 const uint16_t pixel = src_row[xmap[x]];
                 normal_row[x] = pixel;
                 if (dimmed_row != nullptr) dimmed_row[x] = cover_dim_rgb565(pixel);
+                if (tint_row && x == next_tint_x && x < tint_x_end) {
+                    cover_tint_accumulate(&tint_acc, pixel);
+                    next_tint_x += tint_step_x;
+                }
             }
             if (((y + 1U) % COVER_COOPERATIVE_ROW_INTERVAL) == 0U) {
                 // taskYIELD() 不会让优先级 0 的 IDLE1 运行；真正阻塞 1 tick，
@@ -656,10 +812,17 @@ static esp_err_t cover_render_surface(
             uint16_t *dimmed_row = need_dimmed
                 ? dimmed16 + static_cast<size_t>(y) * FAKEPOD_LCD_WIDTH
                 : nullptr;
+            const bool tint_row = y == next_tint_y && y < tint_y_end;
+            if (tint_row) next_tint_y += tint_step_y;
+            uint32_t next_tint_x = tint_x_begin;
             for (uint32_t x = 0; x < FAKEPOD_LCD_WIDTH; ++x) {
                 const uint16_t pixel = cover_rgb888_to_rgb565(src_row + static_cast<size_t>(xmap[x]) * 3U);
                 normal_row[x] = pixel;
                 if (dimmed_row != nullptr) dimmed_row[x] = cover_dim_rgb565(pixel);
+                if (tint_row && x == next_tint_x && x < tint_x_end) {
+                    cover_tint_accumulate(&tint_acc, pixel);
+                    next_tint_x += tint_step_x;
+                }
             }
             if (((y + 1U) % COVER_COOPERATIVE_ROW_INTERVAL) == 0U) {
                 vTaskDelay(1);
@@ -671,9 +834,13 @@ static esp_err_t cover_render_surface(
         out_stats->resample_ms = static_cast<uint32_t>((esp_timer_get_time() - resample_started_us) / 1000LL);
     }
 
+    const CoverSurfaceTint tint = cover_tint_finalize(tint_acc);
+
+    // 阶段屏障：缩放+取色完成后，先释放 source + axis map，再进入磁带壳/快照阶段。
     heap_caps_free(xmap);
     heap_caps_free(ymap);
     heap_caps_free(is_jpeg ? static_cast<void *>(jpeg.data) : static_cast<void *>(png.data));
+    if (out_tint != nullptr) *out_tint = tint;
     *out_normal = normal;
     *out_dimmed = dimmed;
     *out_source_width = static_cast<uint16_t>(sw);
@@ -722,13 +889,14 @@ static void cover_task_main(void *)
         uint16_t source_width = 0U;
         uint16_t source_height = 0U;
         CoverRenderStats render_stats = {};
+        CoverSurfaceTint tint = {};
         const bool need_dimmed = cover_dimmed_retained();
 #if APP_DIAG_ARTWORK_UI
         const MediaArtworkFormatV2 artwork_format = compressed.format;
 #endif
         const esp_err_t render_result = cover_render_surface(
             compressed, need_dimmed, &normal, &dimmed,
-            &source_width, &source_height, &render_stats);
+            &source_width, &source_height, &tint, &render_stats);
         artwork_loader_release_cached(&compressed);
 
         const uint32_t prepare_ms = static_cast<uint32_t>((esp_timer_get_time() - started_us) / 1000LL);
@@ -736,8 +904,13 @@ static void cover_task_main(void *)
             heap_caps_free(normal);
             heap_caps_free(dimmed);
             cover_publish(CoverSurfaceState::Failed, &request, render_result, false, source_width, source_height, prepare_ms);
-            ESP_LOGW(TAG, "封面预处理失败：track=%lu result=%s，保留 LVGL 压缩图回退路径",
-                static_cast<unsigned long>(request.track_index), esp_err_to_name(render_result));
+            if (render_result == ESP_ERR_INVALID_SIZE) {
+                ESP_LOGW(TAG, "封面预处理预算/尺寸拒绝：track=%lu result=%s，切换默认封面",
+                    static_cast<unsigned long>(request.track_index), esp_err_to_name(render_result));
+            } else {
+                ESP_LOGW(TAG, "封面预处理失败：track=%lu result=%s，保留 LVGL 压缩图回退路径",
+                    static_cast<unsigned long>(request.track_index), esp_err_to_name(render_result));
+            }
             continue;
         }
 
@@ -754,7 +927,7 @@ static void cover_task_main(void *)
             dimmed = nullptr;
         }
 
-        if (!cover_cache_insert(request, normal, dimmed)) {
+        if (!cover_cache_insert(request, normal, dimmed, tint)) {
             heap_caps_free(normal);
             heap_caps_free(dimmed);
             cover_publish(CoverSurfaceState::Failed, &request, ESP_ERR_NO_MEM, false, source_width, source_height, prepare_ms);
@@ -775,18 +948,22 @@ static void cover_task_main(void *)
         const size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
         const size_t psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
         const char *format_name = artwork_format == MediaArtworkFormatV2::Png ? "PNG" : "JPEG";
-        COVER_TRACE("当前曲封面完成：track=%lu format=%s source=%ux%u -> %dx%d dimmed=%u total=%lums decode=%lums sample=%lums core=%ld stack_hwm=%u PSRAM_free=%u largest=%u",
+        COVER_TRACE("当前曲封面完成：track=%lu format=%s source=%ux%u -> %dx%d dimmed=%u tint=%s samples=%lu total=%lums decode=%lums scale+tint=%lums core=%ld stack_hwm=%u PSRAM_free=%u largest=%u internal=%u min=%u",
             static_cast<unsigned long>(request.track_index), format_name,
             static_cast<unsigned>(source_width), static_cast<unsigned>(source_height),
             FAKEPOD_LCD_WIDTH, FAKEPOD_LCD_HEIGHT,
             static_cast<unsigned>(cover_dimmed_retained() && dimmed != nullptr),
+            tint.chromatic ? "COLOR" : "NEUTRAL",
+            static_cast<unsigned long>(tint.samples),
             static_cast<unsigned long>(prepare_ms),
             static_cast<unsigned long>(render_stats.decode_ms),
             static_cast<unsigned long>(render_stats.resample_ms),
             static_cast<long>(finish_core),
             static_cast<unsigned>(stack_hwm),
             static_cast<unsigned>(psram_free),
-            static_cast<unsigned>(psram_largest));
+            static_cast<unsigned>(psram_largest),
+            static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+            static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
 #endif
     }
 }
@@ -884,6 +1061,7 @@ static bool cover_surface_cache_acquire_internal(
     out_lease->height = FAKEPOD_LCD_HEIGHT;
     out_lease->catalog_generation = entry.catalog_generation;
     out_lease->track_index = entry.track_index;
+    out_lease->tint = entry.tint;
     out_lease->slot_revision = entry.slot_revision;
     out_lease->slot_index = static_cast<uint8_t>(index);
     out_lease->dimmed_pinned = dimmed_pinned;

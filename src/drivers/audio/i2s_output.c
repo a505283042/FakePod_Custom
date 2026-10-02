@@ -18,12 +18,13 @@ static uint32_t g_sample_rate_hz = 0;
 #define I2S_NSF_DMA_DESC_NUM 16U
 // 普通 Music 的 DMA 描述符数量由统一 Rate Profile 按采样率选择。
 // NSF 单独保持 16×256，保留渲染与瀑布 SPI 争用时的既有余量；Video Exclusive 固定 8×256。
-// 这样 44.1/48kHz 普通 Music 可降到 12×256，而不回退 NSF 的稳定性保护。
+// R46.0.64 已完成 44.1/48kHz Music 8×256 实机验证；高采样率档位保持各自配置。
 #define I2S_DMA_FRAME_NUM I2S_FRAMES_PER_BLOCK
+#define I2S_SILENCE_FRAMES_PER_CHUNK 64U
 #define I2S_MAX_ZERO_PROGRESS_TIMEOUTS 3
 
-// 每帧两个 32bit 声道；正式播放和软切换统一复用这块静音缓冲。
-static uint32_t g_silence[I2S_FRAMES_PER_BLOCK * 2] = {0};
+// 静音源不需要与 DMA 单描述符等长；64帧循环写即可，常驻 Internal 从2048B降到512B。
+static uint32_t g_silence[I2S_SILENCE_FRAMES_PER_CHUNK * 2U] = {0};
 
 static esp_err_t i2s_output_create_channel(uint32_t sample_rate_hz, uint8_t dma_desc_override)
 {
@@ -102,12 +103,14 @@ static esp_err_t i2s_output_create_channel(uint32_t sample_rate_hz, uint8_t dma_
     const uint32_t dma_runway_us = (uint32_t)(
         ((uint64_t)dma_desc_num * I2S_DMA_FRAME_NUM * 1000000ULL) / sample_rate_hz
     );
-    ESP_LOGI(TAG, "DMA配置：%d个描述符 × %d帧，单缓冲=%u字节，总缓冲约=%lu.%03lums",
+    ESP_LOGI(TAG, "DMA配置：%d个描述符 × %d帧，单DMA缓冲=%u字节，总缓冲约=%lu.%03lums，silence_chunk=%u帧/%u字节",
         dma_desc_num,
         I2S_DMA_FRAME_NUM,
-        (unsigned)sizeof(g_silence),
+        (unsigned)(I2S_DMA_FRAME_NUM * 2U * sizeof(uint32_t)),
         (unsigned long)(dma_runway_us / 1000U),
-        (unsigned long)(dma_runway_us % 1000U));
+        (unsigned long)(dma_runway_us % 1000U),
+        (unsigned)I2S_SILENCE_FRAMES_PER_CHUNK,
+        (unsigned)sizeof(g_silence));
 #endif
     return ESP_OK;
 }
@@ -219,7 +222,9 @@ esp_err_t i2s_output_stream_write_silence(size_t frames, uint32_t timeout_ms)
     }
 
     while (frames > 0) {
-        size_t chunk = frames > I2S_FRAMES_PER_BLOCK ? I2S_FRAMES_PER_BLOCK : frames;
+        size_t chunk = frames > I2S_SILENCE_FRAMES_PER_CHUNK
+            ? I2S_SILENCE_FRAMES_PER_CHUNK
+            : frames;
         esp_err_t ret = i2s_output_write_all(
             g_silence,
             chunk * 2U * sizeof(uint32_t),

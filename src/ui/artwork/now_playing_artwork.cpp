@@ -17,6 +17,7 @@
 #include "font/font_manager.h"
 #include "media_catalog_v2.h"
 #include "media_library.h"
+#include "system/system_loop.h"
 #include "player_state.h"
 #include "ui_common.h"
 
@@ -618,6 +619,15 @@ static void artwork_ui_sync_context(bool force)
         return;
     }
 
+    // CoverSurface 的 snapshot 会被下一首磁带预取覆盖；当前曲若已被 system_loop 判为
+    // 永久尺寸/预算拒绝，恢复 Artwork 时直接使用固定默认封面，不再等待已经不存在的 dimmed Surface。
+    if (system_artwork_current_uses_default_fallback(track_index)) {
+        artwork_ui_release_transition_hold();
+        artwork_ui_release_all_sources();
+        artwork_ui_show_no_artwork_fallback();
+        return;
+    }
+
     // R.22：有真实封面时先尝试新曲最终 Surface。命中时会“先 acquire 新、后 release 旧”。
     // 未命中时绝不先释放旧封面，也不显示“准备封面”。
     if (cover_surface_cache_is_ready() && artwork_ui_apply_surface(track_index)) return;
@@ -760,6 +770,13 @@ void now_playing_artwork_update()
     // 不再消费 CoverSurface/ArtworkLoader 状态，避免旧状态把它误切成“封面不可显示”。
     if (!g_context_has_artwork) return;
 
+    if (system_artwork_current_uses_default_fallback(g_context_track)) {
+        artwork_ui_release_transition_hold();
+        artwork_ui_release_all_sources();
+        artwork_ui_show_no_artwork_fallback();
+        return;
+    }
+
     // 先直接查当前曲最终 RGB565 Surface。显示正确性以 cache 命中为准，
     // 不依赖 UI 必须消费某一次 Ready Snapshot。
     if (cover_surface_cache_is_ready() && !artwork_ui_source_matches_context()) {
@@ -783,11 +800,22 @@ void now_playing_artwork_update()
                 } else if (surface.state == CoverSurfaceState::Preparing) {
                     if (!artwork_ui_source_matches_context()) artwork_ui_show_waiting_without_placeholder();
                 } else if (surface.state == CoverSurfaceState::Failed) {
-                    // progressive JPEG 等无法走 esp_new_jpeg 时保留旧 decoder 兼容能力。
-                    if (!artwork_ui_source_matches_context() &&
-                        !artwork_ui_apply_compressed_fallback(g_context_track)) {
+                    if (surface.result == ESP_ERR_INVALID_SIZE) {
+                        // 大尺寸/PSRAM预算拒绝不再让 LVGL 二次展开同一张大图。
+                        // 先释放压缩/Surface lease，再回收未 pin 原图并显示固定默认封面。
+                        artwork_ui_release_transition_hold();
                         artwork_ui_release_all_sources();
-                        artwork_ui_show_placeholder("封面不可显示");
+                        artwork_loader_discard_unpinned();
+                        artwork_ui_show_no_artwork_fallback();
+                        ESP_LOGW(TAG, "当前曲大封面已降级默认封面：track=%lu，压缩原图已释放",
+                            static_cast<unsigned long>(g_context_track));
+                    } else {
+                        // progressive JPEG 等无法走 esp_new_jpeg 时保留旧 decoder 兼容能力。
+                        if (!artwork_ui_source_matches_context() &&
+                            !artwork_ui_apply_compressed_fallback(g_context_track)) {
+                            artwork_ui_release_all_sources();
+                            artwork_ui_show_placeholder("封面不可显示");
+                        }
                     }
                 }
             }

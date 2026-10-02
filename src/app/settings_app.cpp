@@ -27,6 +27,7 @@
 #include "sdcard.h"
 #include "storage_io.h"
 #include "usb_storage_service.h"
+#include "wifi_service.h"
 #include "artwork_loader.h"
 #include "lyrics/lyrics_service.h"
 #include "media_library.h"
@@ -1537,6 +1538,11 @@ static void bluetooth_switch_click_cb(lv_event_t *event)
 {
     if (!click_is_valid(event) || g_page != SettingsPage::Connection) return;
 
+    if (wifi_service_owns_radio()) {
+        ESP_LOGW(TAG, "Wi-Fi正在接管无线链路，暂不允许手动切换BLE");
+        return;
+    }
+
     DeviceSettingsSnapshot settings = {};
     if (!device_settings_get_snapshot(&settings)) return;
 
@@ -1547,6 +1553,7 @@ static void bluetooth_switch_click_cb(lv_event_t *event)
         return;
     }
 
+    wifi_service_set_ble_fallback_enabled(requested);
     ble_remote_service_set_enabled(requested);
     ble_remote_service_update();
 
@@ -1579,7 +1586,19 @@ static void create_connection_page(const DeviceSettingsSnapshot &settings)
         ble_value = ble_remote_service_state_name(ble.state);
     }
     add_clickable_detail_row(2, "蓝牙开关", ble_value, SettingsDetailIcon::Bluetooth, bluetooth_switch_click_cb);
-    add_detail_row(3, "飞行模式", "待接入", SettingsDetailIcon::Airplane, false);
+    WifiServiceSnapshot wifi = {};
+    char wifi_value[64] = "未配置";
+    if (wifi_service_get_snapshot(&wifi)) {
+        if (wifi.connected && wifi.ssid[0] != '\0') {
+            snprintf(wifi_value, sizeof(wifi_value), "已连接 %.40s", wifi.ssid);
+        } else if (wifi.configured && wifi.ssid[0] != '\0' &&
+            wifi.state == WifiServiceState::ConfiguredIdle) {
+            snprintf(wifi_value, sizeof(wifi_value), "已保存 %.40s", wifi.ssid);
+        } else {
+            snprintf(wifi_value, sizeof(wifi_value), "%s", wifi_service_state_name(wifi.state));
+        }
+    }
+    add_detail_row(3, "Wi-Fi", wifi_value, SettingsDetailIcon::Airplane);
 }
 
 static PlayerFolderScope player_folder_scope_from_setting(DeviceMusicListScope scope)
@@ -2193,6 +2212,18 @@ static void refresh_timer_cb(lv_timer_t *timer)
             if (g_detail_values[2] != nullptr) {
                 lv_label_set_text(g_detail_values[2], ble_remote_service_state_name(ble.state));
             }
+        }
+        WifiServiceSnapshot wifi = {};
+        if (g_detail_values[3] != nullptr && wifi_service_get_snapshot(&wifi)) {
+            if (wifi.connected && wifi.ssid[0] != '\0') {
+                snprintf(value, sizeof(value), "已连接 %.40s", wifi.ssid);
+            } else if (wifi.configured && wifi.ssid[0] != '\0' &&
+                wifi.state == WifiServiceState::ConfiguredIdle) {
+                snprintf(value, sizeof(value), "已保存 %.40s", wifi.ssid);
+            } else {
+                snprintf(value, sizeof(value), "%s", wifi_service_state_name(wifi.state));
+            }
+            lv_label_set_text(g_detail_values[3], value);
         }
     }
     if (g_page == SettingsPage::About) {

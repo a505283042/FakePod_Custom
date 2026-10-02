@@ -70,6 +70,7 @@ static uint32_t g_loading_generation = 0U;
 static uint32_t g_loading_track = UINT32_MAX;
 static LyricsDocument g_document = {};
 
+
 static void *lyrics_psram_alloc(size_t bytes)
 {
     if (bytes == 0U) {

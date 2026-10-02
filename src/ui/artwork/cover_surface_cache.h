@@ -34,6 +34,18 @@ struct CoverSurfaceSnapshot
     bool cache_hit = false;
 };
 
+// 封面在首次解码/缩放同一轮顺手完成主色统计；磁带层只消费结果，不再二次扫描 460x460 Surface。
+struct CoverSurfaceTint
+{
+    bool ready = false;
+    bool chromatic = false;
+    uint8_t r = 0U;
+    uint8_t g = 0U;
+    uint8_t b = 0U;
+    uint16_t hue = 0U;
+    uint32_t samples = 0U;
+};
+
 struct CoverSurfaceLease
 {
     const uint8_t *normal_rgb565 = nullptr;
@@ -43,6 +55,7 @@ struct CoverSurfaceLease
     uint16_t height = 0;
     uint32_t catalog_generation = 0;
     uint32_t track_index = UINT32_MAX;
+    CoverSurfaceTint tint = {};
 
     uint32_t slot_revision = 0;
     uint8_t slot_index = 0xFFU;

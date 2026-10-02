@@ -5,13 +5,13 @@
 
 #include "sdkconfig.h"
 #include "esp_log.h"
-#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "audio_service.h"
 #include "battery_service.h"
 #include "media_catalog_v2.h"
 #include "player_control.h"
+#include "wifi_service.h"
 #include "app/video_app.h"
 #include "app/visual_music_app.h"
 
@@ -74,6 +74,9 @@ static constexpr TickType_t kStatusResyncInterval = pdMS_TO_TICKS(15000);
 static constexpr TickType_t kStatusEventPollInterval = pdMS_TO_TICKS(250);
 // R46.0.52：Notify无确认；每轮元数据完整发送后延迟重放一次，补首连窗口的丢包。
 static constexpr TickType_t kMetadataReplayDelay = pdMS_TO_TICKS(750);
+// R46.0.55：复用现有加密 Command Characteristic 分片下发 Wi-Fi 凭据，避免新增GATT句柄触发Android缓存。
+static constexpr uint8_t kWifiProvisionCommand = 0x20U;
+static constexpr size_t kWifiProvisionMaxBytes = 96U; // SSID<=32 + NUL + password<=63
 static const ble_uuid128_t kControlServiceUuid = BLE_UUID128_INIT(
     0x64, 0x6F, 0x50, 0x46, 0x6D, 0x0E, 0x3A, 0x8F,
     0x68, 0x4B, 0x4F, 0x2B, 0x10, 0x9C, 0x7A, 0x7D);
@@ -114,6 +117,11 @@ static uint8_t g_metadata_chunk_count = 0U;
 static uint8_t g_metadata_send_pass = 0U; // 0=首发，1=可靠性补发
 static TickType_t g_metadata_replay_due_tick = 0;
 
+static bool g_wifi_provision_active = false;
+static uint8_t g_wifi_provision_transaction = 0U;
+static uint8_t g_wifi_provision_total = 0U;
+static uint8_t g_wifi_provision_next_offset = 0U;
+static uint8_t g_wifi_provision_payload[kWifiProvisionMaxBytes] = {};
 
 static struct ble_gatt_chr_def g_control_chrs[3] = {};
 static struct ble_gatt_svc_def g_control_svcs[2] = {};
@@ -527,6 +535,88 @@ static void update_phone_state_notify(TickType_t now)
     (void)send_next_metadata_chunk(conn_handle);
 }
 
+static void reset_wifi_provision_assembly()
+{
+    g_wifi_provision_active = false;
+    g_wifi_provision_transaction = 0U;
+    g_wifi_provision_total = 0U;
+    g_wifi_provision_next_offset = 0U;
+    memset(g_wifi_provision_payload, 0, sizeof(g_wifi_provision_payload));
+}
+
+static int handle_wifi_provision_fragment(const uint8_t *payload, size_t payload_len)
+{
+    // Packet: 0x20, transaction, total_bytes, offset, <=16B payload.
+    if (payload == nullptr || payload_len < 5U || payload_len > 20U) {
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    }
+
+    const uint8_t transaction = payload[1];
+    const uint8_t total = payload[2];
+    const uint8_t offset = payload[3];
+    const size_t chunk_size = payload_len - 4U;
+    if (total < 2U || total > kWifiProvisionMaxBytes ||
+        offset >= total || static_cast<size_t>(offset) + chunk_size > total) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    if (offset == 0U) {
+        reset_wifi_provision_assembly();
+        g_wifi_provision_active = true;
+        g_wifi_provision_transaction = transaction;
+        g_wifi_provision_total = total;
+    } else if (!g_wifi_provision_active ||
+        transaction != g_wifi_provision_transaction ||
+        total != g_wifi_provision_total ||
+        offset != g_wifi_provision_next_offset) {
+        ESP_LOGW(TAG, "BLE Wi-Fi配网分片乱序：tx=%u total=%u offset=%u expected=%u",
+            static_cast<unsigned>(transaction),
+            static_cast<unsigned>(total),
+            static_cast<unsigned>(offset),
+            static_cast<unsigned>(g_wifi_provision_next_offset));
+        reset_wifi_provision_assembly();
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    memcpy(&g_wifi_provision_payload[offset], &payload[4], chunk_size);
+    g_wifi_provision_next_offset = static_cast<uint8_t>(offset + chunk_size);
+    if (g_wifi_provision_next_offset < g_wifi_provision_total) return 0;
+
+    size_t separator = 0U;
+    while (separator < g_wifi_provision_total && g_wifi_provision_payload[separator] != 0U) {
+        ++separator;
+    }
+    if (separator == 0U || separator > 32U || separator >= g_wifi_provision_total) {
+        reset_wifi_provision_assembly();
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    const size_t password_len = static_cast<size_t>(g_wifi_provision_total) - separator - 1U;
+    if (password_len > 63U) {
+        reset_wifi_provision_assembly();
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    char ssid[33] = {};
+    char password[64] = {};
+    memcpy(ssid, g_wifi_provision_payload, separator);
+    if (password_len > 0U) {
+        memcpy(password, &g_wifi_provision_payload[separator + 1U], password_len);
+    }
+
+    const esp_err_t ret = wifi_service_submit_credentials(ssid, password);
+    reset_wifi_provision_assembly();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "BLE Wi-Fi配网提交失败：ssid=%s ret=%s", ssid, esp_err_to_name(ret));
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    ESP_LOGI(TAG, "BLE Wi-Fi配网接收完成：ssid=%s password=%uB；即将关闭BLE并连接Wi-Fi",
+        ssid,
+        static_cast<unsigned>(password_len));
+    return 0;
+}
+
 static int control_command_access(
     uint16_t conn_handle,
     uint16_t,
@@ -538,16 +628,22 @@ static int control_command_access(
     }
 
     const size_t payload_len = OS_MBUF_PKTLEN(ctxt->om);
-    if (payload_len != 1U && payload_len != 2U) {
-        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
-    }
+    if (payload_len < 1U || payload_len > 20U) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
 
-    uint8_t payload[2] = {};
+    uint8_t payload[20] = {};
     if (os_mbuf_copydata(ctxt->om, 0, payload_len, payload) != 0) {
         return BLE_ATT_ERR_UNLIKELY;
     }
 
     const uint8_t command = payload[0];
+    if (command == kWifiProvisionCommand) {
+        return handle_wifi_provision_fragment(payload, payload_len);
+    }
+
+    if (payload_len != 1U && payload_len != 2U) {
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    }
+
     const bool absolute_volume = command == 0x06U;
     if (absolute_volume) {
         if (payload_len != 2U) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
@@ -562,8 +658,6 @@ static int control_command_access(
         return BLE_ATT_ERR_UNLIKELY;
     }
 
-    // R46.0.21：0x06 直接提交绝对音量；一次拖动松手只产生一次 GATT Write。
-    // player_control 已负责跨任务串行化；BLE HostTask 这里只复用现有本机控制入口。
     const bool ok = execute_control_command(command, payload[1]);
     if (!ok) {
         ESP_LOGW(TAG, "BLE手机控制执行失败：handle=%u command=0x%02X %s",
@@ -633,18 +727,6 @@ static bool should_advertise()
     return allowed;
 }
 
-static void log_ble_ram(const char *stage)
-{
-    ESP_LOGI(
-        TAG,
-        "RAM_TRACE: %s internal=%u min=%u largest=%u dma=%u psram=%u",
-        stage,
-        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
-        static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
-        static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
-        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
-        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
-}
 
 static int start_advertising();
 
@@ -686,7 +768,6 @@ static int gap_event_cb(struct ble_gap_event *event, void *)
                 set_state_locked(BleRemoteState::Connected);
                 portEXIT_CRITICAL(&g_lock);
                 ESP_LOGI(TAG, "手机已连接：handle=%u", static_cast<unsigned>(event->connect.conn_handle));
-                log_ble_ram("connected");
             } else {
                 ESP_LOGW(TAG, "BLE连接尝试失败：status=%d；恢复广播", event->connect.status);
                 restart_advertising_or_retry("connect_failed");
@@ -711,7 +792,6 @@ static int gap_event_cb(struct ble_gap_event *event, void *)
             }
             portEXIT_CRITICAL(&g_lock);
             ESP_LOGI(TAG, "BLE连接已断开：reason=%d", event->disconnect.reason);
-            log_ble_ram("disconnected");
             if (resume_broadcast) restart_advertising_or_retry("disconnect");
             return 0;
         }
@@ -765,7 +845,6 @@ static int gap_event_cb(struct ble_gap_event *event, void *)
                 portEXIT_CRITICAL(&g_lock);
                 ESP_LOGI(TAG, "BLE状态订阅：notify=%u",
                     static_cast<unsigned>(event->subscribe.cur_notify));
-                if (event->subscribe.cur_notify != 0U) log_ble_ram("notify_subscribed");
             }
             return 0;
 
@@ -910,7 +989,7 @@ static esp_err_t stop_stack()
     g_status_notify_due_tick = 0;
     g_status_event_poll_due_tick = 0;
     portEXIT_CRITICAL(&g_lock);
-    log_ble_ram("after_stop");
+    reset_wifi_provision_assembly();
     return ESP_OK;
 }
 
@@ -941,13 +1020,11 @@ static esp_err_t start_stack()
         CONFIG_BT_NIMBLE_MSYS_2_BLOCK_SIZE,
         CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT,
         CONFIG_BT_NIMBLE_TRANSPORT_EVT_DISCARD_COUNT);
-    log_ble_ram("before_start");
     const int init_rc = nimble_port_init();
     if (init_rc != ESP_OK) {
         ESP_LOGW(TAG, "NimBLE初始化失败：rc=%d", init_rc);
         return init_rc == ESP_ERR_NO_MEM ? ESP_ERR_NO_MEM : ESP_FAIL;
     }
-    log_ble_ram("after_nimble_init");
 
     portENTER_CRITICAL(&g_lock);
     g_stack_initialized = true;
@@ -966,6 +1043,7 @@ static esp_err_t start_stack()
     g_metadata_chunk_count = 0U;
     g_metadata_send_pass = 0U;
     g_metadata_replay_due_tick = 0;
+    reset_wifi_provision_assembly();
     memset(g_last_status_packet, 0, sizeof(g_last_status_packet));
     g_last_status_playback_revision = 0U;
     g_last_status_seek_revision = 0U;
@@ -1015,10 +1093,9 @@ static esp_err_t start_stack()
     // NimBLE 安全存储接入默认 NVS，使 Bond/LTK 在设备重启后仍可恢复。
     ble_store_config_init();
 
-    ESP_LOGI(TAG, "BLE手机控制服务已注册：6命令 + 状态Notify V1（事件驱动 + 15秒校时）");
+    ESP_LOGI(TAG, "BLE手机控制服务已注册：6媒体命令 + Wi-Fi配网分片 + 状态Notify V1");
     ESP_LOGI(TAG, "BLE安全：Bond=ON SC=ON MITM=OFF KeyDist=ENC|ID");
     nimble_port_freertos_init(host_task);
-    log_ble_ram("host_started");
     return ESP_OK;
 }
 

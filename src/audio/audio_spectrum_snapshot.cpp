@@ -28,6 +28,7 @@ constexpr uint32_t ANALYSIS_CAPTURE_HZ = 24U;
 constexpr uint8_t FFT_FRAME_SLOT_COUNT = 2U;
 constexpr uint32_t FFT_TASK_STACK_BYTES = 4096U;
 constexpr UBaseType_t FFT_TASK_PRIORITY = 1U;
+constexpr uint32_t FFT_GRACE_REUSE_MS = 2000U;
 constexpr BaseType_t FFT_TASK_CORE = 1;
 constexpr float FFT_PI = 3.14159265358979323846f;
 constexpr float FFT_REFERENCE_MAGNITUDE = 64.0f; // Bartlett窗下满幅正弦约落在该量级。
@@ -64,7 +65,16 @@ portMUX_TYPE g_spectrum_mux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE g_frame_mux = portMUX_INITIALIZER_UNLOCKED;
 AudioSpectrumSnapshot g_spectrum_snapshot = {};
 FftFrameSlot g_frame_slots[FFT_FRAME_SLOT_COUNT] = {};
-TaskHandle_t g_fft_task = nullptr;
+enum class FftTaskLifecycle : uint8_t
+{
+    Off = 0,
+    Running,
+    Grace
+};
+
+std::atomic<TaskHandle_t> g_fft_task{nullptr};
+std::atomic<FftTaskLifecycle> g_fft_lifecycle{FftTaskLifecycle::Off};
+std::atomic<TickType_t> g_fft_grace_deadline_tick{0};
 
 std::atomic<bool> g_enabled{false};
 std::atomic<uint32_t> g_enable_generation{1U};
@@ -138,7 +148,8 @@ static int16_t spectrum_mix_stereo_to_i16(int32_t left, int32_t right)
 
 static bool spectrum_submit_fft_frame(uint64_t position_frames)
 {
-    if (g_fft_task == nullptr || !g_enabled.load(std::memory_order_acquire)) {
+    TaskHandle_t fft_task = g_fft_task.load(std::memory_order_acquire);
+    if (fft_task == nullptr || !g_enabled.load(std::memory_order_acquire)) {
         return false;
     }
 
@@ -171,7 +182,7 @@ static bool spectrum_submit_fft_frame(uint64_t position_frames)
     portENTER_CRITICAL(&g_frame_mux);
     slot.state = FftFrameState::Ready;
     portEXIT_CRITICAL(&g_frame_mux);
-    xTaskNotifyGive(g_fft_task);
+    xTaskNotifyGive(fft_task);
     return true;
 }
 
@@ -344,11 +355,57 @@ static void spectrum_publish_fft_snapshot(const FftFrameSlot &frame, const uint8
 
 static void spectrum_fft_task_main(void *)
 {
+    TaskHandle_t self = xTaskGetCurrentTaskHandle();
     uint32_t logged_generation = 0U;
-    while (true) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        while (true) {
+    while (true) {
+        FftTaskLifecycle lifecycle = g_fft_lifecycle.load(std::memory_order_acquire);
+        TickType_t wait_ticks = portMAX_DELAY;
+
+        if (lifecycle == FftTaskLifecycle::Grace) {
+            const TickType_t now_tick = xTaskGetTickCount();
+            const TickType_t deadline_tick =
+                g_fft_grace_deadline_tick.load(std::memory_order_acquire);
+            const int32_t remaining_ticks =
+                static_cast<int32_t>(deadline_tick - now_tick);
+            if (remaining_ticks <= 0) {
+                FftTaskLifecycle expected = FftTaskLifecycle::Grace;
+                if (g_fft_lifecycle.compare_exchange_strong(
+                        expected, FftTaskLifecycle::Off,
+                        std::memory_order_acq_rel, std::memory_order_acquire)) {
+                    break;
+                }
+                continue;
+            }
+
+            wait_ticks = static_cast<TickType_t>(remaining_ticks);
+        } else if (lifecycle == FftTaskLifecycle::Off) {
+            break;
+        }
+
+        const uint32_t notified = ulTaskNotifyTake(pdTRUE, wait_ticks);
+        lifecycle = g_fft_lifecycle.load(std::memory_order_acquire);
+
+        if (lifecycle == FftTaskLifecycle::Grace) {
+            const TickType_t now_tick = xTaskGetTickCount();
+            const TickType_t deadline_tick =
+                g_fft_grace_deadline_tick.load(std::memory_order_acquire);
+            if (notified == 0U &&
+                static_cast<int32_t>(now_tick - deadline_tick) >= 0) {
+                FftTaskLifecycle expected = FftTaskLifecycle::Grace;
+                if (g_fft_lifecycle.compare_exchange_strong(
+                        expected, FftTaskLifecycle::Off,
+                        std::memory_order_acq_rel, std::memory_order_acquire)) {
+                    break;
+                }
+            }
+            continue;
+        }
+        if (lifecycle != FftTaskLifecycle::Running) {
+            continue;
+        }
+
+        while (g_fft_lifecycle.load(std::memory_order_acquire) == FftTaskLifecycle::Running) {
             const int slot_index = spectrum_claim_ready_slot();
             if (slot_index < 0) {
                 break;
@@ -386,28 +443,42 @@ static void spectrum_fft_task_main(void *)
             spectrum_release_slot(slot_index);
         }
     }
+
+    TaskHandle_t expected_task = self;
+    (void)g_fft_task.compare_exchange_strong(
+        expected_task, nullptr, std::memory_order_acq_rel, std::memory_order_acquire);
+    ESP_LOGI(TAG, "SpectrumFFT 延迟回收：stack=%uB grace=%ums",
+        static_cast<unsigned>(FFT_TASK_STACK_BYTES),
+        static_cast<unsigned>(FFT_GRACE_REUSE_MS));
+    vTaskDelete(nullptr);
 }
 } // namespace
 
 esp_err_t audio_spectrum_snapshot_start()
 {
-    if (g_fft_task != nullptr) {
+    FftTaskLifecycle expected = FftTaskLifecycle::Off;
+    if (!g_fft_lifecycle.compare_exchange_strong(
+            expected, FftTaskLifecycle::Running,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
         return ESP_OK;
     }
 
+    g_fft_grace_deadline_tick.store(0, std::memory_order_release);
+    TaskHandle_t task = nullptr;
     const BaseType_t created = xTaskCreatePinnedToCore(
         spectrum_fft_task_main,
         "SpectrumFFT",
         FFT_TASK_STACK_BYTES,
         nullptr,
         FFT_TASK_PRIORITY,
-        &g_fft_task,
+        &task,
         FFT_TASK_CORE);
-    if (created != pdPASS) {
-        g_fft_task = nullptr;
+    if (created != pdPASS || task == nullptr) {
+        g_fft_lifecycle.store(FftTaskLifecycle::Off, std::memory_order_release);
         ESP_LOGE(TAG, "创建 SpectrumFFT 任务失败");
         return ESP_ERR_NO_MEM;
     }
+    g_fft_task.store(task, std::memory_order_release);
 
     SPECTRUM_BOOT_LOGI(
         "SpectrumFFT 任务已启动：core=%d priority=%u stack=%uB N=%u capture=%uHz target=%uHz floor=-45dB",
@@ -422,13 +493,71 @@ esp_err_t audio_spectrum_snapshot_start()
 
 bool audio_spectrum_snapshot_is_ready()
 {
-    return g_fft_task != nullptr;
+    return g_fft_lifecycle.load(std::memory_order_acquire) != FftTaskLifecycle::Off;
+}
+
+static esp_err_t spectrum_fft_task_acquire()
+{
+    while (true) {
+        FftTaskLifecycle lifecycle = g_fft_lifecycle.load(std::memory_order_acquire);
+        if (lifecycle == FftTaskLifecycle::Running) {
+            return ESP_OK;
+        }
+        if (lifecycle == FftTaskLifecycle::Grace) {
+            FftTaskLifecycle expected = FftTaskLifecycle::Grace;
+            if (g_fft_lifecycle.compare_exchange_weak(
+                    expected, FftTaskLifecycle::Running,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                g_fft_grace_deadline_tick.store(0, std::memory_order_release);
+                TaskHandle_t task = g_fft_task.load(std::memory_order_acquire);
+                if (task != nullptr) {
+                    xTaskNotifyGive(task);
+                }
+                ESP_LOGI(TAG, "SpectrumFFT Grace复用：无需重建任务");
+                return ESP_OK;
+            }
+            continue;
+        }
+        return audio_spectrum_snapshot_start();
+    }
+}
+
+static void spectrum_fft_task_begin_grace()
+{
+    const TickType_t deadline_tick =
+        xTaskGetTickCount() + pdMS_TO_TICKS(FFT_GRACE_REUSE_MS);
+    g_fft_grace_deadline_tick.store(deadline_tick, std::memory_order_release);
+
+    FftTaskLifecycle lifecycle = g_fft_lifecycle.load(std::memory_order_acquire);
+    while (lifecycle == FftTaskLifecycle::Running &&
+           !g_fft_lifecycle.compare_exchange_weak(
+               lifecycle, FftTaskLifecycle::Grace,
+               std::memory_order_acq_rel, std::memory_order_acquire)) {
+    }
+
+    if (g_fft_lifecycle.load(std::memory_order_acquire) == FftTaskLifecycle::Grace) {
+        TaskHandle_t task = g_fft_task.load(std::memory_order_acquire);
+        if (task != nullptr) {
+            xTaskNotifyGive(task);
+        }
+    }
 }
 
 void audio_spectrum_snapshot_set_enabled(bool enabled)
 {
+    if (enabled) {
+        const esp_err_t start_ret = spectrum_fft_task_acquire();
+        if (start_ret != ESP_OK) {
+            ESP_LOGW(TAG, "FFT频谱按需启动失败：%s", esp_err_to_name(start_ret));
+            return;
+        }
+    }
+
     const bool previous = g_enabled.exchange(enabled, std::memory_order_acq_rel);
     if (previous == enabled) {
+        if (!enabled) {
+            spectrum_fft_task_begin_grace();
+        }
         return;
     }
 
@@ -469,6 +598,7 @@ void audio_spectrum_snapshot_set_enabled(bool enabled)
             static_cast<unsigned long>(generation),
             static_cast<unsigned long>(g_analyzed_frames.load(std::memory_order_relaxed)),
             static_cast<unsigned long>(g_dropped_frames.load(std::memory_order_relaxed)));
+        spectrum_fft_task_begin_grace();
     }
 }
 

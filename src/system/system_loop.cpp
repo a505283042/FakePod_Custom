@@ -47,7 +47,7 @@ static TickType_t g_last_persistent_observe_tick = 0;
 static TickType_t g_last_diag_tick = 0;
 #endif
 
-#if APP_DIAG_AUDIO_RAM
+// R46.0.66：RAM_MON 是正式运行期安全底线，不再依赖 Audio RAM 专项诊断开关。
 // R46.0.31: ESP-IDF minimum_free_size 是开机以来历史低水位，掉下去后不会回升。
 // 这里额外维护 60 秒窗口低水位和 <12KB 进入次数，避免把很早以前的一次峰值误判成当前泄漏。
 // 每秒采样一次；<12KB 只在“进入低水位”时计数，恢复到 >=14KB 后才重新武装，避免阈值附近抖动重复计数。
@@ -115,9 +115,6 @@ static void system_ram_low_water_monitor_update()
         g_ram_mon_below_12k_60s = 0U;
     }
 }
-#else
-static inline void system_ram_low_water_monitor_update() {}
-#endif
 
 #if APP_DIAG_FLAC_PERFORMANCE
 static uint32_t g_last_flac_perf_sequence =
@@ -145,6 +142,7 @@ static uint32_t g_artwork_context_generation = 0U;
 static uint32_t g_artwork_current_track = UINT32_MAX;
 static ArtworkCurrentStage g_artwork_stage = ArtworkCurrentStage::Idle;
 static bool g_artwork_surface_terminal_failure = false;
+static esp_err_t g_artwork_surface_terminal_result = ESP_OK;
 
 // 当前曲封面只在 SD 瞬态繁忙时退避；不再存在 next 的 750ms 慢重试。
 static constexpr TickType_t ARTWORK_CURRENT_RETRY_BASE = pdMS_TO_TICKS(200);
@@ -326,6 +324,7 @@ static void system_artwork_begin_context(uint32_t generation, uint32_t current_t
     g_artwork_current_track = current_track;
     g_artwork_stage = ArtworkCurrentStage::Idle;
     g_artwork_surface_terminal_failure = false;
+    g_artwork_surface_terminal_result = ESP_OK;
     g_artwork_retry_due_tick = 0;
     g_artwork_current_retry_count = 0U;
     g_artwork_pending_request_id = 0U;
@@ -509,18 +508,26 @@ static void system_artwork_current_update()
                 snapshot.catalog_generation != generation || snapshot.track_index != current_track) break;
             if (snapshot.state == CoverSurfaceState::Ready) {
                 g_artwork_surface_terminal_failure = false;
+                g_artwork_surface_terminal_result = ESP_OK;
                 g_artwork_stage = ArtworkCurrentStage::Complete;
             } else if (snapshot.state == CoverSurfaceState::Failed) {
                 if (snapshot.result == ESP_ERR_NO_MEM) {
                     // PSRAM 瞬态不足、两槽交换期间同时被 pin，或 cache mutex 瞬态繁忙都允许退避后重试。
                     // 特别是磁带视图退出会回收约2MiB PSRAM，当前曲无需切歌即可在后续退避周期恢复 Surface。
                     g_artwork_surface_terminal_failure = false;
+                    g_artwork_surface_terminal_result = ESP_OK;
                     system_artwork_schedule_retry(current_track);
                 } else {
-                    // 解码损坏、格式/尺寸预算等确定性失败只保留压缩图 fallback。
-                    // Complete 阶段不得每20ms重新提交同一 Surface。
+                    // 解码损坏/格式/预算等确定性失败进入终态；Complete 阶段不再重复提交。
                     g_artwork_surface_terminal_failure = true;
+                    g_artwork_surface_terminal_result = snapshot.result;
                     g_artwork_stage = ArtworkCurrentStage::Complete;
+                    if (snapshot.result == ESP_ERR_INVALID_SIZE) {
+                        // CoverTask 已关闭 decoder/source；再释放无人持有的压缩原图 PSRAM。
+                        artwork_loader_discard_unpinned();
+                        ESP_LOGW(TAG, "当前曲封面超出Surface预算：track=%lu，停止重试并释放压缩原图",
+                            static_cast<unsigned long>(current_track));
+                    }
                 }
             }
             break;
@@ -545,6 +552,16 @@ static void system_artwork_current_update()
         default:
             break;
     }
+}
+
+
+bool system_artwork_current_uses_default_fallback(uint32_t track_index)
+{
+    return track_index != UINT32_MAX &&
+        g_artwork_current_track == track_index &&
+        g_artwork_context_generation == media_catalog_v2_generation() &&
+        g_artwork_surface_terminal_failure &&
+        g_artwork_surface_terminal_result == ESP_ERR_INVALID_SIZE;
 }
 
 

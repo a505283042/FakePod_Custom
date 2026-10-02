@@ -35,15 +35,16 @@ static inline bool audio_rate_profile_get(uint32_t sample_rate_hz, AudioRateProf
         case 44100U:
             profile.sample_rate_hz = 44100U;
             profile.cs43131_asp_sprate = 0x01U;
-            // 普通 Music 使用 12×256；电子音流 NSF 仍由专用 I2S override 保持 16×256，
-            // 避免为了 NSF 的渲染/SPI 争用余量，让所有 44.1kHz 音乐常驻多占约 8KB DMA。
-            profile.i2s_dma_desc_num = 12U;
+            // R46.0.61 Trial：普通 44.1kHz Music 暂降为 8×256，并用 I2S 写入遥测验证余量；
+            // NSF 仍由专用 override 保持 16×256，高采样率档位不随本轮调整。
+            profile.i2s_dma_desc_num = 8U;
             profile.flac_stage_enabled = true;
             break;
         case 48000U:
             profile.sample_rate_hz = 48000U;
             profile.cs43131_asp_sprate = 0x02U;
-            profile.i2s_dma_desc_num = 12U;
+            // R46.0.61 Trial：48kHz 普通 Music 同步测试 8×256；失败则回退到 10×256。
+            profile.i2s_dma_desc_num = 8U;
             profile.flac_stage_enabled = true;
             break;
         case 88200U:

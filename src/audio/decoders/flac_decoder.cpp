@@ -2330,6 +2330,7 @@ static esp_err_t flac_decoder_prepare_runtime(
         return ESP_ERR_INVALID_ARG;
     }
 
+
     esp_err_t ret = flac_validate_sink_format(decoder);
     if (ret != ESP_OK) {
         flac_decoder_close(decoder);
