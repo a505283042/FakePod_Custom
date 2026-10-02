@@ -164,25 +164,45 @@ void system_runtime_update()
             esp_err_to_name(device_settings_ret));
     }
     if (wifi_ret != ESP_OK) {
-        ESP_LOGW(TAG, "Wi-Fi服务初始化失败：%s；保持BLE模式", esp_err_to_name(wifi_ret));
+        ESP_LOGW(TAG, "Wi-Fi服务初始化失败：%s；本次不启动Wi-Fi", esp_err_to_name(wifi_ret));
     }
     if (device_settings_ret == ESP_OK) {
         DeviceSettingsSnapshot settings_snapshot = {};
         if (device_settings_get_snapshot(&settings_snapshot)) {
-            wifi_service_set_ble_fallback_enabled(settings_snapshot.ble_enabled);
-            bool wifi_boot_requested = false;
-            if (wifi_ret == ESP_OK && wifi_service_has_credentials()) {
-                const esp_err_t connect_ret = wifi_service_connect_saved();
-                wifi_boot_requested = connect_ret == ESP_OK;
-                if (wifi_boot_requested) {
-                    ESP_LOGI(TAG, "开机无线策略：已有Wi-Fi配置，跳过BLE启动并直接连接Wi-Fi");
+            // R46.0.68：旧版没有 Wi-Fi 开关键，只要保存过凭据就会自动接管。首次升级时仅迁移一次，
+            // 把旧的实际启动行为固化为 Wi-Fi=ON / BLE=OFF；之后严格按两个保存开关恢复。
+            if (wifi_ret == ESP_OK && !device_settings_wifi_enabled_is_explicit() &&
+                wifi_service_has_credentials()) {
+                const esp_err_t migrate_ret = device_settings_set_wireless_enabled(false, true);
+                if (migrate_ret == ESP_OK) {
+                    (void)device_settings_get_snapshot(&settings_snapshot);
+                    ESP_LOGI(TAG, "无线设置迁移：旧版已保存Wi-Fi凭据 -> Wi-Fi=开 BLE=关");
                 } else {
-                    ESP_LOGW(TAG, "开机Wi-Fi任务启动失败：%s；恢复BLE启动路径",
-                        esp_err_to_name(connect_ret));
+                    // NVS 偶发写失败时本次仍保持旧版实际行为，避免一次升级突然切到 BLE。
+                    settings_snapshot.ble_enabled = false;
+                    settings_snapshot.wifi_enabled = true;
+                    ESP_LOGW(TAG, "无线设置迁移保存失败：%s；本次临时保持Wi-Fi启动",
+                        esp_err_to_name(migrate_ret));
                 }
             }
-            if (!wifi_boot_requested) {
+
+            wifi_service_set_ble_fallback_enabled(settings_snapshot.ble_enabled);
+            if (settings_snapshot.wifi_enabled) {
+                if (wifi_ret == ESP_OK && wifi_service_has_credentials()) {
+                    const esp_err_t connect_ret = wifi_service_connect_saved();
+                    if (connect_ret == ESP_OK) {
+                        ESP_LOGI(TAG, "开机无线策略：保存状态 Wi-Fi=开 BLE=关，启动Wi-Fi");
+                    } else {
+                        ESP_LOGW(TAG, "开机Wi-Fi任务启动失败：%s；保持保存状态，不自动开启BLE",
+                            esp_err_to_name(connect_ret));
+                    }
+                } else {
+                    ESP_LOGW(TAG, "开机无线策略：Wi-Fi=开但尚无有效凭据；BLE保持关闭");
+                }
+            } else {
                 ble_remote_service_set_enabled(settings_snapshot.ble_enabled);
+                ESP_LOGI(TAG, "开机无线策略：Wi-Fi=关 BLE=%s",
+                    settings_snapshot.ble_enabled ? "开" : "关");
             }
 
             const esp_err_t brightness_ret =

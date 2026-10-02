@@ -19,7 +19,7 @@ enum class SettingsDetailIcon : uint8_t {
     Usb,
     TfFiles,
     Bluetooth,
-    Airplane,
+    Wifi,
     Startup,
     Music,
     Video,

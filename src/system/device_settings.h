@@ -49,6 +49,7 @@ struct DeviceSettingsSnapshot {
     bool loaded_from_nvs = false;
     DeviceUsbMode usb_mode = DeviceUsbMode::Serial;
     bool ble_enabled = false;
+    bool wifi_enabled = false;
     DeviceAudioOutputMode audio_output_mode = DeviceAudioOutputMode::NormalHeadphones;
     uint8_t brightness_level = 60U;          // CO5300 正常显示亮度 5~100%；0 保留给熄屏。
     DeviceAuxKeyMode aux_key_mode = DeviceAuxKeyMode::Volume;
@@ -68,10 +69,14 @@ esp_err_t device_settings_init();
 bool device_settings_get_snapshot(DeviceSettingsSnapshot *out_snapshot);
 // 轻量查询：Settings 未就绪时沿用历史默认行为（记住音量=true），避免调用方复制完整快照到栈。
 bool device_settings_remember_volume_enabled();
+// R46.0.68 迁移辅助：旧版 Settings V1 尚无 Wi-Fi 开关键。
+bool device_settings_wifi_enabled_is_explicit();
 
 // 后续功能模块统一通过这些 setter 修改设置；每次只提交一个很小的 NVS 事务。
 esp_err_t device_settings_set_usb_mode(DeviceUsbMode mode);
 esp_err_t device_settings_set_ble_enabled(bool enabled);
+// 原子保存互斥无线意图：允许 BLE/Wi-Fi 都关闭，但不允许同时开启。
+esp_err_t device_settings_set_wireless_enabled(bool ble_enabled, bool wifi_enabled);
 esp_err_t device_settings_set_audio_output_mode(DeviceAudioOutputMode mode);
 esp_err_t device_settings_set_brightness_level(uint8_t level);
 esp_err_t device_settings_set_aux_key_mode(DeviceAuxKeyMode mode);

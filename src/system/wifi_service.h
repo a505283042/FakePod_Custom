@@ -5,7 +5,7 @@
 #include "esp_err.h"
 
 // R46.0.55：Wi-Fi STA 生命周期服务。
-// 无线策略固定为互斥：启动 Wi-Fi 前必须完整停止 BLE；Wi-Fi 失败/掉线恢复失败后再恢复 BLE。
+// 无线策略固定为互斥：启动 Wi-Fi 前必须完整停止 BLE；关闭 Wi-Fi 后是否恢复 BLE 由已保存的 BLE 开关决定。
 enum class WifiServiceState : uint8_t {
     Unconfigured = 0,
     ConfiguredIdle,
@@ -33,11 +33,14 @@ struct WifiServiceSnapshot {
 esp_err_t wifi_service_init();
 void wifi_service_update();
 
-// Device Settings 的 BLE 开关同时作为 Wi-Fi 失败时是否恢复 BLE 的用户偏好。
+// Device Settings 的 BLE 开关决定 Wi-Fi 收尾后是否恢复 BLE。
 void wifi_service_set_ble_fallback_enabled(bool enabled);
 
-// 开机有已保存凭据时调用；不会启动 BLE，而是直接尝试 Wi-Fi。
+// 已保存 Wi-Fi 开关为 ON 时调用；启动前会完整停止 BLE。
 esp_err_t wifi_service_connect_saved();
+
+// 异步关闭 Wi-Fi Remote + STA/driver/netif。若 BLE 保存状态为 ON，清理完成后再恢复 BLE。
+esp_err_t wifi_service_stop();
 
 // 由 BLE 配网收包完成后提交。函数只复制到 RAM 并创建 Internal-RAM Worker；
 // NVS 写入、BLE 关闭和 Wi-Fi 初始化都不在 NimBLE HostTask 上执行。
