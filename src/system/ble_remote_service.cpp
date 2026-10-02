@@ -72,6 +72,8 @@ static constexpr size_t kMetadataChunkDataBytes = 14U;
 static constexpr size_t kMetadataMaxBytes = 196U;
 static constexpr TickType_t kStatusResyncInterval = pdMS_TO_TICKS(15000);
 static constexpr TickType_t kStatusEventPollInterval = pdMS_TO_TICKS(250);
+// R46.0.52：Notify无确认；每轮元数据完整发送后延迟重放一次，补首连窗口的丢包。
+static constexpr TickType_t kMetadataReplayDelay = pdMS_TO_TICKS(750);
 static const ble_uuid128_t kControlServiceUuid = BLE_UUID128_INIT(
     0x64, 0x6F, 0x50, 0x46, 0x6D, 0x0E, 0x3A, 0x8F,
     0x68, 0x4B, 0x4F, 0x2B, 0x10, 0x9C, 0x7A, 0x7D);
@@ -109,6 +111,8 @@ static char g_metadata_payload[kMetadataMaxBytes + 1U] = {};
 static size_t g_metadata_size = 0U;
 static uint8_t g_metadata_chunk_index = 0U;
 static uint8_t g_metadata_chunk_count = 0U;
+static uint8_t g_metadata_send_pass = 0U; // 0=首发，1=可靠性补发
+static TickType_t g_metadata_replay_due_tick = 0;
 
 
 static struct ble_gatt_chr_def g_control_chrs[3] = {};
@@ -243,6 +247,8 @@ static void queue_metadata_text(
     g_metadata_chunk_count = static_cast<uint8_t>(
         (g_metadata_size + kMetadataChunkDataBytes - 1U) / kMetadataChunkDataBytes);
     if (g_metadata_chunk_count == 0U) g_metadata_chunk_count = 1U;
+    g_metadata_send_pass = 0U;
+    g_metadata_replay_due_tick = 0;
 }
 
 static void queue_metadata(uint32_t track_index, uint32_t catalog_generation)
@@ -433,6 +439,9 @@ static bool send_next_metadata_chunk(uint16_t conn_handle)
     if (rc != 0) return true;
 
     ++g_metadata_chunk_index;
+    if (g_metadata_chunk_index >= g_metadata_chunk_count && g_metadata_send_pass == 0U) {
+        g_metadata_replay_due_tick = xTaskGetTickCount() + kMetadataReplayDelay;
+    }
     return g_metadata_chunk_index < g_metadata_chunk_count;
 }
 
@@ -467,6 +476,19 @@ static void update_phone_state_notify(TickType_t now)
         g_metadata_source_initialized = false;
         g_metadata_chunk_index = 0U;
         g_metadata_chunk_count = 0U;
+        g_metadata_send_pass = 0U;
+        g_metadata_replay_due_tick = 0;
+    }
+
+    if (g_metadata_send_pass == 0U && g_metadata_chunk_count > 0U &&
+        g_metadata_chunk_index >= g_metadata_chunk_count &&
+        g_metadata_replay_due_tick != 0 && tick_due(now, g_metadata_replay_due_tick)) {
+        g_metadata_send_pass = 1U;
+        g_metadata_chunk_index = 0U;
+        g_metadata_replay_due_tick = 0;
+        ESP_LOGI(TAG, "BLE元数据可靠性补发：seq=%u chunks=%u",
+            static_cast<unsigned>(g_metadata_sequence),
+            static_cast<unsigned>(g_metadata_chunk_count));
     }
 
     const bool resync_due = resync_due_tick == 0 || tick_due(now, resync_due_tick);
@@ -942,6 +964,8 @@ static esp_err_t start_stack()
     g_metadata_source_initialized = false;
     g_metadata_chunk_index = 0U;
     g_metadata_chunk_count = 0U;
+    g_metadata_send_pass = 0U;
+    g_metadata_replay_due_tick = 0;
     memset(g_last_status_packet, 0, sizeof(g_last_status_packet));
     g_last_status_playback_revision = 0U;
     g_last_status_seek_revision = 0U;
