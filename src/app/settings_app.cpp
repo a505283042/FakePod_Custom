@@ -37,6 +37,7 @@
 #include "screen_lock_simple.h"
 #include "settings_menu_icons.h"
 #include "ui/screens/cassette_view.h"
+#include "ui/screens/library_view.h"
 #include "ui_common.h"
 
 static const char *TAG = "设置APP";
@@ -1951,6 +1952,7 @@ static void music_player_commit_on_exit()
         if (ret == ESP_OK) {
             g_music_source_saved = requested;
             g_music_source_pending = requested;
+            library_view_on_library_source_changed(requested);
             ESP_LOGI(TAG, "退出设置保存曲库来源：%s；当前播放保持不变",
                 device_settings_music_library_source_name(requested));
         } else {

@@ -14,6 +14,9 @@ void library_view_open();
 bool library_view_open_nas(DeviceMusicListScope scope);
 bool library_view_is_nas_source();
 void library_view_close_nas();
+// R46.0.76：设置保存曲库来源后同步回收非当前 NAS 索引；
+// NAS 选中时 Catalog 跨 UI 关闭常驻，避免每次主页下拉重新读 1.17MB。
+void library_view_on_library_source_changed(DeviceMusicLibrarySource source);
 bool library_view_is_visible();
 
 // APP 切换专用：仅隐藏曲库并停止惯性，不调用 HomeResume，避免 Music 已进入后台时反向唤醒主页。

@@ -315,7 +315,7 @@ struct LibrarySuspendedLocalState
 };
 
 // R46.0.75：本地/NAS 共享一套 UI，但各自保留轻量浏览位置。
-// 只保存状态，不保存 SearchKey/匹配数组；NAS Catalog 关闭后仍完整释放，下一次按需重建。
+// 只保存状态，不保存 SearchKey/匹配数组；R46.0.76 起当前选中的 NAS Catalog 跨 UI 关闭常驻。
 struct LibraryRememberedSourceState
 {
     bool valid = false;
@@ -3394,6 +3394,19 @@ bool library_view_open_nas(DeviceMusicListScope scope)
 {
     if (g_root == nullptr) return false;
 
+    if (nas_library_source_ready()) {
+        const PlayerFolderScope requested_scope = library_folder_scope_from_setting(scope);
+        (void)nas_library_source_set_folder_scope(requested_scope);
+        g_nas_load_elapsed_ms = 0U;
+        g_nas_load_stack_hwm = 0U;
+        ESP_LOGI(TAG,
+            "NAS曲库命中常驻索引：tracks=%lu psram=%uB，不重复读取TF",
+            static_cast<unsigned long>(nas_library_source_track_count()),
+            static_cast<unsigned>(nas_library_source_psram_bytes()));
+        library_view_activate_nas_ui();
+        return true;
+    }
+
     taskENTER_CRITICAL(&g_nas_load_lock);
     const bool already_running = g_nas_load_running;
     if (!already_running) {
@@ -3409,7 +3422,6 @@ bool library_view_open_nas(DeviceMusicListScope scope)
     if (library_source_is_nas()) {
         library_remember_current_source_state();
         library_search_release_cache();
-        nas_library_source_close();
         g_source = LibraryDataSource::Local;
     }
 
@@ -3463,7 +3475,12 @@ void library_view_close_nas()
     quick_index_keyboard_set_visible(&g_search_keyboard, false);
     if (g_root != nullptr) lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
     library_search_release_cache();
-    nas_library_source_close();
+
+    const bool keep_nas_resident =
+        device_settings_music_library_source() == DeviceMusicLibrarySource::Nas;
+    if (!keep_nas_resident) {
+        nas_library_source_close();
+    }
     g_source = LibraryDataSource::Local;
     g_nas_selected_track = UINT32_MAX;
     g_gesture = {};
@@ -3476,11 +3493,44 @@ void library_view_close_nas()
         g_search.match_count = 0U;
     }
     screen_lock_simple_raise();
-    ESP_LOGI(TAG,
-        "NAS共享曲库UI已关闭：Catalog/Search PSRAM已释放；浏览状态=%uB PSRAM internal=%u psram=%u",
-        static_cast<unsigned>(g_nas_remembered_state != nullptr ? sizeof(LibraryRememberedSourceState) : 0U),
-        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
-        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+    const unsigned remembered_state_bytes =
+        static_cast<unsigned>(g_nas_remembered_state != nullptr ? sizeof(LibraryRememberedSourceState) : 0U);
+    const unsigned internal_free =
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    const unsigned psram_free =
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    if (keep_nas_resident) {
+        ESP_LOGI(TAG,
+            "NAS共享曲库UI已关闭：Search已释放，NAS Catalog保持PSRAM常驻；浏览状态=%uB internal=%u psram=%u",
+            remembered_state_bytes,
+            internal_free,
+            psram_free);
+    } else {
+        ESP_LOGI(TAG,
+            "NAS共享曲库UI已关闭：Catalog/Search PSRAM已释放；浏览状态=%uB internal=%u psram=%u",
+            remembered_state_bytes,
+            internal_free,
+            psram_free);
+    }
+}
+
+void library_view_on_library_source_changed(DeviceMusicLibrarySource source)
+{
+    if (source == DeviceMusicLibrarySource::Local && nas_library_source_ready()) {
+        const size_t before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        nas_library_source_close();
+        const size_t after = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        ESP_LOGI(TAG,
+            "曲库来源切回Local：NAS Catalog已释放 reclaimed=%uB psram=%u",
+            static_cast<unsigned>(after >= before ? after - before : 0U),
+            static_cast<unsigned>(after));
+        return;
+    }
+    if (source == DeviceMusicLibrarySource::Nas && nas_library_source_ready()) {
+        ESP_LOGI(TAG,
+            "曲库来源保持NAS：NAS Catalog继续常驻 psram=%uB",
+            static_cast<unsigned>(nas_library_source_psram_bytes()));
+    }
 }
 
 bool library_view_is_visible()
