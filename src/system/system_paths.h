@@ -21,4 +21,17 @@ static constexpr const char *kMusicIndexV2Backup = "/sdcard/System/library/music
 static constexpr const char *kMusicManifestV2 = "/sdcard/System/library/music_manifest_v2.bin";
 static constexpr const char *kMusicManifestV2Temp = "/sdcard/System/library/music_manifest_v2.bin.tmp";
 static constexpr const char *kMusicManifestV2Backup = "/sdcard/System/library/music_manifest_v2.bin.bak";
+
+// R46.0.70：NAS Catalog 与本地 V2 Catalog 使用完全相同的二进制格式，但独立缓存，
+// 绝不覆盖当前 TF 曲库。NAS 端只需要通过 HTTP/WebDAV GET 暴露三个固定文件。
+static constexpr const char *kNasCatalogConfig = "/sdcard/System/nas_catalog.conf";
+static constexpr const char *kNasCatalogMeta = "/sdcard/System/library/nas_catalog.meta";
+static constexpr const char *kNasCatalogMetaTemp = "/sdcard/System/library/nas_catalog.meta.tmp";
+static constexpr const char *kNasCatalogMetaBackup = "/sdcard/System/library/nas_catalog.meta.bak";
+static constexpr const char *kNasMusicIndexV2 = "/sdcard/System/library/nas_music_index_v2.bin";
+static constexpr const char *kNasMusicIndexV2Temp = "/sdcard/System/library/nas_music_index_v2.bin.tmp";
+static constexpr const char *kNasMusicIndexV2Backup = "/sdcard/System/library/nas_music_index_v2.bin.bak";
+static constexpr const char *kNasMusicManifestV2 = "/sdcard/System/library/nas_music_manifest_v2.bin";
+static constexpr const char *kNasMusicManifestV2Temp = "/sdcard/System/library/nas_music_manifest_v2.bin.tmp";
+static constexpr const char *kNasMusicManifestV2Backup = "/sdcard/System/library/nas_music_manifest_v2.bin.bak";
 }

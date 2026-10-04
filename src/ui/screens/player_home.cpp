@@ -3541,7 +3541,17 @@ static void player_home_gesture_timer_cb(lv_timer_t *timer)
     switch (action) {
         case UiGestureAction::PullDownFromTop:
             player_home_overlay_hide();
-            library_view_open();
+            if (device_settings_music_library_source() == DeviceMusicLibrarySource::Nas) {
+                const DeviceMusicListScope scope = device_settings_music_list_scope();
+                HOME_INTERACTION_LOGI("主页下拉曲库：source=NAS scope=%s",
+                    device_settings_music_list_scope_name(scope));
+                if (!library_view_open_nas(scope)) {
+                    ESP_LOGW(TAG, "NAS曲库加载未启动");
+                }
+            } else {
+                HOME_INTERACTION_LOGI("主页下拉曲库：source=本地");
+                library_view_open();
+            }
             break;
         case UiGestureAction::SwipeLeft:
             player_home_overlay_hide();
@@ -4495,9 +4505,15 @@ esp_err_t player_home_app_enter_foreground()
     switch (g_background_page) {
         case MusicBackgroundPage::Library:
             now_playing_artwork_set_bounded_present_allowed(false);
-            library_view_resume_after_app_switch();
-            player_home_update_background_timer_qos();
-            ESP_LOGI(TAG, "Music恢复前台：恢复原曲库页");
+            if (library_view_resume_after_app_switch()) {
+                player_home_update_background_timer_qos();
+                ESP_LOGI(TAG, "Music恢复前台：恢复原曲库页");
+            } else {
+                now_playing_artwork_set_bounded_present_allowed(
+                    g_music_visual_mode == MusicVisualMode::Artwork);
+                player_home_refresh();
+                ESP_LOGI(TAG, "Music恢复前台：曲库未恢复，回Home");
+            }
             break;
         case MusicBackgroundPage::Lyrics:
             now_playing_artwork_set_bounded_present_allowed(false);

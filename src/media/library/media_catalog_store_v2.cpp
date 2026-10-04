@@ -10,6 +10,8 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "media_index_store.h"
 #include "system_paths.h"
 #include "app_diag_config.h"
@@ -769,7 +771,42 @@ static bool section_table_valid(const CatalogFileHeaderV2 &header, const Catalog
         sections[6].row_size == sizeof(TrackDiskRowV2);
 }
 
-static __attribute__((noinline)) esp_err_t load_catalog_file(const char *path, MusicCatalogV2 *catalog, uint32_t *out_crc)
+static constexpr size_t CATALOG_COOPERATIVE_SD_BYTES = 4096U;
+
+static void catalog_load_cooperative_checkpoint(bool cooperative, size_t *bytes_since_checkpoint, size_t bytes)
+{
+    if (!cooperative || bytes_since_checkpoint == nullptr) return;
+    *bytes_since_checkpoint += bytes;
+    if (*bytes_since_checkpoint < CATALOG_COOPERATIVE_SD_BYTES) return;
+    *bytes_since_checkpoint = 0U;
+
+    // R46.0.74：NAS Catalog 允许后台音乐继续播放。不能像启动曲库那样长时间独占全局 SD 锁；
+    // 每约4KB主动让出一次锁，高优先级 FLAC/通用预取任务即可在这个缝隙补 ring。
+    storage_sd_unlock();
+    vTaskDelay(1);
+    while (!storage_sd_lock(pdMS_TO_TICKS(50))) {
+        vTaskDelay(1);
+    }
+}
+
+static void catalog_load_cooperative_cpu_begin(bool cooperative)
+{
+    if (cooperative) storage_sd_unlock();
+}
+
+static void catalog_load_cooperative_cpu_end(bool cooperative)
+{
+    if (!cooperative) return;
+    while (!storage_sd_lock(pdMS_TO_TICKS(50))) {
+        vTaskDelay(1);
+    }
+}
+
+static __attribute__((noinline)) esp_err_t load_catalog_file(
+    const char *path,
+    MusicCatalogV2 *catalog,
+    uint32_t *out_crc,
+    bool cooperative_sd = false)
 {
     if (catalog == nullptr) {
         return ESP_ERR_INVALID_ARG;
@@ -865,12 +902,30 @@ static __attribute__((noinline)) esp_err_t load_catalog_file(const char *path, M
     loaded.track_count = header.track_count;
 
     uint32_t payload_crc = crc32_begin();
-    bool ok = fseek(file, sections[0].offset, SEEK_SET) == 0 &&
-        fread(loaded.pool.data, 1, loaded.pool.size, file) == loaded.pool.size;
+    size_t cooperative_bytes = 0U;
+    bool ok = fseek(file, sections[0].offset, SEEK_SET) == 0;
+    if (ok && cooperative_sd) {
+        size_t offset = 0U;
+        while (ok && offset < loaded.pool.size) {
+            const size_t request =
+                (loaded.pool.size - offset) < CATALOG_COOPERATIVE_SD_BYTES
+                    ? (loaded.pool.size - offset)
+                    : CATALOG_COOPERATIVE_SD_BYTES;
+            ok = fread(loaded.pool.data + offset, 1, request, file) == request;
+            if (ok) {
+                offset += request;
+                catalog_load_cooperative_checkpoint(true, &cooperative_bytes, request);
+            }
+        }
+    } else if (ok) {
+        ok = fread(loaded.pool.data, 1, loaded.pool.size, file) == loaded.pool.size;
+    }
     if (ok) {
+        catalog_load_cooperative_cpu_begin(cooperative_sd);
         const uint32_t section_crc = crc32_buffer(loaded.pool.data, loaded.pool.size);
         ok = section_crc == sections[0].crc32;
         payload_crc = crc32_update(payload_crc, loaded.pool.data, loaded.pool.size);
+        catalog_load_cooperative_cpu_end(cooperative_sd);
     }
 
     for (uint32_t i = 0; ok && i < header.artist_count; ++i) {
@@ -880,15 +935,18 @@ static __attribute__((noinline)) esp_err_t load_catalog_file(const char *path, M
         if (ok) {
             loaded.artists[i] = {row.name_off, row.flags};
             payload_crc = crc32_update(payload_crc, &row, sizeof(row));
+            catalog_load_cooperative_checkpoint(cooperative_sd, &cooperative_bytes, sizeof(row));
         }
     }
     if (ok) {
+        catalog_load_cooperative_cpu_begin(cooperative_sd);
         uint32_t crc = crc32_begin();
         for (uint32_t i = 0; i < header.artist_count; ++i) {
             const ArtistDiskRowV2 row = {loaded.artists[i].name_off, loaded.artists[i].flags};
             crc = crc32_update(crc, &row, sizeof(row));
         }
         ok = crc32_end(crc) == sections[1].crc32;
+        catalog_load_cooperative_cpu_end(cooperative_sd);
     }
 
     for (uint32_t i = 0; ok && i < header.album_count; ++i) {
@@ -898,15 +956,18 @@ static __attribute__((noinline)) esp_err_t load_catalog_file(const char *path, M
         if (ok) {
             loaded.albums[i] = from_disk_album(row);
             payload_crc = crc32_update(payload_crc, &row, sizeof(row));
+            catalog_load_cooperative_checkpoint(cooperative_sd, &cooperative_bytes, sizeof(row));
         }
     }
     if (ok) {
+        catalog_load_cooperative_cpu_begin(cooperative_sd);
         uint32_t crc = crc32_begin();
         for (uint32_t i = 0; i < header.album_count; ++i) {
             const AlbumDiskRowV2 row = to_disk_album(loaded.albums[i]);
             crc = crc32_update(crc, &row, sizeof(row));
         }
         ok = crc32_end(crc) == sections[2].crc32;
+        catalog_load_cooperative_cpu_end(cooperative_sd);
     }
 
     for (uint32_t i = 0; ok && i < header.track_artist_ref_count; ++i) {
@@ -916,15 +977,18 @@ static __attribute__((noinline)) esp_err_t load_catalog_file(const char *path, M
         if (ok) {
             loaded.track_artist_refs[i] = from_disk_track_artist_ref(row);
             payload_crc = crc32_update(payload_crc, &row, sizeof(row));
+            catalog_load_cooperative_checkpoint(cooperative_sd, &cooperative_bytes, sizeof(row));
         }
     }
     if (ok) {
+        catalog_load_cooperative_cpu_begin(cooperative_sd);
         uint32_t crc = crc32_begin();
         for (uint32_t i = 0; i < header.track_artist_ref_count; ++i) {
             const TrackArtistDiskRefV2 row = to_disk_track_artist_ref(loaded.track_artist_refs[i]);
             crc = crc32_update(crc, &row, sizeof(row));
         }
         ok = crc32_end(crc) == sections[3].crc32;
+        catalog_load_cooperative_cpu_end(cooperative_sd);
     }
 
     for (uint32_t i = 0; ok && i < header.lyrics_ref_count; ++i) {
@@ -934,15 +998,18 @@ static __attribute__((noinline)) esp_err_t load_catalog_file(const char *path, M
         if (ok) {
             loaded.lyrics_refs[i] = from_disk_lyrics_ref(row);
             payload_crc = crc32_update(payload_crc, &row, sizeof(row));
+            catalog_load_cooperative_checkpoint(cooperative_sd, &cooperative_bytes, sizeof(row));
         }
     }
     if (ok) {
+        catalog_load_cooperative_cpu_begin(cooperative_sd);
         uint32_t crc = crc32_begin();
         for (uint32_t i = 0; i < header.lyrics_ref_count; ++i) {
             const LyricsDiskRefV2 row = to_disk_lyrics_ref(loaded.lyrics_refs[i]);
             crc = crc32_update(crc, &row, sizeof(row));
         }
         ok = crc32_end(crc) == sections[4].crc32;
+        catalog_load_cooperative_cpu_end(cooperative_sd);
     }
 
     for (uint32_t i = 0; ok && i < header.artwork_ref_count; ++i) {
@@ -952,15 +1019,18 @@ static __attribute__((noinline)) esp_err_t load_catalog_file(const char *path, M
         if (ok) {
             loaded.artwork_refs[i] = from_disk_artwork_ref(row);
             payload_crc = crc32_update(payload_crc, &row, sizeof(row));
+            catalog_load_cooperative_checkpoint(cooperative_sd, &cooperative_bytes, sizeof(row));
         }
     }
     if (ok) {
+        catalog_load_cooperative_cpu_begin(cooperative_sd);
         uint32_t crc = crc32_begin();
         for (uint32_t i = 0; i < header.artwork_ref_count; ++i) {
             const ArtworkDiskRefV2 row = to_disk_artwork_ref(loaded.artwork_refs[i]);
             crc = crc32_update(crc, &row, sizeof(row));
         }
         ok = crc32_end(crc) == sections[5].crc32;
+        catalog_load_cooperative_cpu_end(cooperative_sd);
     }
 
     for (uint32_t i = 0; ok && i < header.track_count; ++i) {
@@ -972,16 +1042,19 @@ static __attribute__((noinline)) esp_err_t load_catalog_file(const char *path, M
             if (ok) {
                 loaded.tracks[i] = from_disk_track(row);
                 payload_crc = crc32_update(payload_crc, &row, sizeof(row));
+                catalog_load_cooperative_checkpoint(cooperative_sd, &cooperative_bytes, sizeof(row));
             }
         }
     }
     if (ok) {
+        catalog_load_cooperative_cpu_begin(cooperative_sd);
         uint32_t crc = crc32_begin();
         for (uint32_t i = 0; i < header.track_count; ++i) {
             const TrackDiskRowV2 row = to_disk_track(loaded.tracks[i]);
             crc = crc32_update(crc, &row, sizeof(row));
         }
         ok = crc32_end(crc) == sections[6].crc32;
+        catalog_load_cooperative_cpu_end(cooperative_sd);
     }
     fclose(file);
 
@@ -990,7 +1063,9 @@ static __attribute__((noinline)) esp_err_t load_catalog_file(const char *path, M
         heap_caps_free(scratch);
         return ESP_ERR_INVALID_CRC;
     }
+    catalog_load_cooperative_cpu_begin(cooperative_sd);
     const esp_err_t semantic_ret = media_catalog_v2_validate(&loaded);
+    catalog_load_cooperative_cpu_end(cooperative_sd);
     if (semantic_ret != ESP_OK) {
         media_catalog_v2_release(&loaded);
         heap_caps_free(scratch);
@@ -1123,6 +1198,198 @@ void media_catalog_store_v2_release(MediaCatalogSnapshotV2 *snapshot)
     media_catalog_v2_release(&snapshot->catalog);
     heap_caps_free(snapshot->manifest);
     *snapshot = {};
+}
+
+esp_err_t media_catalog_store_v2_validate_pair_files(
+    const char *index_path,
+    const char *manifest_path,
+    uint32_t *out_track_count,
+    uint32_t *out_index_crc32,
+    uint32_t *out_manifest_crc32)
+{
+    if (index_path == nullptr || manifest_path == nullptr) return ESP_ERR_INVALID_ARG;
+    if (out_track_count != nullptr) *out_track_count = 0U;
+    if (out_index_crc32 != nullptr) *out_index_crc32 = 0U;
+    if (out_manifest_crc32 != nullptr) *out_manifest_crc32 = 0U;
+
+    StorageSdLockGuard sd_lock;
+    if (!sd_lock.locked()) return ESP_ERR_TIMEOUT;
+
+    FILE *index_file = fopen(index_path, "rb");
+    if (index_file == nullptr) return ESP_ERR_NOT_FOUND;
+    CatalogFileHeaderV2 index_header = {};
+    CatalogSectionV2 sections[SECTION_COUNT_V2] = {};
+    struct stat index_info = {};
+    bool ok = fread(&index_header, 1, sizeof(index_header), index_file) == sizeof(index_header) &&
+        fread(sections, 1, sizeof(sections), index_file) == sizeof(sections) &&
+        memcmp(index_header.magic, "FPCATV2", 7) == 0 &&
+        index_header.version == CATALOG_VERSION_V2 &&
+        index_header.header_size == sizeof(CatalogFileHeaderV2) &&
+        index_header.section_entry_size == sizeof(CatalogSectionV2) &&
+        index_header.section_count == SECTION_COUNT_V2 &&
+        index_header.signature_mode == SIGNATURE_MODE_FAST_V2 &&
+        index_header.track_count <= MAX_TRACKS_V2 &&
+        index_header.artist_count <= MAX_ARTISTS_V2 &&
+        index_header.album_count <= MAX_ALBUMS_V2 &&
+        index_header.track_artist_ref_count <= MAX_TRACK_ARTIST_REFS_V2 &&
+        index_header.lyrics_ref_count <= MAX_LYRICS_REFS_V2 &&
+        index_header.artwork_ref_count <= MAX_ARTWORK_REFS_V2 &&
+        stat(index_path, &index_info) == 0 && index_info.st_size >= 0 &&
+        static_cast<uint64_t>(index_info.st_size) == index_header.file_size &&
+        section_table_valid(index_header, sections);
+    if (!ok) {
+        fclose(index_file);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    static constexpr size_t kValidateScratchBytes = 4096U;
+    uint8_t *scratch = static_cast<uint8_t *>(
+        heap_caps_malloc(kValidateScratchBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (scratch == nullptr) {
+        fclose(index_file);
+        return ESP_ERR_NO_MEM;
+    }
+    uint32_t payload_crc = crc32_begin();
+    for (uint16_t section_index = 0; ok && section_index < SECTION_COUNT_V2; ++section_index) {
+        const CatalogSectionV2 &section = sections[section_index];
+        ok = fseek(index_file, static_cast<long>(section.offset), SEEK_SET) == 0;
+        uint32_t section_crc = crc32_begin();
+        uint32_t remaining = section.size;
+        while (ok && remaining > 0U) {
+            const size_t request = remaining < kValidateScratchBytes ? remaining : kValidateScratchBytes;
+            const size_t got = fread(scratch, 1, request, index_file);
+            if (got != request) {
+                ok = false;
+                break;
+            }
+            section_crc = crc32_update(section_crc, scratch, got);
+            payload_crc = crc32_update(payload_crc, scratch, got);
+            remaining -= static_cast<uint32_t>(got);
+        }
+        if (ok) ok = crc32_end(section_crc) == section.crc32;
+    }
+    fclose(index_file);
+    if (!ok || crc32_end(payload_crc) != index_header.payload_crc32) {
+        heap_caps_free(scratch);
+        return ESP_ERR_INVALID_CRC;
+    }
+
+    FILE *manifest_file = fopen(manifest_path, "rb");
+    if (manifest_file == nullptr) {
+        heap_caps_free(scratch);
+        return ESP_ERR_NOT_FOUND;
+    }
+    ManifestFileHeaderV2 manifest_header = {};
+    struct stat manifest_info = {};
+    ok = fread(&manifest_header, 1, sizeof(manifest_header), manifest_file) == sizeof(manifest_header) &&
+        memcmp(manifest_header.magic, "FPMNFV2", 7) == 0 &&
+        manifest_header.version == MANIFEST_VERSION_V2 &&
+        manifest_header.header_size == sizeof(ManifestFileHeaderV2) &&
+        manifest_header.record_size == sizeof(ManifestDiskRowV2) &&
+        manifest_header.record_count == index_header.track_count &&
+        manifest_header.record_count <= MAX_TRACKS_V2 &&
+        manifest_header.index_payload_crc32 == index_header.payload_crc32 &&
+        manifest_header.signature_mode == SIGNATURE_MODE_FAST_V2 &&
+        stat(manifest_path, &manifest_info) == 0 && manifest_info.st_size >= 0 &&
+        static_cast<uint64_t>(manifest_info.st_size) ==
+            sizeof(ManifestFileHeaderV2) +
+            static_cast<uint64_t>(manifest_header.record_count) * sizeof(ManifestDiskRowV2);
+    uint32_t manifest_crc = crc32_begin();
+    for (uint32_t i = 0; ok && i < manifest_header.record_count; ++i) {
+        ManifestDiskRowV2 row = {};
+        ok = fread(&row, 1, sizeof(row), manifest_file) == sizeof(row) &&
+            row.track_index == i && row.format <= static_cast<uint8_t>(MediaFormat::OPUS);
+        if (ok) manifest_crc = crc32_update(manifest_crc, &row, sizeof(row));
+    }
+    fclose(manifest_file);
+    heap_caps_free(scratch);
+    manifest_crc = crc32_end(manifest_crc);
+    if (!ok || manifest_crc != manifest_header.payload_crc32) return ESP_ERR_INVALID_CRC;
+
+    if (out_track_count != nullptr) *out_track_count = index_header.track_count;
+    if (out_index_crc32 != nullptr) *out_index_crc32 = index_header.payload_crc32;
+    if (out_manifest_crc32 != nullptr) *out_manifest_crc32 = manifest_header.payload_crc32;
+    return ESP_OK;
+}
+
+esp_err_t media_catalog_store_v2_load_catalog_only(
+    const char *index_path,
+    const char *manifest_path,
+    MusicCatalogV2 *out_catalog,
+    uint32_t *out_index_crc32)
+{
+    if (index_path == nullptr || manifest_path == nullptr || out_catalog == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    media_catalog_v2_release(out_catalog);
+    uint32_t track_count = 0U;
+    uint32_t index_crc = 0U;
+    esp_err_t ret = media_catalog_store_v2_validate_pair_files(
+        index_path, manifest_path, &track_count, &index_crc, nullptr);
+    if (ret != ESP_OK) return ret;
+
+    StorageSdLockGuard sd_lock;
+    if (!sd_lock.locked()) return ESP_ERR_TIMEOUT;
+    uint32_t loaded_crc = 0U;
+    ret = load_catalog_file(index_path, out_catalog, &loaded_crc);
+    if (ret != ESP_OK) return ret;
+    if (out_catalog->track_count != track_count || loaded_crc != index_crc) {
+        media_catalog_v2_release(out_catalog);
+        return ESP_ERR_INVALID_CRC;
+    }
+    if (out_index_crc32 != nullptr) *out_index_crc32 = loaded_crc;
+    return ESP_OK;
+}
+
+esp_err_t media_catalog_store_v2_load_catalog_only_cooperative(
+    const char *index_path,
+    const char *manifest_path,
+    MusicCatalogV2 *out_catalog,
+    uint32_t *out_index_crc32)
+{
+    if (index_path == nullptr || manifest_path == nullptr || out_catalog == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    media_catalog_v2_release(out_catalog);
+    StorageSdLockGuard sd_lock;
+    if (!sd_lock.locked()) return ESP_ERR_TIMEOUT;
+
+    uint32_t loaded_crc = 0U;
+    esp_err_t ret = load_catalog_file(index_path, out_catalog, &loaded_crc, true);
+    if (ret != ESP_OK) return ret;
+
+    // NAS 浏览不使用 Manifest 内容，但仍做轻量 header/linkage 校验，防止 index 与 manifest 串版。
+    FILE *manifest_file = fopen(manifest_path, "rb");
+    if (manifest_file == nullptr) {
+        media_catalog_v2_release(out_catalog);
+        return ESP_ERR_NOT_FOUND;
+    }
+    ManifestFileHeaderV2 manifest_header = {};
+    struct stat manifest_info = {};
+    const bool manifest_ok =
+        fread(&manifest_header, 1, sizeof(manifest_header), manifest_file) == sizeof(manifest_header) &&
+        memcmp(manifest_header.magic, "FPMNFV2", 7) == 0 &&
+        manifest_header.version == MANIFEST_VERSION_V2 &&
+        manifest_header.header_size == sizeof(ManifestFileHeaderV2) &&
+        manifest_header.record_size == sizeof(ManifestDiskRowV2) &&
+        manifest_header.record_count == out_catalog->track_count &&
+        manifest_header.record_count <= MAX_TRACKS_V2 &&
+        manifest_header.index_payload_crc32 == loaded_crc &&
+        manifest_header.signature_mode == SIGNATURE_MODE_FAST_V2 &&
+        stat(manifest_path, &manifest_info) == 0 &&
+        manifest_info.st_size >= 0 &&
+        static_cast<uint64_t>(manifest_info.st_size) ==
+            sizeof(ManifestFileHeaderV2) +
+            static_cast<uint64_t>(manifest_header.record_count) * sizeof(ManifestDiskRowV2);
+    fclose(manifest_file);
+    if (!manifest_ok) {
+        media_catalog_v2_release(out_catalog);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    if (out_index_crc32 != nullptr) *out_index_crc32 = loaded_crc;
+    return ESP_OK;
 }
 
 esp_err_t media_catalog_store_v2_load(MediaCatalogSnapshotV2 *snapshot)

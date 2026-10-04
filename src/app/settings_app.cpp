@@ -28,6 +28,7 @@
 #include "storage_io.h"
 #include "usb_storage_service.h"
 #include "wifi_service.h"
+#include "nas_catalog_service.h"
 #include "artwork_loader.h"
 #include "lyrics/lyrics_service.h"
 #include "media_library.h"
@@ -135,6 +136,9 @@ static bool g_brightness_dirty = false;
 static DeviceMusicListScope g_music_scope_saved = DeviceMusicListScope::All;
 static DeviceMusicListScope g_music_scope_pending = DeviceMusicListScope::All;
 static bool g_music_scope_dirty = false;
+static DeviceMusicLibrarySource g_music_source_saved = DeviceMusicLibrarySource::Local;
+static DeviceMusicLibrarySource g_music_source_pending = DeviceMusicLibrarySource::Local;
+static bool g_music_source_dirty = false;
 static bool g_cassette_tint_saved = false;
 static bool g_cassette_tint_pending = false;
 static bool g_cassette_tint_dirty = false;
@@ -270,7 +274,7 @@ static void detail_apply_scroll_y(int32_t y)
 static uint16_t detail_row_count_for_page(SettingsPage page)
 {
     switch (page) {
-        case SettingsPage::Connection: return 4U;
+        case SettingsPage::Connection: return 5U;
         case SettingsPage::Applications: return 5U;
         case SettingsPage::MusicPlayer: return 3U;
         case SettingsPage::ElectronicFlow: return 1U;
@@ -1625,6 +1629,44 @@ static void wifi_switch_click_cb(lv_event_t *event)
         requested ? "开" : "关", requested ? "关" : (old_ble ? "开" : "关"));
 }
 
+static void nas_catalog_sync_click_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event) || g_page != SettingsPage::Connection) return;
+    const esp_err_t ret = nas_catalog_service_request_sync();
+    if (ret != ESP_OK) {
+        NasCatalogSnapshot nas = {};
+        (void)nas_catalog_service_get_snapshot(&nas);
+        ESP_LOGW(TAG,
+            "NAS索引同步未启动：%s（配置=%s Wi-Fi需已连接，且音乐需停止）",
+            esp_err_to_name(ret), nas.configured ? "有" : "无");
+    }
+}
+
+static void format_nas_catalog_value(char *buffer, size_t buffer_size)
+{
+    if (buffer == nullptr || buffer_size == 0U) return;
+    NasCatalogSnapshot nas = {};
+    if (!nas_catalog_service_get_snapshot(&nas) || !nas.configured) {
+        snprintf(buffer, buffer_size, "未配置");
+        return;
+    }
+    if (nas.syncing) {
+        snprintf(buffer, buffer_size, "同步中");
+        return;
+    }
+    if (nas.state == NasCatalogState::Failed) {
+        snprintf(buffer, buffer_size, "同步失败");
+        return;
+    }
+    if (nas.cached) {
+        snprintf(buffer, buffer_size, "%lu首·%s",
+            static_cast<unsigned long>(nas.track_count),
+            nas.state == NasCatalogState::Updated ? "已更新" : "已缓存");
+        return;
+    }
+    snprintf(buffer, buffer_size, "点击同步");
+}
+
 static void create_connection_page(const DeviceSettingsSnapshot &settings)
 {
     // USB模式仅显示当前启动配置；真正的高风险TF owner切换只允许从下一行显式触发，
@@ -1661,6 +1703,10 @@ static void create_connection_page(const DeviceSettingsSnapshot &settings)
         snprintf(wifi_value, sizeof(wifi_value), "关闭·未配置");
     }
     add_clickable_detail_row(3, "Wi-Fi开关", wifi_value, SettingsDetailIcon::Wifi, wifi_switch_click_cb);
+
+    char nas_value[64] = {};
+    format_nas_catalog_value(nas_value, sizeof(nas_value));
+    add_clickable_detail_row(4, "NAS索引", nas_value, SettingsDetailIcon::Wifi, nas_catalog_sync_click_cb);
 }
 
 static PlayerFolderScope player_folder_scope_from_setting(DeviceMusicListScope scope)
@@ -1863,6 +1909,23 @@ static void music_player_page_click_cb(lv_event_t *event)
     lv_async_call(show_page_async, nullptr);
 }
 
+static void music_library_source_click_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event) || g_page != SettingsPage::MusicPlayer) return;
+    g_music_source_pending = g_music_source_pending == DeviceMusicLibrarySource::Local
+        ? DeviceMusicLibrarySource::Nas
+        : DeviceMusicLibrarySource::Local;
+    g_music_source_dirty = g_music_source_pending != g_music_source_saved;
+    if (g_detail_values[3] != nullptr) {
+        lv_label_set_text(
+            g_detail_values[3],
+            device_settings_music_library_source_name(g_music_source_pending));
+        lv_obj_invalidate(g_detail_values[3]);
+    }
+    ESP_LOGI(TAG, "曲库来源待保存：%s（仅切换主页下拉浏览源，不停止当前播放）",
+        device_settings_music_library_source_name(g_music_source_pending));
+}
+
 static void cassette_tint_click_cb(lv_event_t *event)
 {
     if (!click_is_valid(event) || g_page != SettingsPage::MusicPlayer) return;
@@ -1881,6 +1944,21 @@ static void cassette_tint_click_cb(lv_event_t *event)
 static void music_player_commit_on_exit()
 {
     music_list_commit_on_exit();
+
+    if (g_music_source_dirty) {
+        const DeviceMusicLibrarySource requested = g_music_source_pending;
+        const esp_err_t ret = device_settings_set_music_library_source(requested);
+        if (ret == ESP_OK) {
+            g_music_source_saved = requested;
+            g_music_source_pending = requested;
+            ESP_LOGI(TAG, "退出设置保存曲库来源：%s；当前播放保持不变",
+                device_settings_music_library_source_name(requested));
+        } else {
+            ESP_LOGW(TAG, "退出设置保存曲库来源失败：%s", esp_err_to_name(ret));
+            g_music_source_pending = g_music_source_saved;
+        }
+        g_music_source_dirty = false;
+    }
 
     if (g_cassette_tint_dirty) {
         const bool requested = g_cassette_tint_pending;
@@ -2101,6 +2179,13 @@ static void create_music_player_page(const DeviceSettingsSnapshot &settings)
         g_motion_controls_pending ? "开" : "关",
         SettingsDetailIcon::Music,
         motion_controls_click_cb);
+
+    add_clickable_detail_row(
+        3,
+        "曲库来源",
+        device_settings_music_library_source_name(g_music_source_pending),
+        SettingsDetailIcon::Music,
+        music_library_source_click_cb);
 }
 
 static void create_system_page(const DeviceSettingsSnapshot &settings)
@@ -2302,6 +2387,10 @@ static void refresh_timer_cb(lv_timer_t *timer)
                 }
             }
         }
+        if (g_detail_values[4] != nullptr) {
+            format_nas_catalog_value(value, sizeof(value));
+            lv_label_set_text(g_detail_values[4], value);
+        }
     }
     if (g_page == SettingsPage::About) {
         if (g_detail_values[2] != nullptr) {
@@ -2439,6 +2528,8 @@ static esp_err_t settings_enter()
         g_brightness_pending_level = settings.brightness_level;
         g_music_scope_saved = settings.music_list_scope;
         g_music_scope_pending = settings.music_list_scope;
+        g_music_source_saved = settings.music_library_source;
+        g_music_source_pending = settings.music_library_source;
         g_cassette_tint_saved = settings.cassette_dynamic_tint_enabled;
         g_cassette_tint_pending = settings.cassette_dynamic_tint_enabled;
         g_motion_controls_saved = settings.motion_controls_enabled;
@@ -2451,6 +2542,7 @@ static esp_err_t settings_enter()
     }
     g_brightness_dirty = false;
     g_music_scope_dirty = false;
+    g_music_source_dirty = false;
     g_cassette_tint_dirty = false;
     g_motion_controls_dirty = false;
     g_nsf_gain_dirty = false;

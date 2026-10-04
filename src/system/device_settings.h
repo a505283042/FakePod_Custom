@@ -35,6 +35,13 @@ enum class DeviceMusicListScope : uint8_t {
     Level2,
 };
 
+// R46.0.75：曲库入口与播放本身解耦。这里仅保存主页下拉时要浏览的数据源，
+// 不因切换浏览源停止/切换当前正在播放的歌曲。
+enum class DeviceMusicLibrarySource : uint8_t {
+    Local = 0,
+    Nas,
+};
+
 static constexpr size_t DEVICE_UI_FONT_FILENAME_MAX = 128U;
 static constexpr size_t DEVICE_MUSIC_FOLDER_PATH_MAX = 384U;
 
@@ -57,6 +64,7 @@ struct DeviceSettingsSnapshot {
     bool aod_enabled = true;
     DeviceAnimationMode animation_mode = DeviceAnimationMode::Auto;
     DeviceMusicListScope music_list_scope = DeviceMusicListScope::All;
+    DeviceMusicLibrarySource music_library_source = DeviceMusicLibrarySource::Local;
     bool cassette_dynamic_tint_enabled = false;
     bool motion_controls_enabled = true;
     uint8_t nsf_gain_compensation_db = 3U;  // 电子音流专用 CS43131 数字衰减补偿，0~6dB。
@@ -71,6 +79,9 @@ bool device_settings_get_snapshot(DeviceSettingsSnapshot *out_snapshot);
 bool device_settings_remember_volume_enabled();
 // R46.0.68 迁移辅助：旧版 Settings V1 尚无 Wi-Fi 开关键。
 bool device_settings_wifi_enabled_is_explicit();
+// 主页手势热路径只读查询，避免为一个枚举复制完整 SettingsSnapshot。
+DeviceMusicLibrarySource device_settings_music_library_source();
+DeviceMusicListScope device_settings_music_list_scope();
 
 // 后续功能模块统一通过这些 setter 修改设置；每次只提交一个很小的 NVS 事务。
 esp_err_t device_settings_set_usb_mode(DeviceUsbMode mode);
@@ -84,6 +95,7 @@ esp_err_t device_settings_set_auto_screen_off_seconds(uint16_t seconds);
 esp_err_t device_settings_set_aod_enabled(bool enabled);
 esp_err_t device_settings_set_animation_mode(DeviceAnimationMode mode);
 esp_err_t device_settings_set_music_list_scope(DeviceMusicListScope scope);
+esp_err_t device_settings_set_music_library_source(DeviceMusicLibrarySource source);
 esp_err_t device_settings_set_cassette_dynamic_tint_enabled(bool enabled);
 esp_err_t device_settings_set_motion_controls_enabled(bool enabled);
 esp_err_t device_settings_set_nsf_gain_compensation_db(uint8_t db);
@@ -107,3 +119,4 @@ const char *device_settings_audio_output_level_name(DeviceAudioOutputMode mode);
 const char *device_settings_aux_key_mode_name(DeviceAuxKeyMode mode);
 const char *device_settings_animation_mode_name(DeviceAnimationMode mode);
 const char *device_settings_music_list_scope_name(DeviceMusicListScope scope);
+const char *device_settings_music_library_source_name(DeviceMusicLibrarySource source);

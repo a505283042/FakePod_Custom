@@ -968,11 +968,11 @@ static void ui_touch_dispatch_pointer(bool pressed, int16_t x, int16_t y, uint32
     if (pressed) {
         screen_lock_simple_notify_user_activity();
     }
-    if (!library_view_is_visible()) {
-        gesture_router_feed_pointer(pressed, x, y, tick_ms);
-    } else {
+    if (library_view_is_visible()) {
         gesture_router_reset();
         library_view_feed_pointer(pressed, x, y, tick_ms);
+    } else {
+        gesture_router_feed_pointer(pressed, x, y, tick_ms);
     }
 }
 

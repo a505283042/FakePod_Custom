@@ -37,6 +37,28 @@ struct MediaCatalogSnapshotV2
 // 按 tmp -> final -> bak 顺序尝试加载成对的 V2 Catalog/Manifest；任一候选都必须通过
 // header/section/CRC/semantic/manifest linkage 全部校验后才能返回。
 esp_err_t media_catalog_store_v2_load(MediaCatalogSnapshotV2 *snapshot);
+// R46.0.70：流式校验任意 V2 Catalog/Manifest 文件对，不展开 MusicCatalogV2，
+// 因而大 NAS 索引同步时只需要一个 4KB PSRAM scratch，不会临时复制整份 Catalog。
+esp_err_t media_catalog_store_v2_validate_pair_files(
+    const char *index_path,
+    const char *manifest_path,
+    uint32_t *out_track_count,
+    uint32_t *out_index_crc32,
+    uint32_t *out_manifest_crc32);
+
+// R46.0.71：NAS 浏览只需 Catalog，Manifest 只用于链接校验，不常驻 PSRAM。
+esp_err_t media_catalog_store_v2_load_catalog_only(
+    const char *index_path,
+    const char *manifest_path,
+    MusicCatalogV2 *out_catalog,
+    uint32_t *out_index_crc32);
+// R46.0.74：NAS 后台浏览加载专用。索引读取每约4KB主动释放一次全局SD锁并阻塞1 tick，
+// 让高优先级音频预取任务可以穿插补充 ring；只完整校验 Catalog，本次浏览不展开 Manifest。
+esp_err_t media_catalog_store_v2_load_catalog_only_cooperative(
+    const char *index_path,
+    const char *manifest_path,
+    MusicCatalogV2 *out_catalog,
+    uint32_t *out_index_crc32);
 void media_catalog_store_v2_release(MediaCatalogSnapshotV2 *snapshot);
 
 // V2 Track 按完整 UTF-8 路径排序，可二分查找并取到对应 Manifest 签名。

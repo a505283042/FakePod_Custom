@@ -20,6 +20,7 @@
 #include "device_settings.h"
 #include "ble_remote_service.h"
 #include "wifi_service.h"
+#include "nas_catalog_service.h"
 #include "battery_service.h"
 #include "motion_service.h"
 #include "screen_lock_simple.h"
@@ -155,6 +156,7 @@ void system_runtime_update()
     const esp_err_t device_settings_ret = device_settings_init();
     const esp_err_t ble_ret = ble_remote_service_init();
     const esp_err_t wifi_ret = wifi_service_init();
+    const esp_err_t nas_catalog_ret = nas_catalog_service_init();
     if (ble_ret != ESP_OK && ble_ret != ESP_ERR_NOT_SUPPORTED) {
         ESP_LOGW(TAG, "BLE Foundation初始化失败：%s；保持关闭并由运行期恢复",
             esp_err_to_name(ble_ret));
@@ -165,6 +167,10 @@ void system_runtime_update()
     }
     if (wifi_ret != ESP_OK) {
         ESP_LOGW(TAG, "Wi-Fi服务初始化失败：%s；本次不启动Wi-Fi", esp_err_to_name(wifi_ret));
+    }
+    if (nas_catalog_ret != ESP_OK) {
+        ESP_LOGW(TAG, "NAS Catalog Foundation初始化失败：%s；本地TF曲库不受影响",
+            esp_err_to_name(nas_catalog_ret));
     }
     if (device_settings_ret == ESP_OK) {
         DeviceSettingsSnapshot settings_snapshot = {};
@@ -291,7 +297,7 @@ void system_runtime_update()
 
     ESP_LOGI(
         TAG,
-        "READY 后台服务：Apps=%s MusicAdapter=%s Ebook=%s VisualMusic=%s Video=%s DeviceSettings=%s BLE=%s WiFi=%s Settings=%s Battery=%s Motion=%s PowerKey=%s AuxKey=%s Spectrum=ON_DEMAND Artwork=%s CoverSurface=%s Lyrics=%s",
+        "READY 后台服务：Apps=%s MusicAdapter=%s Ebook=%s VisualMusic=%s Video=%s DeviceSettings=%s BLE=%s WiFi=%s NASCatalog=%s Settings=%s Battery=%s Motion=%s PowerKey=%s AuxKey=%s Spectrum=ON_DEMAND Artwork=%s CoverSurface=%s Lyrics=%s",
         esp_err_to_name(app_ret),
         esp_err_to_name(music_adapter_ret),
         esp_err_to_name(ebook_ret),
@@ -300,6 +306,7 @@ void system_runtime_update()
         esp_err_to_name(device_settings_ret),
         ble_ret == ESP_ERR_NOT_SUPPORTED ? "SDKCONFIG_OFF" : esp_err_to_name(ble_ret),
         esp_err_to_name(wifi_ret),
+        esp_err_to_name(nas_catalog_ret),
         esp_err_to_name(settings_ret),
         esp_err_to_name(battery_ret),
         esp_err_to_name(motion_ret),

@@ -39,6 +39,7 @@ static DeviceSettingsSnapshot make_defaults()
     defaults.aod_enabled = true;
     defaults.animation_mode = DeviceAnimationMode::Auto;
     defaults.music_list_scope = DeviceMusicListScope::All;
+    defaults.music_library_source = DeviceMusicLibrarySource::Local;
     defaults.cassette_dynamic_tint_enabled = false;
     defaults.motion_controls_enabled = true;
     defaults.nsf_gain_compensation_db = 3U;
@@ -85,6 +86,11 @@ static bool animation_mode_valid(uint8_t raw)
 static bool music_list_scope_valid(uint8_t raw)
 {
     return raw <= static_cast<uint8_t>(DeviceMusicListScope::Level2);
+}
+
+static bool music_library_source_valid(uint8_t raw)
+{
+    return raw <= static_cast<uint8_t>(DeviceMusicLibrarySource::Nas);
 }
 
 static bool nsf_gain_compensation_valid(uint8_t db)
@@ -198,6 +204,9 @@ esp_err_t device_settings_init()
         g_settings.music_list_scope = static_cast<DeviceMusicListScope>(u8);
         g_music_selection.scope = g_settings.music_list_scope;
     }
+    if (nvs_get_u8(handle, "musrc", &u8) == ESP_OK && music_library_source_valid(u8)) {
+        g_settings.music_library_source = static_cast<DeviceMusicLibrarySource>(u8);
+    }
 
     size_t path_bytes = sizeof(g_music_selection.level1_path);
     if (nvs_get_str(handle, "mul1", g_music_selection.level1_path, &path_bytes) != ESP_OK) {
@@ -233,13 +242,14 @@ esp_err_t device_settings_init()
         ESP_LOGW(TAG, "无线设置冲突：BLE/Wi-Fi同时为开，运行期收敛为Wi-Fi=开 BLE=关");
     }
 
-    ESP_LOGI(TAG, "Settings V1加载完成：USB=%s BLE=%s WiFi=%s audio=%s bright=%u aux=%s cassette=%s motion=%s nsfgain=+%udB",
+    ESP_LOGI(TAG, "Settings V1加载完成：USB=%s BLE=%s WiFi=%s audio=%s bright=%u aux=%s library=%s cassette=%s motion=%s nsfgain=+%udB",
         device_settings_usb_mode_name(g_settings.usb_mode),
         g_settings.ble_enabled ? "开" : "关",
         g_settings.wifi_enabled ? "开" : "关",
         device_settings_audio_output_mode_name(g_settings.audio_output_mode),
         static_cast<unsigned>(g_settings.brightness_level),
         device_settings_aux_key_mode_name(g_settings.aux_key_mode),
+        device_settings_music_library_source_name(g_settings.music_library_source),
         g_settings.cassette_dynamic_tint_enabled ? "封面变色" : "原装粉色",
         g_settings.motion_controls_enabled ? "开" : "关",
         static_cast<unsigned>(g_settings.nsf_gain_compensation_db));
@@ -261,6 +271,16 @@ bool device_settings_remember_volume_enabled()
 bool device_settings_wifi_enabled_is_explicit()
 {
     return g_settings.ready && g_wifi_setting_explicit;
+}
+
+DeviceMusicLibrarySource device_settings_music_library_source()
+{
+    return g_settings.ready ? g_settings.music_library_source : DeviceMusicLibrarySource::Local;
+}
+
+DeviceMusicListScope device_settings_music_list_scope()
+{
+    return g_settings.ready ? g_settings.music_list_scope : DeviceMusicListScope::All;
 }
 
 esp_err_t device_settings_set_usb_mode(DeviceUsbMode mode)
@@ -428,6 +448,17 @@ esp_err_t device_settings_set_music_list_scope(DeviceMusicListScope scope)
         g_music_selection.level2_path);
 }
 
+esp_err_t device_settings_set_music_library_source(DeviceMusicLibrarySource source)
+{
+    if (!music_library_source_valid(static_cast<uint8_t>(source))) return ESP_ERR_INVALID_ARG;
+    const DeviceMusicLibrarySource old = g_settings.music_library_source;
+    g_settings.music_library_source = source;
+    const esp_err_t ret = commit_u8("musrc", static_cast<uint8_t>(source));
+    if (ret != ESP_OK) g_settings.music_library_source = old;
+    log_commit_failure("musrc", ret);
+    return ret;
+}
+
 esp_err_t device_settings_set_cassette_dynamic_tint_enabled(bool enabled)
 {
     const bool old = g_settings.cassette_dynamic_tint_enabled;
@@ -574,6 +605,15 @@ const char *device_settings_music_list_scope_name(DeviceMusicListScope scope)
         case DeviceMusicListScope::All: return "总列表";
         case DeviceMusicListScope::Level1: return "一级列表";
         case DeviceMusicListScope::Level2: return "二级列表";
+        default: return "未知";
+    }
+}
+
+const char *device_settings_music_library_source_name(DeviceMusicLibrarySource source)
+{
+    switch (source) {
+        case DeviceMusicLibrarySource::Local: return "本地曲库";
+        case DeviceMusicLibrarySource::Nas: return "NAS曲库";
         default: return "未知";
     }
 }

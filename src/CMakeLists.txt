@@ -28,6 +28,7 @@ idf_component_register(
         "system/ble_remote_service.cpp"
         "system/wifi_service.cpp"
         "system/wifi_remote_service.cpp"
+        "system/nas_catalog_service.cpp"
         "system/battery_service.cpp"
         "system/motion_service.cpp"
         "system/usb_storage_service.cpp"
@@ -78,6 +79,7 @@ idf_component_register(
         "media/library/media_catalog_v2.cpp"
         "media/library/media_groups_v2.cpp"
         "media/library/media_catalog_store_v2.cpp"
+        "media/library/nas_library_source.cpp"
         "media/library/media_probe.cpp"
         "media/library/media_ogg_opus.cpp"
         "media/library/media_metadata.cpp"
@@ -168,6 +170,7 @@ idf_component_register(
         esp_event
         esp_netif
         esp_wifi
+        esp_http_client
         lwip
 
 )
