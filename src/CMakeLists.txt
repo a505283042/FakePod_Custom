@@ -60,6 +60,7 @@ idf_component_register(
         "audio/sources/audio_source.cpp"
         "audio/sources/sd_file_audio_source.cpp"
         "audio/sources/buffered_sd_audio_source.cpp"
+        "audio/sources/buffered_http_audio_source.cpp"
         "audio/sources/avi_mp3_audio_source.cpp"
         "audio/decoders/pcm_decoder.cpp"
         "audio/decoders/wav_decoder.cpp"

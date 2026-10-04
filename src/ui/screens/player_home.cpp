@@ -23,6 +23,7 @@
 #include "gesture/gesture_router.h"
 #include "input/touch_input.h"
 #include "media_library.h"
+#include "nas_library_source.h"
 #include "media/library/media_catalog_v2.h"
 #include "player_control.h"
 #include "player_state.h"
@@ -3695,7 +3696,8 @@ static void player_home_update_time_labels(uint64_t position_ms, uint64_t total_
 
 static bool player_home_snapshot_can_scrub(const AudioStateSnapshot &snapshot)
 {
-    if (!snapshot.ready || !snapshot.seek_supported || snapshot.track_index == UINT32_MAX) {
+    if (snapshot.source != AudioPlaybackSource::Local ||
+        !snapshot.ready || !snapshot.seek_supported || snapshot.track_index == UINT32_MAX) {
         return false;
     }
     if (snapshot.track_index != player_state_get_index()) {
@@ -3911,6 +3913,34 @@ static void player_home_format_sample_info(
 static void player_home_refresh_track(const AudioStateSnapshot *audio_snapshot)
 {
     if (g_title == nullptr || g_artist == nullptr || g_track_info == nullptr) {
+        return;
+    }
+
+    if (audio_snapshot != nullptr &&
+        audio_snapshot->source == AudioPlaybackSource::NasHttp &&
+        audio_snapshot->track_index != UINT32_MAX) {
+        MediaTrackViewV2 nas = {};
+        const bool have_nas = nas_library_source_get_track_view(audio_snapshot->track_index, &nas);
+        player_home_label_set_text_if_changed(
+            g_title,
+            have_nas && nas.title != nullptr && nas.title[0] != '\0' ? nas.title : "NAS MP3");
+        player_home_label_set_text_if_changed(
+            g_artist,
+            have_nas && nas.artist != nullptr && nas.artist[0] != '\0' ? nas.artist : "NAS");
+
+        char sample_info[48] = {};
+        player_home_format_sample_info(
+            audio_snapshot->sample_rate_hz,
+            audio_snapshot->bits_per_sample,
+            sample_info,
+            sizeof(sample_info));
+        char track_info[128] = {};
+        if (sample_info[0] != '\0') {
+            snprintf(track_info, sizeof(track_info), "NAS  ·  MP3  ·  %s", sample_info);
+        } else {
+            snprintf(track_info, sizeof(track_info), "NAS  ·  MP3");
+        }
+        player_home_label_set_text_if_changed(g_track_info, track_info);
         return;
     }
 

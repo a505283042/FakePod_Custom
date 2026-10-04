@@ -4,6 +4,14 @@
 #include "esp_err.h"
 #include "media_types.h"
 
+// 当前 Music pipeline 的真实播放来源。浏览曲库来源与本字段独立；
+// 只有新音频 pipeline 成功接管时才改变播放来源。
+enum class AudioPlaybackSource : uint8_t
+{
+    Local = 0,
+    NasHttp,
+};
+
 // 音频任务对外发布的播放状态。
 enum class AudioPlaybackState : uint8_t
 {
@@ -38,6 +46,7 @@ struct AudioStateSnapshot
     uint32_t playback_revision = 1;
     uint32_t last_request_id = 0;
     uint32_t track_index = UINT32_MAX;
+    AudioPlaybackSource source = AudioPlaybackSource::Local;
     MediaFormat format = MediaFormat::Unknown;
     esp_err_t last_error = ESP_OK;
     AudioFailureScope failure_scope = AudioFailureScope::None;

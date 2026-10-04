@@ -43,6 +43,17 @@ bool audio_service_play_track(
     bool wait = false
 );
 
+// R46.0.78：NAS MP3 顺序流播放。url 已由 NAS Catalog path 构造成 HTTP URL；
+// Basic Auth 可为空。当前不开放网络 Seek，先验证 HTTP->128KB PSRAM ring->现有 MP3 decoder。
+bool audio_service_play_nas_mp3(
+    uint32_t track_index,
+    const char *url,
+    const char *username,
+    const char *password,
+    const MediaTechnicalInfo *technical_info = nullptr,
+    bool wait = false
+);
+
 // 停止、暂停和恢复均通过 AudioTask 串行执行。
 bool audio_service_stop(bool wait = true);
 bool audio_service_pause(bool wait = true);

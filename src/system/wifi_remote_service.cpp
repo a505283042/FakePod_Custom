@@ -8,6 +8,7 @@
 #include "audio_service.h"
 #include "battery_service.h"
 #include "media_catalog_v2.h"
+#include "nas_library_source.h"
 #include "player_control.h"
 #include "video_app.h"
 #include "visual_music_app.h"
@@ -68,6 +69,7 @@ static uint32_t g_metadata_generation = 0U;
 static uint32_t g_metadata_revision = 0U;
 static MediaContext g_metadata_context = MediaContext::Music;
 static bool g_metadata_initialized = false;
+static AudioPlaybackSource g_metadata_music_source = AudioPlaybackSource::Local;
 
 
 static void write_u16_le(uint8_t *dst, uint16_t value)
@@ -128,20 +130,26 @@ static void set_metadata(
     g_metadata_initialized = true;
 }
 
-static void ensure_music_metadata(uint32_t track)
+static void ensure_music_metadata(uint32_t track, AudioPlaybackSource source)
 {
     MediaTrackViewV2 view = {};
     uint32_t generation = 0U;
     const char *title = "";
     const char *artist = "";
-    if (track != UINT32_MAX && media_catalog_v2_get_track_view(track, &view)) {
+    const bool have_view = track != UINT32_MAX &&
+        (source == AudioPlaybackSource::NasHttp
+            ? nas_library_source_get_track_view(track, &view)
+            : media_catalog_v2_get_track_view(track, &view));
+    if (have_view) {
         generation = view.generation;
         if (view.title != nullptr) title = view.title;
         if (view.artist != nullptr) artist = view.artist;
     }
     if (!g_metadata_initialized || g_metadata_context != MediaContext::Music ||
-        g_metadata_track != track || g_metadata_generation != generation) {
+        g_metadata_track != track || g_metadata_generation != generation ||
+        g_metadata_music_source != source) {
         set_metadata(title, artist, track, generation, 0U, MediaContext::Music);
+        g_metadata_music_source = source;
     }
 }
 
@@ -179,7 +187,8 @@ static void build_status(uint8_t packet[kStatusPacketSize])
         : (video_valid ? video.item_index : (audio_valid ? audio.track_index : UINT32_MAX));
     if (nsf_valid) ensure_nsf_metadata(nsf);
     else if (video_valid) ensure_video_metadata(video);
-    else ensure_music_metadata(track);
+    else ensure_music_metadata(
+        track, audio_valid ? audio.source : AudioPlaybackSource::Local);
 
     packet[2] = nsf_valid
         ? static_cast<uint8_t>(nsf.paused

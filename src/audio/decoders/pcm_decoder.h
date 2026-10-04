@@ -75,6 +75,13 @@ esp_err_t pcm_decoder_open(
     const char *path,
     AudioDecodeWorkspace *workspace = nullptr
 );
+// R46.0.78：接管一个已经打开且自带预读的 Streaming AudioSource。
+// 当前只开放 NAS MP3；函数调用后无论成功失败，source 的所有权都已转移/清空。
+esp_err_t pcm_decoder_open_streaming_mp3(
+    PcmDecoder *decoder,
+    AudioSource *source,
+    AudioDecodeWorkspace *workspace = nullptr
+);
 // 在硬件启动前直接建立到目标位置的解码器。FLAC 会从目标 seekpoint 一次性建立运行时，
 // 避免普通 open 后再 seek 造成重复 Prefetch；MP3/WAV/Opus 保持 open + seek 行为。
 esp_err_t pcm_decoder_open_for_seek(

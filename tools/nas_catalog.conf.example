@@ -1,5 +1,7 @@
 # Copy to /sdcard/System/nas_catalog.conf on FakePod.
-# R46.0.70 intentionally supports HTTP only; HTTPS is deferred until its RAM cost is measured.
-base_url=http://192.168.1.10:5005/fakepod
+# HTTP only in the current low-RAM profile; HTTPS/TLS is deferred until RAM is measured.
+base_url=http://192.168.1.105:8080/music-index
+# R46.0.78 NAS MP3 playback source. If omitted, .../music-index is automatically mapped to sibling .../music.
+music_url=http://192.168.1.105:8080/music
 username=
 password=

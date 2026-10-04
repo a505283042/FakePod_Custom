@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -45,6 +46,7 @@ static constexpr const char *kRemoteManifestName = "music_manifest_v2.bin";
 struct NasConfig
 {
     char base_url[kBaseUrlMax] = {};
+    char music_url[kBaseUrlMax] = {};
     char username[kUsernameMax] = {};
     char password[kPasswordMax] = {};
 };
@@ -193,6 +195,8 @@ static bool parse_config_text(char *text, NasConfig *config)
         char *value = trim(equals + 1);
         if (strcmp(key, "base_url") == 0) {
             snprintf(config->base_url, sizeof(config->base_url), "%s", value);
+        } else if (strcmp(key, "music_url") == 0) {
+            snprintf(config->music_url, sizeof(config->music_url), "%s", value);
         } else if (strcmp(key, "username") == 0) {
             snprintf(config->username, sizeof(config->username), "%s", value);
         } else if (strcmp(key, "password") == 0) {
@@ -203,8 +207,16 @@ static bool parse_config_text(char *text, NasConfig *config)
     while (length > 0U && config->base_url[length - 1U] == '/') {
         config->base_url[--length] = '\0';
     }
+    length = strlen(config->music_url);
+    while (length > 0U && config->music_url[length - 1U] == '/') {
+        config->music_url[--length] = '\0';
+    }
     // R46.0.70 刻意只开放 HTTP：不拉入 TLS 运行期开销；HTTPS 后续必须单独量 RAM 后再决定。
-    return strncmp(config->base_url, "http://", 7U) == 0 && strlen(config->base_url) > 7U;
+    if (strncmp(config->base_url, "http://", 7U) != 0 || strlen(config->base_url) <= 7U) {
+        return false;
+    }
+    return config->music_url[0] == '\0' ||
+        (strncmp(config->music_url, "http://", 7U) == 0 && strlen(config->music_url) > 7U);
 }
 
 static bool parse_remote_meta(char *text, NasRemoteMeta *meta)
@@ -674,6 +686,96 @@ bool nas_catalog_service_get_snapshot(NasCatalogSnapshot *out_snapshot)
     out_snapshot->revision = g_revision;
     taskEXIT_CRITICAL(&g_lock);
     return out_snapshot->ready;
+}
+
+
+
+esp_err_t nas_catalog_service_get_playback_endpoint(NasPlaybackEndpoint *out_endpoint)
+{
+    if (out_endpoint == nullptr) return ESP_ERR_INVALID_ARG;
+    *out_endpoint = {};
+
+    char *text = static_cast<char *>(heap_caps_malloc(
+        kMetaBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (text == nullptr) return ESP_ERR_NO_MEM;
+    esp_err_t ret = read_small_file(SystemPaths::kNasCatalogConfig, text, kMetaBufferBytes);
+    if (ret != ESP_OK) {
+        heap_caps_free(text);
+        return ret;
+    }
+
+    NasConfig config = {};
+    if (!parse_config_text(text, &config)) {
+        heap_caps_free(text);
+        return ESP_ERR_INVALID_ARG;
+    }
+    heap_caps_free(text);
+
+    if (config.music_url[0] != '\0') {
+        snprintf(out_endpoint->music_base_url, sizeof(out_endpoint->music_base_url), "%s", config.music_url);
+    } else {
+        static constexpr const char *kIndexSuffix = "/music-index";
+        const size_t base_len = strlen(config.base_url);
+        const size_t suffix_len = strlen(kIndexSuffix);
+        if (base_len <= suffix_len || strcasecmp(config.base_url + base_len - suffix_len, kIndexSuffix) != 0) {
+            ESP_LOGW(TAG, "NAS播放地址无法从base_url推导，请在nas_catalog.conf增加music_url=");
+            return ESP_ERR_NOT_FOUND;
+        }
+        const size_t prefix_len = base_len - suffix_len;
+        const int written = snprintf(
+            out_endpoint->music_base_url,
+            sizeof(out_endpoint->music_base_url),
+            "%.*s/music",
+            static_cast<int>(prefix_len),
+            config.base_url);
+        if (written <= 0 || static_cast<size_t>(written) >= sizeof(out_endpoint->music_base_url)) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+    }
+
+    snprintf(out_endpoint->username, sizeof(out_endpoint->username), "%s", config.username);
+    snprintf(out_endpoint->password, sizeof(out_endpoint->password), "%s", config.password);
+    return ESP_OK;
+}
+
+static bool nas_url_unreserved(unsigned char ch)
+{
+    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+        (ch >= '0' && ch <= '9') || ch == '-' || ch == '.' || ch == '_' || ch == '~';
+}
+
+esp_err_t nas_catalog_service_build_track_url(
+    const NasPlaybackEndpoint *endpoint,
+    const char *relative_path,
+    char *out_url,
+    size_t out_url_size)
+{
+    if (endpoint == nullptr || relative_path == nullptr || out_url == nullptr || out_url_size == 0U ||
+        endpoint->music_base_url[0] == '\0' || relative_path[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t used = strlen(endpoint->music_base_url);
+    if (used + 2U > out_url_size) return ESP_ERR_INVALID_SIZE;
+    memcpy(out_url, endpoint->music_base_url, used);
+    const char *path = relative_path;
+    if (path[0] != '/') out_url[used++] = '/';
+
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    for (; *path != '\0'; ++path) {
+        const unsigned char ch = static_cast<unsigned char>(*path);
+        if (ch == '/' || nas_url_unreserved(ch)) {
+            if (used + 1U >= out_url_size) return ESP_ERR_INVALID_SIZE;
+            out_url[used++] = static_cast<char>(ch);
+        } else {
+            if (used + 3U >= out_url_size) return ESP_ERR_INVALID_SIZE;
+            out_url[used++] = '%';
+            out_url[used++] = kHex[(ch >> 4U) & 0x0FU];
+            out_url[used++] = kHex[ch & 0x0FU];
+        }
+    }
+    out_url[used] = '\0';
+    return ESP_OK;
 }
 
 const char *nas_catalog_service_state_name(NasCatalogState state)

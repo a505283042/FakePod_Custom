@@ -13,12 +13,14 @@
 #include "freertos/task.h"
 #include "board_pins.h"
 #include "device_settings.h"
+#include "audio_service.h"
 #include "flac_decoder.h"
 #include "font/font_manager.h"
 #include "media_catalog_v2.h"
 #include "media_groups_v2.h"
 #include "media_library.h"
 #include "nas_library_source.h"
+#include "nas_catalog_service.h"
 #include "player_control.h"
 #include "player_home.h"
 #include "cassette_view.h"
@@ -26,6 +28,7 @@
 #include "player_state.h"
 #include "search/search_key_builder.h"
 #include "system/screen_lock_simple.h"
+#include "wifi_service.h"
 #include "ui_common.h"
 #include "widgets/quick_index_keyboard.h"
 
@@ -2588,6 +2591,72 @@ static void library_view_queue_gesture(LibraryPendingGesture action, uint32_t ti
     }
 }
 
+static bool library_view_play_nas_mp3(uint32_t track_index)
+{
+    MediaTrackViewV2 track = {};
+    if (!nas_library_source_get_track_view(track_index, &track) ||
+        track.row == nullptr || track.path == nullptr || track.path[0] == '\0') {
+        ESP_LOGW(TAG, "NAS MP3播放失败：Track绑定不可用 track=%lu",
+            static_cast<unsigned long>(track_index));
+        return false;
+    }
+    if (track.row->format != MediaFormat::MP3) {
+        ESP_LOGW(TAG, "NAS播放第一阶段仅支持MP3：track=%lu format=%s path=%s",
+            static_cast<unsigned long>(track_index),
+            media_format_name(track.row->format),
+            track.path);
+        return false;
+    }
+
+    WifiServiceSnapshot wifi = {};
+    if (!wifi_service_get_snapshot(&wifi) || !wifi.connected) {
+        ESP_LOGW(TAG, "NAS MP3播放失败：Wi-Fi未连接");
+        return false;
+    }
+
+    NasPlaybackEndpoint endpoint = {};
+    esp_err_t ret = nas_catalog_service_get_playback_endpoint(&endpoint);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "NAS MP3播放端点不可用：%s", esp_err_to_name(ret));
+        return false;
+    }
+
+    static constexpr size_t kNasTrackUrlMax = 4096U;
+    char *url = static_cast<char *>(heap_caps_malloc(
+        kNasTrackUrlMax, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (url == nullptr) {
+        ESP_LOGW(TAG, "NAS MP3 URL缓冲分配失败");
+        return false;
+    }
+    ret = nas_catalog_service_build_track_url(
+        &endpoint, track.path, url, kNasTrackUrlMax);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "NAS MP3 URL构造失败：%s path=%s", esp_err_to_name(ret), track.path);
+        heap_caps_free(url);
+        return false;
+    }
+
+    const bool submitted = audio_service_play_nas_mp3(
+        track_index,
+        url,
+        endpoint.username,
+        endpoint.password,
+        &track.row->technical,
+        false);
+    if (submitted) {
+        g_nas_selected_track = track_index;
+        ESP_LOGI(TAG, "NAS MP3播放请求已提交：track=%lu title=%s path=%s",
+            static_cast<unsigned long>(track_index),
+            track.title != nullptr ? track.title : "",
+            track.path);
+    } else {
+        ESP_LOGW(TAG, "NAS MP3播放请求提交失败：track=%lu",
+            static_cast<unsigned long>(track_index));
+    }
+    heap_caps_free(url);
+    return submitted;
+}
+
 static void library_view_row_clicked_cb(lv_event_t *event)
 {
     if (lv_event_get_code(event) != LV_EVENT_CLICKED || library_click_suppressed()) {
@@ -2609,17 +2678,12 @@ static void library_view_row_clicked_cb(lv_event_t *event)
         player_home_prepare_track_transition_hold();
     if (selecting_track && library_source_is_nas()) {
         if (row->track_index == UINT32_MAX) {
-            ESP_LOGW(TAG, "NAS歌曲绑定无效，拒绝选中");
+            ESP_LOGW(TAG, "NAS歌曲绑定无效，拒绝播放");
             return;
         }
-        g_nas_selected_track = row->track_index;
-        MediaTrackViewV2 track = {};
-        const char *path = nas_library_source_get_track_view(row->track_index, &track) ? track.path : nullptr;
-        ESP_LOGI(TAG,
-            "NAS歌曲已选中（共享曲库UI，当前仍不启动播放）：track=%lu path=%s",
-            static_cast<unsigned long>(row->track_index),
-            path != nullptr ? path : "?");
-        library_view_refresh_virtual_rows(true);
+        if (library_view_play_nas_mp3(row->track_index)) {
+            library_view_refresh_virtual_rows(true);
+        }
         return;
     }
 
@@ -3466,6 +3530,24 @@ bool library_view_is_nas_source()
     return library_source_is_nas();
 }
 
+static bool library_view_nas_catalog_needed_by_playback()
+{
+    AudioStateSnapshot audio = {};
+    if (!audio_service_get_snapshot(&audio) || audio.source != AudioPlaybackSource::NasHttp) {
+        return false;
+    }
+    switch (audio.state) {
+        case AudioPlaybackState::Preparing:
+        case AudioPlaybackState::Prepared:
+        case AudioPlaybackState::Playing:
+        case AudioPlaybackState::Seeking:
+        case AudioPlaybackState::Paused:
+            return true;
+        default:
+            return false;
+    }
+}
+
 void library_view_close_nas()
 {
     if (!library_source_is_nas()) return;
@@ -3477,7 +3559,8 @@ void library_view_close_nas()
     library_search_release_cache();
 
     const bool keep_nas_resident =
-        device_settings_music_library_source() == DeviceMusicLibrarySource::Nas;
+        device_settings_music_library_source() == DeviceMusicLibrarySource::Nas ||
+        library_view_nas_catalog_needed_by_playback();
     if (!keep_nas_resident) {
         nas_library_source_close();
     }
@@ -3517,6 +3600,12 @@ void library_view_close_nas()
 void library_view_on_library_source_changed(DeviceMusicLibrarySource source)
 {
     if (source == DeviceMusicLibrarySource::Local && nas_library_source_ready()) {
+        if (library_view_nas_catalog_needed_by_playback()) {
+            ESP_LOGI(TAG,
+                "曲库来源切回Local：当前播放源仍为NAS，延后释放NAS Catalog psram=%uB",
+                static_cast<unsigned>(nas_library_source_psram_bytes()));
+            return;
+        }
         const size_t before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
         nas_library_source_close();
         const size_t after = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);

@@ -18,6 +18,7 @@
 #include "audio_spectrum_snapshot.h"
 #include "nsf_synth.h"
 #include "sources/avi_mp3_audio_source.h"
+#include "sources/buffered_http_audio_source.h"
 #include "app_diag_config.h"
 
 static const char *TAG = "音频服务";
@@ -124,6 +125,7 @@ struct AudioRequest
     uint32_t request_id = 0;
     uint32_t transport_intent_revision = 0;
     uint32_t track_index = UINT32_MAX;
+    AudioPlaybackSource source = AudioPlaybackSource::Local;
     MediaFormat format = MediaFormat::Unknown;
     bool has_technical_info = false;
     MediaTechnicalInfo technical_info = {};
@@ -144,6 +146,8 @@ struct AudioRequest
     uint64_t seek_target_ms = 0;
     char path[AUDIO_INLINE_PATH_SIZE] = {};
     char *extended_path = nullptr;
+    char nas_username[64] = {};
+    char nas_password[96] = {};
     SemaphoreHandle_t done = nullptr;
     bool success = false;
     esp_err_t result = ESP_FAIL;
@@ -185,6 +189,7 @@ static uint32_t g_task_state_revision = 0;
 static uint32_t g_task_playback_revision = 1;
 static uint32_t g_task_last_request_id = 0;
 static uint32_t g_task_track_index = UINT32_MAX;
+static AudioPlaybackSource g_task_source = AudioPlaybackSource::Local;
 static MediaFormat g_task_format = MediaFormat::Unknown;
 static esp_err_t g_task_last_error = ESP_OK;
 static AudioFailureScope g_task_failure_scope = AudioFailureScope::None;
@@ -649,6 +654,7 @@ static void audio_task_publish_snapshot()
     snapshot.playback_revision = g_task_playback_revision;
     snapshot.last_request_id = g_task_last_request_id;
     snapshot.track_index = g_task_track_index;
+    snapshot.source = g_task_source;
     snapshot.format = g_task_format;
     snapshot.last_error = g_task_last_error;
     snapshot.failure_scope = g_task_failure_scope;
@@ -1491,16 +1497,37 @@ static esp_err_t audio_task_start_pcm_pipeline(
     }
     audio_task_log_ram("before_decoder_open");
     PcmSeekResult seek_result = {};
-    esp_err_t ret = apply_seek
-        ? pcm_decoder_open_for_seek(
-            &g_decoder,
-            decoder_type,
+    const bool nas_http = request != nullptr && request->source == AudioPlaybackSource::NasHttp;
+    esp_err_t ret = ESP_OK;
+    if (nas_http) {
+        if (apply_seek || decoder_type != PcmDecoderType::Mp3) {
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+        AudioSource http_source = {};
+        ret = buffered_http_audio_source_open(
+            &http_source,
             path,
-            &g_decode_workspace,
-            seek_target_ms,
-            request != nullptr && request->has_technical_info ? &request->technical_info : nullptr,
-            &seek_result)
-        : pcm_decoder_open(&g_decoder, decoder_type, path, &g_decode_workspace);
+            request->nas_username,
+            request->nas_password);
+        if (ret == ESP_OK) {
+            ret = pcm_decoder_open_streaming_mp3(
+                &g_decoder, &http_source, &g_decode_workspace);
+        }
+        if (audio_source_is_open(&http_source)) {
+            (void)audio_source_close(&http_source);
+        }
+    } else {
+        ret = apply_seek
+            ? pcm_decoder_open_for_seek(
+                &g_decoder,
+                decoder_type,
+                path,
+                &g_decode_workspace,
+                seek_target_ms,
+                request != nullptr && request->has_technical_info ? &request->technical_info : nullptr,
+                &seek_result)
+            : pcm_decoder_open(&g_decoder, decoder_type, path, &g_decode_workspace);
+    }
     if (ret != ESP_OK) {
         if (out_failure_scope != nullptr) {
             *out_failure_scope = audio_decoder_failure_scope(ret);
@@ -1569,13 +1596,15 @@ static esp_err_t audio_task_start_pcm_pipeline(
     }
 
     // 格式解析和可选 Seek 均已完成；从这里开始才进入连续播放阶段。
-    // MP3/WAV/Ogg Opus 切换到 Core1 顺序预读，避免 AudioTask 在 I2S 运行期间直接等待 FATFS。
-    ret = pcm_decoder_enable_runtime_read_ahead(&g_decoder, path);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "启用运行期音频预读失败：format=%s ret=%s",
-            pcm_decoder_type_name(decoder_type), esp_err_to_name(ret));
-        pcm_decoder_close(&g_decoder);
-        return ret;
+    // Local MP3/WAV/Opus 切到 SD 顺序预读；NAS MP3 的 HTTP Source 自身已经是 Core1 + PSRAM ring。
+    if (!nas_http) {
+        ret = pcm_decoder_enable_runtime_read_ahead(&g_decoder, path);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "启用运行期音频预读失败：format=%s ret=%s",
+                pcm_decoder_type_name(decoder_type), esp_err_to_name(ret));
+            pcm_decoder_close(&g_decoder);
+            return ret;
+        }
     }
     if (check_transport_intent && request != nullptr &&
         audio_task_transport_request_superseded(request, "after_read_ahead")) {
@@ -4193,6 +4222,7 @@ static void audio_task_handle_play(AudioRequest *request)
 #endif
     g_task_last_request_id = request->request_id;
     g_task_track_index = request->track_index;
+    g_task_source = request->source;
     g_task_format = request->format;
     g_task_last_seek_request_id = 0;
     g_task_last_seek_target_ms = 0;
@@ -4200,9 +4230,10 @@ static void audio_task_handle_play(AudioRequest *request)
     audio_task_advance_playback_revision();
     audio_task_set_state(AudioPlaybackState::Preparing);
 
-    ESP_LOGI(TAG, "收到播放请求：请求=%lu 世代=%lu 曲目=%lu 格式=%s 路径=%s",
+    ESP_LOGI(TAG, "收到播放请求：请求=%lu 世代=%lu 来源=%s 曲目=%lu 格式=%s 路径=%s",
         static_cast<unsigned long>(request->request_id),
         static_cast<unsigned long>(g_task_playback_revision),
+        request->source == AudioPlaybackSource::NasHttp ? "NAS_HTTP" : "LOCAL",
         static_cast<unsigned long>(request->track_index + 1),
         media_format_name(request->format),
         path != nullptr ? path : "(空)");
@@ -4533,6 +4564,7 @@ static void audio_task_handle_stop(AudioRequest *request)
     esp_err_t ret = audio_task_shutdown_pipeline();
     audio_task_advance_playback_revision();
     g_task_track_index = UINT32_MAX;
+    g_task_source = AudioPlaybackSource::Local;
     g_task_format = MediaFormat::Unknown;
     g_task_last_seek_request_id = 0;
     g_task_last_seek_target_ms = 0;
@@ -5360,6 +5392,7 @@ bool audio_service_play_track(
         return false;
     }
     request->track_index = track_index;
+    request->source = AudioPlaybackSource::Local;
     request->format = format;
     if (technical_info != nullptr) {
         // 跨任务只复制 POD 快照，不把 Catalog 内部指针交给 AudioTask。
@@ -5367,6 +5400,33 @@ bool audio_service_play_track(
         request->has_technical_info = true;
     }
     if (!audio_request_set_path(request, path)) {
+        audio_request_release(request);
+        return false;
+    }
+    return audio_service_submit_transport_intent(request, wait);
+}
+
+bool audio_service_play_nas_mp3(
+    uint32_t track_index,
+    const char *url,
+    const char *username,
+    const char *password,
+    const MediaTechnicalInfo *technical_info,
+    bool wait)
+{
+    if (url == nullptr || strncmp(url, "http://", 7U) != 0) return false;
+    AudioRequest *request = audio_request_create(AudioCommandType::Play, wait);
+    if (request == nullptr) return false;
+    request->track_index = track_index;
+    request->source = AudioPlaybackSource::NasHttp;
+    request->format = MediaFormat::MP3;
+    if (technical_info != nullptr) {
+        request->technical_info = *technical_info;
+        request->has_technical_info = true;
+    }
+    snprintf(request->nas_username, sizeof(request->nas_username), "%s", username != nullptr ? username : "");
+    snprintf(request->nas_password, sizeof(request->nas_password), "%s", password != nullptr ? password : "");
+    if (!audio_request_set_path(request, url)) {
         audio_request_release(request);
         return false;
     }
