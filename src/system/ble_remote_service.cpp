@@ -11,6 +11,7 @@
 #include "battery_service.h"
 #include "media_catalog_v2.h"
 #include "player_control.h"
+#include "player_state.h"
 #include "wifi_service.h"
 #include "app/video_app.h"
 #include "app/visual_music_app.h"
@@ -264,7 +265,8 @@ static void queue_metadata(uint32_t track_index, uint32_t catalog_generation)
     const char *title = "";
     const char *artist = "";
     MediaTrackViewV2 view = {};
-    if (track_index != UINT32_MAX && media_catalog_v2_get_track_view(track_index, &view)) {
+    if (track_index != UINT32_MAX && player_state_is_ready() &&
+        player_state_get_index() == track_index && player_state_get_track_view(&view)) {
         if (view.title != nullptr) title = view.title;
         if (view.artist != nullptr) artist = view.artist;
         catalog_generation = view.generation;
@@ -278,7 +280,8 @@ static void ensure_metadata_for_track(uint32_t track_index)
     uint32_t generation = 0U;
     if (track_index != UINT32_MAX) {
         MediaTrackViewV2 view = {};
-        if (media_catalog_v2_get_track_view(track_index, &view)) generation = view.generation;
+        if (player_state_is_ready() && player_state_get_index() == track_index &&
+            player_state_get_track_view(&view)) generation = view.generation;
     }
 
     if (!g_metadata_source_initialized || g_metadata_context != PhoneMediaContext::Music ||

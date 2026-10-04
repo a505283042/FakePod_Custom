@@ -10,6 +10,7 @@
 #include "media_catalog_v2.h"
 #include "nas_library_source.h"
 #include "player_control.h"
+#include "player_state.h"
 #include "video_app.h"
 #include "visual_music_app.h"
 
@@ -136,10 +137,11 @@ static void ensure_music_metadata(uint32_t track, AudioPlaybackSource source)
     uint32_t generation = 0U;
     const char *title = "";
     const char *artist = "";
-    const bool have_view = track != UINT32_MAX &&
-        (source == AudioPlaybackSource::NasHttp
-            ? nas_library_source_get_track_view(track, &view)
-            : media_catalog_v2_get_track_view(track, &view));
+    const AudioPlaybackSource current_source = player_state_get_source() == PlayerMediaSource::Nas
+        ? AudioPlaybackSource::NasHttp : AudioPlaybackSource::Local;
+    const bool have_view = track != UINT32_MAX && source == current_source &&
+        player_state_is_ready() && player_state_get_index() == track &&
+        player_state_get_track_view(&view);
     if (have_view) {
         generation = view.generation;
         if (view.title != nullptr) title = view.title;

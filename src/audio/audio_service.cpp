@@ -7,6 +7,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_heap_caps.h"
+#include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "cs43131.h"
@@ -79,6 +80,11 @@ static constexpr uint32_t AUDIO_SEEK_MUTE_SETTLE_MS = 50;
 // 不再把第一个 20ms 等待超时直接升级成 AUDIO_FAULT。
 static constexpr uint32_t AUDIO_FLAC_STARVE_GRACE_MAX_MS = 1000;
 static constexpr uint32_t AUDIO_FLAC_STARVE_GRACE_MAX_ATTEMPTS = 32;
+// R46.0.81：HTTP MP3 的网络读可能短时停顿。ring 真正耗空时不把第一个
+// Source timeout 直接升级成播放故障，而是在有硬上限的恢复窗口内用静音维持 I2S。
+// HTTP client 自身超时为5s，因此恢复窗略高于5s，确保能等到真实 transport 结果。
+static constexpr uint32_t AUDIO_HTTP_MP3_STARVE_GRACE_MAX_MS = 6000;
+static constexpr uint32_t AUDIO_HTTP_MP3_STARVE_GRACE_MAX_ATTEMPTS = 192;
 // 常规 codec workspace 跨曲保留复用；若异常文件把 PCM 工作区推到超大尺寸，
 // 关闭该曲后释放，避免一次特殊文件永久占住大量 PSRAM。
 static constexpr size_t AUDIO_DECODE_WORKSPACE_RETAIN_INPUT_BYTES = 32 * 1024;
@@ -221,6 +227,8 @@ static AudioOutputMode g_task_output_mode = AudioOutputMode::NormalHeadphones;
 static bool g_task_user_muted = false;
 static uint32_t g_flac_starve_grace_attempts = 0;
 static int64_t g_flac_starve_grace_started_us = 0;
+static uint32_t g_http_mp3_starve_grace_attempts = 0;
+static int64_t g_http_mp3_starve_grace_started_us = 0;
 
 // 正式播放资源也只属于 AudioTask。
 // WAV/FLAC/MP3/Ogg Opus 都通过统一 PcmDecoder 产出 32bit stereo PCM，I2S/DAC 不关心源格式。
@@ -695,6 +703,8 @@ static AudioFailureScope audio_decoder_failure_scope(esp_err_t error)
         case ESP_ERR_NO_MEM:
         case ESP_ERR_TIMEOUT:
         case ESP_ERR_INVALID_STATE:
+        case ESP_ERR_HTTP_CONNECT:
+        case ESP_ERR_INVALID_RESPONSE:
             return AudioFailureScope::System;
         default:
             return AudioFailureScope::Track;
@@ -793,6 +803,88 @@ static bool audio_task_try_recover_flac_starvation(esp_err_t decoder_error)
     return true;
 }
 
+static void audio_task_reset_http_mp3_starve_grace()
+{
+    g_http_mp3_starve_grace_attempts = 0;
+    g_http_mp3_starve_grace_started_us = 0;
+}
+
+static void audio_task_log_http_mp3_starve_recovered()
+{
+    if (g_http_mp3_starve_grace_attempts == 0) {
+        return;
+    }
+
+    BufferedHttpAudioSourceStats http = {};
+    (void)buffered_http_audio_source_get_stats(&g_decoder.source, &http);
+    const int64_t now_us = esp_timer_get_time();
+    const uint32_t elapsed_ms = g_http_mp3_starve_grace_started_us > 0 &&
+        now_us > g_http_mp3_starve_grace_started_us
+        ? static_cast<uint32_t>((now_us - g_http_mp3_starve_grace_started_us) / 1000LL)
+        : 0U;
+    ESP_LOGI(TAG,
+        "NAS MP3欠载已恢复：attempts=%u elapsed=%ums ring=%u/%uB",
+        static_cast<unsigned>(g_http_mp3_starve_grace_attempts),
+        static_cast<unsigned>(elapsed_ms),
+        static_cast<unsigned>(http.ring_buffered_bytes),
+        static_cast<unsigned>(http.ring_capacity_bytes));
+    audio_task_reset_http_mp3_starve_grace();
+}
+
+static bool audio_task_try_recover_http_mp3_starvation(esp_err_t decoder_error)
+{
+    if (decoder_error != ESP_ERR_TIMEOUT || g_task_format != MediaFormat::MP3 ||
+        g_task_source != AudioPlaybackSource::NasHttp) {
+        return false;
+    }
+
+    BufferedHttpAudioSourceStats http = {};
+    if (!buffered_http_audio_source_get_stats(&g_decoder.source, &http) ||
+        http.io_error || http.eof) {
+        return false;
+    }
+
+    const int64_t now_us = esp_timer_get_time();
+    if (g_http_mp3_starve_grace_attempts == 0) {
+        g_http_mp3_starve_grace_started_us = now_us;
+        ESP_LOGW(TAG,
+            "NAS MP3欠载进入有界恢复：ring=%u/%uB ioerr=0 eof=0，最多%ums/%u次；期间以静音维持I2S",
+            static_cast<unsigned>(http.ring_buffered_bytes),
+            static_cast<unsigned>(http.ring_capacity_bytes),
+            static_cast<unsigned>(AUDIO_HTTP_MP3_STARVE_GRACE_MAX_MS),
+            static_cast<unsigned>(AUDIO_HTTP_MP3_STARVE_GRACE_MAX_ATTEMPTS));
+    }
+
+    const uint32_t elapsed_ms = g_http_mp3_starve_grace_started_us > 0 &&
+        now_us > g_http_mp3_starve_grace_started_us
+        ? static_cast<uint32_t>((now_us - g_http_mp3_starve_grace_started_us) / 1000LL)
+        : 0U;
+    if (elapsed_ms >= AUDIO_HTTP_MP3_STARVE_GRACE_MAX_MS ||
+        g_http_mp3_starve_grace_attempts >= AUDIO_HTTP_MP3_STARVE_GRACE_MAX_ATTEMPTS) {
+        ESP_LOGE(TAG,
+            "NAS MP3欠载恢复超限：attempts=%u elapsed=%ums ring=%u/%uB；升级为真实播放故障",
+            static_cast<unsigned>(g_http_mp3_starve_grace_attempts),
+            static_cast<unsigned>(elapsed_ms),
+            static_cast<unsigned>(http.ring_buffered_bytes),
+            static_cast<unsigned>(http.ring_capacity_bytes));
+        audio_task_reset_http_mp3_starve_grace();
+        return false;
+    }
+
+    ++g_http_mp3_starve_grace_attempts;
+    // 20ms Source 等待后补约23ms静音，既让网络任务有时间回填，也持续喂I2S DMA。
+    const esp_err_t silence_ret = i2s_output_stream_write_silence(
+        AUDIO_STREAM_FRAMES * 4U, AUDIO_I2S_WRITE_TIMEOUT_MS);
+    if (silence_ret != ESP_OK) {
+        ESP_LOGE(TAG, "NAS MP3欠载恢复期间I2S静音写入失败：%s", esp_err_to_name(silence_ret));
+        audio_task_reset_http_mp3_starve_grace();
+        return false;
+    }
+
+    // 静音只维持硬件时钟，不推进媒体播放时钟。
+    return true;
+}
+
 static void audio_task_reset_media_fields()
 {
     g_task_sample_rate_hz = 0;
@@ -802,6 +894,7 @@ static void audio_task_reset_media_fields()
     g_task_total_frames = 0;
     g_last_progress_publish_frame = 0;
     audio_task_reset_flac_starve_grace();
+    audio_task_reset_http_mp3_starve_grace();
 }
 
 static void audio_request_complete(AudioRequest *request, bool success, esp_err_t result)
@@ -1506,6 +1599,7 @@ static esp_err_t audio_task_start_pcm_pipeline(
         AudioSource http_source = {};
         ret = buffered_http_audio_source_open(
             &http_source,
+            BufferedHttpAudioProfile::Mp3,
             path,
             request->nas_username,
             request->nas_password);
@@ -1888,11 +1982,16 @@ static void audio_task_service_pcm_playback()
         if (audio_task_try_recover_flac_starvation(ret)) {
             return;
         }
+        if (audio_task_try_recover_http_mp3_starvation(ret)) {
+            return;
+        }
         audio_task_reset_flac_starve_grace();
+        audio_task_reset_http_mp3_starve_grace();
         audio_task_fail_stream(ret, "读取PCM", audio_decoder_failure_scope(ret));
         return;
     }
     audio_task_log_flac_starve_recovered();
+    audio_task_log_http_mp3_starve_recovered();
 
     // decoder 位置只用于诊断；正式播放时钟必须等真实 PCM 成功进入 I2S 后才推进。
     audio_playback_clock_note_decoder(

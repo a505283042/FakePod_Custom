@@ -26,6 +26,10 @@ static constexpr size_t MP3_INPUT_REFILL_LOW_WATER_BYTES = 2048;
 // 这里预留 16KB，兼容 parser 一次返回更大的连续 PCM，并允许按 needed_size 扩容。
 static constexpr size_t MP3_DECODED_BUFFER_BYTES = 16384;
 static constexpr size_t MP3_MAX_DECODED_BUFFER_BYTES = 128 * 1024;
+// R46.0.82：HTTP 首播时 parser 可能连续吞掉 ID3/封面等标签，瞬间跑空网络 ring。
+// source_read 每次空 ring 已有20ms有界等待；首块 PCM 阶段允许原地继续同一 decoder
+// 最多128次 timeout（约2.56s），不关闭/重建 HTTP，也不把瞬态空窗误判成坏曲。
+static constexpr uint32_t MP3_STREAM_OPEN_TIMEOUT_RETRY_MAX = 128U;
 
 #if APP_DIAG_MP3_PERFORMANCE
 static constexpr uint32_t MP3_PERF_REPORT_INTERVAL_US = 5000000U;
@@ -639,8 +643,12 @@ static esp_err_t mp3_fill_input(Mp3Decoder *decoder, bool *out_read)
     decoder->input_size += read_bytes;
 
     if (source_ret != ESP_OK) {
-        ESP_LOGE(TAG, "读取 MP3 压缩数据失败：source=%s ret=%s",
-            audio_source_name(decoder->source), esp_err_to_name(source_ret));
+        // Streaming ring 的短时 timeout 是流控信号，不是 decoder/文件损坏。
+        // 首播由 mp3_decoder_open 原地续等，运行期由 AudioTask 的 NAS MP3 欠载恢复处理。
+        if (!(decoder->streaming_source && source_ret == ESP_ERR_TIMEOUT)) {
+            ESP_LOGE(TAG, "读取 MP3 压缩数据失败：source=%s ret=%s",
+                audio_source_name(decoder->source), esp_err_to_name(source_ret));
+        }
         return source_ret;
     }
     if (read_bytes < free_bytes && audio_source_eof(decoder->source)) {
@@ -1181,9 +1189,27 @@ esp_err_t mp3_decoder_open(
     decoder->simple_handle = handle;
 
     // 与 FLAC 一致：在 I2S/DAC 启动前先解出第一块 PCM，确认真实格式并预热解码器。
-    ret = mp3_decode_next_output(decoder);
+    // HTTP streaming 首播允许在同一个 decoder/source 上原地等网络继续填 ring。
+    // 不能像旧路径那样遇到第一个20ms空窗就关闭 HTTP，再从头重连一次。
+    uint32_t stream_open_timeout_retries = 0U;
+    do {
+        ret = mp3_decode_next_output(decoder);
+        if (!(streaming_source && ret == ESP_ERR_TIMEOUT) ||
+            stream_open_timeout_retries >= MP3_STREAM_OPEN_TIMEOUT_RETRY_MAX) {
+            break;
+        }
+        if (stream_open_timeout_retries == 0U) {
+            ESP_LOGW(TAG, "NAS MP3首块PCM等待网络补充：保持同一HTTP连接/decoder，不重建链路");
+        }
+        ++stream_open_timeout_retries;
+    } while (true);
+    if (ret == ESP_OK && stream_open_timeout_retries > 0U) {
+        ESP_LOGI(TAG, "NAS MP3首块PCM等待已恢复：timeouts=%u",
+            static_cast<unsigned>(stream_open_timeout_retries));
+    }
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "MP3 首块 PCM 预解码失败：%s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "MP3 首块 PCM 预解码失败：%s retries=%u",
+            esp_err_to_name(ret), static_cast<unsigned>(stream_open_timeout_retries));
         mp3_decoder_close(decoder);
         return ret;
     }

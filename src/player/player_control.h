@@ -60,3 +60,10 @@ bool player_control_select_folder_queue_position(size_t position);
 bool player_control_select_artist_group(size_t group_index, size_t position);
 bool player_control_select_album_group(size_t group_index, size_t position);
 bool player_control_select_decade_group(size_t group_index, size_t position);
+
+// NAS 只在绑定入口指定来源；绑定后 transport/loop/上一首/下一首/自动EOF 与 Local 共用同一套逻辑。
+bool player_control_select_nas_all_tracks(size_t position);
+bool player_control_select_nas_folder_queue_position(size_t position);
+bool player_control_select_nas_artist_group(size_t group_index, size_t position);
+bool player_control_select_nas_album_group(size_t group_index, size_t position);
+bool player_control_select_nas_decade_group(size_t group_index, size_t position);

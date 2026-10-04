@@ -382,6 +382,7 @@ static uint32_t g_last_audio_state_revision = UINT32_MAX;
 // P1.5.3.2R.19：记录主页最后已经绑定的 Player Track。切歌后不再等待 100ms Artwork timer，
 // 而是在当前 LVGL 线程立即把预热好的 RGB565 Surface 绑定到主页；20ms watcher 同时覆盖自然 EOF。
 static uint32_t g_last_artwork_bound_track = UINT32_MAX;
+static PlayerMediaSource g_last_artwork_bound_source = PlayerMediaSource::Local;
 
 // Overlay / Launcher 内部 helper 先行声明，供后续多个回调交叉调用。
 static void player_home_cancel_progress_interaction();
@@ -3286,7 +3287,8 @@ static void player_home_repaint_controls_after_bounded_present()
 
 static void player_home_artwork_fast_rebind(const char *reason)
 {
-    if (!player_state_is_ready() || media_library_get_count() == 0U ||
+    if (!player_state_is_ready() ||
+        (player_state_get_source() == PlayerMediaSource::Local && media_library_get_count() == 0U) ||
         library_view_is_visible() || lyrics_view_is_visible() || spectrum_view_is_visible()) {
         return;
     }
@@ -3294,7 +3296,9 @@ static void player_home_artwork_fast_rebind(const char *reason)
     const uint32_t track_index = static_cast<uint32_t>(player_state_get_index());
 
     const int64_t started_us = esp_timer_get_time();
-    if (g_music_visual_mode == MusicVisualMode::Cassette) {
+    const bool use_cassette = g_music_visual_mode == MusicVisualMode::Cassette &&
+        player_state_get_source() == PlayerMediaSource::Local;
+    if (use_cassette) {
         cassette_view_update();
         // Overlay 保持打开并切歌时，缓存会先失效再重建；同步切换兜底/快路径。
         if (g_overlay_visible) {
@@ -3306,10 +3310,11 @@ static void player_home_artwork_fast_rebind(const char *reason)
         player_home_repaint_controls_after_bounded_present();
     }
     g_last_artwork_bound_track = track_index;
+    g_last_artwork_bound_source = player_state_get_source();
 
     HOME_INTERACTION_LOGI(
         "%s立即重绑：reason=%s track=%lu cost=%lldus",
-        g_music_visual_mode == MusicVisualMode::Cassette ? "磁带封面" : "封面",
+        use_cassette ? "磁带封面" : "封面",
         reason != nullptr ? reason : "track-change",
         static_cast<unsigned long>(track_index),
         static_cast<long long>(esp_timer_get_time() - started_us));
@@ -3317,12 +3322,14 @@ static void player_home_artwork_fast_rebind(const char *reason)
 
 static void player_home_artwork_watch_track_change()
 {
-    if (!player_state_is_ready() || media_library_get_count() == 0U ||
+    if (!player_state_is_ready() ||
+        (player_state_get_source() == PlayerMediaSource::Local && media_library_get_count() == 0U) ||
         library_view_is_visible() || lyrics_view_is_visible() || spectrum_view_is_visible()) {
         return;
     }
     const uint32_t track_index = static_cast<uint32_t>(player_state_get_index());
-    if (track_index != g_last_artwork_bound_track) {
+    const PlayerMediaSource source = player_state_get_source();
+    if (track_index != g_last_artwork_bound_track || source != g_last_artwork_bound_source) {
         player_home_artwork_fast_rebind("20ms-context-watch");
     }
 }
@@ -3350,9 +3357,11 @@ static void player_home_update_background_timer_qos()
         // 页面被 Launcher/曲库等完整覆盖时取消尚未完成的首次切换，返回主页后仍保持 Artwork。
         g_cassette_visual_switch_pending = false;
     }
+    const bool nas_playback = player_state_is_ready() && player_state_get_source() == PlayerMediaSource::Nas;
+    // NAS封面Provider尚未接入时统一退回 Artwork 的默认封面；绝不继续绑定上一首 Local 磁带/封面。
     const bool artwork_should_run = should_run &&
-        (g_music_visual_mode == MusicVisualMode::Artwork || g_cassette_visual_switch_pending);
-    const bool cassette_should_run = should_run &&
+        (nas_playback || g_music_visual_mode == MusicVisualMode::Artwork || g_cassette_visual_switch_pending);
+    const bool cassette_should_run = should_run && !nas_playback &&
         (g_music_visual_mode == MusicVisualMode::Cassette || g_cassette_visual_switch_pending);
     const bool quiet_resume = artwork_should_run && g_artwork_resume_without_invalidation;
     now_playing_artwork_set_active(artwork_should_run, quiet_resume);
@@ -3916,37 +3925,8 @@ static void player_home_refresh_track(const AudioStateSnapshot *audio_snapshot)
         return;
     }
 
-    if (audio_snapshot != nullptr &&
-        audio_snapshot->source == AudioPlaybackSource::NasHttp &&
-        audio_snapshot->track_index != UINT32_MAX) {
-        MediaTrackViewV2 nas = {};
-        const bool have_nas = nas_library_source_get_track_view(audio_snapshot->track_index, &nas);
-        player_home_label_set_text_if_changed(
-            g_title,
-            have_nas && nas.title != nullptr && nas.title[0] != '\0' ? nas.title : "NAS MP3");
-        player_home_label_set_text_if_changed(
-            g_artist,
-            have_nas && nas.artist != nullptr && nas.artist[0] != '\0' ? nas.artist : "NAS");
-
-        char sample_info[48] = {};
-        player_home_format_sample_info(
-            audio_snapshot->sample_rate_hz,
-            audio_snapshot->bits_per_sample,
-            sample_info,
-            sizeof(sample_info));
-        char track_info[128] = {};
-        if (sample_info[0] != '\0') {
-            snprintf(track_info, sizeof(track_info), "NAS  ·  MP3  ·  %s", sample_info);
-        } else {
-            snprintf(track_info, sizeof(track_info), "NAS  ·  MP3");
-        }
-        player_home_label_set_text_if_changed(g_track_info, track_info);
-        return;
-    }
-
-    const size_t library_count = media_library_get_count();
     const size_t list_count = player_state_get_list_count();
-    if (library_count == 0U || list_count == 0U) {
+    if (!player_state_is_ready() || list_count == 0U) {
         player_home_label_set_text_if_changed(g_title, "暂无歌曲");
         player_home_label_set_text_if_changed(g_artist, "");
         player_home_label_set_text_if_changed(g_track_info, "音乐库为空");
@@ -3963,13 +3943,14 @@ static void player_home_refresh_track(const AudioStateSnapshot *audio_snapshot)
         }
     }
     MediaTrackViewV2 view = {};
-    const bool have_view = media_catalog_v2_get_track_view(index, &view);
+    const bool have_view = player_state_get_track_view(&view);
 
     char title_fallback[512] = {};
     const char *title = nullptr;
     if (have_view && view.title != nullptr && view.title[0] != '\0') {
         title = view.title;
-    } else if (media_library_copy_display_name(index, title_fallback, sizeof(title_fallback))) {
+    } else if (player_state_get_source() == PlayerMediaSource::Local &&
+               media_library_copy_display_name(index, title_fallback, sizeof(title_fallback))) {
         title = title_fallback;
     } else {
         snprintf(title_fallback, sizeof(title_fallback), "歌曲 %u", static_cast<unsigned>(index + 1U));
@@ -3984,7 +3965,10 @@ static void player_home_refresh_track(const AudioStateSnapshot *audio_snapshot)
 
     uint32_t sample_rate_hz = 0U;
     uint16_t bits_per_sample = 0U;
-    if (audio_snapshot != nullptr && audio_snapshot->track_index == index) {
+    const AudioPlaybackSource expected_source = player_state_get_source() == PlayerMediaSource::Nas
+        ? AudioPlaybackSource::NasHttp : AudioPlaybackSource::Local;
+    if (audio_snapshot != nullptr && audio_snapshot->source == expected_source &&
+        audio_snapshot->track_index == index) {
         sample_rate_hz = audio_snapshot->sample_rate_hz;
         bits_per_sample = audio_snapshot->bits_per_sample;
     }
@@ -4384,6 +4368,7 @@ static void player_home_refresh()
     }
     if (player_state_is_ready() && media_library_get_count() > 0U) {
         g_last_artwork_bound_track = static_cast<uint32_t>(player_state_get_index());
+        g_last_artwork_bound_source = player_state_get_source();
     }
     if (g_overlay_visible) {
         player_home_overlay_apply_dim_path();
@@ -4682,6 +4667,7 @@ void player_home_create(lv_obj_t *screen)
     g_launcher_open_after_foreground = false;
     g_artwork_resume_without_invalidation = false;
     g_last_artwork_bound_track = UINT32_MAX;
+    g_last_artwork_bound_source = PlayerMediaSource::Local;
     gesture_router_reset();
     now_playing_artwork_set_bounded_present_allowed(true);
 
@@ -4710,6 +4696,7 @@ void player_home_create(lv_obj_t *screen)
 
     if (player_state_is_ready() && media_library_get_count() > 0U) {
         g_last_artwork_bound_track = static_cast<uint32_t>(player_state_get_index());
+        g_last_artwork_bound_source = player_state_get_source();
     }
 
     // P1.2：Overlay 本体只负责承载控件，本身透明且不可点击。backdrop 仍作为最底层

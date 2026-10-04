@@ -599,9 +599,20 @@ static bool artwork_ui_apply_compressed_fallback(uint32_t track_index)
 
 static void artwork_ui_sync_context(bool force)
 {
-    if (g_container == nullptr || !player_state_is_ready() || media_library_get_count() == 0U) return;
-    const uint32_t generation = media_catalog_v2_generation();
+    if (g_container == nullptr || !player_state_is_ready()) return;
     const uint32_t track_index = static_cast<uint32_t>(player_state_get_index());
+    if (player_state_get_source() == PlayerMediaSource::Nas) {
+        if (!force && g_context_generation == 0x4E415300U && g_context_track == track_index) return;
+        g_context_generation = 0x4E415300U;
+        g_context_track = track_index;
+        g_context_has_artwork = false;
+        artwork_ui_release_transition_hold();
+        artwork_ui_release_all_sources();
+        artwork_ui_show_no_artwork_fallback();
+        return;
+    }
+    if (media_library_get_count() == 0U) return;
+    const uint32_t generation = media_catalog_v2_generation();
     if (!force && generation == g_context_generation && track_index == g_context_track) return;
 
     g_context_generation = generation;
@@ -874,8 +885,8 @@ void now_playing_artwork_update()
 bool now_playing_artwork_prepare_track_transition_hold()
 {
     artwork_ui_release_transition_hold();
-    if (!player_state_is_ready() || media_library_get_count() == 0U ||
-        !cover_surface_cache_is_ready()) {
+    if (!player_state_is_ready() || player_state_get_source() == PlayerMediaSource::Nas ||
+        media_library_get_count() == 0U || !cover_surface_cache_is_ready()) {
         return false;
     }
 

@@ -179,11 +179,6 @@ static void player_control_unlock()
 
 void player_control_update()
 {
-    // R46.0.78：NAS MP3 第一阶段只验证单曲 HTTP pipeline。NAS EOF 不能误推进 Local PlayerState。
-    AudioStateSnapshot audio = {};
-    if (audio_service_get_snapshot(&audio) && audio.source == AudioPlaybackSource::NasHttp) {
-        return;
-    }
     // UI 与 loopTask 可能运行在不同任务；EOF 自动续播与手动切歌必须串行修改 Playlist Context。
     if (!player_control_lock(0)) {
         return;
@@ -215,22 +210,12 @@ bool player_control_toggle_play_pause()
         return false;
     }
 
-    if (snapshot.source == AudioPlaybackSource::NasHttp) {
-        bool ok = false;
-        if (snapshot.state == AudioPlaybackState::Playing) {
-            ok = audio_service_pause(false);
-        } else if (snapshot.state == AudioPlaybackState::Paused) {
-            ok = audio_service_resume(false);
-        } else {
-            ESP_LOGW(TAG, "NAS MP3当前状态不可切换播放/暂停：%s",
-                audio_playback_state_name_cn(snapshot.state));
-        }
-        player_control_unlock();
-        return ok;
-    }
 
     const size_t selected_track = player_state_get_index();
+    const AudioPlaybackSource expected_source = player_state_get_source() == PlayerMediaSource::Nas
+        ? AudioPlaybackSource::NasHttp : AudioPlaybackSource::Local;
     const bool audio_is_selected_track =
+        snapshot.source == expected_source &&
         snapshot.track_index != UINT32_MAX && snapshot.track_index == selected_track;
 
     bool ok = false;
@@ -258,12 +243,6 @@ bool player_control_previous()
     if (!player_control_lock(pdMS_TO_TICKS(100))) {
         return false;
     }
-    AudioStateSnapshot audio = {};
-    if (audio_service_get_snapshot(&audio) && audio.source == AudioPlaybackSource::NasHttp) {
-        ESP_LOGW(TAG, "NAS MP3第一阶段暂不接上一首队列");
-        player_control_unlock();
-        return false;
-    }
     const bool ok = player_transport_previous();
     player_control_unlock();
     return ok;
@@ -272,12 +251,6 @@ bool player_control_previous()
 bool player_control_next()
 {
     if (!player_control_lock(pdMS_TO_TICKS(100))) {
-        return false;
-    }
-    AudioStateSnapshot audio = {};
-    if (audio_service_get_snapshot(&audio) && audio.source == AudioPlaybackSource::NasHttp) {
-        ESP_LOGW(TAG, "NAS MP3第一阶段暂不接下一首队列");
-        player_control_unlock();
         return false;
     }
     const bool ok = player_transport_next();
@@ -289,10 +262,6 @@ bool player_control_peek_next_track(uint32_t *out_track_index)
 {
     if (out_track_index == nullptr) return false;
     *out_track_index = UINT32_MAX;
-    AudioStateSnapshot audio = {};
-    if (audio_service_get_snapshot(&audio) && audio.source == AudioPlaybackSource::NasHttp) {
-        return true;
-    }
     // 预热只是后台机会任务，绝不能为了拿下一首提示阻塞 LVGL。
     if (!player_control_lock(0)) return false;
     (void)player_transport_peek_next_track(out_track_index);
@@ -474,6 +443,47 @@ bool player_control_select_decade_group(size_t group_index, size_t position)
         return false;
     }
     const bool ok = player_control_select_context(player_state_select_decade_group(group_index, position));
+    player_control_unlock();
+    return ok;
+}
+
+
+bool player_control_select_nas_all_tracks(size_t position)
+{
+    if (!player_control_lock(pdMS_TO_TICKS(100))) return false;
+    const bool ok = player_control_select_context(player_state_select_nas_all_tracks(position));
+    player_control_unlock();
+    return ok;
+}
+
+bool player_control_select_nas_folder_queue_position(size_t position)
+{
+    if (!player_control_lock(pdMS_TO_TICKS(100))) return false;
+    const bool ok = player_control_select_context(player_state_select_nas_folder_queue_position(position));
+    player_control_unlock();
+    return ok;
+}
+
+bool player_control_select_nas_artist_group(size_t group_index, size_t position)
+{
+    if (!player_control_lock(pdMS_TO_TICKS(100))) return false;
+    const bool ok = player_control_select_context(player_state_select_nas_artist_group(group_index, position));
+    player_control_unlock();
+    return ok;
+}
+
+bool player_control_select_nas_album_group(size_t group_index, size_t position)
+{
+    if (!player_control_lock(pdMS_TO_TICKS(100))) return false;
+    const bool ok = player_control_select_context(player_state_select_nas_album_group(group_index, position));
+    player_control_unlock();
+    return ok;
+}
+
+bool player_control_select_nas_decade_group(size_t group_index, size_t position)
+{
+    if (!player_control_lock(pdMS_TO_TICKS(100))) return false;
+    const bool ok = player_control_select_context(player_state_select_nas_decade_group(group_index, position));
     player_control_unlock();
     return ok;
 }

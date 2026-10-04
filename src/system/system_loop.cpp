@@ -376,7 +376,28 @@ static void system_artwork_current_update()
 {
     // CoverSurface 是性能优化层，不是封面可用性的硬依赖；它没起来时仍允许 ArtworkLoader
     // 读取压缩图，并由 NowPlaying 直接走 LVGL compressed fallback。
-    if (!artwork_loader_is_ready() || !player_state_is_ready() || !media_catalog_v2_ready()) return;
+    if (!artwork_loader_is_ready() || !player_state_is_ready()) return;
+
+    // Unified Playback Context：system_loop 当前这条 Artwork 编排链仍然只支持 Local/SD。
+    // NAS ArtworkProvider 尚未接入时，NowPlaying 会立即使用 no_cover fallback。这里必须完全
+    // 停止 Local ArtworkLoader 的 track-index 重试，否则 NAS 的 track_id 会被误当作 Local
+    // Catalog index，并形成 200/400/800/1600/3200ms 的永久退避循环。
+    // 同时清空本地封面编排上下文；以后重新切回 Local 时强制按真实 Local Track 重建。
+    if (player_state_get_source() != PlayerMediaSource::Local) {
+        g_artwork_context_generation = 0U;
+        g_artwork_current_track = UINT32_MAX;
+        g_artwork_stage = ArtworkCurrentStage::Idle;
+        g_artwork_surface_terminal_failure = false;
+        g_artwork_surface_terminal_result = ESP_OK;
+        g_artwork_retry_due_tick = 0;
+        g_artwork_current_retry_count = 0U;
+        g_artwork_pending_request_id = 0U;
+        g_artwork_pending_request_tick = 0;
+        g_artwork_storage_wait_last_log_tick = 0;
+        return;
+    }
+
+    if (!media_catalog_v2_ready()) return;
 
     // Music 进入 Background 后 UI 已不可见，不再为后台切曲读 TF / 解码封面 / 生成 Surface。
     // 已在执行的任务不强制取消；返回前台后会按当前 track 自动补齐资源。

@@ -880,7 +880,8 @@ static void lyrics_view_refresh_header(uint32_t track_index)
     g_last_title_track = track_index;
 
     MediaTrackViewV2 view = {};
-    if (!media_catalog_v2_get_track_view(track_index, &view)) {
+    if (!player_state_is_ready() || player_state_get_index() != track_index ||
+        !player_state_get_track_view(&view)) {
         lv_label_set_text(g_title, "歌词");
         lv_label_set_text(g_artist, "");
         return;
@@ -1101,6 +1102,15 @@ static void lyrics_view_timer_cb(lv_timer_t *timer)
         return;
     }
     lyrics_view_refresh_header(track_index);
+    if (player_state_get_source() == PlayerMediaSource::Nas) {
+        lyrics_view_clear_lines();
+        g_requested_track = track_index;
+        if (g_status != nullptr) {
+            lv_label_set_text(g_status, "暂无同步歌词");
+            lv_obj_remove_flag(g_status, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+    }
     lyrics_view_request_if_needed(track_index);
 
     AudioStateSnapshot audio = {};

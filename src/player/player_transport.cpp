@@ -4,8 +4,10 @@
 
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_heap_caps.h"
 #include "audio_service.h"
 #include "media_library.h"
+#include "nas_catalog_service.h"
 #include "player_state.h"
 #include "app_diag_config.h"
 
@@ -272,24 +274,53 @@ static bool player_transport_play_current_internal(const char *reason)
 
     const size_t track_index = player_state_get_index();
     MediaTechnicalInfo technical = {};
-    const bool has_technical_info = media_library_get_technical_info(track_index, &technical);
+    const bool has_technical_info = player_state_get_technical_info(&technical);
+    const PlayerMediaSource source = player_state_get_source();
 
 #if APP_DIAG_PLAYER_TRANSPORT
-    ESP_LOGI(TAG, "播放当前歌曲：原因=%s track=%u 路径=%s",
+    ESP_LOGI(TAG, "播放当前歌曲：原因=%s source=%s track=%u 路径=%s",
         reason != nullptr ? reason : "显式播放",
+        player_media_source_name(source),
         static_cast<unsigned>(track_index),
         path);
 #else
     (void)reason;
 #endif
 
-    return audio_service_play_track(
-        static_cast<uint32_t>(track_index),
-        path,
-        player_state_get_format(),
-        has_technical_info ? &technical : nullptr,
-        false
-    );
+    if (source == PlayerMediaSource::Local) {
+        return audio_service_play_track(
+            static_cast<uint32_t>(track_index),
+            path,
+            player_state_get_format(),
+            has_technical_info ? &technical : nullptr,
+            false);
+    }
+
+    if (player_state_get_format() != MediaFormat::MP3) {
+        ESP_LOGW(TAG, "NAS当前阶段仅开放MP3：track=%u format=%s",
+            static_cast<unsigned>(track_index), media_format_name(player_state_get_format()));
+        return false;
+    }
+    NasPlaybackEndpoint endpoint = {};
+    const esp_err_t endpoint_ret = nas_catalog_service_get_playback_endpoint(&endpoint);
+    if (endpoint_ret != ESP_OK) {
+        ESP_LOGW(TAG, "NAS播放端点不可用：%s", esp_err_to_name(endpoint_ret));
+        return false;
+    }
+    static constexpr size_t kUrlMax = 4096U;
+    char *url = static_cast<char *>(heap_caps_malloc(kUrlMax, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (url == nullptr) return false;
+    const esp_err_t url_ret = nas_catalog_service_build_track_url(&endpoint, path, url, kUrlMax);
+    if (url_ret != ESP_OK) {
+        heap_caps_free(url);
+        ESP_LOGW(TAG, "NAS播放URL构造失败：%s", esp_err_to_name(url_ret));
+        return false;
+    }
+    const bool ok = audio_service_play_nas_mp3(
+        static_cast<uint32_t>(track_index), url, endpoint.username, endpoint.password,
+        has_technical_info ? &technical : nullptr, false);
+    heap_caps_free(url);
+    return ok;
 }
 
 bool player_transport_play_current(const char *reason)
@@ -334,19 +365,24 @@ bool player_transport_previous()
     AudioStateSnapshot snapshot = {};
     const bool has_audio = audio_service_get_snapshot(&snapshot) && snapshot.ready;
     const size_t current_track = player_state_get_index();
+    const AudioPlaybackSource expected_source = player_state_get_source() == PlayerMediaSource::Nas
+        ? AudioPlaybackSource::NasHttp : AudioPlaybackSource::Local;
 
-    // Stage 11.0 后，>3 秒上一曲直接走统一 Seek(0)，列表位置保持不变。
+    // Stage 11.0 后，>3 秒上一曲直接回到曲首；NAS 顺序 HTTP 当前用重开同一 Track 代替 Seek。
     // AudioTask 内部仍通过 pop-free 重建 pipeline，避免在 I2S 正在运行时硬改 Source。
     if (
         has_audio &&
-        snapshot.track_index == current_track &&
+        snapshot.source == expected_source && snapshot.track_index == current_track &&
         (snapshot.state == AudioPlaybackState::Playing || snapshot.state == AudioPlaybackState::Paused) &&
         snapshot.position_ms >= 3000ULL
     ) {
 #if APP_DIAG_PLAYER_TRANSPORT
-        ESP_LOGI(TAG, "手动上一曲：当前已播放超过3秒，Seek回曲首");
+        ESP_LOGI(TAG, "手动上一曲：当前已播放超过3秒，回到曲首 source=%s",
+            player_media_source_name(player_state_get_source()));
 #endif
-        return player_transport_seek_ms(0);
+        return player_state_get_source() == PlayerMediaSource::Nas
+            ? player_transport_play_current_internal("NAS上一曲回曲首")
+            : player_transport_seek_ms(0);
     }
 
     // 只有真正要切换曲目时才作废下一首预留；>3秒 Seek(0) 不改变队列。
@@ -426,7 +462,7 @@ bool player_transport_peek_next_track(uint32_t *out_track_index)
     }
 
     size_t track_index = 0U;
-    if (!player_playlist_get_folder_queue_track_index_at_position(next_position, &track_index)) {
+    if (!player_state_get_folder_queue_track_index_at_position(next_position, &track_index)) {
         return false;
     }
     *out_track_index = static_cast<uint32_t>(track_index);
@@ -442,9 +478,14 @@ bool player_transport_seek_ms(uint64_t target_ms)
     if (path == nullptr || path[0] == '\0') {
         return false;
     }
+    if (player_state_get_source() == PlayerMediaSource::Nas) {
+        ESP_LOGW(TAG, "NAS HTTP顺序流当前不支持Seek：target=%llums",
+            static_cast<unsigned long long>(target_ms));
+        return false;
+    }
     const size_t track_index = player_state_get_index();
     MediaTechnicalInfo technical = {};
-    const bool has_technical = media_library_get_technical_info(track_index, &technical);
+    const bool has_technical = player_state_get_technical_info(&technical);
 #if APP_DIAG_AUDIO_SEEK
     ESP_LOGI(TAG, "SEEK_TRACE: Player请求 track=%u target=%llums",
         static_cast<unsigned>(track_index),
@@ -477,7 +518,9 @@ static void player_transport_handle_finished(const AudioStateSnapshot &audio)
     }
 
     // 若用户刚好在 EOF 边沿切换了 UI 列表，旧 AudioTask 的 Finished 不能推进新列表。
-    if (audio.track_index == UINT32_MAX || audio.track_index != list.track_index) {
+    const AudioPlaybackSource expected_source = player_state_get_source() == PlayerMediaSource::Nas
+        ? AudioPlaybackSource::NasHttp : AudioPlaybackSource::Local;
+    if (audio.source != expected_source || audio.track_index == UINT32_MAX || audio.track_index != list.track_index) {
 #if APP_DIAG_PLAYER_TRANSPORT
         ESP_LOGI(TAG,
             "AUTO_NEXT_TRACE: 忽略过期 EOF audio_track=%lu list_track=%lu generation=%lu",
@@ -548,7 +591,9 @@ static void player_transport_handle_track_error(const AudioStateSnapshot &audio)
         ESP_LOGW(TAG, "坏曲跳过失败：当前目录播放范围不可用，保持 Error");
         return;
     }
-    if (audio.track_index == UINT32_MAX || audio.track_index != list.track_index) {
+    const AudioPlaybackSource expected_source = player_state_get_source() == PlayerMediaSource::Nas
+        ? AudioPlaybackSource::NasHttp : AudioPlaybackSource::Local;
+    if (audio.source != expected_source || audio.track_index == UINT32_MAX || audio.track_index != list.track_index) {
         return;
     }
 

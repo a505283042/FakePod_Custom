@@ -2685,7 +2685,8 @@ static bool cassette_view_current_lyrics_settled()
 static void cassette_view_service_next_prefetch()
 {
     if (!g_active || g_cache_build_busy ||
-        !player_state_is_ready() || media_library_get_count() == 0U) {
+        !player_state_is_ready() || player_state_get_source() == PlayerMediaSource::Nas ||
+        media_library_get_count() == 0U) {
         return;
     }
 
@@ -3617,6 +3618,10 @@ esp_err_t cassette_view_create(lv_obj_t *parent)
 static bool cassette_view_set_active_internal(bool active, bool preserve_next_prefetch)
 {
     if (g_root == nullptr) return false;
+    if (active && player_state_get_source() == PlayerMediaSource::Nas) {
+        if (g_active) (void)cassette_view_set_active_internal(false, preserve_next_prefetch);
+        return false;
+    }
     if (active) {
         if (!cassette_view_prepare_shell()) {
             return false;
@@ -3711,8 +3716,8 @@ bool cassette_view_set_temporary_hidden(bool hidden)
 bool cassette_view_prepare_track_transition_hold()
 {
     cassette_view_release_transition_hold();
-    if (!player_state_is_ready() || media_library_get_count() == 0U ||
-        !cover_surface_cache_is_ready()) {
+    if (!player_state_is_ready() || player_state_get_source() == PlayerMediaSource::Nas ||
+        media_library_get_count() == 0U || !cover_surface_cache_is_ready()) {
         return false;
     }
 
@@ -3812,7 +3817,8 @@ void cassette_view_update()
 
 static void cassette_view_revalidate_next_prefetch(const char *cancel_reason)
 {
-    if (!player_state_is_ready() || media_library_get_count() == 0U) {
+    if (!player_state_is_ready() || player_state_get_source() == PlayerMediaSource::Nas ||
+        media_library_get_count() == 0U) {
         return;
     }
 

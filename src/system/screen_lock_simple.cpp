@@ -509,12 +509,11 @@ static void aod_refresh_now_playing_if_due(const TickType_t now_tick)
     (void)audio_service_get_snapshot(&snap);
 
     // 2) 曲目信息（title / artist）
-    const size_t library_cnt = media_library_get_count();
-    const size_t idx         = player_state_get_index();
-    bool    song_changed = false;
+    const size_t idx = player_state_get_index();
+    const bool current_ready = player_state_is_ready();
+    bool song_changed = false;
 
-    // idx 是全局 Catalog Track index，不能拿目录播放队列的 track_count 做边界判断。
-    if (library_cnt == 0U || idx >= library_cnt) {
+    if (!current_ready) {
         if (g_aod_last_track_idx != UINT32_MAX) {
             lv_label_set_text(g_aod_title, "— 未在播放 —");
             lv_label_set_text(g_aod_lyric, "");
@@ -524,13 +523,14 @@ static void aod_refresh_now_playing_if_due(const TickType_t now_tick)
         }
     } else {
         MediaTrackViewV2 view = {};
-        const bool have_view = media_catalog_v2_get_track_view(idx, &view);
+        const bool have_view = player_state_get_track_view(&view);
 
         char title_buf[512] = {};
         const char *title = nullptr;
         if (have_view && view.title != nullptr && view.title[0]) {
             title = view.title;
-        } else if (media_library_copy_display_name(idx, title_buf, sizeof(title_buf))) {
+        } else if (player_state_get_source() == PlayerMediaSource::Local &&
+                   media_library_copy_display_name(idx, title_buf, sizeof(title_buf))) {
             title = title_buf;
         } else {
             snprintf(title_buf, sizeof(title_buf), "歌曲 %u", static_cast<unsigned>(idx + 1U));
@@ -549,7 +549,9 @@ static void aod_refresh_now_playing_if_due(const TickType_t now_tick)
             // 新曲第一次显示：主动向 LyricsService 提交一次加载请求。
             // （否则歌词只在用户进入过歌词页才会被 LyricsTask 从 TF 卡取出，
             //   直接 AOD 的话一直拿不到 → 显示"暂无歌词"。）
-            (void)lyrics_service_request_track(static_cast<uint32_t>(idx));
+            if (player_state_get_source() == PlayerMediaSource::Local) {
+                (void)lyrics_service_request_track(static_cast<uint32_t>(idx));
+            }
             // 新曲强制刷新歌词行（避免沿用旧曲的"当前行索引"）
             g_aod_last_lyric_line_idx = UINT32_MAX;
         }
@@ -562,8 +564,8 @@ static void aod_refresh_now_playing_if_due(const TickType_t now_tick)
         uint32_t     curr_line   = UINT32_MAX;
         bool         have_curr   = false;
 
-        if (g_aod_last_track_idx != UINT32_MAX &&
-            lyrics_service_get_window(
+        if (player_state_get_source() == PlayerMediaSource::Local &&
+            g_aod_last_track_idx != UINT32_MAX && lyrics_service_get_window(
                 static_cast<uint32_t>(g_aod_last_track_idx),
                 static_cast<uint32_t>(snap.position_ms), &win)) {
             for (size_t i = 0; i < LYRICS_VIEW_WINDOW_LINES; ++i) {
@@ -605,8 +607,7 @@ static void aod_refresh_now_playing_if_due(const TickType_t now_tick)
     }
     if (total_ms == 0U && g_aod_last_track_idx != UINT32_MAX) {
         MediaTechnicalInfo ti = {};
-        if (media_library_get_technical_info(
-                static_cast<size_t>(g_aod_last_track_idx), &ti) && ti.duration_ms > 0U) {
+        if (player_state_get_technical_info(&ti) && ti.duration_ms > 0U) {
             total_ms = ti.duration_ms;
         }
     }

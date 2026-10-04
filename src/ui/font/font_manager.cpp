@@ -65,7 +65,8 @@ static constexpr const char *FONT_CACHE_PARTITION_LABEL = "fontcache";
 static constexpr uint32_t FONT_CACHE_MAGIC = 0x31435446U;  // "FTC1"
 static constexpr uint32_t FONT_CACHE_VERSION = 3U;
 static constexpr size_t FONT_CACHE_DATA_OFFSET = 256U * 1024U;
-static constexpr size_t FONT_CACHE_COPY_CHUNK = 16U * 1024U;
+// R46.0.84：保持 INTERNAL 不变，只把复制分块从16KB收紧到8KB，降低字体缓存重建瞬时峰值。
+static constexpr size_t FONT_CACHE_COPY_CHUNK = 8U * 1024U;
 
 struct FontCacheHeader
 {

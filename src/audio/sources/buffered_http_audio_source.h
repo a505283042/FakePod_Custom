@@ -17,11 +17,17 @@ struct BufferedHttpAudioSourceStats
     esp_err_t io_error_code = ESP_OK;
 };
 
-// R46.0.78：NAS MP3 第一阶段网络 Source。
-// HTTP client 只由 Core1 预读任务持有；AudioTask 热路径只从 128KB PSRAM ring 取压缩字节。
-// 当前仅支持顺序播放，不开放 Range/Seek。HTTPS 仍未启用。
+enum class BufferedHttpAudioProfile : uint8_t
+{
+    Mp3 = 0,
+};
+
+// R46.0.85：NAS HTTP Source 改为统一字节流 Worker。
+// Worker 只负责 connect/retry/read -> PSRAM ring，不解析 MP3/FLAC；Codec 继续只消费 AudioSource。
+// 当前只启用 MP3 profile，后续 NAS FLAC 复用同一个 Worker，不再创建第二套 HTTP task。
 esp_err_t buffered_http_audio_source_open(
     AudioSource *out_source,
+    BufferedHttpAudioProfile profile,
     const char *url,
     const char *username,
     const char *password

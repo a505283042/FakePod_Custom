@@ -14,6 +14,7 @@
 #include "lyrics_service.h"
 #include "lyrics_text_layout.h"
 #include "player/player_playlist.h"
+#include "player/player_state.h"
 #include "system/screen_lock_simple.h"
 #include "ui_common.h"
 
@@ -223,7 +224,8 @@ static void spectrum_refresh_header(uint32_t track_index)
     const char *title = "未选择歌曲";
     const char *artist = "";
     MediaTrackViewV2 view = {};
-    if (track_index != UINT32_MAX && media_catalog_v2_get_track_view(track_index, &view)) {
+    if (track_index != UINT32_MAX && player_state_is_ready() &&
+        player_state_get_index() == track_index && player_state_get_track_view(&view)) {
         if (view.title != nullptr && view.title[0] != '\0') {
             title = view.title;
         }
@@ -318,7 +320,8 @@ static void spectrum_request_lyrics_if_needed(
     uint32_t track_index,
     const LyricsWindowSnapshot &window)
 {
-    if (!lyrics_service_is_ready() || track_index == UINT32_MAX) {
+    if (!lyrics_service_is_ready() || track_index == UINT32_MAX ||
+        player_state_get_source() == PlayerMediaSource::Nas) {
         return;
     }
 
@@ -340,7 +343,8 @@ static void spectrum_update_current_lyric(
     const AudioStateSnapshot &audio,
     uint32_t track_index)
 {
-    if (g_lyric == nullptr || !lyrics_service_is_ready() || track_index == UINT32_MAX) {
+    if (g_lyric == nullptr || !lyrics_service_is_ready() || track_index == UINT32_MAX ||
+        player_state_get_source() == PlayerMediaSource::Nas) {
         spectrum_clear_current_lyric(false);
         return;
     }

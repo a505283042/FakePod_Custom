@@ -110,7 +110,8 @@ static constexpr uint32_t LIBRARY_SCROLLBAR_TOUCH_UPDATE_MS = 48U;
 
 // R46.0.74：NAS Catalog 后台分步加载。Worker 与 CoverTask 同级，仅临时存在；
 // 真实 SD 访问由 cooperative loader 每约4KB释放一次全局锁，避免后台 FLAC 预取被饿死。
-static constexpr uint32_t NAS_LIBRARY_LOAD_TASK_STACK_BYTES = 5120U;
+// R46.0.84：5120B 实测 HWM=2280~2320B；收至4096B后仍保留约1.2KB实测余量。
+static constexpr uint32_t NAS_LIBRARY_LOAD_TASK_STACK_BYTES = 4096U;
 static constexpr UBaseType_t NAS_LIBRARY_LOAD_TASK_PRIORITY = 1U;
 static constexpr BaseType_t NAS_LIBRARY_LOAD_TASK_CORE = 1;
 static constexpr UBaseType_t NAS_LIBRARY_LOAD_TASK_STACK_CAPS =
@@ -2189,9 +2190,9 @@ static bool library_view_bind_track_row(LibraryVirtualRow &row, uint32_t positio
         return false;
     }
 
-    const bool current = library_source_is_nas()
-        ? g_nas_selected_track == track_index
-        : (player_state_is_ready() && player_state_get_index() == track_index);
+    const bool current = player_state_is_ready() &&
+        player_state_get_source() == (library_source_is_nas() ? PlayerMediaSource::Nas : PlayerMediaSource::Local) &&
+        player_state_get_index() == track_index;
     const char *secondary = nullptr;
     if (track.artist != nullptr && track.artist[0] != '\0') {
         secondary = track.artist;
@@ -2591,72 +2592,6 @@ static void library_view_queue_gesture(LibraryPendingGesture action, uint32_t ti
     }
 }
 
-static bool library_view_play_nas_mp3(uint32_t track_index)
-{
-    MediaTrackViewV2 track = {};
-    if (!nas_library_source_get_track_view(track_index, &track) ||
-        track.row == nullptr || track.path == nullptr || track.path[0] == '\0') {
-        ESP_LOGW(TAG, "NAS MP3播放失败：Track绑定不可用 track=%lu",
-            static_cast<unsigned long>(track_index));
-        return false;
-    }
-    if (track.row->format != MediaFormat::MP3) {
-        ESP_LOGW(TAG, "NAS播放第一阶段仅支持MP3：track=%lu format=%s path=%s",
-            static_cast<unsigned long>(track_index),
-            media_format_name(track.row->format),
-            track.path);
-        return false;
-    }
-
-    WifiServiceSnapshot wifi = {};
-    if (!wifi_service_get_snapshot(&wifi) || !wifi.connected) {
-        ESP_LOGW(TAG, "NAS MP3播放失败：Wi-Fi未连接");
-        return false;
-    }
-
-    NasPlaybackEndpoint endpoint = {};
-    esp_err_t ret = nas_catalog_service_get_playback_endpoint(&endpoint);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "NAS MP3播放端点不可用：%s", esp_err_to_name(ret));
-        return false;
-    }
-
-    static constexpr size_t kNasTrackUrlMax = 4096U;
-    char *url = static_cast<char *>(heap_caps_malloc(
-        kNasTrackUrlMax, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (url == nullptr) {
-        ESP_LOGW(TAG, "NAS MP3 URL缓冲分配失败");
-        return false;
-    }
-    ret = nas_catalog_service_build_track_url(
-        &endpoint, track.path, url, kNasTrackUrlMax);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "NAS MP3 URL构造失败：%s path=%s", esp_err_to_name(ret), track.path);
-        heap_caps_free(url);
-        return false;
-    }
-
-    const bool submitted = audio_service_play_nas_mp3(
-        track_index,
-        url,
-        endpoint.username,
-        endpoint.password,
-        &track.row->technical,
-        false);
-    if (submitted) {
-        g_nas_selected_track = track_index;
-        ESP_LOGI(TAG, "NAS MP3播放请求已提交：track=%lu title=%s path=%s",
-            static_cast<unsigned long>(track_index),
-            track.title != nullptr ? track.title : "",
-            track.path);
-    } else {
-        ESP_LOGW(TAG, "NAS MP3播放请求提交失败：track=%lu",
-            static_cast<unsigned long>(track_index));
-    }
-    heap_caps_free(url);
-    return submitted;
-}
-
 static void library_view_row_clicked_cb(lv_event_t *event)
 {
     if (lv_event_get_code(event) != LV_EVENT_CLICKED || library_click_suppressed()) {
@@ -2674,19 +2609,25 @@ static void library_view_row_clicked_cb(lv_event_t *event)
         row->action == LibraryRowAction::PlayAllTrack ||
         row->action == LibraryRowAction::PlayFolderTrack ||
         row->action == LibraryRowAction::PlayGroupTrack;
-    const bool transition_hold = selecting_track && !library_source_is_nas() &&
-        player_home_prepare_track_transition_hold();
+    // NAS 网络播放目前只接入 MP3。先在提交 PlayerState 之前做能力检查，
+    // 避免点击暂不支持的 FLAC/OPUS 后把统一“当前播放上下文”改成 NAS，
+    // 而旧的 Local 音频实际上仍在播放。
     if (selecting_track && library_source_is_nas()) {
-        if (row->track_index == UINT32_MAX) {
-            ESP_LOGW(TAG, "NAS歌曲绑定无效，拒绝播放");
+        MediaTrackViewV2 candidate = {};
+        if (!library_source_get_track_view(row->track_index, &candidate) || candidate.row == nullptr) {
+            ESP_LOGW(TAG, "NAS选歌预检失败：track=%lu",
+                static_cast<unsigned long>(row->track_index));
             return;
         }
-        if (library_view_play_nas_mp3(row->track_index)) {
-            library_view_refresh_virtual_rows(true);
+        if (candidate.row->format != MediaFormat::MP3) {
+            ESP_LOGW(TAG, "NAS当前阶段仅开放MP3：track=%lu format=%s；保持当前播放上下文不变",
+                static_cast<unsigned long>(row->track_index),
+                media_format_name(candidate.row->format));
+            return;
         }
-        return;
     }
-
+    const bool transition_hold = selecting_track && !library_source_is_nas() &&
+        player_home_prepare_track_transition_hold();
     switch (row->action) {
         case LibraryRowAction::OpenArtist:
         case LibraryRowAction::OpenAlbum:
@@ -2718,7 +2659,9 @@ static void library_view_row_clicked_cb(lv_event_t *event)
         }
 
         case LibraryRowAction::PlayAllTrack:
-            if (!player_control_select_all_tracks(row->position)) {
+            if (!(library_source_is_nas()
+                    ? player_control_select_nas_all_tracks(row->position)
+                    : player_control_select_all_tracks(row->position))) {
                 if (transition_hold) player_home_cancel_track_transition_hold();
                 ESP_LOGW(TAG, "选择全部歌曲位置失败：%lu", static_cast<unsigned long>(row->position));
                 return;
@@ -2726,7 +2669,9 @@ static void library_view_row_clicked_cb(lv_event_t *event)
             break;
 
         case LibraryRowAction::PlayFolderTrack:
-            if (!player_control_select_folder_queue_position(row->position)) {
+            if (!(library_source_is_nas()
+                    ? player_control_select_nas_folder_queue_position(row->position)
+                    : player_control_select_folder_queue_position(row->position))) {
                 if (transition_hold) player_home_cancel_track_transition_hold();
                 ESP_LOGW(TAG, "选择目录列表位置失败：%lu", static_cast<unsigned long>(row->position));
                 return;
@@ -2738,16 +2683,16 @@ static void library_view_row_clicked_cb(lv_event_t *event)
             bool selected = false;
             switch (row->group_type) {
                 case PlayerListType::Artist:
-                    selected = player_control_select_artist_group(row->group_index, row->position);
+                    selected = library_source_is_nas() ? player_control_select_nas_artist_group(row->group_index, row->position) : player_control_select_artist_group(row->group_index, row->position);
                     break;
                 case PlayerListType::Album:
-                    selected = player_control_select_album_group(row->group_index, row->position);
+                    selected = library_source_is_nas() ? player_control_select_nas_album_group(row->group_index, row->position) : player_control_select_album_group(row->group_index, row->position);
                     break;
                 case PlayerListType::Decade:
-                    selected = player_control_select_decade_group(row->group_index, row->position);
+                    selected = library_source_is_nas() ? player_control_select_nas_decade_group(row->group_index, row->position) : player_control_select_decade_group(row->group_index, row->position);
                     break;
                 case PlayerListType::AllTracks:
-                    selected = player_control_select_all_tracks(row->position);
+                    selected = library_source_is_nas() ? player_control_select_nas_all_tracks(row->position) : player_control_select_all_tracks(row->position);
                     break;
             }
             if (!selected) {
@@ -3532,20 +3477,9 @@ bool library_view_is_nas_source()
 
 static bool library_view_nas_catalog_needed_by_playback()
 {
-    AudioStateSnapshot audio = {};
-    if (!audio_service_get_snapshot(&audio) || audio.source != AudioPlaybackSource::NasHttp) {
-        return false;
-    }
-    switch (audio.state) {
-        case AudioPlaybackState::Preparing:
-        case AudioPlaybackState::Prepared:
-        case AudioPlaybackState::Playing:
-        case AudioPlaybackState::Seeking:
-        case AudioPlaybackState::Paused:
-            return true;
-        default:
-            return false;
-    }
+    // 播放上下文而不是瞬时 AudioState 决定 Catalog 生命周期。Finished/Error 边沿仍可能
+    // 由同一套 Transport 执行自动下一首/坏曲跳过，不能提前释放 NAS Catalog。
+    return player_state_is_ready() && player_state_get_source() == PlayerMediaSource::Nas;
 }
 
 void library_view_close_nas()

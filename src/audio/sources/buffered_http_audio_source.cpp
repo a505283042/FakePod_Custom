@@ -14,18 +14,43 @@ static const char *TAG = "NAS音频";
 
 namespace {
 
-static constexpr size_t kRingBytes = 128U * 1024U;
 static constexpr size_t kReadChunkBytes = 8U * 1024U;
-static constexpr size_t kStartTargetBytes = 64U * 1024U;
+// R46.0.85：统一 NAS Stream Worker 固定一份 Internal stack。
+// HTTP connect/retry/read/EOF 全部只在此任务执行；为后续 FLAC 共用保留 4KB，不继续沿用 MP3-only 3072B trial。
 static constexpr uint32_t kTaskStackBytes = 4096U;
 static constexpr UBaseType_t kTaskPriority = 4U;
 static constexpr BaseType_t kTaskCore = 1;
-static constexpr TickType_t kReadWait = pdMS_TO_TICKS(500);
-static constexpr TickType_t kOpenWait = pdMS_TO_TICKS(12000);
+static constexpr TickType_t kReadWait = pdMS_TO_TICKS(20);
+static constexpr TickType_t kOpenWait = pdMS_TO_TICKS(23000);
 static constexpr TickType_t kStopWarnWait = pdMS_TO_TICKS(1500);
-static constexpr int kHttpTimeoutMs = 5000;
+// R46.0.86：连接/响应头仍允许 10s；进入连续音频体后把单次 read 限制为 1s。
+// AudioTask 的 NAS 欠载恢复窗口约 4.5~6s，网络 read 必须先返回，才能让 stop/恢复真正有机会运行。
+static constexpr int kConnectHeaderTimeoutMs = 10000;
+static constexpr int kStreamReadTimeoutMs = 1000;
+static constexpr uint32_t kConnectAttempts = 2U;
+static constexpr TickType_t kConnectRetryDelay = pdMS_TO_TICKS(250);
 static constexpr size_t kHttpRxBufferBytes = 1024U;
 static constexpr size_t kHttpTxBufferBytes = 256U;
+
+struct HttpStreamProfile
+{
+    const char *label = nullptr;
+    size_t ring_bytes = 0U;
+    size_t start_target_bytes = 0U;
+};
+
+static bool resolve_profile(BufferedHttpAudioProfile profile, HttpStreamProfile *out)
+{
+    if (out == nullptr) return false;
+    switch (profile) {
+        case BufferedHttpAudioProfile::Mp3:
+            // MP3 parser 首块可能先消费较大的 ID3/内嵌封面；保留 R46.0.82 的 128KB/96KB 实测配置。
+            *out = {"MP3", 128U * 1024U, 96U * 1024U};
+            return true;
+        default:
+            return false;
+    }
+}
 
 struct BufferedHttpContext
 {
@@ -39,6 +64,9 @@ struct BufferedHttpContext
 
     uint8_t *ring_storage = nullptr;
     uint8_t *read_buffer = nullptr;
+    const char *profile_label = nullptr;
+    size_t ring_bytes = 0U;
+    size_t start_target_bytes = 0U;
     char *url = nullptr;
     char *username = nullptr;
     char *password = nullptr;
@@ -52,6 +80,9 @@ struct BufferedHttpContext
     volatile uint64_t content_length = 0ULL;
     volatile uint32_t min_buffered_bytes = UINT32_MAX;
     volatile uint32_t task_stack_hwm = 0U;
+    volatile uint32_t read_timeout_total = 0U;
+    volatile uint32_t read_timeout_streak = 0U;
+    volatile uint32_t read_timeout_streak_max = 0U;
 };
 
 extern const AudioSourceOps kOps;
@@ -86,7 +117,7 @@ static char *dup_psram(const char *text)
     return copy;
 }
 
-static void http_prefetch_task(void *arg)
+static void nas_stream_task(void *arg)
 {
     BufferedHttpContext *context = static_cast<BufferedHttpContext *>(arg);
     esp_http_client_handle_t client = nullptr;
@@ -100,7 +131,7 @@ static void http_prefetch_task(void *arg)
 
     esp_http_client_config_t config = {};
     config.url = context->url;
-    config.timeout_ms = kHttpTimeoutMs;
+    config.timeout_ms = kConnectHeaderTimeoutMs;
     config.buffer_size = kHttpRxBufferBytes;
     config.buffer_size_tx = kHttpTxBufferBytes;
     config.keep_alive_enable = false;
@@ -110,19 +141,44 @@ static void http_prefetch_task(void *arg)
         config.auth_type = HTTP_AUTH_TYPE_BASIC;
     }
 
-    client = esp_http_client_init(&config);
-    if (client == nullptr) {
-        set_error(context, ESP_ERR_NO_MEM);
-        goto finish;
-    }
-
     {
-        esp_err_t ret = esp_http_client_open(client, 0);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "HTTP连接失败：%s", esp_err_to_name(ret));
+        esp_err_t ret = ESP_FAIL;
+        for (uint32_t attempt = 1U; attempt <= kConnectAttempts && !context->stop_requested; ++attempt) {
+            client = esp_http_client_init(&config);
+            if (client == nullptr) {
+                set_error(context, ESP_ERR_NO_MEM);
+                goto finish;
+            }
+
+            ret = esp_http_client_open(client, 0);
+            if (ret == ESP_OK) break;
+
+            if (attempt < kConnectAttempts) {
+                ESP_LOGW(TAG,
+                    "HTTP连接超时/失败：attempt=%u/%u ret=%s，%ums后仅重试一次",
+                    static_cast<unsigned>(attempt),
+                    static_cast<unsigned>(kConnectAttempts),
+                    esp_err_to_name(ret),
+                    static_cast<unsigned>(kConnectRetryDelay * portTICK_PERIOD_MS));
+                esp_http_client_cleanup(client);
+                client = nullptr;
+                vTaskDelay(kConnectRetryDelay);
+                continue;
+            }
+
+            ESP_LOGE(TAG, "HTTP连接失败：attempt=%u/%u ret=%s",
+                static_cast<unsigned>(attempt),
+                static_cast<unsigned>(kConnectAttempts),
+                esp_err_to_name(ret));
             set_error(context, ret);
             goto finish;
         }
+
+        if (context->stop_requested || client == nullptr || ret != ESP_OK) {
+            set_error(context, context->stop_requested ? ESP_ERR_INVALID_STATE : ret);
+            goto finish;
+        }
+
         const int64_t header_length = esp_http_client_fetch_headers(client);
         if (header_length < 0) {
             ESP_LOGE(TAG, "HTTP响应头读取失败");
@@ -139,10 +195,25 @@ static void http_prefetch_task(void *arg)
         if (content_length > 0) {
             context->content_length = static_cast<uint64_t>(content_length);
         }
-        ESP_LOGI(TAG, "NAS MP3 HTTP已连接：content=%lldB ring=%uKB start=%uKB",
+
+        // open/fetch_headers 需要较宽容的连接时间；真正持续播放后，单次 socket read 必须有界。
+        // ESP-IDF 5.5 的 esp_http_client_read() 在“暂时无数据直到超时”时返回 -ESP_ERR_HTTP_EAGAIN。
+        const esp_err_t timeout_ret = esp_http_client_set_timeout_ms(client, kStreamReadTimeoutMs);
+        if (timeout_ret != ESP_OK) {
+            ESP_LOGE(TAG, "NAS流读取超时配置失败：ret=%s", esp_err_to_name(timeout_ret));
+            set_error(context, timeout_ret);
+            goto finish;
+        }
+
+        ESP_LOGI(TAG,
+            "NAS流已连接：profile=%s content=%lldB ring=%uKB start=%uKB read_timeout=%dms task=P%u/Core%d",
+            context->profile_label != nullptr ? context->profile_label : "?",
             static_cast<long long>(content_length),
-            static_cast<unsigned>(kRingBytes / 1024U),
-            static_cast<unsigned>(kStartTargetBytes / 1024U));
+            static_cast<unsigned>(context->ring_bytes / 1024U),
+            static_cast<unsigned>(context->start_target_bytes / 1024U),
+            kStreamReadTimeoutMs,
+            static_cast<unsigned>(kTaskPriority),
+            static_cast<int>(kTaskCore));
     }
 
     while (!context->stop_requested) {
@@ -153,8 +224,25 @@ static void http_prefetch_task(void *arg)
 
         const int got = esp_http_client_read(
             client, reinterpret_cast<char *>(context->read_buffer), kReadChunkBytes);
+        if (got == -ESP_ERR_HTTP_EAGAIN) {
+            const uint32_t read_timeout_total = context->read_timeout_total + 1U;
+            const uint32_t read_timeout_streak = context->read_timeout_streak + 1U;
+            context->read_timeout_total = read_timeout_total;
+            context->read_timeout_streak = read_timeout_streak;
+            if (read_timeout_streak > context->read_timeout_streak_max) {
+                context->read_timeout_streak_max = read_timeout_streak;
+            }
+            if (read_timeout_streak == 1U) {
+                ESP_LOGW(TAG,
+                    "NAS HTTP读暂时无数据：timeout=%dms buffered=%uB，保持同一连接等待恢复",
+                    kStreamReadTimeoutMs,
+                    static_cast<unsigned>(xStreamBufferBytesAvailable(context->stream)));
+            }
+            continue;
+        }
         if (got < 0) {
-            set_error(context, ESP_FAIL);
+            ESP_LOGE(TAG, "NAS HTTP读取失败：ret=%d", got);
+            set_error(context, ESP_ERR_HTTP_CONNECT);
             break;
         }
         if (got == 0) {
@@ -167,6 +255,15 @@ static void http_prefetch_task(void *arg)
                 set_error(context, ESP_ERR_INVALID_RESPONSE);
             }
             break;
+        }
+
+        if (context->read_timeout_streak > 0U) {
+            ESP_LOGI(TAG,
+                "NAS HTTP读已恢复：timeouts=%u total=%u buffered=%uB",
+                static_cast<unsigned>(context->read_timeout_streak),
+                static_cast<unsigned>(context->read_timeout_total),
+                static_cast<unsigned>(xStreamBufferBytesAvailable(context->stream)));
+            context->read_timeout_streak = 0U;
         }
 
         size_t sent = 0U;
@@ -183,7 +280,7 @@ static void http_prefetch_task(void *arg)
         if (buffered < context->min_buffered_bytes) {
             context->min_buffered_bytes = static_cast<uint32_t>(buffered);
         }
-        if (buffered >= kStartTargetBytes) signal_ready(context);
+        if (buffered >= context->start_target_bytes) signal_ready(context);
         taskYIELD();
     }
 
@@ -207,34 +304,28 @@ static esp_err_t source_read(void *raw, void *buffer, size_t bytes, size_t *out_
     }
     if (bytes == 0U) return ESP_OK;
 
-    size_t total = 0U;
-    while (total < bytes) {
-        const size_t received = xStreamBufferReceive(
-            context->stream,
-            static_cast<uint8_t *>(buffer) + total,
-            bytes - total,
-            kReadWait);
-        if (received > 0U) {
-            total += received;
-            const size_t buffered = xStreamBufferBytesAvailable(context->stream);
-            if (buffered < context->min_buffered_bytes) {
-                context->min_buffered_bytes = static_cast<uint32_t>(buffered);
-            }
-            continue;
+    // Streaming source 只返回当前已经可用的一批数据，不为了凑满 decoder 的整个请求窗口。
+    // Worker 不理解 MP3/FLAC 格式；真正 ring=0 后由对应 Codec/AudioTask 决定欠载策略。
+    const size_t received = xStreamBufferReceive(
+        context->stream,
+        static_cast<uint8_t *>(buffer),
+        bytes,
+        kReadWait);
+    if (received > 0U) {
+        *out_bytes = received;
+        const size_t buffered = xStreamBufferBytesAvailable(context->stream);
+        if (buffered < context->min_buffered_bytes) {
+            context->min_buffered_bytes = static_cast<uint32_t>(buffered);
         }
-        if (context->io_error) {
-            *out_bytes = total;
-            return total > 0U ? ESP_OK :
-                (context->io_error_code != ESP_OK ? context->io_error_code : ESP_FAIL);
-        }
-        if (context->eof) break;
-        // 网络流允许把已经拿到的部分数据先交给 MP3 parser；只有完全无数据时才报告欠载超时。
-        // 这样一次小抖动不会因为“未凑满整个 8KB 窗口”被误判成播放故障。
-        *out_bytes = total;
-        return total > 0U ? ESP_OK : ESP_ERR_TIMEOUT;
+        return ESP_OK;
     }
-    *out_bytes = total;
-    return ESP_OK;
+    if (context->io_error) {
+        return context->io_error_code != ESP_OK ? context->io_error_code : ESP_FAIL;
+    }
+    if (context->eof) {
+        return ESP_OK;
+    }
+    return ESP_ERR_TIMEOUT;
 }
 
 static bool source_eof(void *raw)
@@ -259,11 +350,14 @@ static void destroy_context(BufferedHttpContext *context)
     const size_t buffered = context->stream != nullptr
         ? xStreamBufferBytesAvailable(context->stream) : 0U;
     ESP_LOGI(TAG,
-        "NAS MP3 HTTP关闭：download=%lluB buffered=%uB min=%uB stack_hwm=%u eof=%u ioerr=%u",
+        "NAS流关闭：profile=%s download=%lluB buffered=%uB min=%uB stack_hwm=%u read_timeout=%u max_streak=%u eof=%u ioerr=%u",
+        context->profile_label != nullptr ? context->profile_label : "?",
         static_cast<unsigned long long>(context->network_bytes),
         static_cast<unsigned>(buffered),
         static_cast<unsigned>(context->min_buffered_bytes == UINT32_MAX ? 0U : context->min_buffered_bytes),
         static_cast<unsigned>(context->task_stack_hwm),
+        static_cast<unsigned>(context->read_timeout_total),
+        static_cast<unsigned>(context->read_timeout_streak_max),
         context->eof ? 1U : 0U,
         context->io_error ? 1U : 0U);
 
@@ -286,7 +380,7 @@ static esp_err_t source_close(void *raw)
 
 static const char *source_name(void *)
 {
-    return "HTTP_MP3";
+    return "NAS_HTTP";
 }
 
 const AudioSourceOps kOps = {
@@ -303,11 +397,14 @@ const AudioSourceOps kOps = {
 
 esp_err_t buffered_http_audio_source_open(
     AudioSource *out_source,
+    BufferedHttpAudioProfile profile,
     const char *url,
     const char *username,
     const char *password)
 {
-    if (out_source == nullptr || url == nullptr || strncmp(url, "http://", 7U) != 0) {
+    HttpStreamProfile stream_profile = {};
+    if (out_source == nullptr || url == nullptr || strncmp(url, "http://", 7U) != 0 ||
+        !resolve_profile(profile, &stream_profile)) {
         return ESP_ERR_INVALID_ARG;
     }
     (void)audio_source_close(out_source);
@@ -316,9 +413,12 @@ esp_err_t buffered_http_audio_source_open(
         1, sizeof(BufferedHttpContext), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     if (context == nullptr) return ESP_ERR_NO_MEM;
     context->min_buffered_bytes = UINT32_MAX;
+    context->profile_label = stream_profile.label;
+    context->ring_bytes = stream_profile.ring_bytes;
+    context->start_target_bytes = stream_profile.start_target_bytes;
 
     context->ring_storage = static_cast<uint8_t *>(heap_caps_malloc(
-        kRingBytes + 1U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        context->ring_bytes + 1U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     context->read_buffer = static_cast<uint8_t *>(heap_caps_malloc(
         kReadChunkBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     context->url = dup_psram(url);
@@ -331,7 +431,7 @@ esp_err_t buffered_http_audio_source_open(
     }
 
     context->stream = xStreamBufferCreateStatic(
-        kRingBytes + 1U, 1U, context->ring_storage, &context->stream_storage);
+        context->ring_bytes + 1U, 1U, context->ring_storage, &context->stream_storage);
     context->ready = xSemaphoreCreateBinaryStatic(&context->ready_storage);
     context->done = xSemaphoreCreateBinaryStatic(&context->done_storage);
     if (context->stream == nullptr || context->ready == nullptr || context->done == nullptr) {
@@ -340,8 +440,8 @@ esp_err_t buffered_http_audio_source_open(
     }
 
     const BaseType_t created = xTaskCreatePinnedToCore(
-        http_prefetch_task,
-        "NasMp3Http",
+        nas_stream_task,
+        "NasStream",
         kTaskStackBytes,
         context,
         kTaskPriority,
@@ -353,7 +453,8 @@ esp_err_t buffered_http_audio_source_open(
     }
 
     if (xSemaphoreTake(context->ready, kOpenWait) != pdTRUE) {
-        ESP_LOGE(TAG, "NAS MP3 HTTP启动超时：%ums", static_cast<unsigned>(kOpenWait * portTICK_PERIOD_MS));
+        ESP_LOGE(TAG, "NAS流启动超时：profile=%s wait=%ums",
+            context->profile_label != nullptr ? context->profile_label : "?", static_cast<unsigned>(kOpenWait * portTICK_PERIOD_MS));
         destroy_context(context);
         return ESP_ERR_TIMEOUT;
     }
@@ -365,7 +466,8 @@ esp_err_t buffered_http_audio_source_open(
     if (context->io_error || primed < minimum) {
         const esp_err_t error = context->io_error && context->io_error_code != ESP_OK
             ? context->io_error_code : ESP_ERR_TIMEOUT;
-        ESP_LOGE(TAG, "NAS MP3 HTTP预取启动失败：primed=%uB min=%uB ret=%s",
+        ESP_LOGE(TAG, "NAS流预取启动失败：profile=%s primed=%uB min=%uB ret=%s",
+            context->profile_label != nullptr ? context->profile_label : "?",
             static_cast<unsigned>(primed), static_cast<unsigned>(minimum), esp_err_to_name(error));
         destroy_context(context);
         return error;
@@ -376,10 +478,13 @@ esp_err_t buffered_http_audio_source_open(
     out_source->context = context;
     out_source->capabilities = AUDIO_SOURCE_CAP_READ | AUDIO_SOURCE_CAP_EOF | AUDIO_SOURCE_CAP_STREAMING;
     out_source->stats = {};
-    ESP_LOGI(TAG, "NAS MP3 HTTP预取就绪：primed=%uB ring=%uKB task_stack=%uB",
+    ESP_LOGI(TAG, "NAS流预取就绪：profile=%s primed=%uB ring=%uKB task_stack=%uB priority=%u core=%d",
+        context->profile_label != nullptr ? context->profile_label : "?",
         static_cast<unsigned>(primed),
-        static_cast<unsigned>(kRingBytes / 1024U),
-        static_cast<unsigned>(kTaskStackBytes));
+        static_cast<unsigned>(context->ring_bytes / 1024U),
+        static_cast<unsigned>(kTaskStackBytes),
+        static_cast<unsigned>(kTaskPriority),
+        static_cast<int>(kTaskCore));
     return ESP_OK;
 }
 
@@ -392,7 +497,7 @@ bool buffered_http_audio_source_get_stats(
     }
     BufferedHttpContext *context = static_cast<BufferedHttpContext *>(source->context);
     BufferedHttpAudioSourceStats stats = {};
-    stats.ring_capacity_bytes = kRingBytes;
+    stats.ring_capacity_bytes = static_cast<uint32_t>(context->ring_bytes);
     stats.ring_buffered_bytes = context->stream != nullptr
         ? static_cast<uint32_t>(xStreamBufferBytesAvailable(context->stream)) : 0U;
     stats.ring_min_buffered_bytes = context->min_buffered_bytes == UINT32_MAX
