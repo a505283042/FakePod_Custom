@@ -17,6 +17,7 @@
 #include "lvgl.h"
 #include "media_library.h"
 #include "player_state.h"
+#include "player_transport.h"
 #include "ui_common.h"
 #include "visual_music_browser_model.h"
 #include "visual_music_nsf.h"
@@ -52,7 +53,6 @@ static constexpr int32_t kContentMargin = 12;
 static constexpr int32_t kRowHeight = 58;
 static constexpr int32_t kRowGap = 8;
 static constexpr size_t kVisibleRows = 5U;
-static constexpr size_t kGestureStepRows = 4U;
 static constexpr uint32_t kBrowserTimerPeriodMs = 20U;
 static constexpr uint32_t kNsfAnalyzingTimerPeriodMs = 20U;
 static constexpr uint32_t kNsfFinalTimerPeriodMs = 10U;
@@ -454,6 +454,7 @@ static void update_header()
 
 static bool pause_music_for_nsf_exclusive()
 {
+    player_transport_cancel_deferred_nas_play("进入NSF独占播放");
     // 同一 NSF Session 内返回列表/换文件不恢复 Music；已经深度挂起时直接复用该上下文。
     if (g_music_deep_suspended_for_nsf || g_music_paused_for_nsf) return true;
 
@@ -487,10 +488,17 @@ static bool pause_music_for_nsf_exclusive()
     const bool has_technical = media_library_get_technical_info(player_track, &technical);
     const bool mp3_index_safe = snapshot.format != MediaFormat::MP3 ||
         (has_technical && (technical.flags & MEDIA_TECH_PARSED) != 0U);
+    const AudioPlaybackSource player_source = player_state_get_source() == PlayerMediaSource::Nas
+        ? AudioPlaybackSource::NasHttp : AudioPlaybackSource::Local;
     const bool context_matches = player_state_is_ready() && path != nullptr && path[0] != '\0' &&
-        player_track == snapshot.track_index && player_state_get_format() == snapshot.format;
+        player_track == snapshot.track_index && player_state_get_format() == snapshot.format &&
+        player_source == snapshot.source;
+    const bool nas_restart_from_beginning =
+        snapshot.source == AudioPlaybackSource::NasHttp && snapshot.format == MediaFormat::MP3;
+    const bool local_seek_restore = snapshot.source == AudioPlaybackSource::Local &&
+        snapshot.seek_supported && mp3_index_safe;
 
-    if (snapshot.seek_supported && mp3_index_safe && context_matches) {
+    if ((nas_restart_from_beginning || local_seek_restore) && context_matches) {
         if (audio_service_music_deep_suspend(
                 AudioMusicSuspendOwner::Nsf,
                 snapshot.track_index,
@@ -499,13 +507,17 @@ static bool pause_music_for_nsf_exclusive()
                 has_technical ? &technical : nullptr,
                 true)) {
             g_music_deep_suspended_for_nsf = true;
-            ESP_LOGI(TAG, "NSF Exclusive：Music已深度挂起；decoder/read-ahead/workspace RAM已回收");
+            ESP_LOGI(TAG,
+                "NSF Exclusive：Music已深度挂起；source=%s restore=%s decoder/source/read-ahead/workspace已回收",
+                nas_restart_from_beginning ? "NAS_HTTP" : "LOCAL",
+                nas_restart_from_beginning ? "00:00" : "原位置");
         } else {
             ESP_LOGW(TAG, "NSF Exclusive：Music深度挂起不可用，本次保持浅暂停继续NSF");
         }
     } else {
         ESP_LOGI(TAG,
-            "NSF Exclusive：Music保持浅暂停 seek=%u context=%u mp3_index=%u format=%s",
+            "NSF Exclusive：Music保持浅暂停 source=%u seek=%u context=%u mp3_index=%u format=%s",
+            static_cast<unsigned>(snapshot.source),
             static_cast<unsigned>(snapshot.seek_supported),
             static_cast<unsigned>(context_matches),
             static_cast<unsigned>(mp3_index_safe),
@@ -1837,10 +1849,9 @@ static void update_rows()
     }
     if (g_browser_status != nullptr) set_visible(g_browser_status, false);
 
-    const size_t max_first = g_directory.count > kVisibleRows
-        ? g_directory.count - kVisibleRows
-        : 0U;
-    if (g_first_index > max_first) g_first_index = max_first;
+    const size_t last_page_first =
+        ((g_directory.count - 1U) / kVisibleRows) * kVisibleRows;
+    if (g_first_index > last_page_first) g_first_index = last_page_first;
 
     size_t last = g_first_index;
     for (size_t slot = 0U; slot < kVisibleRows; ++slot) {
@@ -1901,18 +1912,19 @@ static void shift_window(int direction)
         return;
     }
     const size_t old = g_first_index;
-    const size_t max_first = g_directory.count - kVisibleRows;
+    const size_t last_page_first =
+        ((g_directory.count - 1U) / kVisibleRows) * kVisibleRows;
     if (direction > 0) {
-        const size_t candidate = old + kGestureStepRows;
-        g_first_index = candidate < max_first ? candidate : max_first;
+        const size_t candidate = old + kVisibleRows;
+        g_first_index = candidate < last_page_first ? candidate : last_page_first;
     } else {
-        g_first_index = old > kGestureStepRows ? old - kGestureStepRows : 0U;
+        g_first_index = old >= kVisibleRows ? old - kVisibleRows : 0U;
     }
     if (old == g_first_index) return;
     update_rows();
     ESP_LOGI(
         TAG,
-        "电子音流虚拟目录：first=%u total=%u direction=%s",
+        "电子音流目录分页：first=%u total=%u direction=%s",
         static_cast<unsigned>(g_first_index),
         static_cast<unsigned>(g_directory.count),
         direction > 0 ? "NEXT" : "PREV");

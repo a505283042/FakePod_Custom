@@ -20,6 +20,7 @@
 #include "lvgl.h"
 #include "media_library.h"
 #include "player_state.h"
+#include "player_transport.h"
 #include "ui_common.h"
 #include "video_benchmark.h"
 #include "video_browser_model.h"
@@ -55,7 +56,6 @@ static constexpr int32_t kContentMargin = 12;
 static constexpr int32_t kRowHeight = 58;
 static constexpr int32_t kRowGap = 8;
 static constexpr size_t kVisibleRows = 5U;
-static constexpr size_t kGestureStepRows = 4U;
 static constexpr uint32_t kFlacSafePercent = 90U;
 static constexpr size_t kScanBatchNoFlac = 8U;
 static constexpr size_t kScanBatchWithFlac = 1U;
@@ -343,40 +343,56 @@ static bool flac_storage_safe(bool *out_competing = nullptr, uint32_t *out_perce
     return percent >= kFlacSafePercent;
 }
 
+static bool benchmark_music_exclusive_active()
+{
+    return g_music_paused_for_benchmark || g_music_deep_suspended_for_benchmark;
+}
+
 static bool benchmark_pause_music_for_exclusive()
 {
-    if (g_music_paused_for_benchmark) return true;
+    player_transport_cancel_deferred_nas_play("进入Video独占播放");
+    if (benchmark_music_exclusive_active()) return true;
 
     AudioStateSnapshot snapshot = {};
     if (!audio_service_get_snapshot(&snapshot) || !snapshot.ready) {
         ESP_LOGI(TAG, "Video Exclusive：AudioTask未就绪，无活动Music需要暂停");
         return true;
     }
-    if (snapshot.state != AudioPlaybackState::Playing) {
-        ESP_LOGI(TAG, "Video Exclusive：Music当前非Playing(state=%u)，保持原状态",
+    if (snapshot.state == AudioPlaybackState::Playing) {
+        if (!audio_service_pause(true)) {
+            ESP_LOGE(TAG, "Video Exclusive：暂停Music失败，取消AVI启动");
+            return false;
+        }
+        g_music_paused_for_benchmark = true;
+        if (!audio_service_get_snapshot(&snapshot)) {
+            ESP_LOGW(TAG, "Video Exclusive：暂停后读取Music状态失败，本次保持浅暂停");
+            return true;
+        }
+    } else if (snapshot.state != AudioPlaybackState::Paused) {
+        ESP_LOGI(TAG, "Video Exclusive：Music当前非Playing/Paused(state=%u)，保持原状态",
             static_cast<unsigned>(snapshot.state));
         return true;
     }
-
-    if (!audio_service_pause(true)) {
-        ESP_LOGE(TAG, "Video Exclusive：暂停Music失败，取消AVI启动");
-        return false;
-    }
-    g_music_paused_for_benchmark = true;
     g_music_deep_suspended_for_benchmark = false;
 
-    // R46.0.30：只有当前 decoder 已证明能可靠回到非零位置时才深度挂起。
-    // FLAC 无 SEEKTABLE、或 Player/Catalog 上下文不一致时继续沿用浅暂停，不牺牲恢复正确性。
+    // Local 仍要求可靠 Seek；NAS 顺序 HTTP 则彻底释放并在退出 Video 后从 00:00 重建。
     const size_t player_track = player_state_get_index();
     const char *path = player_state_get_path();
     MediaTechnicalInfo technical = {};
     const bool has_technical = media_library_get_technical_info(player_track, &technical);
     const bool mp3_index_safe = snapshot.format != MediaFormat::MP3 ||
         (has_technical && (technical.flags & MEDIA_TECH_PARSED) != 0U);
+    const AudioPlaybackSource player_source = player_state_get_source() == PlayerMediaSource::Nas
+        ? AudioPlaybackSource::NasHttp : AudioPlaybackSource::Local;
     const bool context_matches = player_state_is_ready() && path != nullptr && path[0] != '\0' &&
-        player_track == snapshot.track_index && player_state_get_format() == snapshot.format;
+        player_track == snapshot.track_index && player_state_get_format() == snapshot.format &&
+        player_source == snapshot.source;
+    const bool nas_restart_from_beginning =
+        snapshot.source == AudioPlaybackSource::NasHttp && snapshot.format == MediaFormat::MP3;
+    const bool local_seek_restore = snapshot.source == AudioPlaybackSource::Local &&
+        snapshot.seek_supported && mp3_index_safe;
 
-    if (snapshot.seek_supported && mp3_index_safe && context_matches) {
+    if ((nas_restart_from_beginning || local_seek_restore) && context_matches) {
         if (audio_service_music_deep_suspend(
                 AudioMusicSuspendOwner::Video,
                 snapshot.track_index,
@@ -385,27 +401,30 @@ static bool benchmark_pause_music_for_exclusive()
                 has_technical ? &technical : nullptr,
                 true)) {
             g_music_deep_suspended_for_benchmark = true;
-            ESP_LOGI(TAG, "Video Exclusive：Music已深度挂起；decoder/read-ahead/workspace RAM已回收");
+            ESP_LOGI(TAG,
+                "Video Exclusive：Music已深度挂起；source=%s restore=%s decoder/source/read-ahead/workspace已回收",
+                nas_restart_from_beginning ? "NAS_HTTP" : "LOCAL",
+                nas_restart_from_beginning ? "00:00" : "原位置");
         } else {
-            // suspend 的失败路径都发生在释放 decoder 之前，因此可安全回退到原浅暂停。
             ESP_LOGW(TAG, "Video Exclusive：Music深度挂起不可用，本次保持浅暂停继续播放Video");
         }
     } else {
         ESP_LOGI(TAG,
-            "Video Exclusive：Music保持浅暂停 seek=%u context=%u mp3_index=%u format=%s",
+            "Video Exclusive：Music保持浅暂停 source=%u seek=%u context=%u mp3_index=%u format=%s",
+            static_cast<unsigned>(snapshot.source),
             static_cast<unsigned>(snapshot.seek_supported),
             static_cast<unsigned>(context_matches),
             static_cast<unsigned>(mp3_index_safe),
             media_format_name(snapshot.format));
     }
 
-    ESP_LOGI(TAG, "Video Exclusive：Music已暂停；AVI独占TF/Decode/Presenter性能窗口");
+    ESP_LOGI(TAG, "Video Exclusive：Music已进入独占暂停；AVI接管TF/Decode/Presenter性能窗口");
     return true;
 }
 
 static void benchmark_restore_music_after_exclusive(const char *reason)
 {
-    if (!g_music_paused_for_benchmark) return;
+    if (!benchmark_music_exclusive_active()) return;
     if (g_music_deep_suspended_for_benchmark) {
         if (!audio_service_music_deep_restore(AudioMusicSuspendOwner::Video, true)) {
             ESP_LOGW(TAG, "Video Exclusive：深度恢复Music失败 reason=%s；保留上下文等待生命周期重试",
@@ -414,14 +433,19 @@ static void benchmark_restore_music_after_exclusive(const char *reason)
         }
         g_music_deep_suspended_for_benchmark = false;
     }
-    if (!audio_service_resume(false)) {
-        ESP_LOGW(TAG, "Video Exclusive：恢复Music请求失败 reason=%s；保留暂停标记等待后续生命周期重试",
+    if (g_music_paused_for_benchmark) {
+        if (!audio_service_resume(false)) {
+            ESP_LOGW(TAG, "Video Exclusive：恢复Music请求失败 reason=%s；保留暂停标记等待后续生命周期重试",
+                reason != nullptr ? reason : "unknown");
+            return;
+        }
+        g_music_paused_for_benchmark = false;
+        ESP_LOGI(TAG, "Video Exclusive：已请求恢复Music reason=%s",
             reason != nullptr ? reason : "unknown");
-        return;
+    } else {
+        ESP_LOGI(TAG, "Video Exclusive：Music进入Video前原本Paused，深度恢复后继续保持Paused reason=%s",
+            reason != nullptr ? reason : "unknown");
     }
-    g_music_paused_for_benchmark = false;
-    ESP_LOGI(TAG, "Video Exclusive：已请求恢复Music reason=%s",
-        reason != nullptr ? reason : "unknown");
 }
 
 static bool benchmark_stop_avi_audio(const char *reason)
@@ -478,8 +502,9 @@ static void update_rows()
         return;
     }
     if (g_browser_status != nullptr) set_visible(g_browser_status, false);
-    const size_t max_first = g_directory.count > kVisibleRows ? g_directory.count - kVisibleRows : 0U;
-    if (g_first_index > max_first) g_first_index = max_first;
+    const size_t last_page_first =
+        ((g_directory.count - 1U) / kVisibleRows) * kVisibleRows;
+    if (g_first_index > last_page_first) g_first_index = last_page_first;
 
     size_t last = g_first_index;
     for (size_t slot = 0; slot < kVisibleRows; ++slot) {
@@ -517,16 +542,17 @@ static void shift_window(int direction)
     if (g_page != VideoPage::Browser || g_browser_load.phase != BrowserLoadPhase::Idle ||
         g_directory.entries == nullptr || g_directory.count <= kVisibleRows || direction == 0) return;
     const size_t old = g_first_index;
-    const size_t max_first = g_directory.count - kVisibleRows;
+    const size_t last_page_first =
+        ((g_directory.count - 1U) / kVisibleRows) * kVisibleRows;
     if (direction > 0) {
-        const size_t candidate = old + kGestureStepRows;
-        g_first_index = candidate < max_first ? candidate : max_first;
+        const size_t candidate = old + kVisibleRows;
+        g_first_index = candidate < last_page_first ? candidate : last_page_first;
     } else {
-        g_first_index = old > kGestureStepRows ? old - kGestureStepRows : 0U;
+        g_first_index = old >= kVisibleRows ? old - kVisibleRows : 0U;
     }
     if (old == g_first_index) return;
     update_rows();
-    ESP_LOGI(TAG, "Video虚拟目录：first=%u total=%u direction=%s",
+    ESP_LOGI(TAG, "Video目录分页：first=%u total=%u direction=%s",
         static_cast<unsigned>(g_first_index), static_cast<unsigned>(g_directory.count),
         direction > 0 ? "NEXT" : "PREV");
 }
@@ -1686,7 +1712,7 @@ static void show_fullcanvas_risk_prompt(const VideoProbe::Snapshot &snapshot)
     ESP_LOGW(TAG,
         "视频播放前风险确认：460x460/%uFPS > 稳定档位20FPS；规格预检只读取信息，Music%s，等待用户选择",
         static_cast<unsigned>(snapshot.fps),
-        g_music_paused_for_benchmark ? "保持暂停" : "保持连续");
+        benchmark_music_exclusive_active() ? "保持暂停" : "保持连续");
 }
 
 static void profile_probe_tick()
@@ -1743,7 +1769,7 @@ static void profile_probe_tick()
         "Video Profile预检通过：%ux%u/%uFPS%s；现在进入Video Exclusive",
         static_cast<unsigned>(snapshot.width), static_cast<unsigned>(snapshot.height),
         static_cast<unsigned>(snapshot.fps), snapshot.has_audio ? " + MP3" : "");
-    const bool chained_from_video = g_music_paused_for_benchmark;
+    const bool chained_from_video = benchmark_music_exclusive_active();
     g_fullcanvas_risk_authorized = true;
     if (!benchmark_start_selected(true)) {
         g_fullcanvas_risk_authorized = false;
@@ -1771,7 +1797,7 @@ static bool start_profile_probe_selected()
     }
     g_profile_probe_pending = true;
     show_status("正在检查视频规格…", 0x8E9AAA);
-    if (g_music_paused_for_benchmark) {
+    if (benchmark_music_exclusive_active()) {
         ESP_LOGI(TAG, "自动下一视频规格预检启动：保持视频独占，Music继续暂停");
     } else {
         ESP_LOGI(TAG, "Video播放前Profile Probe启动：Music保持后台，不暂停AudioTask");
@@ -1785,7 +1811,7 @@ static void risk_continue_clicked_cb(lv_event_t *event)
         gesture_router_should_suppress_click() || g_page != VideoPage::Benchmark ||
         !g_risk_prompt_active || g_fullcanvas_risk_authorized) return;
 
-    const bool chained_from_video = g_music_paused_for_benchmark;
+    const bool chained_from_video = benchmark_music_exclusive_active();
     g_risk_prompt_active = false;
     g_fullcanvas_risk_authorized = true;
     ESP_LOGW(TAG, "用户选择继续播放高负载460x460 AVI；保持源FPS，不自动降帧");

@@ -510,3 +510,23 @@ bool buffered_http_audio_source_get_stats(
     *out_stats = stats;
     return true;
 }
+
+bool buffered_http_audio_source_get_endpoint_view(
+    const AudioSource *source,
+    const char **out_url,
+    const char **out_username,
+    const char **out_password)
+{
+    if (source == nullptr || source->ops != &kOps || source->context == nullptr ||
+        out_url == nullptr || out_username == nullptr || out_password == nullptr) {
+        return false;
+    }
+    const BufferedHttpContext *context = static_cast<const BufferedHttpContext *>(source->context);
+    if (context->url == nullptr || context->username == nullptr || context->password == nullptr) {
+        return false;
+    }
+    *out_url = context->url;
+    *out_username = context->username;
+    *out_password = context->password;
+    return true;
+}

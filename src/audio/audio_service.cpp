@@ -243,11 +243,14 @@ struct MusicDeepSuspendContext
     AudioMusicSuspendOwner owner = AudioMusicSuspendOwner::Video;
     uint32_t track_index = UINT32_MAX;
     uint32_t playback_revision = 0U;
+    AudioPlaybackSource source = AudioPlaybackSource::Local;
     MediaFormat format = MediaFormat::Unknown;
     bool has_technical_info = false;
     MediaTechnicalInfo technical_info = {};
     uint64_t position_ms = 0ULL;
     char *path = nullptr;
+    char *nas_username = nullptr;
+    char *nas_password = nullptr;
 };
 static MusicDeepSuspendContext g_music_deep_suspend = {};
 
@@ -2115,11 +2118,20 @@ static const char *audio_music_suspend_ram_label(
     return ready ? "video_music_suspend_ready" : "video_music_suspend_before";
 }
 
+static char *audio_task_dup_psram_string(const char *text)
+{
+    if (text == nullptr) return nullptr;
+    const size_t bytes = strlen(text) + 1U;
+    char *copy = static_cast<char *>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (copy != nullptr) memcpy(copy, text, bytes);
+    return copy;
+}
+
 static void audio_task_release_music_deep_suspend_context()
 {
-    if (g_music_deep_suspend.path != nullptr) {
-        heap_caps_free(g_music_deep_suspend.path);
-    }
+    if (g_music_deep_suspend.path != nullptr) heap_caps_free(g_music_deep_suspend.path);
+    if (g_music_deep_suspend.nas_username != nullptr) heap_caps_free(g_music_deep_suspend.nas_username);
+    if (g_music_deep_suspend.nas_password != nullptr) heap_caps_free(g_music_deep_suspend.nas_password);
     g_music_deep_suspend = {};
 }
 
@@ -2149,10 +2161,12 @@ static void audio_task_handle_music_deep_suspend(AudioRequest *request)
         g_task_state != AudioPlaybackState::Paused ||
         !pcm_decoder_is_open(&g_decoder) ||
         g_video_mp3_active || g_nsf_active ||
+        request->source != g_task_source ||
         request->format != g_task_format) {
-        ESP_LOGW(TAG, "%s Music深度挂起被拒绝：state=%s track=%lu/%lu format=%s/%s",
+        ESP_LOGW(TAG, "%s Music深度挂起被拒绝：state=%s source=%u/%u track=%lu/%lu format=%s/%s",
             owner_name,
             audio_playback_state_name_cn(g_task_state),
+            static_cast<unsigned>(request->source), static_cast<unsigned>(g_task_source),
             static_cast<unsigned long>(request->track_index),
             static_cast<unsigned long>(g_task_track_index),
             media_format_name(request->format), media_format_name(g_task_format));
@@ -2160,50 +2174,77 @@ static void audio_task_handle_music_deep_suspend(AudioRequest *request)
         return;
     }
 
-    const uint64_t target_frame = g_playback_clock.submitted_frames;
-    if (!pcm_decoder_seek_supported(&g_decoder, target_frame)) {
-        ESP_LOGI(TAG,
-            "%s Music保持浅暂停：当前实例不能可靠Seek恢复 format=%s position=%llums",
-            owner_name, media_format_name(g_task_format),
-            static_cast<unsigned long long>(audio_playback_clock_position_ms(&g_playback_clock)));
-        audio_request_complete(request, false, ESP_ERR_NOT_SUPPORTED);
-        return;
-    }
-    if (g_task_format == MediaFormat::MP3 &&
-        (!request->has_technical_info ||
-         (request->technical_info.flags & MEDIA_TECH_PARSED) == 0U)) {
-        ESP_LOGI(TAG, "%s Music保持浅暂停：MP3缺少已解析技术索引，拒绝深度挂起", owner_name);
-        audio_request_complete(request, false, ESP_ERR_NOT_SUPPORTED);
-        return;
+    const bool nas_http = g_task_source == AudioPlaybackSource::NasHttp;
+    const uint64_t current_position_ms = audio_playback_clock_position_ms(&g_playback_clock);
+    if (nas_http) {
+        if (g_task_format != MediaFormat::MP3) {
+            ESP_LOGI(TAG, "%s Music保持浅暂停：NAS当前仅支持MP3 Deep Suspend format=%s",
+                owner_name, media_format_name(g_task_format));
+            audio_request_complete(request, false, ESP_ERR_NOT_SUPPORTED);
+            return;
+        }
+    } else {
+        const uint64_t target_frame = g_playback_clock.submitted_frames;
+        if (!pcm_decoder_seek_supported(&g_decoder, target_frame)) {
+            ESP_LOGI(TAG,
+                "%s Music保持浅暂停：当前实例不能可靠Seek恢复 format=%s position=%llums",
+                owner_name, media_format_name(g_task_format),
+                static_cast<unsigned long long>(current_position_ms));
+            audio_request_complete(request, false, ESP_ERR_NOT_SUPPORTED);
+            return;
+        }
+        if (g_task_format == MediaFormat::MP3 &&
+            (!request->has_technical_info ||
+             (request->technical_info.flags & MEDIA_TECH_PARSED) == 0U)) {
+            ESP_LOGI(TAG, "%s Music保持浅暂停：MP3缺少已解析技术索引，拒绝深度挂起", owner_name);
+            audio_request_complete(request, false, ESP_ERR_NOT_SUPPORTED);
+            return;
+        }
     }
 
-    const char *path = audio_request_path(request);
-    if (path == nullptr || path[0] == '\0') {
+    const char *restore_path = audio_request_path(request);
+    const char *restore_username = "";
+    const char *restore_password = "";
+    if (nas_http) {
+        if (!buffered_http_audio_source_get_endpoint_view(
+                &g_decoder.source, &restore_path, &restore_username, &restore_password)) {
+            ESP_LOGW(TAG, "%s NAS Music深度挂起失败：当前HTTP Source端点不可用", owner_name);
+            audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+            return;
+        }
+    }
+    if (restore_path == nullptr || restore_path[0] == '\0') {
         audio_request_complete(request, false, ESP_ERR_INVALID_ARG);
         return;
     }
-    const size_t path_bytes = strlen(path) + 1U;
-    char *saved_path = static_cast<char *>(
-        heap_caps_malloc(path_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (saved_path == nullptr) {
-        ESP_LOGW(TAG, "%s Music深度挂起路径缓存分配失败：%uB，保持浅暂停",
-            owner_name, static_cast<unsigned>(path_bytes));
+
+    char *saved_path = audio_task_dup_psram_string(restore_path);
+    char *saved_username = nas_http ? audio_task_dup_psram_string(restore_username) : nullptr;
+    char *saved_password = nas_http ? audio_task_dup_psram_string(restore_password) : nullptr;
+    if (saved_path == nullptr || (nas_http && (saved_username == nullptr || saved_password == nullptr))) {
+        if (saved_path != nullptr) heap_caps_free(saved_path);
+        if (saved_username != nullptr) heap_caps_free(saved_username);
+        if (saved_password != nullptr) heap_caps_free(saved_password);
+        ESP_LOGW(TAG, "%s Music深度挂起恢复上下文分配失败，保持浅暂停", owner_name);
         audio_request_complete(request, false, ESP_ERR_NO_MEM);
         return;
     }
-    memcpy(saved_path, path, path_bytes);
 
     g_music_deep_suspend.active = true;
     g_music_deep_suspend.owner = owner;
     g_music_deep_suspend.track_index = g_task_track_index;
     g_music_deep_suspend.playback_revision = g_task_playback_revision;
+    g_music_deep_suspend.source = g_task_source;
     g_music_deep_suspend.format = g_task_format;
     g_music_deep_suspend.has_technical_info = request->has_technical_info;
     if (request->has_technical_info) {
         g_music_deep_suspend.technical_info = request->technical_info;
     }
-    g_music_deep_suspend.position_ms = audio_playback_clock_position_ms(&g_playback_clock);
+    // 本地仍恢复原位置；NAS 顺序 HTTP 当前没有 Range Seek，恢复时明确从 00:00 重建。
+    g_music_deep_suspend.position_ms = nas_http ? 0ULL : current_position_ms;
     g_music_deep_suspend.path = saved_path;
+    g_music_deep_suspend.nas_username = saved_username;
+    g_music_deep_suspend.nas_password = saved_password;
 
     audio_task_log_ram(audio_music_suspend_ram_label(owner, false, false));
     const esp_err_t shutdown_ret = audio_task_shutdown_pipeline();
@@ -2217,8 +2258,10 @@ static void audio_task_handle_music_deep_suspend(AudioRequest *request)
             owner_name, esp_err_to_name(shutdown_ret));
     }
     ESP_LOGI(TAG,
-        "%s Music深度挂起完成：track=%lu format=%s position=%llums；Music decoder/read-ahead/workspace已释放",
-        owner_name, static_cast<unsigned long>(g_task_track_index), media_format_name(g_task_format),
+        "%s Music深度挂起完成：source=%s track=%lu format=%s current=%llums restore=%llums；decoder/source/read-ahead/workspace已释放",
+        owner_name, nas_http ? "NAS_HTTP" : "LOCAL",
+        static_cast<unsigned long>(g_task_track_index), media_format_name(g_task_format),
+        static_cast<unsigned long long>(current_position_ms),
         static_cast<unsigned long long>(g_music_deep_suspend.position_ms));
     audio_request_complete(request, true, ESP_OK);
 }
@@ -2262,12 +2305,20 @@ static void audio_task_handle_music_deep_restore(AudioRequest *request)
         return;
     }
 
+    const bool nas_http = g_music_deep_suspend.source == AudioPlaybackSource::NasHttp;
     AudioRequest restore = {};
     restore.type = AudioCommandType::Play;
     restore.track_index = g_music_deep_suspend.track_index;
+    restore.source = g_music_deep_suspend.source;
     restore.format = g_music_deep_suspend.format;
     restore.has_technical_info = g_music_deep_suspend.has_technical_info;
     if (restore.has_technical_info) restore.technical_info = g_music_deep_suspend.technical_info;
+    if (nas_http) {
+        snprintf(restore.nas_username, sizeof(restore.nas_username), "%s",
+            g_music_deep_suspend.nas_username != nullptr ? g_music_deep_suspend.nas_username : "");
+        snprintf(restore.nas_password, sizeof(restore.nas_password), "%s",
+            g_music_deep_suspend.nas_password != nullptr ? g_music_deep_suspend.nas_password : "");
+    }
 
     audio_task_log_ram(audio_music_suspend_ram_label(owner, true, false));
     PcmSeekResult seek = {};
@@ -2275,27 +2326,31 @@ static void audio_task_handle_music_deep_restore(AudioRequest *request)
         decoder_type,
         g_music_deep_suspend.path,
         &restore,
-        true,
+        !nas_http,
         g_music_deep_suspend.position_ms,
         &seek,
         nullptr,
         false);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "%s Music恢复失败：position=%llums ret=%s；保留上下文供后续重试",
-            owner_name, static_cast<unsigned long long>(g_music_deep_suspend.position_ms),
+        ESP_LOGE(TAG, "%s Music恢复失败：source=%s position=%llums ret=%s；保留上下文供后续重试",
+            owner_name, nas_http ? "NAS_HTTP" : "LOCAL",
+            static_cast<unsigned long long>(g_music_deep_suspend.position_ms),
             esp_err_to_name(ret));
         audio_task_set_state(AudioPlaybackState::Paused, ret);
         audio_request_complete(request, false, ret);
         return;
     }
+    if (nas_http) seek.method = PcmSeekMethod::RestartFromBeginning;
 
     const uint64_t requested_ms = g_music_deep_suspend.position_ms;
+    const AudioPlaybackSource restored_source = g_music_deep_suspend.source;
     audio_task_set_state(AudioPlaybackState::Paused, ESP_OK);
     audio_task_release_music_deep_suspend_context();
     audio_task_log_ram(audio_music_suspend_ram_label(owner, true, true));
     ESP_LOGI(TAG,
-        "%s Music深度恢复完成：requested=%llums actual=%llums method=%s；保持Paused等待APP生命周期决定是否resume",
+        "%s Music深度恢复完成：source=%s requested=%llums actual=%llums method=%s；保持Paused等待APP生命周期决定是否resume",
         owner_name,
+        restored_source == AudioPlaybackSource::NasHttp ? "NAS_HTTP" : "LOCAL",
         static_cast<unsigned long long>(requested_ms),
         static_cast<unsigned long long>(audio_playback_clock_position_ms(&g_playback_clock)),
         pcm_seek_method_name(seek.method));
@@ -5594,6 +5649,7 @@ bool audio_service_music_deep_suspend(
     if (request == nullptr) return false;
     request->music_suspend_owner = owner;
     request->track_index = track_index;
+    request->source = snapshot.source;
     request->format = format;
     request->expected_playback_revision = snapshot.playback_revision;
     if (technical_info != nullptr) {

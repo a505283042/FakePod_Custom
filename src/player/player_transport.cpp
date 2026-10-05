@@ -8,6 +8,7 @@
 #include "audio_service.h"
 #include "media_library.h"
 #include "nas_catalog_service.h"
+#include "wifi_service.h"
 #include "player_state.h"
 #include "app_diag_config.h"
 
@@ -21,6 +22,11 @@ static uint32_t g_last_finished_playback_revision = 0U;
 static uint32_t g_last_track_error_playback_revision = 0U;
 static uint32_t g_track_error_skip_count = 0U;
 static constexpr uint32_t TRACK_ERROR_AUTO_SKIP_MAX = 8U;
+
+// R46.0.91：Wi-Fi 开机/重连尚未业务 READY 时，只保留最后一次 NAS 起播意图。
+// 仅保存 Track 索引；URL/认证仍在真正起播时现取，避免跨层持有网络资源。
+static constexpr uint32_t kNoDeferredNasTrack = UINT32_MAX;
+static std::atomic<uint32_t> g_deferred_nas_track{kNoDeferredNasTrack};
 
 // P1.5.3.2R.8：随机播放只维护一个很小的“实际播放历史”，不生成整张 Shuffle Bag。
 // 这样不会按曲库规模分配内存；上一曲可以回到随机模式下真正听过的上一首。
@@ -259,6 +265,43 @@ PlayerLoopMode player_transport_cycle_loop_mode()
     return next;
 }
 
+static bool wifi_can_still_become_ready(const WifiServiceSnapshot &wifi)
+{
+    if (!wifi.ready || !wifi.configured) return false;
+    switch (wifi.state) {
+        case WifiServiceState::WaitingBleOff:
+        case WifiServiceState::SavingCredentials:
+        case WifiServiceState::WifiInit:
+        case WifiServiceState::Connecting:
+            return true;
+        case WifiServiceState::ConfiguredIdle:
+            // ConnectSaved worker 刚创建、尚未来得及切 WaitingBleOff 的极短窗口。
+            return wifi.transition_running;
+        default:
+            return false;
+    }
+}
+
+static void defer_nas_play_until_wifi_ready(uint32_t track_index)
+{
+    const uint32_t previous = g_deferred_nas_track.exchange(track_index, std::memory_order_acq_rel);
+    if (previous == track_index) return;
+    ESP_LOGI(TAG,
+        "NAS播放等待Wi-Fi业务READY：track=%u，%s一次性播放请求",
+        static_cast<unsigned>(track_index),
+        previous == kNoDeferredNasTrack ? "已挂起" : "已更新");
+}
+
+void player_transport_cancel_deferred_nas_play(const char *reason)
+{
+    const uint32_t previous = g_deferred_nas_track.exchange(
+        kNoDeferredNasTrack, std::memory_order_acq_rel);
+    if (previous == kNoDeferredNasTrack) return;
+    ESP_LOGI(TAG, "待处理NAS播放已取消：track=%u reason=%s",
+        static_cast<unsigned>(previous),
+        reason != nullptr ? reason : "上下文变化");
+}
+
 static bool player_transport_play_current_internal(const char *reason)
 {
     if (!player_state_is_ready()) {
@@ -288,6 +331,7 @@ static bool player_transport_play_current_internal(const char *reason)
 #endif
 
     if (source == PlayerMediaSource::Local) {
+        player_transport_cancel_deferred_nas_play("切换本地播放");
         return audio_service_play_track(
             static_cast<uint32_t>(track_index),
             path,
@@ -301,6 +345,28 @@ static bool player_transport_play_current_internal(const char *reason)
             static_cast<unsigned>(track_index), media_format_name(player_state_get_format()));
         return false;
     }
+
+    WifiServiceSnapshot wifi = {};
+    const bool has_wifi_snapshot = wifi_service_get_snapshot(&wifi);
+    const bool wifi_ready = has_wifi_snapshot && wifi.connected &&
+        !wifi.transition_running && wifi.state == WifiServiceState::Connected;
+    if (!wifi_ready) {
+        if (has_wifi_snapshot && wifi_can_still_become_ready(wifi)) {
+            defer_nas_play_until_wifi_ready(static_cast<uint32_t>(track_index));
+            return true;
+        }
+        player_transport_cancel_deferred_nas_play("Wi-Fi未处于启动/恢复过程");
+        ESP_LOGW(TAG,
+            "NAS播放不可用：Wi-Fi业务未启动 connected=%u transition=%u state=%s",
+            wifi.connected ? 1U : 0U,
+            wifi.transition_running ? 1U : 0U,
+            wifi_service_state_name(wifi.state));
+        return false;
+    }
+
+    // 用户在 READY 后再次点播时，显式请求覆盖此前的待处理请求。
+    g_deferred_nas_track.store(kNoDeferredNasTrack, std::memory_order_release);
+
     NasPlaybackEndpoint endpoint = {};
     const esp_err_t endpoint_ret = nas_catalog_service_get_playback_endpoint(&endpoint);
     if (endpoint_ret != ESP_OK) {
@@ -328,6 +394,44 @@ bool player_transport_play_current(const char *reason)
     // 显式用户起播开启新的容错窗口；自动 EOF/坏曲跳过走 internal，不会把连续坏曲计数清零。
     g_track_error_skip_count = 0U;
     return player_transport_play_current_internal(reason);
+}
+
+static void player_transport_update_deferred_nas_play()
+{
+    const uint32_t pending_track = g_deferred_nas_track.load(std::memory_order_acquire);
+    if (pending_track == kNoDeferredNasTrack) return;
+
+    if (!player_state_is_ready() || player_state_get_source() != PlayerMediaSource::Nas ||
+        player_state_get_index() != pending_track) {
+        player_transport_cancel_deferred_nas_play("Player选择已变化");
+        return;
+    }
+
+    WifiServiceSnapshot wifi = {};
+    if (!wifi_service_get_snapshot(&wifi)) return;
+
+    const bool wifi_ready = wifi.connected && !wifi.transition_running &&
+        wifi.state == WifiServiceState::Connected;
+    if (!wifi_ready) {
+        if (!wifi_can_still_become_ready(wifi)) {
+            player_transport_cancel_deferred_nas_play("Wi-Fi启动/恢复已结束但未READY");
+        }
+        return;
+    }
+
+    uint32_t expected = pending_track;
+    if (!g_deferred_nas_track.compare_exchange_strong(
+            expected, kNoDeferredNasTrack,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "Wi-Fi业务READY：执行待处理NAS播放 track=%u",
+        static_cast<unsigned>(pending_track));
+    if (!player_transport_play_current_internal("Wi-Fi READY待处理NAS播放")) {
+        ESP_LOGW(TAG, "Wi-Fi业务READY后NAS自动起播失败：track=%u",
+            static_cast<unsigned>(pending_track));
+    }
 }
 
 static bool player_transport_shuffle_next(const char *reason)
@@ -648,6 +752,9 @@ static void player_transport_handle_track_error(const AudioStateSnapshot &audio)
 
 void player_transport_update()
 {
+    // Wi-Fi READY 与 AudioTask state_revision 无关；必须每拍先检查一次性 NAS 待播放请求。
+    player_transport_update_deferred_nas_play();
+
     AudioStateSnapshot snapshot = {};
     if (!audio_service_get_snapshot(&snapshot) || !snapshot.ready) {
         return;

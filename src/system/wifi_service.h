@@ -23,6 +23,7 @@ struct WifiServiceSnapshot {
     bool ready = false;
     bool configured = false;
     bool transition_running = false;
+    // 只有 STA 已拿到 IP，且 Wi-Fi runtime/Remote 启动完整收口后才为 true。
     bool connected = false;
     bool ble_fallback_enabled = false;
     WifiServiceState state = WifiServiceState::Unconfigured;

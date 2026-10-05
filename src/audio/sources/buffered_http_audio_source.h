@@ -37,3 +37,11 @@ bool buffered_http_audio_source_get_stats(
     const AudioSource *source,
     BufferedHttpAudioSourceStats *out_stats
 );
+
+// 仅供 AudioTask 在 Deep Suspend 关闭 Source 前复制恢复端点；返回指针只在 Source 打开期间有效。
+bool buffered_http_audio_source_get_endpoint_view(
+    const AudioSource *source,
+    const char **out_url,
+    const char **out_username,
+    const char **out_password
+);

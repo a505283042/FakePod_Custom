@@ -19,6 +19,10 @@ void player_transport_update();
 // 串行收回旧 pipeline，避免“Stop + Play 又二次 shutdown”。
 bool player_transport_play_current(const char *reason = nullptr);
 
+// R46.0.91：取消“等待 Wi-Fi READY 后自动起播”的一次性 NAS 请求。
+// 使用原子状态，可由 NSF/Video 生命周期直接调用，不持有 Player transport 锁。
+void player_transport_cancel_deferred_nas_play(const char *reason = nullptr);
+
 // 手动 transport。上一曲在当前歌曲已播放超过 3 秒时重播当前首；否则切上一首。
 // 随机模式下：下一曲随机选择，上一曲优先返回本次随机会话的实际历史；
 // 非随机模式继续按当前 Playlist Context 首尾循环。

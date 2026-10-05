@@ -220,17 +220,18 @@ static void wifi_event_handler(void *, esp_event_base_t base, int32_t event_id, 
     if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         const auto *event = static_cast<const ip_event_got_ip_t *>(event_data);
         portENTER_CRITICAL(&g_lock);
+        // GOT_IP 只表示 STA 已拿到 IP；对业务层仍保持 Connecting。
+        // 必须等 Wi-Fi Remote 启动完成并由 wifi_worker() 发布最终 READY。
         g_connected = true;
         g_connecting = false;
-        g_state = WifiServiceState::Connected;
         g_last_error = ESP_OK;
         portEXIT_CRITICAL(&g_lock);
         if (event != nullptr) {
-            ESP_LOGI(TAG, "Wi-Fi已连接：ssid=%s ip=" IPSTR,
+            ESP_LOGI(TAG, "Wi-Fi已获取IP：ssid=%s ip=" IPSTR "，等待业务READY",
                 g_saved.ssid,
                 IP2STR(&event->ip_info.ip));
         } else {
-            ESP_LOGI(TAG, "Wi-Fi已连接：ssid=%s", g_saved.ssid);
+            ESP_LOGI(TAG, "Wi-Fi已获取IP：ssid=%s，等待业务READY", g_saved.ssid);
         }
         if (g_wifi_events != nullptr) xEventGroupSetBits(g_wifi_events, kConnectedBit);
     }
@@ -517,8 +518,8 @@ static void wifi_worker(void *)
             ESP_LOGW(TAG, "Wi-Fi已接管但保存无线开关失败：%s", esp_err_to_name(persist_ret));
         }
     }
-    ESP_LOGI(TAG, "Wi-Fi接管成功：ssid=%s；BLE保持关闭；Wi-Fi遥控=READY", g_saved.ssid);
     worker_finish(true, ESP_OK);
+    ESP_LOGI(TAG, "Wi-Fi接管成功：ssid=%s；BLE保持关闭；Wi-Fi遥控=READY", g_saved.ssid);
     vTaskDeleteWithCaps(xTaskGetCurrentTaskHandle());
     return;
 
@@ -712,7 +713,9 @@ bool wifi_service_get_snapshot(WifiServiceSnapshot *out_snapshot)
     out_snapshot->ready = g_ready;
     out_snapshot->configured = g_configured;
     out_snapshot->transition_running = g_transition_running;
-    out_snapshot->connected = g_connected;
+    // 对业务层的 connected 表示完整 Wi-Fi 服务 READY，而不是仅仅 GOT_IP。
+    out_snapshot->connected = g_connected && !g_transition_running &&
+        g_state == WifiServiceState::Connected;
     out_snapshot->ble_fallback_enabled = g_ble_fallback_enabled;
     out_snapshot->state = g_state;
     out_snapshot->last_error = g_last_error;
