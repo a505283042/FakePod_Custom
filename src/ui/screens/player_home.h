@@ -11,9 +11,9 @@
 // Overlay 使用一次性显隐而非全屏 alpha 动画，复用 Stage 11.2 Seek 与既有 Player/AudioTask 控制链。
 void player_home_create(lv_obj_t *screen);
 
-// P1.5.3.2R.36.2：歌词/频谱/曲库等全屏页面隐藏后使用统一恢复事务。
-// 先恢复主页 timer/Artwork lease 与 LVGL source，再尝试一次无 barrier 的当前封面物理提交，
-// 最后强制 invalidation，确保 BoundedSPI 快路径已熔断时也能由 LVGL 完整重绘。
+// 歌词/频谱/曲库等全屏页面隐藏后使用统一恢复事务。
+// 先恢复主页 timer/Artwork lease 与 LVGL source；Launcher 自 R46.0.93 起只有 Flash I4 +
+// BoundedSPI 单路径，异常时直接保持/恢复主页，不再切换第二套 LVGL Launcher。
 void player_home_resume_from_fullscreen_view(const char *reason);
 
 // APP.1 Music Lifecycle Adapter：Music 转后台时暂停所有主页前台活动并释放 Artwork UI lease；

@@ -97,13 +97,15 @@ esp_err_t pcm_decoder_open(
     return ESP_OK;
 }
 
-esp_err_t pcm_decoder_open_streaming_mp3(
+esp_err_t pcm_decoder_open_streaming(
     PcmDecoder *decoder,
+    PcmDecoderType type,
     AudioSource *source,
     AudioDecodeWorkspace *workspace)
 {
     if (decoder == nullptr || source == nullptr || !audio_source_is_open(source) ||
-        !audio_source_has_capability(source, AUDIO_SOURCE_CAP_STREAMING)) {
+        !audio_source_has_capability(source, AUDIO_SOURCE_CAP_STREAMING) ||
+        (type != PcmDecoderType::Mp3 && type != PcmDecoderType::Flac)) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -111,20 +113,33 @@ esp_err_t pcm_decoder_open_streaming_mp3(
     decoder->source = *source;
     *source = {};
 
-    const esp_err_t ret = mp3_decoder_open(
-        &decoder->mp3, &decoder->source, workspace, true);
+    esp_err_t ret = ESP_ERR_NOT_SUPPORTED;
+    if (type == PcmDecoderType::Mp3) {
+        ret = mp3_decoder_open(&decoder->mp3, &decoder->source, workspace, true);
+        if (ret == ESP_OK) {
+            decoder->info.sample_rate_hz = decoder->mp3.sample_rate_hz;
+            decoder->info.channels = decoder->mp3.channels;
+            decoder->info.bits_per_sample = decoder->mp3.bits_per_sample;
+            decoder->info.total_frames = decoder->mp3.total_frames;
+        }
+    } else {
+        ret = flac_decoder_open_streaming(&decoder->flac, &decoder->source, workspace);
+        if (ret == ESP_OK) {
+            decoder->info.sample_rate_hz = decoder->flac.sample_rate_hz;
+            decoder->info.channels = decoder->flac.channels;
+            decoder->info.bits_per_sample = decoder->flac.bits_per_sample;
+            decoder->info.total_frames = decoder->flac.total_frames;
+        }
+    }
     if (ret != ESP_OK) {
         pcm_decoder_close(decoder);
         return ret;
     }
 
-    decoder->type = PcmDecoderType::Mp3;
-    decoder->info.sample_rate_hz = decoder->mp3.sample_rate_hz;
-    decoder->info.channels = decoder->mp3.channels;
-    decoder->info.bits_per_sample = decoder->mp3.bits_per_sample;
-    decoder->info.total_frames = decoder->mp3.total_frames;
+    decoder->type = type;
 #if APP_DIAG_AUDIO_CODEC
-    ESP_LOGI(TAG, "统一PCM流式解码器已打开：格式=MP3 source=%s %luHz/%ubit/%u声道",
+    ESP_LOGI(TAG, "统一PCM流式解码器已打开：格式=%s source=%s %luHz/%ubit/%u声道",
+        pcm_decoder_type_name(type),
         audio_source_name(&decoder->source),
         static_cast<unsigned long>(decoder->info.sample_rate_hz),
         static_cast<unsigned>(decoder->info.bits_per_sample),
@@ -443,7 +458,8 @@ bool pcm_decoder_seek_supported(const PcmDecoder *decoder, uint64_t target_frame
         case PcmDecoderType::Mp3:
             return !decoder->mp3.streaming_source;
         case PcmDecoderType::Flac:
-            return target_frame == 0 || flac_decoder_has_seektable(&decoder->flac);
+            return !decoder->flac.streaming_source &&
+                (target_frame == 0 || flac_decoder_has_seektable(&decoder->flac));
         case PcmDecoderType::Opus:
             return true;
         default:

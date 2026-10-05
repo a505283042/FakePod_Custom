@@ -388,7 +388,8 @@ static bool benchmark_pause_music_for_exclusive()
         player_track == snapshot.track_index && player_state_get_format() == snapshot.format &&
         player_source == snapshot.source;
     const bool nas_restart_from_beginning =
-        snapshot.source == AudioPlaybackSource::NasHttp && snapshot.format == MediaFormat::MP3;
+        snapshot.source == AudioPlaybackSource::NasHttp &&
+        (snapshot.format == MediaFormat::MP3 || snapshot.format == MediaFormat::FLAC);
     const bool local_seek_restore = snapshot.source == AudioPlaybackSource::Local &&
         snapshot.seek_supported && mp3_index_safe;
 

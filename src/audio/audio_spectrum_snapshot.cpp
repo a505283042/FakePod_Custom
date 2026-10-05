@@ -24,10 +24,13 @@ static const char *TAG = "音频频谱";
 // 第一有效 bin 约 57~63Hz，优先保留底鼓/贝斯瞬态；有效视觉频段约覆盖到 7~8kHz。
 constexpr size_t FFT_SIZE = 256U;
 constexpr uint32_t ANALYSIS_TARGET_RATE_HZ = 16000U;
-constexpr uint32_t ANALYSIS_CAPTURE_HZ = 24U;
+constexpr uint32_t ANALYSIS_CAPTURE_NORMAL_HZ = 24U;
+constexpr uint32_t ANALYSIS_CAPTURE_HIGH_RATE_HZ = 12U;
+constexpr uint32_t ANALYSIS_HIGH_RATE_THRESHOLD_HZ = 96000U;
 constexpr uint8_t FFT_FRAME_SLOT_COUNT = 2U;
 constexpr uint32_t FFT_TASK_STACK_BYTES = 4096U;
-constexpr UBaseType_t FFT_TASK_PRIORITY = 1U;
+// R46.0.94：P2 仍严格低于 LVGL P3 / NasStream P4，但不再与歌词/封面等 P1 后台任务同级争抢。
+constexpr UBaseType_t FFT_TASK_PRIORITY = 2U;
 constexpr uint32_t FFT_GRACE_REUSE_MS = 2000U;
 constexpr BaseType_t FFT_TASK_CORE = 1;
 constexpr float FFT_PI = 3.14159265358979323846f;
@@ -115,6 +118,13 @@ static void spectrum_reset_capture_state()
     g_capture_analysis_rate_hz = 0U;
     g_capture_enable_generation = 0U;
     g_last_capture_start_frame = 0ULL;
+}
+
+static uint32_t spectrum_capture_rate_hz(uint32_t source_rate_hz)
+{
+    return source_rate_hz >= ANALYSIS_HIGH_RATE_THRESHOLD_HZ
+        ? ANALYSIS_CAPTURE_HIGH_RATE_HZ
+        : ANALYSIS_CAPTURE_NORMAL_HZ;
 }
 
 static uint32_t spectrum_choose_decimation(uint32_t source_rate_hz)
@@ -481,12 +491,13 @@ esp_err_t audio_spectrum_snapshot_start()
     g_fft_task.store(task, std::memory_order_release);
 
     SPECTRUM_BOOT_LOGI(
-        "SpectrumFFT 任务已启动：core=%d priority=%u stack=%uB N=%u capture=%uHz target=%uHz floor=-45dB",
+        "SpectrumFFT 任务已启动：core=%d priority=%u stack=%uB N=%u capture=%u/%uHz target=%uHz floor=-45dB",
         static_cast<int>(FFT_TASK_CORE),
         static_cast<unsigned>(FFT_TASK_PRIORITY),
         static_cast<unsigned>(FFT_TASK_STACK_BYTES),
         static_cast<unsigned>(FFT_SIZE),
-        static_cast<unsigned>(ANALYSIS_CAPTURE_HZ),
+        static_cast<unsigned>(ANALYSIS_CAPTURE_NORMAL_HZ),
+        static_cast<unsigned>(ANALYSIS_CAPTURE_HIGH_RATE_HZ),
         static_cast<unsigned>(ANALYSIS_TARGET_RATE_HZ));
     return ESP_OK;
 }
@@ -632,12 +643,21 @@ void audio_spectrum_snapshot_reset(
 void audio_spectrum_snapshot_publish_pcm(
     const int32_t *interleaved_stereo,
     size_t frames,
+    AudioPlaybackSource source,
     uint32_t playback_revision,
     uint32_t track_index,
     uint32_t sample_rate_hz,
     uint64_t submitted_frames)
 {
     if (interleaved_stereo == nullptr || frames == 0U || sample_rate_hz == 0U) {
+        return;
+    }
+
+    // R46.0.99：只保护 NAS_HTTP 的 96kHz及以上流；本地高采样率仍保留12Hz FFT降载。
+    if (source == AudioPlaybackSource::NasHttp &&
+        sample_rate_hz >= ANALYSIS_HIGH_RATE_THRESHOLD_HZ) {
+        if (g_capture_enabled_last) spectrum_reset_capture_state();
+        g_capture_enabled_last = false;
         return;
     }
 
@@ -667,8 +687,9 @@ void audio_spectrum_snapshot_publish_pcm(
     }
 
     if (!g_capture_active) {
-        const uint64_t interval = sample_rate_hz >= ANALYSIS_CAPTURE_HZ
-            ? static_cast<uint64_t>(sample_rate_hz / ANALYSIS_CAPTURE_HZ)
+        const uint32_t capture_rate_hz = spectrum_capture_rate_hz(sample_rate_hz);
+        const uint64_t interval = sample_rate_hz >= capture_rate_hz
+            ? static_cast<uint64_t>(sample_rate_hz / capture_rate_hz)
             : 1ULL;
         if (
             g_last_capture_start_frame != 0ULL &&

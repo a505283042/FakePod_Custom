@@ -19,6 +19,10 @@ static const char *TAG = "FLAC";
 // SD 读取不再由 AudioTask 同步执行，而是由独立低优先级预取任务填充 PSRAM 环形缓冲。
 // 预取缓存按采样率扩展，未来开放 96/192kHz 时优先增加 PSRAM 吞吐余量，不堆内部 DMA RAM。
 static constexpr size_t FLAC_INPUT_BUFFER_BYTES = 32768;
+// NAS metadata 顺序解析阶段允许网络 ring 短暂补充，但不能让 AudioTask 无限卡在坏链路上。
+static constexpr uint32_t FLAC_STREAMING_METADATA_WAIT_MS = 5000U;
+// NAS FLAC metadata 解析后的首块 PCM 预解码可等网络短暂补充；正式播放不使用这个窗口。
+static constexpr uint32_t FLAC_STREAMING_PREPLAY_WAIT_MS = 1000U;
 // 在 Simple Decoder parser 模式下，尽量让下一完整 FLAC 压缩帧连续落在同一个输入窗口中。
 // STREAMINFO 的 max_frame_size 再留少量保护字节，避免窗口边界导致一次 PCM refill 需要两轮 process。
 static constexpr size_t FLAC_INPUT_FRAME_GUARD_BYTES = 64;
@@ -1227,6 +1231,184 @@ static uint16_t flac_read_be16(const uint8_t *p)
     );
 }
 
+static esp_err_t flac_decode_streaminfo_payload(FlacStreamDescriptor *descriptor)
+{
+    if (descriptor == nullptr) return ESP_ERR_INVALID_ARG;
+    const uint8_t *info = descriptor->streaminfo_payload;
+    descriptor->max_block_size = static_cast<uint16_t>(
+        (static_cast<uint16_t>(info[2]) << 8) | info[3]
+    );
+    descriptor->min_frame_size =
+        (static_cast<uint32_t>(info[4]) << 16) |
+        (static_cast<uint32_t>(info[5]) << 8) |
+        static_cast<uint32_t>(info[6]);
+    descriptor->max_frame_size =
+        (static_cast<uint32_t>(info[7]) << 16) |
+        (static_cast<uint32_t>(info[8]) << 8) |
+        static_cast<uint32_t>(info[9]);
+    descriptor->sample_rate_hz =
+        (static_cast<uint32_t>(info[10]) << 12) |
+        (static_cast<uint32_t>(info[11]) << 4) |
+        (static_cast<uint32_t>(info[12]) >> 4);
+    descriptor->channels = static_cast<uint16_t>(((info[12] >> 1) & 0x07U) + 1U);
+    descriptor->bits_per_sample = static_cast<uint16_t>(
+        (((static_cast<uint16_t>(info[12]) & 0x01U) << 4) | (info[13] >> 4)) + 1U
+    );
+    descriptor->total_frames =
+        (static_cast<uint64_t>(info[13] & 0x0FU) << 32) |
+        (static_cast<uint64_t>(info[14]) << 24) |
+        (static_cast<uint64_t>(info[15]) << 16) |
+        (static_cast<uint64_t>(info[16]) << 8) |
+        static_cast<uint64_t>(info[17]);
+
+    if (descriptor->max_block_size == 0 || descriptor->sample_rate_hz == 0 ||
+        descriptor->channels == 0) {
+        ESP_LOGE(TAG, "STREAMINFO 参数无效：block=%u rate=%lu channels=%u",
+            static_cast<unsigned>(descriptor->max_block_size),
+            static_cast<unsigned long>(descriptor->sample_rate_hz),
+            static_cast<unsigned>(descriptor->channels));
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t flac_streaming_read_exact(AudioSource *source, void *buffer, size_t bytes)
+{
+    if (!audio_source_is_open(source) || buffer == nullptr) return ESP_ERR_INVALID_ARG;
+    size_t total = 0U;
+    const int64_t start_us = esp_timer_get_time();
+    while (total < bytes) {
+        size_t got = 0U;
+        const esp_err_t ret = audio_source_read(
+            source, static_cast<uint8_t *>(buffer) + total, bytes - total, &got);
+        if (ret == ESP_OK && got > 0U) {
+            total += got;
+            continue;
+        }
+        if (ret != ESP_ERR_TIMEOUT) {
+            return ret != ESP_OK ? ret : (audio_source_eof(source) ? ESP_ERR_INVALID_SIZE : ESP_ERR_INVALID_STATE);
+        }
+        const int64_t now_us = esp_timer_get_time();
+        if (now_us <= start_us ||
+            static_cast<uint64_t>(now_us - start_us) >=
+                static_cast<uint64_t>(FLAC_STREAMING_METADATA_WAIT_MS) * 1000ULL) {
+            return ESP_ERR_TIMEOUT;
+        }
+        taskYIELD();
+    }
+    return ESP_OK;
+}
+
+static esp_err_t flac_streaming_discard(AudioSource *source, uint64_t bytes)
+{
+    uint8_t scratch[256] = {};
+    while (bytes > 0U) {
+        const size_t chunk = bytes < sizeof(scratch) ? static_cast<size_t>(bytes) : sizeof(scratch);
+        const esp_err_t ret = flac_streaming_read_exact(source, scratch, chunk);
+        if (ret != ESP_OK) return ret;
+        bytes -= chunk;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t flac_parse_stream_descriptor_streaming(
+    AudioSource *source,
+    FlacStreamDescriptor *out_descriptor)
+{
+    if (!audio_source_is_open(source) || out_descriptor == nullptr ||
+        !audio_source_has_capability(source, AUDIO_SOURCE_CAP_READ) ||
+        !audio_source_has_capability(source, AUDIO_SOURCE_CAP_STREAMING) ||
+        !audio_source_has_capability(source, AUDIO_SOURCE_CAP_EOF)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_descriptor = {};
+
+    uint8_t first4[4] = {};
+    esp_err_t ret = flac_streaming_read_exact(source, first4, sizeof(first4));
+    if (ret != ESP_OK) return ret;
+
+    uint64_t cursor = 0U;
+    if (memcmp(first4, "ID3", 3) == 0) {
+        uint8_t id3_tail[6] = {};
+        ret = flac_streaming_read_exact(source, id3_tail, sizeof(id3_tail));
+        if (ret != ESP_OK) return ret;
+        uint8_t id3_header[10] = {};
+        memcpy(id3_header, first4, sizeof(first4));
+        memcpy(id3_header + 4, id3_tail, sizeof(id3_tail));
+        if ((id3_header[6] | id3_header[7] | id3_header[8] | id3_header[9]) & 0x80U) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        const uint32_t tag_size = flac_read_synchsafe_u28(&id3_header[6]);
+        const bool has_footer = (id3_header[5] & 0x10U) != 0U;
+        ret = flac_streaming_discard(source, static_cast<uint64_t>(tag_size) + (has_footer ? 10ULL : 0ULL));
+        if (ret != ESP_OK) return ret;
+        cursor = 10ULL + tag_size + (has_footer ? 10ULL : 0ULL);
+        ret = flac_streaming_read_exact(source, first4, sizeof(first4));
+        if (ret != ESP_OK) return ret;
+#if APP_DIAG_AUDIO_CODEC
+        ESP_LOGI(TAG, "NAS FLAC检测到前置 ID3v2：顺序跳过=%llu字节",
+            static_cast<unsigned long long>(cursor));
+#endif
+    }
+    if (memcmp(first4, "fLaC", 4) != 0) {
+        ESP_LOGE(TAG, "NAS FLAC未找到标准 fLaC 文件头");
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    out_descriptor->flac_offset_bytes = cursor;
+    cursor += 4ULL;
+
+    uint8_t block_header[4] = {};
+    ret = flac_streaming_read_exact(source, block_header, sizeof(block_header));
+    if (ret != ESP_OK) return ret;
+    cursor += sizeof(block_header);
+    bool is_last = (block_header[0] & 0x80U) != 0U;
+    const uint8_t block_type = block_header[0] & 0x7FU;
+    const uint32_t block_length =
+        (static_cast<uint32_t>(block_header[1]) << 16) |
+        (static_cast<uint32_t>(block_header[2]) << 8) |
+        static_cast<uint32_t>(block_header[3]);
+    if (block_type != 0U || block_length != FLAC_STREAMINFO_BYTES) {
+        ESP_LOGE(TAG, "NAS FLAC首个元数据块不是标准 STREAMINFO：type=%u length=%lu",
+            static_cast<unsigned>(block_type), static_cast<unsigned long>(block_length));
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    ret = flac_streaming_read_exact(
+        source, out_descriptor->streaminfo_payload, FLAC_STREAMINFO_BYTES);
+    if (ret != ESP_OK) return ret;
+    cursor += FLAC_STREAMINFO_BYTES;
+    ret = flac_decode_streaminfo_payload(out_descriptor);
+    if (ret != ESP_OK) return ret;
+
+    while (!is_last) {
+        ret = flac_streaming_read_exact(source, block_header, sizeof(block_header));
+        if (ret != ESP_OK) return ret;
+        cursor += sizeof(block_header);
+        is_last = (block_header[0] & 0x80U) != 0U;
+        const uint32_t metadata_length =
+            (static_cast<uint32_t>(block_header[1]) << 16) |
+            (static_cast<uint32_t>(block_header[2]) << 8) |
+            static_cast<uint32_t>(block_header[3]);
+        ret = flac_streaming_discard(source, metadata_length);
+        if (ret != ESP_OK) return ret;
+        cursor += metadata_length;
+    }
+    out_descriptor->audio_data_offset_bytes = cursor;
+
+#if APP_DIAG_AUDIO_CODEC
+    ESP_LOGI(TAG,
+        "NAS FLAC STREAMINFO：%luHz / %ubit / %u声道 total=%llu max_block=%u frame=%lu~%luB audio_offset=%llu",
+        static_cast<unsigned long>(out_descriptor->sample_rate_hz),
+        static_cast<unsigned>(out_descriptor->bits_per_sample),
+        static_cast<unsigned>(out_descriptor->channels),
+        static_cast<unsigned long long>(out_descriptor->total_frames),
+        static_cast<unsigned>(out_descriptor->max_block_size),
+        static_cast<unsigned long>(out_descriptor->min_frame_size),
+        static_cast<unsigned long>(out_descriptor->max_frame_size),
+        static_cast<unsigned long long>(out_descriptor->audio_data_offset_bytes));
+#endif
+    return ESP_OK;
+}
+
 static esp_err_t flac_parse_stream_descriptor(
     AudioSource *source,
     FlacStreamDescriptor *out_descriptor)
@@ -1276,41 +1458,9 @@ static esp_err_t flac_parse_stream_descriptor(
         return ret != ESP_OK ? ret : ESP_ERR_INVALID_SIZE;
     }
 
-    const uint8_t *info = out_descriptor->streaminfo_payload;
-    out_descriptor->max_block_size = static_cast<uint16_t>(
-        (static_cast<uint16_t>(info[2]) << 8) | info[3]
-    );
-    out_descriptor->min_frame_size =
-        (static_cast<uint32_t>(info[4]) << 16) |
-        (static_cast<uint32_t>(info[5]) << 8) |
-        static_cast<uint32_t>(info[6]);
-    out_descriptor->max_frame_size =
-        (static_cast<uint32_t>(info[7]) << 16) |
-        (static_cast<uint32_t>(info[8]) << 8) |
-        static_cast<uint32_t>(info[9]);
-    out_descriptor->sample_rate_hz =
-        (static_cast<uint32_t>(info[10]) << 12) |
-        (static_cast<uint32_t>(info[11]) << 4) |
-        (static_cast<uint32_t>(info[12]) >> 4);
-    out_descriptor->channels = static_cast<uint16_t>(((info[12] >> 1) & 0x07U) + 1U);
-    out_descriptor->bits_per_sample = static_cast<uint16_t>(
-        (((static_cast<uint16_t>(info[12]) & 0x01U) << 4) | (info[13] >> 4)) + 1U
-    );
-    out_descriptor->total_frames =
-        (static_cast<uint64_t>(info[13] & 0x0FU) << 32) |
-        (static_cast<uint64_t>(info[14]) << 24) |
-        (static_cast<uint64_t>(info[15]) << 16) |
-        (static_cast<uint64_t>(info[16]) << 8) |
-        static_cast<uint64_t>(info[17]);
-
-    if (out_descriptor->max_block_size == 0 ||
-        out_descriptor->sample_rate_hz == 0 ||
-        out_descriptor->channels == 0) {
-        ESP_LOGE(TAG, "STREAMINFO 参数无效：block=%u rate=%lu channels=%u",
-            static_cast<unsigned>(out_descriptor->max_block_size),
-            static_cast<unsigned long>(out_descriptor->sample_rate_hz),
-            static_cast<unsigned>(out_descriptor->channels));
-        return ESP_ERR_INVALID_RESPONSE;
+    ret = flac_decode_streaminfo_payload(out_descriptor);
+    if (ret != ESP_OK) {
+        return ret;
     }
 
     uint64_t cursor = out_descriptor->flac_offset_bytes + 4ULL + 4ULL + FLAC_STREAMINFO_BYTES;
@@ -1988,13 +2138,82 @@ static esp_err_t flac_prepare_input_window(FlacDecoder *decoder, bool *out_recei
         return ESP_OK;
     }
 
+    const size_t target = flac_input_window_target(decoder);
+
+    if (decoder->streaming_source) {
+        if (!audio_source_is_open(decoder->source)) return ESP_ERR_INVALID_STATE;
+        if (remaining >= target) return ESP_OK;
+
+        const size_t initial_needed = target - remaining;
+        size_t tail_capacity = decoder->input_size < decoder->input_capacity
+            ? decoder->input_capacity - decoder->input_size : 0U;
+        if (tail_capacity < initial_needed && remaining > 0U && decoder->input_offset > 0U) {
+            memmove(decoder->input_buffer, decoder->input_buffer + decoder->input_offset, remaining);
+#if APP_DIAG_FLAC_PERFORMANCE
+            ++decoder->perf_input_compact_calls;
+            decoder->perf_input_compact_bytes += remaining;
+#endif
+            decoder->input_offset = 0U;
+            decoder->input_size = remaining;
+        } else if (remaining == 0U) {
+            decoder->input_offset = 0U;
+            decoder->input_size = 0U;
+        }
+
+        const int64_t direct_wait_started_us = esp_timer_get_time();
+        while ((decoder->input_size - decoder->input_offset) < target) {
+            const size_t available_now = decoder->input_size - decoder->input_offset;
+            const size_t needed = target - available_now;
+            const size_t tail_free = decoder->input_capacity - decoder->input_size;
+            const size_t request = needed < tail_free ? needed : tail_free;
+            if (request == 0U) return ESP_ERR_INVALID_SIZE;
+
+            size_t got = 0U;
+            const esp_err_t ret = audio_source_read(
+                decoder->source, decoder->input_buffer + decoder->input_size, request, &got);
+            if (got > 0U) {
+                decoder->input_size += got;
+#if APP_DIAG_FLAC_PERFORMANCE
+                decoder->perf_input_topup_bytes += got;
+                ++decoder->perf_input_topup_calls;
+                if (got > decoder->perf_input_topup_max_bytes) {
+                    decoder->perf_input_topup_max_bytes = static_cast<uint32_t>(got);
+                }
+#endif
+                if (out_received != nullptr) *out_received = true;
+            }
+            if (ret != ESP_OK) {
+                if (ret == ESP_ERR_TIMEOUT && available_now > 0U) break;
+                if (ret == ESP_ERR_TIMEOUT && decoder->preplay_decode_active && available_now == 0U) {
+                    const int64_t now_us = esp_timer_get_time();
+                    if (now_us > direct_wait_started_us &&
+                        static_cast<uint64_t>(now_us - direct_wait_started_us) <
+                            static_cast<uint64_t>(FLAC_STREAMING_PREPLAY_WAIT_MS) * 1000ULL) {
+                        taskYIELD();
+                        continue;
+                    }
+                }
+                return ret;
+            }
+            if (got == 0U) {
+                if (audio_source_eof(decoder->source)) {
+                    decoder->input_chunk_eos = true;
+                    break;
+                }
+                if (available_now == 0U) return ESP_ERR_TIMEOUT;
+                break;
+            }
+        }
+        decoder->input_chunk_eos = audio_source_eof(decoder->source);
+        if (decoder->input_size == 0U && decoder->input_chunk_eos) decoder->eof = true;
+        return ESP_OK;
+    }
+
     FlacPrefetchContext *context = flac_prefetch_context(decoder);
     if (context == nullptr || context->ring_storage == nullptr) {
         ESP_LOGE(TAG, "FLAC 压缩流预取上下文不存在");
         return ESP_ERR_INVALID_STATE;
     }
-
-    const size_t target = flac_input_window_target(decoder);
 
     // 已经有足够连续输入时直接交给 parser，不做无意义 memmove，也不从 ring 复制新数据。
     // 只有当前尾部不足以覆盖 max_frame_size + guard 时才补窗。
@@ -2323,7 +2542,8 @@ static esp_err_t flac_decoder_prepare_runtime(
     uint64_t source_start_offset,
     const uint8_t *prefix,
     size_t prefix_size,
-    uint64_t start_frame)
+    uint64_t start_frame,
+    bool direct_streaming = false)
 {
     if (decoder == nullptr || decoder->source == nullptr ||
         prefix_size > sizeof(decoder->prefetch_prefix)) {
@@ -2382,6 +2602,7 @@ static esp_err_t flac_decoder_prepare_runtime(
     }
     decoder->input_capacity = FLAC_INPUT_BUFFER_BYTES;
     decoder->decoded_capacity = decoded_capacity;
+    decoder->streaming_source = direct_streaming;
     if (decoder->max_frame_size > decoder->input_capacity) {
         ESP_LOGW(TAG,
             "FLAC 最大压缩帧=%luB 超过当前输入缓冲=%uB，单帧可能跨多次读取；高采样率优化时需要重点观察 refill 负载",
@@ -2398,19 +2619,33 @@ static esp_err_t flac_decoder_prepare_runtime(
     if (prefix_size > 0 && prefix != nullptr) {
         memcpy(decoder->prefetch_prefix, prefix, prefix_size);
     }
-    ret = audio_source_seek(
-        decoder->source,
-        static_cast<int64_t>(source_start_offset),
-        AudioSourceSeekOrigin::Begin);
-    if (ret != ESP_OK) {
-        flac_decoder_close(decoder);
-        return ret;
-    }
+    if (direct_streaming) {
+        decoder->input_offset = 0U;
+        decoder->input_size = 0U;
+        decoder->input_chunk_eos = false;
+        if (prefix_size > decoder->input_capacity) {
+            flac_decoder_close(decoder);
+            return ESP_ERR_INVALID_SIZE;
+        }
+        if (prefix_size > 0U && prefix != nullptr) {
+            memcpy(decoder->input_buffer, prefix, prefix_size);
+            decoder->input_size = prefix_size;
+        }
+    } else {
+        ret = audio_source_seek(
+            decoder->source,
+            static_cast<int64_t>(source_start_offset),
+            AudioSourceSeekOrigin::Begin);
+        if (ret != ESP_OK) {
+            flac_decoder_close(decoder);
+            return ret;
+        }
 
-    ret = flac_prefetch_start(decoder);
-    if (ret != ESP_OK) {
-        flac_decoder_close(decoder);
-        return ret;
+        ret = flac_prefetch_start(decoder);
+        if (ret != ESP_OK) {
+            flac_decoder_close(decoder);
+            return ret;
+        }
     }
 
     esp_audio_simple_dec_cfg_t cfg = {};
@@ -2547,6 +2782,47 @@ esp_err_t flac_decoder_open(FlacDecoder *decoder, AudioSource *source, AudioDeco
         nullptr,
         0,
         0);
+}
+
+esp_err_t flac_decoder_open_streaming(
+    FlacDecoder *decoder,
+    AudioSource *source,
+    AudioDecodeWorkspace *workspace)
+{
+    if (decoder == nullptr || !audio_source_is_open(source)) return ESP_ERR_INVALID_ARG;
+    flac_decoder_close(decoder);
+    esp_err_t ret = flac_decoder_register_backend();
+    if (ret != ESP_OK) return ret;
+
+    decoder->source = source;
+    FlacStreamDescriptor descriptor = {};
+    ret = flac_parse_stream_descriptor_streaming(source, &descriptor);
+    if (ret != ESP_OK) {
+        flac_decoder_close(decoder);
+        return ret;
+    }
+    flac_apply_stream_descriptor(decoder, descriptor);
+
+    uint8_t synthetic_header[FLAC_SYNTHETIC_HEADER_BYTES] = {};
+    flac_build_synthetic_header(descriptor, synthetic_header);
+    ret = flac_decoder_prepare_runtime(
+        decoder,
+        workspace,
+        descriptor.audio_data_offset_bytes,
+        synthetic_header,
+        sizeof(synthetic_header),
+        0U,
+        true);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG,
+            "NAS FLAC直接流式解码已就绪：%luHz/%ubit/%u声道 input=%uB pcm=%uB，无FlacPrefetch",
+            static_cast<unsigned long>(decoder->sample_rate_hz),
+            static_cast<unsigned>(decoder->bits_per_sample),
+            static_cast<unsigned>(decoder->channels),
+            static_cast<unsigned>(decoder->input_capacity),
+            static_cast<unsigned>(decoder->decoded_capacity));
+    }
+    return ret;
 }
 
 esp_err_t flac_decoder_read_pcm32(

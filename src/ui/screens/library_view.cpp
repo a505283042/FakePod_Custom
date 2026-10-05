@@ -2609,8 +2609,8 @@ static void library_view_row_clicked_cb(lv_event_t *event)
         row->action == LibraryRowAction::PlayAllTrack ||
         row->action == LibraryRowAction::PlayFolderTrack ||
         row->action == LibraryRowAction::PlayGroupTrack;
-    // NAS 网络播放目前只接入 MP3。先在提交 PlayerState 之前做能力检查，
-    // 避免点击暂不支持的 FLAC/OPUS 后把统一“当前播放上下文”改成 NAS，
+    // NAS 网络播放当前接入 MP3/FLAC。先在提交 PlayerState 之前做能力检查，
+    // 避免点击暂不支持的 OPUS 等格式后把统一“当前播放上下文”改成 NAS，
     // 而旧的 Local 音频实际上仍在播放。
     if (selecting_track && library_source_is_nas()) {
         MediaTrackViewV2 candidate = {};
@@ -2619,8 +2619,8 @@ static void library_view_row_clicked_cb(lv_event_t *event)
                 static_cast<unsigned long>(row->track_index));
             return;
         }
-        if (candidate.row->format != MediaFormat::MP3) {
-            ESP_LOGW(TAG, "NAS当前阶段仅开放MP3：track=%lu format=%s；保持当前播放上下文不变",
+        if (candidate.row->format != MediaFormat::MP3 && candidate.row->format != MediaFormat::FLAC) {
+            ESP_LOGW(TAG, "NAS当前阶段仅开放MP3/FLAC：track=%lu format=%s；保持当前播放上下文不变",
                 static_cast<unsigned long>(row->track_index),
                 media_format_name(candidate.row->format));
             return;

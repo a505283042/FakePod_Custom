@@ -34,7 +34,11 @@ static const char *TAG = "频谱界面";
 #define UI_PAGE_INTERACTION_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
 #endif
 
-constexpr uint32_t SPECTRUM_FRAME_MS = 50U; // P1.5.2R.3.1：20 FPS，只消费最新16-band FFT Snapshot。
+// R46.0.99：仅 NAS_HTTP 的 96kHz及以上 FLAC 禁用实时FFT；本地高采样率 FLAC 保留 R46.0.94 降载频谱。
+constexpr uint32_t SPECTRUM_FRAME_MP3_MS = 50U;
+constexpr uint32_t SPECTRUM_FRAME_FLAC_MS = 67U;
+constexpr uint32_t SPECTRUM_FRAME_FLAC_HIGH_RATE_MS = 83U;
+constexpr uint32_t SPECTRUM_HI_RES_GUARD_HZ = 96000U;
 constexpr uint8_t SPECTRUM_BAR_COUNT = 16U; // FFT 数据 band 数，保持不变。
 constexpr uint8_t SPECTRUM_VISUAL_BAR_COUNT = 24U; // P1.5.2R.4：绘制层插值为24根镜像音柱。
 constexpr int16_t SPECTRUM_BAR_W = 9;
@@ -75,7 +79,7 @@ constexpr int16_t SPECTRUM_LYRIC_Y = 316;
 constexpr int16_t SPECTRUM_LYRIC_W = 416;
 constexpr int16_t SPECTRUM_LYRIC_H = 62;
 constexpr int16_t SPECTRUM_LYRIC_LINE_SPACE = 2;
-constexpr uint32_t SPECTRUM_LYRIC_POLL_FRAMES = 2U; // 50ms频谱timer下约100ms检查一次歌词行。
+constexpr uint32_t SPECTRUM_LYRIC_POLL_FRAMES = 2U; // 动态timer下约100~166ms检查一次歌词行。
 constexpr int32_t SPECTRUM_LYRIC_TEXT_MAX_W = SPECTRUM_LYRIC_W - 8;
 constexpr size_t SPECTRUM_LYRIC_FORMATTED_BYTES = LYRICS_VIEW_TEXT_BYTES + 8U;
 
@@ -151,10 +155,13 @@ lv_obj_t *g_title = nullptr;
 lv_obj_t *g_artist = nullptr;
 lv_obj_t *g_time = nullptr;
 lv_obj_t *g_spectrum_widget = nullptr;
+lv_obj_t *g_hi_res_guard = nullptr;
 lv_obj_t *g_lyric = nullptr;
 lv_timer_t *g_timer = nullptr;
 lv_timer_t *g_delayed_start_timer = nullptr;
+uint32_t g_timer_period_ms = SPECTRUM_FRAME_MP3_MS;
 bool g_visible = false;
+bool g_hi_res_guard_active = false;
 // 防烧屏：暂停/停止时频谱整体收起（高度0不画），避免固定亮色条长期定格在屏上。
 bool g_idle_collapsed = true;
 uint32_t g_frame = 0U;
@@ -400,6 +407,44 @@ static void spectrum_set_idle_targets()
     for (uint8_t i = 0U; i < SPECTRUM_BAR_COUNT; ++i) {
         g_bar_target[i] = SPECTRUM_MIN_H;
     }
+}
+
+static bool spectrum_hi_res_guard_required(const AudioStateSnapshot &audio)
+{
+    return audio.source == AudioPlaybackSource::NasHttp &&
+        audio.format == MediaFormat::FLAC &&
+        audio.sample_rate_hz >= SPECTRUM_HI_RES_GUARD_HZ;
+}
+
+static void spectrum_update_hi_res_guard(const AudioStateSnapshot &audio)
+{
+    const bool active = spectrum_hi_res_guard_required(audio);
+    if (active == g_hi_res_guard_active) return;
+
+    g_hi_res_guard_active = active;
+    if (active) {
+        audio_service_set_spectrum_enabled(false);
+        spectrum_set_idle_targets();
+        g_idle_collapsed = true;
+        if (g_spectrum_widget != nullptr) lv_obj_add_flag(g_spectrum_widget, LV_OBJ_FLAG_HIDDEN);
+        if (g_hi_res_guard != nullptr) {
+            char message[64] = {};
+            snprintf(message, sizeof(message),
+                "Hi-Res %lu kHz\n实时频谱已关闭",
+                static_cast<unsigned long>(audio.sample_rate_hz / 1000U));
+            lv_label_set_text(g_hi_res_guard, message);
+            lv_obj_remove_flag(g_hi_res_guard, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(g_hi_res_guard);
+        }
+        ESP_LOGI(TAG, "NAS Hi-Res保护：%luHz，禁用实时FFT频谱",
+            static_cast<unsigned long>(audio.sample_rate_hz));
+        return;
+    }
+
+    if (g_hi_res_guard != nullptr) lv_obj_add_flag(g_hi_res_guard, LV_OBJ_FLAG_HIDDEN);
+    if (g_spectrum_widget != nullptr) lv_obj_remove_flag(g_spectrum_widget, LV_OBJ_FLAG_HIDDEN);
+    if (g_visible) audio_service_set_spectrum_enabled(true);
+    ESP_LOGI(TAG, "NAS Hi-Res保护解除：恢复实时FFT频谱");
 }
 
 static bool spectrum_snapshot_matches(
@@ -823,6 +868,32 @@ static void spectrum_update_ridge_qos(const AudioStateSnapshot &audio)
     }
 }
 
+static uint32_t spectrum_frame_period_ms(const AudioStateSnapshot &audio)
+{
+    if (audio.format != MediaFormat::FLAC) {
+        return SPECTRUM_FRAME_MP3_MS;
+    }
+    return audio.sample_rate_hz >= 96000U
+        ? SPECTRUM_FRAME_FLAC_HIGH_RATE_MS
+        : SPECTRUM_FRAME_FLAC_MS;
+}
+
+static void spectrum_update_timer_qos(const AudioStateSnapshot &audio)
+{
+    const uint32_t period_ms = spectrum_frame_period_ms(audio);
+    if (period_ms == g_timer_period_ms) {
+        return;
+    }
+    g_timer_period_ms = period_ms;
+    if (g_timer != nullptr) {
+        lv_timer_set_period(g_timer, period_ms);
+    }
+    ESP_LOGI(TAG, "频谱QoS：format=%s rate=%luHz ui=%lums",
+        media_format_name(audio.format),
+        static_cast<unsigned long>(audio.sample_rate_hz),
+        static_cast<unsigned long>(period_ms));
+}
+
 static void spectrum_draw_segmented_columns(lv_layer_t *layer, lv_obj_t *obj)
 {
     if (layer == nullptr || obj == nullptr) {
@@ -1093,7 +1164,8 @@ static void spectrum_update_bars()
 
 static void spectrum_root_click_cb(lv_event_t *event)
 {
-    if (event == nullptr || lv_event_get_code(event) != LV_EVENT_CLICKED || !g_visible) {
+    if (event == nullptr || lv_event_get_code(event) != LV_EVENT_CLICKED || !g_visible ||
+        g_hi_res_guard_active) {
         return;
     }
     // R.35.2：样式切换只认真正 Tap。除了已成立的 Swipe 会 suppress 外，
@@ -1120,7 +1192,7 @@ static void spectrum_timer_cb(lv_timer_t *timer)
     if (!g_visible || g_root == nullptr || lv_obj_has_flag(g_root, LV_OBJ_FLAG_HIDDEN)) {
         return;
     }
-    // 锁屏/AOD/熄屏动作菜单覆盖频谱时，50ms 频谱刷新完全让路；
+    // 锁屏/AOD/熄屏动作菜单覆盖频谱时，当前频谱刷新完全让路；
     // 只冻结屏幕呈现，不影响后台音频播放。
     if (screen_action_menu_is_open()) {
         return;
@@ -1131,7 +1203,9 @@ static void spectrum_timer_cb(lv_timer_t *timer)
         return;
     }
 
+    spectrum_update_hi_res_guard(audio);
     spectrum_update_ridge_qos(audio);
+    spectrum_update_timer_qos(audio);
 
     const uint32_t track_index = spectrum_current_track(audio);
     spectrum_refresh_header(track_index);
@@ -1141,9 +1215,10 @@ static void spectrum_timer_cb(lv_timer_t *timer)
     }
 
     const bool playing = audio.state == AudioPlaybackState::Playing;
-    // 防烧屏：真正停止/暂停时整组音柱收起；播放中保留最小高度防闪烁。
-    g_idle_collapsed = !playing;
-    if (playing) {
+    // Hi-Res Guard 时页面仍保留歌名/歌词/时间，但不读取或绘制FFT数据。
+    // 其他格式继续沿用原有防烧屏规则。
+    g_idle_collapsed = g_hi_res_guard_active || !playing;
+    if (playing && !g_hi_res_guard_active) {
         AudioSpectrumSnapshot spectrum = {};
         if (
             audio_service_get_spectrum_snapshot(&spectrum) &&
@@ -1229,6 +1304,12 @@ void spectrum_view_create(lv_obj_t *screen)
     lv_obj_remove_flag(g_spectrum_widget, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(g_spectrum_widget, spectrum_widget_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
 
+    g_hi_res_guard = spectrum_create_label(
+        g_root, "", lv_color_hex(0x8E9AAA), SPECTRUM_AREA_W, 72);
+    lv_obj_set_pos(g_hi_res_guard, SPECTRUM_AREA_LEFT, 194);
+    lv_label_set_long_mode(g_hi_res_guard, LV_LABEL_LONG_WRAP);
+    lv_obj_add_flag(g_hi_res_guard, LV_OBJ_FLAG_HIDDEN);
+
     for (uint8_t i = 0U; i < SPECTRUM_BAR_COUNT; ++i) {
         g_bar_height[i] = SPECTRUM_MIN_H;
         g_bar_target[i] = SPECTRUM_MIN_H;
@@ -1251,14 +1332,13 @@ void spectrum_view_create(lv_obj_t *screen)
 
     spectrum_apply_style_layout();
 
-    g_timer = lv_timer_create(spectrum_timer_cb, SPECTRUM_FRAME_MS, nullptr);
+    g_timer = lv_timer_create(spectrum_timer_cb, SPECTRUM_FRAME_MP3_MS, nullptr);
     if (g_timer != nullptr) {
         lv_timer_pause(g_timer);
     }
 
     UI_PAGE_BOOT_LOGI(
-        "频谱页：3 styles，刷新=%ums，continuous-TE-bypass",
-        static_cast<unsigned>(SPECTRUM_FRAME_MS));
+        "频谱页：3 styles，本地=20/15/12FPS；NAS FLAC>=96k Hi-Res Guard");
 }
 
 void spectrum_view_open()
@@ -1287,11 +1367,13 @@ void spectrum_view_open()
 
     AudioStateSnapshot audio = {};
     if (audio_service_get_snapshot(&audio)) {
+        spectrum_update_hi_res_guard(audio);
         spectrum_update_ridge_qos(audio);
+        spectrum_update_timer_qos(audio);
         const uint32_t track_index = spectrum_current_track(audio);
         spectrum_refresh_header(track_index);
         spectrum_update_current_lyric(audio, track_index);
-        if (audio.state == AudioPlaybackState::Playing) {
+        if (audio.state == AudioPlaybackState::Playing && !g_hi_res_guard_active) {
             AudioSpectrumSnapshot spectrum = {};
             if (
                 audio_service_get_spectrum_snapshot(&spectrum) &&
@@ -1318,9 +1400,12 @@ void spectrum_view_open()
             lv_timer_set_repeat_count(g_delayed_start_timer, 1);
         }
     }
-    audio_service_set_spectrum_enabled(true);
-    UI_PAGE_INTERACTION_LOGI("打开频谱页：style=%u %s",
-        static_cast<unsigned>(g_style), spectrum_style_name(g_style));
+    if (!g_hi_res_guard_active) {
+        audio_service_set_spectrum_enabled(true);
+    }
+    UI_PAGE_INTERACTION_LOGI("打开频谱页：style=%u %s guard=%u",
+        static_cast<unsigned>(g_style), spectrum_style_name(g_style),
+        g_hi_res_guard_active ? 1U : 0U);
 }
 
 void spectrum_view_close()
@@ -1369,7 +1454,14 @@ void spectrum_view_resume_after_app_switch()
     lv_obj_remove_flag(g_root, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(g_root);
     screen_lock_simple_raise();
-    audio_service_set_spectrum_enabled(true);
+
+    AudioStateSnapshot audio = {};
+    if (audio_service_get_snapshot(&audio)) {
+        spectrum_update_hi_res_guard(audio);
+    }
+    if (!g_hi_res_guard_active) {
+        audio_service_set_spectrum_enabled(true);
+    }
 
     // 不清柱高/样式缓存，直接同步后台期间产生的最新 Audio/Spectrum Snapshot。
     spectrum_timer_cb(nullptr);
@@ -1377,7 +1469,8 @@ void spectrum_view_resume_after_app_switch()
         lv_timer_reset(g_timer);
         lv_timer_resume(g_timer);
     }
-    UI_PAGE_INTERACTION_LOGI("频谱页恢复：复用FFT服务并同步最新频谱");
+    UI_PAGE_INTERACTION_LOGI("频谱页恢复：同步最新状态 guard=%u",
+        g_hi_res_guard_active ? 1U : 0U);
 }
 
 bool spectrum_view_is_visible()

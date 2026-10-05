@@ -17,20 +17,26 @@ struct BufferedHttpAudioSourceStats
     esp_err_t io_error_code = ESP_OK;
 };
 
+using BufferedHttpAudioAbortFn = bool (*)(const void *context);
+
 enum class BufferedHttpAudioProfile : uint8_t
 {
     Mp3 = 0,
+    Flac,
 };
 
 // R46.0.85：NAS HTTP Source 改为统一字节流 Worker。
 // Worker 只负责 connect/retry/read -> PSRAM ring，不解析 MP3/FLAC；Codec 继续只消费 AudioSource。
-// 当前只启用 MP3 profile，后续 NAS FLAC 复用同一个 Worker，不再创建第二套 HTTP task。
+// R46.0.98：MP3/FLAC 共用同一个 NasStream task；MP3保持128KB/96KB，NAS FLAC固定384KB/256KB，
+// 不再依赖建链前不可用/不可靠的采样率信息，不增加第二个网络任务。
 esp_err_t buffered_http_audio_source_open(
     AudioSource *out_source,
     BufferedHttpAudioProfile profile,
     const char *url,
     const char *username,
-    const char *password
+    const char *password,
+    BufferedHttpAudioAbortFn abort_fn = nullptr,
+    const void *abort_context = nullptr
 );
 
 bool buffered_http_audio_source_get_stats(

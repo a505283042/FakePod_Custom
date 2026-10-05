@@ -75,10 +75,11 @@ esp_err_t pcm_decoder_open(
     const char *path,
     AudioDecodeWorkspace *workspace = nullptr
 );
-// R46.0.78：接管一个已经打开且自带预读的 Streaming AudioSource。
-// 当前只开放 NAS MP3；函数调用后无论成功失败，source 的所有权都已转移/清空。
-esp_err_t pcm_decoder_open_streaming_mp3(
+// 接管一个已经打开且自带预读的 Streaming AudioSource。
+// R46.0.92：NAS MP3/FLAC 共用该入口；函数调用后无论成功失败，source 所有权均转移/清空。
+esp_err_t pcm_decoder_open_streaming(
     PcmDecoder *decoder,
+    PcmDecoderType type,
     AudioSource *source,
     AudioDecodeWorkspace *workspace = nullptr
 );

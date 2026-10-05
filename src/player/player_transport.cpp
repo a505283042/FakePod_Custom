@@ -1,6 +1,7 @@
 #include "player_transport.h"
 
 #include <atomic>
+#include <string.h>
 
 #include "esp_log.h"
 #include "esp_random.h"
@@ -340,9 +341,10 @@ static bool player_transport_play_current_internal(const char *reason)
             false);
     }
 
-    if (player_state_get_format() != MediaFormat::MP3) {
-        ESP_LOGW(TAG, "NAS当前阶段仅开放MP3：track=%u format=%s",
-            static_cast<unsigned>(track_index), media_format_name(player_state_get_format()));
+    const MediaFormat nas_format = player_state_get_format();
+    if (nas_format != MediaFormat::MP3 && nas_format != MediaFormat::FLAC) {
+        ESP_LOGW(TAG, "NAS当前阶段仅开放MP3/FLAC：track=%u format=%s",
+            static_cast<unsigned>(track_index), media_format_name(nas_format));
         return false;
     }
 
@@ -382,8 +384,12 @@ static bool player_transport_play_current_internal(const char *reason)
         ESP_LOGW(TAG, "NAS播放URL构造失败：%s", esp_err_to_name(url_ret));
         return false;
     }
-    const bool ok = audio_service_play_nas_mp3(
-        static_cast<uint32_t>(track_index), url, endpoint.username, endpoint.password,
+    ESP_LOGI(TAG, "NAS播放URL：mode=%s len=%u track=%lu",
+        endpoint.track_base_url[0] != '\0' ? "SHORT_ID" : "LEGACY_PATH",
+        static_cast<unsigned>(strlen(url)),
+        static_cast<unsigned long>(track_index));
+    const bool ok = audio_service_play_nas_track(
+        static_cast<uint32_t>(track_index), url, nas_format, endpoint.username, endpoint.password,
         has_technical_info ? &technical : nullptr, false);
     heap_caps_free(url);
     return ok;
@@ -698,6 +704,16 @@ static void player_transport_handle_track_error(const AudioStateSnapshot &audio)
     const AudioPlaybackSource expected_source = player_state_get_source() == PlayerMediaSource::Nas
         ? AudioPlaybackSource::NasHttp : AudioPlaybackSource::Local;
     if (audio.source != expected_source || audio.track_index == UINT32_MAX || audio.track_index != list.track_index) {
+        return;
+    }
+
+    if (audio.failure_scope != AudioFailureScope::Track) {
+        g_track_error_skip_count = 0U;
+        ESP_LOGW(TAG,
+            "NAS/系统播放故障不自动跳歌：track=%lu err=%s scope=%u，保持 Error 等待网络恢复或用户重新点播",
+            static_cast<unsigned long>(audio.track_index),
+            esp_err_to_name(audio.last_error),
+            static_cast<unsigned>(audio.failure_scope));
         return;
     }
 

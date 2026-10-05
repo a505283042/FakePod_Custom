@@ -16,6 +16,8 @@ struct FlacDecoder
     void *simple_handle = nullptr;
     // 压缩流预取层只拥有 Source 读取和 PSRAM 环形缓冲，不拥有 FLAC 解码器状态。
     void *prefetch_context = nullptr;
+    // NAS 顺序流已经由 NasStream 提供 PSRAM ring；该模式直接消费 Source，不再创建 FlacPrefetch。
+    bool streaming_source = false;
 
     uint8_t *input_buffer = nullptr;
     size_t input_capacity = 0;
@@ -206,6 +208,14 @@ esp_err_t flac_decoder_register_backend();
 // 从统一 AudioSource 打开 FLAC 并读取 STREAMINFO。支持标准 fLaC，也兼容前置 ID3v2 标签。
 // 当前 PCM sink 支持：44.1/48/88.2/96/176.4/192kHz、单/双声道、16/24/32bit。
 esp_err_t flac_decoder_open(FlacDecoder *decoder, AudioSource *source, AudioDecodeWorkspace *workspace = nullptr);
+
+// 从已经自带预读 ring 的顺序 Streaming AudioSource 打开 FLAC。只顺序解析 metadata，
+// 不要求 seek/random access，也不创建 FlacPrefetch；当前用于 NAS HTTP FLAC。
+esp_err_t flac_decoder_open_streaming(
+    FlacDecoder *decoder,
+    AudioSource *source,
+    AudioDecodeWorkspace *workspace = nullptr
+);
 
 // 直接从指定毫秒位置建立 FLAC 运行时。Seek 请求使用该入口可避免先按曲首建立一次
 // Prefetch/首块 PCM，随后又立即关闭并重建到 seekpoint 的重复工作。

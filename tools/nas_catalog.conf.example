@@ -1,7 +1,9 @@
 # Copy to /sdcard/System/nas_catalog.conf on FakePod.
 # HTTP only in the current low-RAM profile; HTTPS/TLS is deferred until RAM is measured.
-base_url=http://192.168.1.105:8080/music-index
-# R46.0.78 NAS MP3 playback source. If omitted, .../music-index is automatically mapped to sibling .../music.
+base_url=http://192.168.1.105:8080/web/music-index
+# R46.0.96 static short-ID alias endpoint. No NAS Python/Docker service is required.
+track_url=http://192.168.1.105:8080/track
+# Legacy full-path endpoint kept only for older firmware compatibility.
 music_url=http://192.168.1.105:8080/music
 username=
 password=

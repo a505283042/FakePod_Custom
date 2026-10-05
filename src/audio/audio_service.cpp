@@ -82,9 +82,13 @@ static constexpr uint32_t AUDIO_FLAC_STARVE_GRACE_MAX_MS = 1000;
 static constexpr uint32_t AUDIO_FLAC_STARVE_GRACE_MAX_ATTEMPTS = 32;
 // R46.0.81：HTTP MP3 的网络读可能短时停顿。ring 真正耗空时不把第一个
 // Source timeout 直接升级成播放故障，而是在有硬上限的恢复窗口内用静音维持 I2S。
-// HTTP client 自身超时为5s，因此恢复窗略高于5s，确保能等到真实 transport 结果。
+// HTTP streaming read 已有 1s 有界 timeout；恢复窗保持 6s，允许同一连接经历数次短暂停顿后继续。
 static constexpr uint32_t AUDIO_HTTP_MP3_STARVE_GRACE_MAX_MS = 6000;
 static constexpr uint32_t AUDIO_HTTP_MP3_STARVE_GRACE_MAX_ATTEMPTS = 192;
+// R46.0.92：NAS FLAC 直接消费 NasStream ring；网络欠载按 HTTP 时间尺度恢复，
+// 不套用本地 SD FlacPrefetch 的 1s/32次窗口。
+static constexpr uint32_t AUDIO_HTTP_FLAC_STARVE_GRACE_MAX_MS = 6000;
+static constexpr uint32_t AUDIO_HTTP_FLAC_STARVE_GRACE_MAX_ATTEMPTS = 192;
 // 常规 codec workspace 跨曲保留复用；若异常文件把 PCM 工作区推到超大尺寸，
 // 关闭该曲后释放，避免一次特殊文件永久占住大量 PSRAM。
 static constexpr size_t AUDIO_DECODE_WORKSPACE_RETAIN_INPUT_BYTES = 32 * 1024;
@@ -735,22 +739,31 @@ static void audio_task_reset_flac_starve_grace()
 
 static void audio_task_log_flac_starve_recovered()
 {
-    if (g_flac_starve_grace_attempts == 0) {
-        return;
-    }
+    if (g_flac_starve_grace_attempts == 0) return;
 
-    FlacPrefetchRuntimeSnapshot flac = {};
-    (void)flac_decoder_get_prefetch_runtime(&g_decoder.flac, &flac);
     const int64_t now_us = esp_timer_get_time();
     const uint32_t elapsed_ms = g_flac_starve_grace_started_us > 0 && now_us > g_flac_starve_grace_started_us
         ? static_cast<uint32_t>((now_us - g_flac_starve_grace_started_us) / 1000LL)
         : 0U;
-    ESP_LOGI(TAG,
-        "FLAC欠载已恢复：attempts=%u elapsed=%ums ring=%u/%uB",
-        static_cast<unsigned>(g_flac_starve_grace_attempts),
-        static_cast<unsigned>(elapsed_ms),
-        static_cast<unsigned>(flac.buffered_bytes),
-        static_cast<unsigned>(flac.capacity_bytes));
+    if (g_task_source == AudioPlaybackSource::NasHttp) {
+        BufferedHttpAudioSourceStats http = {};
+        (void)buffered_http_audio_source_get_stats(&g_decoder.source, &http);
+        ESP_LOGI(TAG,
+            "NAS FLAC欠载已恢复：attempts=%u elapsed=%ums ring=%u/%uB",
+            static_cast<unsigned>(g_flac_starve_grace_attempts),
+            static_cast<unsigned>(elapsed_ms),
+            static_cast<unsigned>(http.ring_buffered_bytes),
+            static_cast<unsigned>(http.ring_capacity_bytes));
+    } else {
+        FlacPrefetchRuntimeSnapshot flac = {};
+        (void)flac_decoder_get_prefetch_runtime(&g_decoder.flac, &flac);
+        ESP_LOGI(TAG,
+            "FLAC欠载已恢复：attempts=%u elapsed=%ums ring=%u/%uB",
+            static_cast<unsigned>(g_flac_starve_grace_attempts),
+            static_cast<unsigned>(elapsed_ms),
+            static_cast<unsigned>(flac.buffered_bytes),
+            static_cast<unsigned>(flac.capacity_bytes));
+    }
     audio_task_reset_flac_starve_grace();
 }
 
@@ -761,48 +774,68 @@ static bool audio_task_try_recover_flac_starvation(esp_err_t decoder_error)
         return false;
     }
 
-    FlacPrefetchRuntimeSnapshot flac = {};
-    if (!flac_decoder_get_prefetch_runtime(&g_decoder.flac, &flac) ||
-        !flac.active || flac.io_error || flac.eof) {
-        return false;
+    const bool nas_http = g_task_source == AudioPlaybackSource::NasHttp;
+    uint32_t buffered = 0U;
+    uint32_t capacity = 0U;
+    uint32_t max_ms = AUDIO_FLAC_STARVE_GRACE_MAX_MS;
+    uint32_t max_attempts = AUDIO_FLAC_STARVE_GRACE_MAX_ATTEMPTS;
+    if (nas_http) {
+        BufferedHttpAudioSourceStats http = {};
+        if (!buffered_http_audio_source_get_stats(&g_decoder.source, &http) ||
+            http.io_error || http.eof) {
+            return false;
+        }
+        buffered = http.ring_buffered_bytes;
+        capacity = http.ring_capacity_bytes;
+        max_ms = AUDIO_HTTP_FLAC_STARVE_GRACE_MAX_MS;
+        max_attempts = AUDIO_HTTP_FLAC_STARVE_GRACE_MAX_ATTEMPTS;
+    } else {
+        FlacPrefetchRuntimeSnapshot flac = {};
+        if (!flac_decoder_get_prefetch_runtime(&g_decoder.flac, &flac) ||
+            !flac.active || flac.io_error || flac.eof) {
+            return false;
+        }
+        buffered = flac.buffered_bytes;
+        capacity = flac.capacity_bytes;
     }
 
     const int64_t now_us = esp_timer_get_time();
     if (g_flac_starve_grace_attempts == 0) {
         g_flac_starve_grace_started_us = now_us;
         ESP_LOGW(TAG,
-            "FLAC欠载进入有界恢复：ring=%u/%uB ioerr=0 eof=0，最多%ums/%u次；期间以静音维持I2S",
-            static_cast<unsigned>(flac.buffered_bytes),
-            static_cast<unsigned>(flac.capacity_bytes),
-            static_cast<unsigned>(AUDIO_FLAC_STARVE_GRACE_MAX_MS),
-            static_cast<unsigned>(AUDIO_FLAC_STARVE_GRACE_MAX_ATTEMPTS));
+            "%sFLAC欠载进入有界恢复：ring=%u/%uB ioerr=0 eof=0，最多%ums/%u次；期间以静音维持I2S",
+            nas_http ? "NAS " : "",
+            static_cast<unsigned>(buffered),
+            static_cast<unsigned>(capacity),
+            static_cast<unsigned>(max_ms),
+            static_cast<unsigned>(max_attempts));
     }
 
     const uint32_t elapsed_ms = g_flac_starve_grace_started_us > 0 && now_us > g_flac_starve_grace_started_us
         ? static_cast<uint32_t>((now_us - g_flac_starve_grace_started_us) / 1000LL)
         : 0U;
-    if (elapsed_ms >= AUDIO_FLAC_STARVE_GRACE_MAX_MS ||
-        g_flac_starve_grace_attempts >= AUDIO_FLAC_STARVE_GRACE_MAX_ATTEMPTS) {
+    if (elapsed_ms >= max_ms || g_flac_starve_grace_attempts >= max_attempts) {
         ESP_LOGE(TAG,
-            "FLAC欠载恢复超限：attempts=%u elapsed=%ums ring=%u/%uB；升级为真实播放故障",
+            "%sFLAC欠载恢复超限：attempts=%u elapsed=%ums ring=%u/%uB；升级为真实播放故障",
+            nas_http ? "NAS " : "",
             static_cast<unsigned>(g_flac_starve_grace_attempts),
             static_cast<unsigned>(elapsed_ms),
-            static_cast<unsigned>(flac.buffered_bytes),
-            static_cast<unsigned>(flac.capacity_bytes));
+            static_cast<unsigned>(buffered),
+            static_cast<unsigned>(capacity));
         audio_task_reset_flac_starve_grace();
         return false;
     }
 
     ++g_flac_starve_grace_attempts;
+    const size_t silence_frames = nas_http ? AUDIO_STREAM_FRAMES * 4U : AUDIO_STREAM_FRAMES;
     const esp_err_t silence_ret = i2s_output_stream_write_silence(
-        AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
+        silence_frames, AUDIO_I2S_WRITE_TIMEOUT_MS);
     if (silence_ret != ESP_OK) {
-        ESP_LOGE(TAG, "FLAC欠载恢复期间I2S静音写入失败：%s", esp_err_to_name(silence_ret));
+        ESP_LOGE(TAG, "%sFLAC欠载恢复期间I2S静音写入失败：%s",
+            nas_http ? "NAS " : "", esp_err_to_name(silence_ret));
         audio_task_reset_flac_starve_grace();
         return false;
     }
-
-    // 静音只负责维持硬件时钟，不属于媒体 PCM，因此绝不能推进正式播放时钟。
     return true;
 }
 
@@ -994,6 +1027,12 @@ static bool audio_task_transport_request_superseded(
     (void)stage;
 #endif
     return true;
+}
+
+static bool audio_task_nas_open_should_abort(const void *context)
+{
+    const AudioRequest *request = static_cast<const AudioRequest *>(context);
+    return request != nullptr && !audio_transport_request_is_latest(request);
 }
 
 static void audio_task_remember_first_error(esp_err_t candidate, esp_err_t *first_error)
@@ -1596,20 +1635,29 @@ static esp_err_t audio_task_start_pcm_pipeline(
     const bool nas_http = request != nullptr && request->source == AudioPlaybackSource::NasHttp;
     esp_err_t ret = ESP_OK;
     if (nas_http) {
-        if (apply_seek || decoder_type != PcmDecoderType::Mp3) {
+        if (apply_seek || (decoder_type != PcmDecoderType::Mp3 && decoder_type != PcmDecoderType::Flac)) {
             return ESP_ERR_NOT_SUPPORTED;
         }
+        const BufferedHttpAudioProfile profile = decoder_type == PcmDecoderType::Flac
+            ? BufferedHttpAudioProfile::Flac
+            : BufferedHttpAudioProfile::Mp3;
         AudioSource http_source = {};
         ret = buffered_http_audio_source_open(
             &http_source,
-            BufferedHttpAudioProfile::Mp3,
+            profile,
             path,
             request->nas_username,
-            request->nas_password);
-        if (ret == ESP_OK) {
-            ret = pcm_decoder_open_streaming_mp3(
-                &g_decoder, &http_source, &g_decode_workspace);
+            request->nas_password,
+            audio_task_nas_open_should_abort,
+            request);
+        if (ret != ESP_OK) {
+            // HTTP connect/header/prime 属于 NAS transport 故障，不是“坏曲”。
+            // 保持 System scope，Player 不会因此连续随机跳过后续正常曲目。
+            if (out_failure_scope != nullptr) *out_failure_scope = AudioFailureScope::System;
+            return ret;
         }
+        ret = pcm_decoder_open_streaming(
+            &g_decoder, decoder_type, &http_source, &g_decode_workspace);
         if (audio_source_is_open(&http_source)) {
             (void)audio_source_close(&http_source);
         }
@@ -1693,7 +1741,7 @@ static esp_err_t audio_task_start_pcm_pipeline(
     }
 
     // 格式解析和可选 Seek 均已完成；从这里开始才进入连续播放阶段。
-    // Local MP3/WAV/Opus 切到 SD 顺序预读；NAS MP3 的 HTTP Source 自身已经是 Core1 + PSRAM ring。
+    // Local MP3/WAV/Opus 切到 SD 顺序预读；NAS MP3/FLAC 的 HTTP Source 自身已经是 Core1 + PSRAM ring。
     if (!nas_http) {
         ret = pcm_decoder_enable_runtime_read_ahead(&g_decoder, path);
         if (ret != ESP_OK) {
@@ -1839,19 +1887,31 @@ static void audio_task_capture_fault(esp_err_t error, const char *stage)
     snapshot.decoder_position_frames = g_playback_clock.decoder_frames;
 
     if (g_task_format == MediaFormat::FLAC && flac_decoder_is_open(&g_decoder.flac)) {
-        FlacPrefetchRuntimeSnapshot flac = {};
-        if (flac_decoder_get_prefetch_runtime(&g_decoder.flac, &flac)) {
-            snapshot.flac_prefetch_active = flac.active;
-            snapshot.flac_prefetch_io_error = flac.io_error;
-            snapshot.flac_prefetch_eof = flac.eof;
-            snapshot.flac_prefetch_pressure = flac.pressure_active;
-            snapshot.flac_qos_level = static_cast<uint8_t>(flac.qos_level);
-            snapshot.flac_ring_buffered_bytes = flac.buffered_bytes;
-            snapshot.flac_ring_capacity_bytes = flac.capacity_bytes;
-            snapshot.flac_ring_min_buffered_bytes = flac.min_buffered_bytes;
-            snapshot.flac_emergency_entries = flac.emergency_entries;
-            snapshot.flac_recovered_count = flac.recovered_count;
-            snapshot.flac_max_consecutive_reads = flac.max_consecutive_reads;
+        if (g_task_source == AudioPlaybackSource::NasHttp) {
+            BufferedHttpAudioSourceStats http = {};
+            if (buffered_http_audio_source_get_stats(&g_decoder.source, &http)) {
+                snapshot.flac_prefetch_active = true;
+                snapshot.flac_prefetch_io_error = http.io_error;
+                snapshot.flac_prefetch_eof = http.eof;
+                snapshot.flac_ring_buffered_bytes = http.ring_buffered_bytes;
+                snapshot.flac_ring_capacity_bytes = http.ring_capacity_bytes;
+                snapshot.flac_ring_min_buffered_bytes = http.ring_min_buffered_bytes;
+            }
+        } else {
+            FlacPrefetchRuntimeSnapshot flac = {};
+            if (flac_decoder_get_prefetch_runtime(&g_decoder.flac, &flac)) {
+                snapshot.flac_prefetch_active = flac.active;
+                snapshot.flac_prefetch_io_error = flac.io_error;
+                snapshot.flac_prefetch_eof = flac.eof;
+                snapshot.flac_prefetch_pressure = flac.pressure_active;
+                snapshot.flac_qos_level = static_cast<uint8_t>(flac.qos_level);
+                snapshot.flac_ring_buffered_bytes = flac.buffered_bytes;
+                snapshot.flac_ring_capacity_bytes = flac.capacity_bytes;
+                snapshot.flac_ring_min_buffered_bytes = flac.min_buffered_bytes;
+                snapshot.flac_emergency_entries = flac.emergency_entries;
+                snapshot.flac_recovered_count = flac.recovered_count;
+                snapshot.flac_max_consecutive_reads = flac.max_consecutive_reads;
+            }
         }
     }
 
@@ -2029,11 +2089,12 @@ static void audio_task_service_pcm_playback()
     // 启动 prime、暂停保持时钟和 EOF drain 都走 silence API，因此不会污染该计数。
     audio_playback_clock_commit_pcm(&g_playback_clock, frames);
 
-    // P1.5.2R.3：只在“真实 PCM 已成功进入 I2S DMA”之后旁路采样。
-    // 所有格式统一约24Hz抽取，略高于20FPS频谱UI；FFT仍在Core1/P1任务执行。
+    // P1.5.2R.3 / R46.0.99：只在“真实 PCM 已成功进入 I2S DMA”之后旁路采样。
+    // 本地>=96kHz仍按12Hz降载；NAS_HTTP>=96kHz由Hi-Res Guard跳过FFT。
     audio_spectrum_snapshot_publish_pcm(
         g_pcm_block,
         frames,
+        g_task_source,
         g_task_playback_revision,
         g_task_track_index,
         g_task_sample_rate_hz,
@@ -2177,8 +2238,8 @@ static void audio_task_handle_music_deep_suspend(AudioRequest *request)
     const bool nas_http = g_task_source == AudioPlaybackSource::NasHttp;
     const uint64_t current_position_ms = audio_playback_clock_position_ms(&g_playback_clock);
     if (nas_http) {
-        if (g_task_format != MediaFormat::MP3) {
-            ESP_LOGI(TAG, "%s Music保持浅暂停：NAS当前仅支持MP3 Deep Suspend format=%s",
+        if (g_task_format != MediaFormat::MP3 && g_task_format != MediaFormat::FLAC) {
+            ESP_LOGI(TAG, "%s Music保持浅暂停：NAS Deep Suspend暂不支持 format=%s",
                 owner_name, media_format_name(g_task_format));
             audio_request_complete(request, false, ESP_ERR_NOT_SUPPORTED);
             return;
@@ -5560,20 +5621,22 @@ bool audio_service_play_track(
     return audio_service_submit_transport_intent(request, wait);
 }
 
-bool audio_service_play_nas_mp3(
+bool audio_service_play_nas_track(
     uint32_t track_index,
     const char *url,
+    MediaFormat format,
     const char *username,
     const char *password,
     const MediaTechnicalInfo *technical_info,
     bool wait)
 {
-    if (url == nullptr || strncmp(url, "http://", 7U) != 0) return false;
+    if (url == nullptr || strncmp(url, "http://", 7U) != 0 ||
+        (format != MediaFormat::MP3 && format != MediaFormat::FLAC)) return false;
     AudioRequest *request = audio_request_create(AudioCommandType::Play, wait);
     if (request == nullptr) return false;
     request->track_index = track_index;
     request->source = AudioPlaybackSource::NasHttp;
-    request->format = MediaFormat::MP3;
+    request->format = format;
     if (technical_info != nullptr) {
         request->technical_info = *technical_info;
         request->has_technical_info = true;

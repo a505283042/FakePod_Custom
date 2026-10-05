@@ -21,16 +21,18 @@ static constexpr uint32_t kTaskStackBytes = 4096U;
 static constexpr UBaseType_t kTaskPriority = 4U;
 static constexpr BaseType_t kTaskCore = 1;
 static constexpr TickType_t kReadWait = pdMS_TO_TICKS(20);
-static constexpr TickType_t kOpenWait = pdMS_TO_TICKS(23000);
+static constexpr TickType_t kOpenWait = pdMS_TO_TICKS(10000);
 static constexpr TickType_t kStopWarnWait = pdMS_TO_TICKS(1500);
-// R46.0.86：连接/响应头仍允许 10s；进入连续音频体后把单次 read 限制为 1s。
-// AudioTask 的 NAS 欠载恢复窗口约 4.5~6s，网络 read 必须先返回，才能让 stop/恢复真正有机会运行。
-static constexpr int kConnectHeaderTimeoutMs = 10000;
+// R46.0.95：连接/响应头单次上限收紧为 3s；新 transport intent 会在连接检查点取消旧重试。
+// 进入连续音频体后单次 read 仍保持 1s，避免网络阻塞拖住 AudioTask 的恢复/切歌。
+static constexpr int kConnectHeaderTimeoutMs = 3000;
 static constexpr int kStreamReadTimeoutMs = 1000;
 static constexpr uint32_t kConnectAttempts = 2U;
 static constexpr TickType_t kConnectRetryDelay = pdMS_TO_TICKS(250);
-static constexpr size_t kHttpRxBufferBytes = 1024U;
-static constexpr size_t kHttpTxBufferBytes = 256U;
+// R46.0.94/R46.0.95：RX 2KB覆盖较长响应头；Short-ID 后请求 URL 固定很短，TX 1KB
+// 足够容纳请求行/Basic Auth 等头部，不再为多字节文件名无限扩大 Internal buffer。
+static constexpr size_t kHttpRxBufferBytes = 2048U;
+static constexpr size_t kHttpTxBufferBytes = 1024U;
 
 struct HttpStreamProfile
 {
@@ -46,6 +48,11 @@ static bool resolve_profile(BufferedHttpAudioProfile profile, HttpStreamProfile 
         case BufferedHttpAudioProfile::Mp3:
             // MP3 parser 首块可能先消费较大的 ID3/内嵌封面；保留 R46.0.82 的 128KB/96KB 实测配置。
             *out = {"MP3", 128U * 1024U, 96U * 1024U};
+            return true;
+        case BufferedHttpAudioProfile::Flac:
+            // R46.0.98：NAS 在 HTTP 建链前拿不到可靠采样率；所有 FLAC 固定使用高余量档，
+            // 避免 96k/24bit 被误分到 192KB ring。只增加 PSRAM，不增加 Internal task stack。
+            *out = {"FLAC", 384U * 1024U, 256U * 1024U};
             return true;
         default:
             return false;
@@ -70,6 +77,8 @@ struct BufferedHttpContext
     char *url = nullptr;
     char *username = nullptr;
     char *password = nullptr;
+    BufferedHttpAudioAbortFn abort_fn = nullptr;
+    const void *abort_context = nullptr;
 
     volatile bool stop_requested = false;
     volatile bool ready_signaled = false;
@@ -105,6 +114,12 @@ static void set_error(BufferedHttpContext *context, esp_err_t error)
     context->io_error = true;
     context->io_error_code = error != ESP_OK ? error : ESP_FAIL;
     signal_ready(context);
+}
+
+static bool open_should_abort(const BufferedHttpContext *context)
+{
+    return context != nullptr && (context->stop_requested ||
+        (context->abort_fn != nullptr && context->abort_fn(context->abort_context)));
 }
 
 static char *dup_psram(const char *text)
@@ -144,6 +159,10 @@ static void nas_stream_task(void *arg)
     {
         esp_err_t ret = ESP_FAIL;
         for (uint32_t attempt = 1U; attempt <= kConnectAttempts && !context->stop_requested; ++attempt) {
+            if (open_should_abort(context)) {
+                set_error(context, ESP_ERR_INVALID_STATE);
+                goto finish;
+            }
             client = esp_http_client_init(&config);
             if (client == nullptr) {
                 set_error(context, ESP_ERR_NO_MEM);
@@ -152,6 +171,15 @@ static void nas_stream_task(void *arg)
 
             ret = esp_http_client_open(client, 0);
             if (ret == ESP_OK) break;
+
+            if (open_should_abort(context)) {
+                ESP_LOGI(TAG, "NAS旧建链已被更新播放意图取消：attempt=%u/%u",
+                    static_cast<unsigned>(attempt), static_cast<unsigned>(kConnectAttempts));
+                esp_http_client_cleanup(client);
+                client = nullptr;
+                set_error(context, ESP_ERR_INVALID_STATE);
+                goto finish;
+            }
 
             if (attempt < kConnectAttempts) {
                 ESP_LOGW(TAG,
@@ -174,12 +202,16 @@ static void nas_stream_task(void *arg)
             goto finish;
         }
 
-        if (context->stop_requested || client == nullptr || ret != ESP_OK) {
-            set_error(context, context->stop_requested ? ESP_ERR_INVALID_STATE : ret);
+        if (open_should_abort(context) || client == nullptr || ret != ESP_OK) {
+            set_error(context, open_should_abort(context) ? ESP_ERR_INVALID_STATE : ret);
             goto finish;
         }
 
         const int64_t header_length = esp_http_client_fetch_headers(client);
+        if (open_should_abort(context)) {
+            set_error(context, ESP_ERR_INVALID_STATE);
+            goto finish;
+        }
         if (header_length < 0) {
             ESP_LOGE(TAG, "HTTP响应头读取失败");
             set_error(context, ESP_ERR_HTTP_CONNECT);
@@ -206,11 +238,14 @@ static void nas_stream_task(void *arg)
         }
 
         ESP_LOGI(TAG,
-            "NAS流已连接：profile=%s content=%lldB ring=%uKB start=%uKB read_timeout=%dms task=P%u/Core%d",
+            "NAS流已连接：profile=%s content=%lldB ring=%uKB start=%uKB url=%uB http_rx=%uB http_tx=%uB read_timeout=%dms task=P%u/Core%d",
             context->profile_label != nullptr ? context->profile_label : "?",
             static_cast<long long>(content_length),
             static_cast<unsigned>(context->ring_bytes / 1024U),
             static_cast<unsigned>(context->start_target_bytes / 1024U),
+            static_cast<unsigned>(strlen(context->url)),
+            static_cast<unsigned>(kHttpRxBufferBytes),
+            static_cast<unsigned>(kHttpTxBufferBytes),
             kStreamReadTimeoutMs,
             static_cast<unsigned>(kTaskPriority),
             static_cast<int>(kTaskCore));
@@ -400,7 +435,9 @@ esp_err_t buffered_http_audio_source_open(
     BufferedHttpAudioProfile profile,
     const char *url,
     const char *username,
-    const char *password)
+    const char *password,
+    BufferedHttpAudioAbortFn abort_fn,
+    const void *abort_context)
 {
     HttpStreamProfile stream_profile = {};
     if (out_source == nullptr || url == nullptr || strncmp(url, "http://", 7U) != 0 ||
@@ -416,6 +453,8 @@ esp_err_t buffered_http_audio_source_open(
     context->profile_label = stream_profile.label;
     context->ring_bytes = stream_profile.ring_bytes;
     context->start_target_bytes = stream_profile.start_target_bytes;
+    context->abort_fn = abort_fn;
+    context->abort_context = abort_context;
 
     context->ring_storage = static_cast<uint8_t *>(heap_caps_malloc(
         context->ring_bytes + 1U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));

@@ -43,11 +43,12 @@ bool audio_service_play_track(
     bool wait = false
 );
 
-// R46.0.78：NAS MP3 顺序流播放。url 已由 NAS Catalog path 构造成 HTTP URL；
-// Basic Auth 可为空。当前不开放网络 Seek，先验证 HTTP->128KB PSRAM ring->现有 MP3 decoder。
-bool audio_service_play_nas_mp3(
+// NAS 顺序流播放。url 已由 NAS Catalog path 构造成 HTTP URL；Basic Auth 可为空。
+// R46.0.92：开放 MP3/FLAC，共用 NasStream；当前不开放网络 Seek。
+bool audio_service_play_nas_track(
     uint32_t track_index,
     const char *url,
+    MediaFormat format,
     const char *username,
     const char *password,
     const MediaTechnicalInfo *technical_info = nullptr,

@@ -377,7 +377,7 @@ bool player_control_seek_ms(uint64_t target_ms)
     }
     AudioStateSnapshot audio = {};
     if (audio_service_get_snapshot(&audio) && audio.source == AudioPlaybackSource::NasHttp) {
-        ESP_LOGW(TAG, "NAS MP3顺序流当前不支持Seek：target=%llums",
+        ESP_LOGW(TAG, "NAS顺序流当前不支持Seek：target=%llums",
             static_cast<unsigned long long>(target_ms));
         player_control_unlock();
         return false;

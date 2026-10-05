@@ -5,6 +5,7 @@ Outputs are byte-compatible with FakePod's V2 catalog reader:
   - music_index_v2.bin    (FPCATV2 version 6)
   - music_manifest_v2.bin (FPMNFV2 version 2)
   - fakepod_catalog.meta  (tiny revision/size/CRC descriptor)
+  - fakepod_make_static_track_links.sh (DSM/ext4 hard-link builder for short-ID aliases)
 
 R46.0.72 enriches the NAS-side catalog with lightweight media tags using only
 Python's standard library. The ESP32 still only downloads/validates the finished
@@ -79,6 +80,65 @@ NUMBER_RE = re.compile(r"^\s*(\d{1,5})(?:\s*/\s*(\d{1,5}))?")
 
 def crc32(data: bytes) -> int:
     return zlib.crc32(data) & 0xFFFFFFFF
+
+
+def stable_track_id(relative_path: str) -> int:
+    """64-bit FNV-1a over the exact UTF-8 catalog path.
+
+    Firmware uses the same tiny hash, so the V2 catalog row layout does not grow.
+    A path rename intentionally creates a new ID; unchanged paths keep the same ID
+    across rescans and sorting changes.
+    """
+    value = 0xCBF29CE484222325
+    for byte in relative_path.encode("utf-8"):
+        value ^= byte
+        value = (value * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return value
+
+
+def shell_single_quote(value: str) -> str:
+    """POSIX shell single-quote escaping; BusyBox /bin/sh compatible."""
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def build_static_alias_script(tracks: List["TrackMeta"]) -> bytes:
+    """Build an atomic hard-link set for DSM 5.2/ext4."""
+    lines = [
+        "#!/bin/sh",
+        "set -eu",
+        'MUSIC_ROOT="${1:-/volume1/music}"',
+        'TRACK_ROOT="${2:-/volume1/web/track}"',
+        'PARENT="$(dirname "$TRACK_ROOT")"',
+        'NAME="$(basename "$TRACK_ROOT")"',
+        'TMP="$PARENT/.${NAME}.new.$$"',
+        'OLD="$PARENT/.${NAME}.old.$$"',
+        'cleanup() { rm -rf "$TMP"; }',
+        "trap cleanup EXIT INT TERM",
+        'rm -rf "$TMP" "$OLD"',
+        'mkdir -p "$TMP"',
+        'echo "FakePod static short-ID aliases: building ${TRACK_ROOT}"',
+    ]
+    for track in tracks:
+        suffix = Path(track.path).suffix
+        if suffix.lower() not in (".mp3", ".flac"):
+            continue
+        relative = track.path.lstrip("/")
+        src_tail = shell_single_quote(relative)
+        alias_name = shell_single_quote(f"{track.track_id:016X}{suffix}")
+        lines.append(f'ln "$MUSIC_ROOT"/{src_tail} "$TMP"/{alias_name}')
+    lines.extend([
+        'if [ -d "$TRACK_ROOT" ]; then mv "$TRACK_ROOT" "$OLD"; fi',
+        'if ! mv "$TMP" "$TRACK_ROOT"; then',
+        '  if [ -d "$OLD" ]; then mv "$OLD" "$TRACK_ROOT"; fi',
+        '  exit 1',
+        'fi',
+        'rm -rf "$OLD"',
+        "trap - EXIT INT TERM",
+        'COUNT="$(find "$TRACK_ROOT" -type f | wc -l | tr -d " ")"',
+        'echo "FakePod static short-ID aliases ready: files=${COUNT} path=${TRACK_ROOT}"',
+        "",
+    ])
+    return "\n".join(lines).encode("utf-8")
 
 
 def ascii_fold_key(text: str) -> bytes:
@@ -374,6 +434,7 @@ def joined(tags: Dict[str, List[str]], *keys: str) -> str:
 @dataclass
 class TrackMeta:
     path: str
+    track_id: int
     title: str
     artist: str
     album: str
@@ -474,6 +535,7 @@ def build_track_meta(path: Path, root: Path, fmt: int) -> TrackMeta:
 
     return TrackMeta(
         path=rel,
+        track_id=stable_track_id(rel),
         title=clean_text(title),
         artist=clean_text(artist),
         album=clean_text(album),
@@ -503,12 +565,19 @@ def iter_tracks(root: Path) -> List[TrackMeta]:
 
     rows: List[TrackMeta] = []
     previous_key = None
+    seen_track_ids: Dict[int, str] = {}
     for index, (path, fmt) in enumerate(paths, 1):
         row = build_track_meta(path, root, fmt)
         key = ascii_fold_key(row.path)
         if key == previous_key:
             raise ValueError(f"case-insensitive duplicate path is not valid in FakePod V2: {row.path}")
         previous_key = key
+        collided = seen_track_ids.get(row.track_id)
+        if collided is not None and collided != row.path:
+            raise ValueError(
+                f"stable track-id collision: {row.track_id:016X} maps to both {collided!r} and {row.path!r}"
+            )
+        seen_track_ids[row.track_id] = row.path
         rows.append(row)
         if index % 250 == 0 or index == len(paths):
             print(f"metadata: {index}/{len(paths)}", flush=True)
@@ -729,12 +798,25 @@ def main() -> int:
 
     tracks = iter_tracks(root)
     index_file, manifest_file, index_crc, manifest_crc, artist_count, album_count = build_catalog(tracks)
-    revision = ((index_crc << 32) | manifest_crc) & 0xFFFFFFFFFFFFFFFF
+
+    # R46.0.96: no Python/Docker runtime on DSM. Emit a BusyBox-compatible hard-link
+    # builder; the V2 catalog row layout still does not gain a per-track ID field.
+    alias_script = build_static_alias_script(tracks)
+    alias_crc = crc32(alias_script)
+    # Force a metadata transition from R46.0.95 dynamic-map catalogs even when
+    # index/manifest bytes are unchanged.
+    revision = (((index_crc << 32) | manifest_crc) ^ ((alias_crc << 1) | 0x96)) & 0xFFFFFFFFFFFFFFFF
     if revision == 0:
         revision = 1
 
     (out / "music_index_v2.bin").write_bytes(index_file)
     (out / "music_manifest_v2.bin").write_bytes(manifest_file)
+    (out / "fakepod_make_static_track_links.sh").write_bytes(alias_script)
+
+    stale_map = out / "fakepod_track_map_v1.json"
+    if stale_map.exists():
+        stale_map.unlink()
+
     meta = (
         "FAKEPOD_NAS_V1\n"
         f"catalog_version={CATALOG_VERSION}\n"
@@ -746,6 +828,9 @@ def main() -> int:
         f"index_crc32=0x{index_crc:08X}\n"
         f"manifest_size={len(manifest_file)}\n"
         f"manifest_crc32=0x{manifest_crc:08X}\n"
+        "track_alias_version=1\n"
+        f"track_alias_script_size={len(alias_script)}\n"
+        f"track_alias_script_crc32=0x{alias_crc:08X}\n"
     )
     (out / "fakepod_catalog.meta").write_text(meta, encoding="utf-8", newline="\n")
 
@@ -757,6 +842,9 @@ def main() -> int:
     print(f"metadata: title={title_tagged} artist={artist_tagged} album={album_tagged} year={year_tagged}")
     print(f"index={len(index_file)} bytes crc=0x{index_crc:08X}")
     print(f"manifest={len(manifest_file)} bytes crc=0x{manifest_crc:08X}")
+    alias_count = sum(1 for t in tracks if Path(t.path).suffix.lower() in (".mp3", ".flac"))
+    print(f"static_alias_script={len(alias_script)} bytes crc=0x{alias_crc:08X} links={alias_count} ids=FNV1A64 collisions=0")
+    print("DSM: sh fakepod_make_static_track_links.sh /volume1/music /volume1/web/track")
     print(f"revision=0x{revision:016X}")
     print(f"output={out}")
     return 0

@@ -38,7 +38,9 @@ void wifi_service_update();
 void wifi_service_set_ble_fallback_enabled(bool enabled);
 
 // 已保存 Wi-Fi 开关为 ON 时调用；启动前会完整停止 BLE。
-esp_err_t wifi_service_connect_saved();
+// boot_rebind_once=true 仅用于开机自动恢复：首次GOT_IP后在发布业务READY前完整重绑定一次，
+// 规避实机偶发“有IP但TCP/UDP数据面不通”；运行期手动开关保持单次连接。
+esp_err_t wifi_service_connect_saved(bool boot_rebind_once = false);
 
 // 异步关闭 Wi-Fi Remote + STA/driver/netif。若 BLE 保存状态为 ON，清理完成后再恢复 BLE。
 esp_err_t wifi_service_stop();

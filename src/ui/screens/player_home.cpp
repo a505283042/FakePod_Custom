@@ -88,36 +88,27 @@ static constexpr int16_t kOverlayTapSafeBottomPx = 404;
 // 即使没有达到 72px 页面手势触发阈值，也绝不补成 Overlay 点击。
 static constexpr int16_t kOverlayTapMaxMovePx = 12;
 
-// P1.5.3.2R.18：Launcher 改为“单对象径向菜单”。
-// 外圈扇区、外圈图标、中心圆和中心图标全部在同一个 340x340 对象里绘制；
-// 点击也不再依赖 7 个矩形按钮，而是直接根据触摸点的半径/角度映射到对应扇区。
-// 这样显示几何与触摸几何只保留一套极坐标，彻底消除“看到A却点中B”的结构性误差。
+// Launcher 的显示几何来自 Flash I4 动画帧，触摸仍使用同一套 340x340 极坐标命中。
+// R46.0.93 起 Music 不再保留第二套 LVGL 实时圆环，避免两套几何/视觉随机切换。
 static constexpr uint32_t kLauncherAccentRgb = 0xFF4FA3;
 static constexpr uint32_t kLauncherSelectedSectorRgb = 0x28E6F2;
 static constexpr uint32_t kLauncherBackdropRgb = 0x000000;
 static constexpr lv_opa_t kLauncherBackdropOpa = 142;
 static constexpr uint8_t kLauncherItemCount = 7U;
 
-// P1.5.3.2R.32：圆环仍只占屏幕中央 340x340，但对象从创建起就固定在最终坐标。
-// 动画不再移动整个 LVGL 对象，而只改变 DRAW_MAIN 使用的径向展开 progress。
-// 这样每帧只失效固定 viewport，不再同时重绘旧位置 + 新位置 + 被暴露的主页区域。
+// 圆环占屏幕中央 340x340；动画 progress 只负责选择 Flash I4 的预生成帧。
+// LVGL 对象仅保留命中几何/生命周期容器，实际 Launcher 图形不再由 LVGL DRAW_MAIN 绘制。
 static constexpr int16_t kLauncherPanelSize = 340;
 static constexpr int16_t kLauncherPanelX = (460 - kLauncherPanelSize) / 2;
 static constexpr int16_t kLauncherPanelShownY = (460 - kLauncherPanelSize) / 2;
 static constexpr int32_t kLauncherAnimProgressMax = 1000;
-static constexpr int16_t kLauncherCollapsedOuterRadius = 82;
-static constexpr int16_t kLauncherCollapsedRingWidth = 20;
 static constexpr int16_t kLauncherCollapsedCenterDiameter = 52;
-static constexpr int16_t kLauncherCollapsedIconRadius = 24;
 static constexpr int16_t kLauncherCenterX = kLauncherPanelSize / 2;
 static constexpr int16_t kLauncherCenterY = kLauncherPanelSize / 2;
 static constexpr uint16_t kLauncherOuterRadius = 150U;
 static constexpr int16_t kLauncherRingWidth = 70;
 static constexpr int16_t kLauncherInnerRadius =
     static_cast<int16_t>(kLauncherOuterRadius) - kLauncherRingWidth;
-static constexpr int16_t kLauncherIconRadius =
-    static_cast<int16_t>(kLauncherOuterRadius) - kLauncherRingWidth / 2;
-static constexpr int16_t kLauncherSectorHalfSpanDeg = 23;
 static constexpr int16_t kLauncherCenterDiameter = 116;
 static constexpr int16_t kLauncherTouchInnerRadius = kLauncherInnerRadius - 8;
 static constexpr int16_t kLauncherTouchOuterRadius =
@@ -252,11 +243,13 @@ static lv_obj_t *g_launcher = nullptr;
 static lv_obj_t *g_launcher_backdrop = nullptr;
 static lv_obj_t *g_launcher_panel = nullptr;
 static CoverSurfaceLease g_launcher_surface_lease = {};
+// 无封面默认图仍是正常背景资源，不是第二套 Launcher 渲染路径。
 static FallbackCoverImageLease g_launcher_fallback_lease = {};
-// 无封面 Launcher 只在菜单打开期间持有一张暗化副本；收起立即释放，不长期增加 PSRAM 常驻量。
+// 默认图只在菜单打开期间持有一张暗化副本；收起立即释放，不长期增加 PSRAM 常驻量。
 static uint8_t *g_launcher_fallback_dimmed = nullptr;
 static const uint8_t *g_launcher_surface_source = nullptr;
-static bool g_launcher_surface_is_fallback = false;
+static bool g_launcher_surface_is_default = false;
+static PlayerMediaSource g_launcher_surface_media_source = PlayerMediaSource::Local;
 static bool g_launcher_frame_cache_ready = false;
 static bool g_launcher_frame_cache_active = false;
 static bool g_launcher_surface_lease_ready = false;
@@ -268,7 +261,7 @@ static uint16_t g_launcher_index_color565[16] = {};
 static uint8_t g_launcher_index_alpha[16] = {};
 // R46.0.65：pair LUT 只在 Launcher 展开期间需要。旧实现三张静态表常驻 2304B Internal；
 // 其中 native pair LUT 仅用于初始化 wire LUT，本身完全冗余。现在只按需申请 wire+mode=1280B，
-// 收起/降级/切 APP 立即释放，平时不占 Internal。
+// 收起/取消/切 APP 立即释放，平时不占 Internal。
 static constexpr size_t kLauncherPairWireLutBytes = 256U * sizeof(uint32_t);
 static constexpr size_t kLauncherPairModeBytes = 256U * sizeof(uint8_t);
 static constexpr size_t kLauncherPairLutStorageBytes =
@@ -281,12 +274,10 @@ static uint8_t g_launcher_frame_index = kLauncherFrameInvalid;
 static uint32_t g_launcher_frame_decode_count = 0U;
 static uint32_t g_launcher_frame_decode_us = 0U;
 static uint32_t g_launcher_frame_decode_max_us = 0U;
-// R.33.2：Launcher 动画曾复用 esp_lcd Panel IO 做 Continuous GRAM，实机反复开关会被
-// Panel IO 内部 portMAX_DELAY 永久卡死。R.36.2.1 因此先回退 LVGL 安全路径。
-// R.36.3：重新启用高速路径，但不再调用旧 PanelIO DirectPresent；改用 display 层的
-// Launcher BoundedSPI session：同一个 SPI device、独立 transaction identity、所有 queue/get
-// 都有 deadline；可安全回收的失败结束 session 并回到 R.36.2.1 LVGL Canvas，无法回收
-// descriptor 的异常则受控重启，避免旧式永久卡死。
+// R46.0.93：Launcher 只保留 Flash I4 + BoundedSPI 这一条渲染路径。
+// 同一个 SPI device、独立 transaction identity、所有 queue/get 都有 deadline；
+// 正常路径资源未就绪或有界提交失败时直接取消本次 Launcher，保持/恢复 Music 页面，
+// 不再切换到另一套 LVGL 实时圆弧。无法回收 descriptor 的异常仍由 display 层受控重启。
 #ifndef APP_DISPLAY_LAUNCHER_BOUNDED_SPI
 #define APP_DISPLAY_LAUNCHER_BOUNDED_SPI 1
 #endif
@@ -994,188 +985,10 @@ static void player_home_refresh_wireless_status()
     }
 }
 
-static void player_home_launcher_draw_line(
-    lv_layer_t *layer,
-    lv_draw_line_dsc_t *line,
-    int32_t x0,
-    int32_t y0,
-    int32_t x1,
-    int32_t y1)
-{
-    line->p1.x = x0;
-    line->p1.y = y0;
-    line->p2.x = x1;
-    line->p2.y = y1;
-    lv_draw_line(layer, line);
-}
-
-static void player_home_launcher_draw_dot(
-    lv_layer_t *layer,
-    int32_t cx,
-    int32_t cy,
-    int32_t diameter,
-    lv_color_t color,
-    lv_opa_t opa)
-{
-    lv_draw_rect_dsc_t dot = {};
-    lv_draw_rect_dsc_init(&dot);
-    dot.bg_color = color;
-    dot.bg_opa = opa;
-    dot.radius = LV_RADIUS_CIRCLE;
-    dot.border_width = 0;
-    const int32_t half = diameter / 2;
-    lv_area_t area = {cx - half, cy - half, cx + half, cy + half};
-    lv_draw_rect(layer, &dot, &area);
-}
-
-static void player_home_launcher_draw_icon(
-    lv_layer_t *layer,
-    LauncherIconKind icon,
-    int32_t cx,
-    int32_t cy,
-    lv_color_t color,
-    int32_t scale_percent,
-    lv_opa_t opa)
-{
-    if (layer == nullptr) {
-        return;
-    }
-
-    auto s = [scale_percent](int32_t value) -> int32_t {
-        const int32_t scaled = (value * scale_percent + (value >= 0 ? 50 : -50)) / 100;
-        if (value != 0 && scaled == 0) {
-            return value > 0 ? 1 : -1;
-        }
-        return scaled;
-    };
-
-    lv_draw_line_dsc_t line = {};
-    lv_draw_line_dsc_init(&line);
-    line.color = color;
-    line.width = scale_percent >= 120 ? 4 : (scale_percent >= 70 ? 3 : 2);
-    line.opa = opa;
-    line.round_start = 1U;
-    line.round_end = 1U;
-
-    auto draw = [&](int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
-        player_home_launcher_draw_line(
-            layer, &line,
-            cx + s(x0), cy + s(y0),
-            cx + s(x1), cy + s(y1));
-    };
-    auto dot = [&](int32_t x, int32_t y, int32_t d) {
-        player_home_launcher_draw_dot(
-            layer, cx + s(x), cy + s(y), s(d) < 3 ? 3 : s(d), color, opa);
-    };
-
-    switch (icon) {
-        case LauncherIconKind::Music:
-            // R.35.3.2：与 Flash 生成器/BoundedSPI 中心图标共用同一套 19px 间距双音符几何。
-            draw(-4, -16, -4, 7);
-            draw(-4, -16, 15, -20);
-            draw(15, -20, 15, 2);
-            dot(-11, 10, 10);
-            dot(8, 4, 10);
-            break;
-
-        case LauncherIconKind::Nsf:
-            // 芯片/游戏音源图标：方形主体 + 四周引脚 + 中心脉冲。
-            draw(-13, -13, 13, -13);
-            draw(13, -13, 13, 13);
-            draw(13, 13, -13, 13);
-            draw(-13, 13, -13, -13);
-            draw(-8, -18, -8, -13);
-            draw(0, -18, 0, -13);
-            draw(8, -18, 8, -13);
-            draw(-8, 13, -8, 18);
-            draw(0, 13, 0, 18);
-            draw(8, 13, 8, 18);
-            draw(-18, -8, -13, -8);
-            draw(-18, 0, -13, 0);
-            draw(-18, 8, -13, 8);
-            draw(13, -8, 18, -8);
-            draw(13, 0, 18, 0);
-            draw(13, 8, 18, 8);
-            draw(-7, 4, -2, -4);
-            draw(-2, -4, 3, 4);
-            draw(3, 4, 8, -4);
-            break;
-
-        case LauncherIconKind::MicSpectrum:
-            // 麦克风 + 右侧三根频谱条。
-            draw(-11, -14, -11, 6);
-            draw(-11, -14, -4, -18);
-            draw(-4, -18, 3, -14);
-            draw(3, -14, 3, 6);
-            draw(3, 6, -4, 10);
-            draw(-4, 10, -11, 6);
-            draw(-15, 4, -15, 7);
-            draw(-15, 7, -9, 13);
-            draw(-9, 13, -4, 14);
-            draw(-4, 14, 2, 12);
-            draw(-4, 14, -4, 19);
-            draw(-10, 19, 2, 19);
-            draw(8, 10, 8, 17);
-            draw(13, 4, 13, 17);
-            draw(18, -3, 18, 17);
-            break;
-
-        case LauncherIconKind::Mjpg:
-            // 视频：矩形画框 + 播放三角。
-            draw(-18, -13, 11, -13);
-            draw(11, -13, 11, 13);
-            draw(11, 13, -18, 13);
-            draw(-18, 13, -18, -13);
-            draw(11, -7, 18, -12);
-            draw(18, -12, 18, 12);
-            draw(18, 12, 11, 7);
-            draw(-6, -7, -6, 7);
-            draw(-6, -7, 5, 0);
-            draw(5, 0, -6, 7);
-            break;
-
-        case LauncherIconKind::Picture:
-            // 图片：相框 + 山峰 + 太阳。
-            draw(-18, -15, 18, -15);
-            draw(18, -15, 18, 15);
-            draw(18, 15, -18, 15);
-            draw(-18, 15, -18, -15);
-            draw(-14, 10, -5, 0);
-            draw(-5, 0, 1, 6);
-            draw(1, 6, 8, -4);
-            draw(8, -4, 15, 10);
-            dot(9, -9, 6);
-            break;
-
-        case LauncherIconKind::Ebook:
-            // 打开的书本：左右页 + 中缝。
-            draw(0, -14, 0, 15);
-            draw(-1, -12, -7, -15);
-            draw(-7, -15, -18, -12);
-            draw(-18, -12, -18, 12);
-            draw(-18, 12, -7, 10);
-            draw(-7, 10, -1, 13);
-            draw(1, -12, 7, -15);
-            draw(7, -15, 18, -12);
-            draw(18, -12, 18, 12);
-            draw(18, 12, 7, 10);
-            draw(7, 10, 1, 13);
-            break;
-
-        case LauncherIconKind::Settings:
-            // 轻量齿轮：中心圆 + 8 个短辐条。
-            dot(0, 0, 10);
-            draw(0, -18, 0, -11);
-            draw(0, 11, 0, 18);
-            draw(-18, 0, -11, 0);
-            draw(11, 0, 18, 0);
-            draw(-13, -13, -8, -8);
-            draw(8, 8, 13, 13);
-            draw(13, -13, 8, -8);
-            draw(-8, 8, -13, 13);
-            break;
-    }
-}
+static void player_home_update_background_timer_qos();
+static bool player_home_present_current_cover_bounded(const char *reason);
+static void player_home_launcher_abort_single_path(const char *reason);
+static void player_home_launcher_progress_anim_exec(void *var, int32_t value);
 
 static int16_t player_home_launcher_normalize_angle(int16_t angle)
 {
@@ -1263,7 +1076,8 @@ static void player_home_launcher_release_surface_lease()
     g_launcher_fallback_lease = {};
     g_launcher_fallback_dimmed = nullptr;
     g_launcher_surface_source = nullptr;
-    g_launcher_surface_is_fallback = false;
+    g_launcher_surface_is_default = false;
+    g_launcher_surface_media_source = PlayerMediaSource::Local;
     g_launcher_surface_lease_ready = false;
     g_launcher_surface_lease_track = UINT32_MAX;
     g_launcher_surface_lease_us = 0U;
@@ -1276,6 +1090,7 @@ static void player_home_launcher_release_surface_lease()
 
 static bool player_home_launcher_acquire_surface(
     uint32_t track_index,
+    PlayerMediaSource media_source,
     CoverSurfaceLease *out_lease,
     uint32_t *out_acquire_us)
 {
@@ -1285,6 +1100,10 @@ static bool player_home_launcher_acquire_surface(
     *out_lease = {};
     if (out_acquire_us != nullptr) {
         *out_acquire_us = 0U;
+    }
+    if (media_source != PlayerMediaSource::Local) {
+        // NAS 尚无 artwork provider。绝不能把 NAS track index 当成本地曲库 index。
+        return false;
     }
 
     const int64_t started_us = esp_timer_get_time();
@@ -1320,7 +1139,8 @@ struct LauncherSurfaceCandidate
     const uint8_t *source = nullptr;
     uint32_t track = UINT32_MAX;
     uint32_t acquire_us = 0U;
-    bool is_fallback = false;
+    PlayerMediaSource media_source = PlayerMediaSource::Local;
+    bool is_default = false;
 };
 
 static inline uint16_t player_home_launcher_dim_rgb565(uint16_t pixel)
@@ -1354,22 +1174,27 @@ static void player_home_launcher_release_candidate(LauncherSurfaceCandidate *can
     fallback_cover_image_discard_unpinned();
 }
 
-static bool player_home_launcher_acquire_fallback_surface(
+static bool player_home_launcher_acquire_default_surface(
     uint32_t track_index,
+    PlayerMediaSource media_source,
     LauncherSurfaceCandidate *out_candidate)
 {
     if (out_candidate == nullptr) return false;
 
-    MediaArtworkViewV2 artwork = {};
-    if (media_library_get_artwork_view(track_index, &artwork)) {
-        // 有真实封面但 Surface 还没 ready 时继续等待，不允许替补图抢占真实封面。
-        return false;
+    if (media_source == PlayerMediaSource::Local) {
+        MediaArtworkViewV2 artwork = {};
+        if (media_library_get_artwork_view(track_index, &artwork)) {
+            // Local 有真实封面但 Surface 尚未 ready：本次菜单不展开，等待正常 Surface。
+            return false;
+        }
     }
 
     const FallbackCoverImageKind kind =
-        g_music_visual_mode == MusicVisualMode::Cassette
-            ? FallbackCoverImageKind::Cassette
-            : FallbackCoverImageKind::Artwork;
+        media_source == PlayerMediaSource::Nas
+            ? FallbackCoverImageKind::Artwork
+            : (g_music_visual_mode == MusicVisualMode::Cassette
+                ? FallbackCoverImageKind::Cassette
+                : FallbackCoverImageKind::Artwork);
 
     const int64_t started_us = esp_timer_get_time();
     FallbackCoverImageLease fallback = {};
@@ -1391,7 +1216,7 @@ static bool player_home_launcher_acquire_fallback_surface(
         fallback_cover_image_release(&fallback);
         fallback_cover_image_discard_unpinned();
         ESP_LOGW(TAG,
-            "Launcher替补背景暗化缓存分配失败：track=%u bytes=%u，回退LVGL背景",
+            "Launcher默认背景暗化缓存分配失败：track=%u bytes=%u，本次保持原页面",
             static_cast<unsigned>(track_index),
             static_cast<unsigned>(bytes));
         return false;
@@ -1409,12 +1234,14 @@ static bool player_home_launcher_acquire_fallback_surface(
     out_candidate->source = dimmed;
     out_candidate->track = track_index;
     out_candidate->acquire_us = static_cast<uint32_t>(esp_timer_get_time() - started_us);
-    out_candidate->is_fallback = true;
+    out_candidate->media_source = media_source;
+    out_candidate->is_default = true;
     return true;
 }
 
 static bool player_home_launcher_acquire_candidate(
     uint32_t track_index,
+    PlayerMediaSource media_source,
     LauncherSurfaceCandidate *out_candidate)
 {
     if (out_candidate == nullptr) return false;
@@ -1422,16 +1249,17 @@ static bool player_home_launcher_acquire_candidate(
 
     CoverSurfaceLease cover = {};
     uint32_t acquire_us = 0U;
-    if (player_home_launcher_acquire_surface(track_index, &cover, &acquire_us)) {
+    if (player_home_launcher_acquire_surface(track_index, media_source, &cover, &acquire_us)) {
         out_candidate->cover = cover;
         out_candidate->source = cover.dimmed_rgb565;
         out_candidate->track = track_index;
         out_candidate->acquire_us = acquire_us;
-        out_candidate->is_fallback = false;
+        out_candidate->media_source = media_source;
+        out_candidate->is_default = false;
         return true;
     }
 
-    return player_home_launcher_acquire_fallback_surface(track_index, out_candidate);
+    return player_home_launcher_acquire_default_surface(track_index, media_source, out_candidate);
 }
 
 static LauncherSurfaceCandidate player_home_launcher_detach_current_surface()
@@ -1443,7 +1271,8 @@ static LauncherSurfaceCandidate player_home_launcher_detach_current_surface()
     current.source = g_launcher_surface_source;
     current.track = g_launcher_surface_lease_track;
     current.acquire_us = g_launcher_surface_lease_us;
-    current.is_fallback = g_launcher_surface_is_fallback;
+    current.media_source = g_launcher_surface_media_source;
+    current.is_default = g_launcher_surface_is_default;
 
     g_launcher_surface_lease = {};
     g_launcher_fallback_lease = {};
@@ -1452,7 +1281,8 @@ static LauncherSurfaceCandidate player_home_launcher_detach_current_surface()
     g_launcher_surface_lease_track = UINT32_MAX;
     g_launcher_surface_lease_us = 0U;
     g_launcher_surface_lease_ready = false;
-    g_launcher_surface_is_fallback = false;
+    g_launcher_surface_is_default = false;
+    g_launcher_surface_media_source = PlayerMediaSource::Local;
     return current;
 }
 
@@ -1468,8 +1298,9 @@ static void player_home_launcher_commit_candidate(LauncherSurfaceCandidate *cand
     g_launcher_surface_source = candidate->source;
     g_launcher_surface_lease_track = candidate->track;
     g_launcher_surface_lease_us = candidate->acquire_us;
+    g_launcher_surface_media_source = candidate->media_source;
     g_launcher_surface_lease_ready = true;
-    g_launcher_surface_is_fallback = candidate->is_fallback;
+    g_launcher_surface_is_default = candidate->is_default;
 
     candidate->cover = {};
     candidate->fallback = {};
@@ -1477,7 +1308,8 @@ static void player_home_launcher_commit_candidate(LauncherSurfaceCandidate *cand
     candidate->source = nullptr;
     candidate->track = UINT32_MAX;
     candidate->acquire_us = 0U;
-    candidate->is_fallback = false;
+    candidate->media_source = PlayerMediaSource::Local;
+    candidate->is_default = false;
 }
 
 static bool player_home_launcher_prepare_surface_lease()
@@ -1489,13 +1321,14 @@ static bool player_home_launcher_prepare_surface_lease()
     }
 
     const uint32_t track_index = static_cast<uint32_t>(player_state_get_index());
+    const PlayerMediaSource media_source = player_state_get_source();
     LauncherSurfaceCandidate candidate = {};
-    if (!player_home_launcher_acquire_candidate(track_index, &candidate)) {
+    if (!player_home_launcher_acquire_candidate(track_index, media_source, &candidate)) {
         return false;
     }
 
-    // 真实封面继续 pin CoverSurface；无封面时 pin 当前视图对应的 TF 替补 JPG，
-    // 并只在 Launcher 生命周期内持有暗化副本。
+    // Local 真实封面继续 pin CoverSurface；Local/NAS 无封面时使用默认 JPG 背景。
+    // 圆环本身始终只有 Flash I4 + BoundedSPI 这一套，不存在第二套渲染菜单。
     player_home_launcher_commit_candidate(&candidate);
     return true;
 }
@@ -1519,7 +1352,7 @@ static bool player_home_launcher_prepare_frame_lut()
         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     if (storage == nullptr) {
         ESP_LOGW(TAG,
-            "Launcher LUT Internal申请失败：need=%uB，当前展开回退LVGL",
+            "Launcher LUT Internal申请失败：need=%uB，本次菜单保持关闭",
             static_cast<unsigned>(kLauncherPairLutStorageBytes));
         return false;
     }
@@ -2101,35 +1934,6 @@ static bool player_home_launcher_present_work_bounded()
     return true;
 }
 
-static void player_home_launcher_switch_to_lvgl_fallback()
-{
-    if (!g_launcher_bounded_session_active) {
-        return;
-    }
-    // R.36.3：先结束 BoundedSPI session，释放固定 DMA staging。display 层保证只有在
-    // 所有 raw descriptor 已有界回收后才会返回；无法回收的极端状态直接受控重启。
-    display_launcher_bounded_spi_session_end();
-    g_launcher_bounded_session_active = false;
-    if (g_launcher_backdrop != nullptr) {
-        lv_obj_set_style_bg_opa(g_launcher_backdrop, kLauncherBackdropOpa, 0);
-    }
-    // R.36.6：没有整帧 Canvas。降级后直接启用 R.32 LVGL 实时圆弧绘制。
-    g_launcher_frame_cache_active = false;
-    player_home_launcher_release_frame_lut();
-    if (g_launcher_panel != nullptr) {
-        lv_obj_invalidate(g_launcher_panel);
-    }
-    // BoundedSPI 正常路径让 Launcher LVGL 根对象保持隐藏；降级时必须重新显示根对象，
-    // 否则 R.32 fallback 虽已重绘但仍不可见。
-    if (g_launcher != nullptr) {
-        lv_obj_remove_flag(g_launcher, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_move_foreground(g_launcher);
-        screen_lock_simple_raise();
-        lv_obj_invalidate(g_launcher);
-    }
-    ESP_LOGW(TAG, "Launcher BoundedSPI 已降级到 LVGL 实时圆弧安全路径");
-}
-
 static void player_home_launcher_try_surface_rebind()
 {
     if (!g_launcher_visible || g_launcher_motion != LauncherMotionState::Shown ||
@@ -2139,16 +1943,20 @@ static void player_home_launcher_try_surface_rebind()
     }
 
     const uint32_t current_track = static_cast<uint32_t>(player_state_get_index());
-    if (current_track == g_launcher_surface_lease_track) {
+    const PlayerMediaSource current_source = player_state_get_source();
+    if (current_track == g_launcher_surface_lease_track &&
+        current_source == g_launcher_surface_media_source) {
         return;
     }
 
     LauncherSurfaceCandidate next = {};
-    if (!player_home_launcher_acquire_candidate(current_track, &next)) {
-        // 有真实封面但 Surface 尚未 ready 时继续旧背景；真正无封面歌曲会直接取得 TF 替补图。
+    if (!player_home_launcher_acquire_candidate(current_track, current_source, &next)) {
+        // 正常背景尚未 ready 时继续旧背景，不切换另一套 Launcher。
         return;
     }
-    if (!player_state_is_ready() || static_cast<uint32_t>(player_state_get_index()) != current_track) {
+    if (!player_state_is_ready() ||
+        static_cast<uint32_t>(player_state_get_index()) != current_track ||
+        player_state_get_source() != current_source) {
         player_home_launcher_release_candidate(&next);
         return;
     }
@@ -2188,27 +1996,29 @@ static void player_home_launcher_try_surface_rebind()
             &base_stats);
         if (base_ret != ESP_OK) {
             ESP_LOGW(TAG,
-                "Launcher 新背景 BoundedSPI 提交失败：track=%u ret=%s，降级LVGL",
+                "Launcher 新背景 BoundedSPI 提交失败：track=%u ret=%s，关闭本次菜单",
                 static_cast<unsigned>(current_track),
                 esp_err_to_name(base_ret));
-            player_home_launcher_switch_to_lvgl_fallback();
-            bounded_ok = false;
+            player_home_launcher_abort_single_path("rebind-base");
+            player_home_launcher_release_candidate(&old);
+            return;
         }
-        else if (!player_home_launcher_present_work_bounded()) {
+        if (!player_home_launcher_present_work_bounded()) {
             ESP_LOGW(TAG,
-                "Launcher 新背景 StripFrame 提交失败：track=%u，降级LVGL",
+                "Launcher 新背景 StripFrame 提交失败：track=%u，关闭本次菜单",
                 static_cast<unsigned>(current_track));
-            player_home_launcher_switch_to_lvgl_fallback();
-            bounded_ok = false;
+            player_home_launcher_abort_single_path("rebind-frame");
+            player_home_launcher_release_candidate(&old);
+            return;
         }
     }
 
     const uint32_t old_track = old.track;
     const uint32_t acquire_us = g_launcher_surface_lease_us;
-    const bool fallback_source = g_launcher_surface_is_fallback;
+    const bool default_source = g_launcher_surface_is_default;
     player_home_launcher_release_candidate(&old);
     HOME_DISPLAY_LOGI(
-        "Launcher背景换绑：%u -> %u acquire=%uus gen=%u base=%uus stream=%uus frame=%u bounded=%d fallback=%d",
+        "Launcher背景换绑：%u -> %u acquire=%uus gen=%u base=%uus stream=%uus frame=%u bounded=%d default=%d",
         static_cast<unsigned>(old_track),
         static_cast<unsigned>(current_track),
         static_cast<unsigned>(acquire_us),
@@ -2217,7 +2027,7 @@ static void player_home_launcher_try_surface_rebind()
         static_cast<unsigned>(base_stats.stream_us),
         static_cast<unsigned>(frame_index),
         bounded_ok ? 1 : 0,
-        fallback_source ? 1 : 0);
+        default_source ? 1 : 0);
 }
 
 static bool player_home_launcher_present_frame_bounded(uint8_t frame_index)
@@ -2226,11 +2036,11 @@ static bool player_home_launcher_present_frame_bounded(uint8_t frame_index)
         return false;
     }
     if (g_launcher_frame_index != frame_index && !player_home_launcher_decode_cached_frame(frame_index)) {
-        player_home_launcher_switch_to_lvgl_fallback();
+        player_home_launcher_abort_single_path("frame-decode");
         return false;
     }
     if (!player_home_launcher_present_work_bounded()) {
-        player_home_launcher_switch_to_lvgl_fallback();
+        player_home_launcher_abort_single_path("frame-present");
         return false;
     }
     return true;
@@ -2246,7 +2056,7 @@ static bool player_home_launcher_begin_bounded_scene()
     const esp_err_t begin_ret = display_launcher_bounded_spi_session_begin();
     if (begin_ret != ESP_OK) {
         ESP_LOGW(TAG,
-            "Launcher BoundedSPI Session 启动失败：%s，回退LVGL",
+            "Launcher BoundedSPI Session 启动失败：%s，本次菜单保持关闭",
             esp_err_to_name(begin_ret));
         return false;
     }
@@ -2265,7 +2075,7 @@ static bool player_home_launcher_begin_bounded_scene()
         &stats);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG,
-            "Launcher BoundedSPI 底图提交失败：%s，回退LVGL",
+            "Launcher BoundedSPI 底图提交失败：%s，本次菜单保持关闭",
             esp_err_to_name(ret));
         display_launcher_bounded_spi_session_end();
         return false;
@@ -2282,7 +2092,7 @@ static bool player_home_launcher_begin_bounded_scene()
         static_cast<unsigned>(stats.total_us),
         static_cast<unsigned>(stats.panel_drain_us),
         static_cast<unsigned>(stats.stream_us),
-        g_launcher_surface_is_fallback ? "TF-fallback.dimmed" : "CoverSurface.dimmed");
+        g_launcher_surface_is_default ? "DefaultCover.dimmed" : "CoverSurface.dimmed");
     return true;
 }
 
@@ -2292,24 +2102,30 @@ static bool player_home_present_current_cover_bounded(const char *reason)
         return false;
     }
     const uint32_t track_index = static_cast<uint32_t>(player_state_get_index());
+    const PlayerMediaSource media_source = player_state_get_source();
     CoverSurfaceLease lease = {};
-    const bool has_cover_surface = cover_surface_cache_acquire(track_index, &lease);
+    const bool has_cover_surface = media_source == PlayerMediaSource::Local &&
+        cover_surface_cache_acquire(track_index, &lease);
     const uint8_t *source = nullptr;
     FallbackCoverImageLease fallback = {};
-    bool using_fallback = false;
+    bool using_default = false;
 
     if (has_cover_surface) {
         source = g_overlay_visible ? lease.dimmed_rgb565 : lease.normal_rgb565;
     } else {
-        MediaArtworkViewV2 artwork = {};
-        if (media_library_get_artwork_view(track_index, &artwork) ||
-            !fallback_cover_image_acquire(FallbackCoverImageKind::Artwork, &fallback)) {
+        if (media_source == PlayerMediaSource::Local) {
+            MediaArtworkViewV2 artwork = {};
+            if (media_library_get_artwork_view(track_index, &artwork)) {
+                return false;
+            }
+        }
+        if (!fallback_cover_image_acquire(FallbackCoverImageKind::Artwork, &fallback)) {
             return false;
         }
         source = fallback.rgb565;
-        using_fallback = source != nullptr &&
+        using_default = source != nullptr &&
             fallback.width == FAKEPOD_LCD_WIDTH && fallback.height == FAKEPOD_LCD_HEIGHT;
-        if (!using_fallback) {
+        if (!using_default) {
             fallback_cover_image_release(&fallback);
             fallback_cover_image_discard_unpinned();
             return false;
@@ -2337,167 +2153,90 @@ static bool player_home_present_current_cover_bounded(const char *reason)
     }
     if (ret == ESP_OK) {
         HOME_DISPLAY_LOGI(
-            "Launcher退出封面恢复：reason=%s track=%lu gen=%u total=%uus drain=%uus stream=%uus fallback=%d",
+            "Launcher退出封面恢复：reason=%s track=%lu gen=%u total=%uus drain=%uus stream=%uus default=%d",
             reason != nullptr ? reason : "unknown",
             static_cast<unsigned long>(track_index),
             static_cast<unsigned>(stats.generation),
             static_cast<unsigned>(stats.total_us),
             static_cast<unsigned>(stats.panel_drain_us),
             static_cast<unsigned>(stats.stream_us),
-            using_fallback ? 1 : 0);
+            using_default ? 1 : 0);
         return true;
     }
     ESP_LOGW(TAG,
-        "Launcher 退出封面恢复失败：reason=%s track=%lu ret=%s，交给LVGL重绘",
+        "Launcher 退出封面恢复失败：reason=%s track=%lu ret=%s，恢复主页正常刷新",
         reason != nullptr ? reason : "unknown",
         static_cast<unsigned long>(track_index),
         esp_err_to_name(ret));
     return false;
 }
 
-static void player_home_launcher_panel_draw_cb(lv_event_t *event)
+static void player_home_launcher_abort_single_path(const char *reason)
 {
-    if (event == nullptr || lv_event_get_code(event) != LV_EVENT_DRAW_MAIN) {
-        return;
-    }
-    // R.36.6 BoundedSPI Strip 激活时，R.32 实时圆弧只作为备用路径，不重复绘制。
-    if (g_launcher_frame_cache_active) {
-        return;
+    if (g_launcher_panel != nullptr) {
+        lv_anim_delete(g_launcher_panel, player_home_launcher_progress_anim_exec);
     }
 
-    lv_layer_t *layer = lv_event_get_layer(event);
-    lv_obj_t *obj = lv_event_get_current_target_obj(event);
-    if (layer == nullptr || obj == nullptr) {
-        return;
+    const bool used_bounded = g_launcher_bounded_session_active;
+    bool restored = false;
+    if (used_bounded && g_music_visual_mode == MusicVisualMode::Artwork) {
+        restored = player_home_present_current_cover_bounded(reason);
     }
-
-    const int32_t progress = g_launcher_anim_progress < 0
-        ? 0
-        : (g_launcher_anim_progress > kLauncherAnimProgressMax
-            ? kLauncherAnimProgressMax
-            : g_launcher_anim_progress);
-    if (progress <= 0) {
-        return;
+    if (used_bounded) {
+        display_launcher_bounded_spi_session_end();
     }
+    g_launcher_bounded_session_active = false;
 
-    lv_area_t coords = {};
-    lv_obj_get_coords(obj, &coords);
-    const int32_t cx = coords.x1 + kLauncherCenterX;
-    const int32_t cy = coords.y1 + kLauncherCenterY;
-
-    // R.32：对象坐标固定，只让几何从中心向最终半径展开。
-    // 1000 时所有数值严格回到 R.31 的最终几何，因此菜单静态外观与命中区域不变。
-    auto lerp_progress = [progress](int32_t from, int32_t to) -> int32_t {
-        return from + ((to - from) * progress + kLauncherAnimProgressMax / 2) /
-            kLauncherAnimProgressMax;
-    };
-    const int32_t outer_radius = lerp_progress(kLauncherCollapsedOuterRadius, kLauncherOuterRadius);
-    const int32_t ring_width = lerp_progress(kLauncherCollapsedRingWidth, kLauncherRingWidth);
-    const int32_t center_diameter = lerp_progress(kLauncherCollapsedCenterDiameter, kLauncherCenterDiameter);
-    const int32_t icon_radius = lerp_progress(kLauncherCollapsedIconRadius, kLauncherIconRadius);
-    // 动画期间保持扇区/图标不透明，避免为了淡入额外支付 alpha blend；
-    // “展开感”完全由半径/线宽/图标位置与缩放提供。
-    const lv_opa_t geometry_opa = LV_OPA_COVER;
-
-    // 外圈图标稍晚于扇区出现，避免展开起点 7 个图标堆在中心。
-    static constexpr int32_t kOuterIconDelay = 140;
-    const int32_t icon_progress = progress <= kOuterIconDelay
-        ? 0
-        : ((progress - kOuterIconDelay) * kLauncherAnimProgressMax) /
-            (kLauncherAnimProgressMax - kOuterIconDelay);
-    const lv_opa_t icon_opa = LV_OPA_COVER;
-    const int32_t outer_icon_scale = 62 + (38 * icon_progress) / kLauncherAnimProgressMax;
-
-    // 1) 七个扇区。只修改 radius/width/opa，不移动 340x340 panel。
-    for (uint8_t i = 0; i < kLauncherItemCount; ++i) {
-        const LauncherMenuItemDef &item = kLauncherItems[i];
-        lv_draw_arc_dsc_t arc = {};
-        lv_draw_arc_dsc_init(&arc);
-        arc.color = lv_color_hex(
-            i == g_launcher_selected_index ? kLauncherSelectedSectorRgb : item.idle_rgb);
-        arc.width = ring_width;
-        arc.start_angle = player_home_launcher_normalize_angle(
-            static_cast<int16_t>(item.center_angle - kLauncherSectorHalfSpanDeg));
-        arc.end_angle = player_home_launcher_normalize_angle(
-            static_cast<int16_t>(item.center_angle + kLauncherSectorHalfSpanDeg));
-        arc.center.x = cx;
-        arc.center.y = cy;
-        arc.radius = outer_radius;
-        arc.opa = geometry_opa;
-        arc.rounded = 0U;
-        lv_draw_arc(layer, &arc);
-    }
-
-    // 2) 七个图标沿同一极坐标半径从中心向最终位置展开。
-    if (icon_progress > 0) {
-        for (uint8_t i = 0; i < kLauncherItemCount; ++i) {
-            const LauncherMenuItemDef &item = kLauncherItems[i];
-            const int32_t icon_x = kLauncherCenterX +
-                (static_cast<int32_t>(item.unit_x_10000) * icon_radius +
-                    (item.unit_x_10000 >= 0 ? 5000 : -5000)) / 10000 +
-                (item.optical_x * icon_progress) / kLauncherAnimProgressMax;
-            const int32_t icon_y = kLauncherCenterY +
-                (static_cast<int32_t>(item.unit_y_10000) * icon_radius +
-                    (item.unit_y_10000 >= 0 ? 5000 : -5000)) / 10000 +
-                (item.optical_y * icon_progress) / kLauncherAnimProgressMax;
-            player_home_launcher_draw_icon(
-                layer,
-                item.icon,
-                coords.x1 + icon_x,
-                coords.y1 + icon_y,
-                lv_color_hex(0xF8FAFF),
-                outer_icon_scale,
-                icon_opa);
+    if (g_music_visual_mode == MusicVisualMode::Cassette) {
+        now_playing_artwork_set_active(false);
+        if (g_launcher_cassette_scene_hidden) {
+            (void)cassette_view_set_temporary_hidden(false);
         }
+        cassette_view_set_launcher_suspended(false);
+        lv_obj_t *screen = lv_screen_active();
+        if (screen != nullptr) lv_obj_invalidate(screen);
+    } else if (!restored) {
+        lv_obj_t *screen = lv_screen_active();
+        if (screen != nullptr) lv_obj_invalidate(screen);
     }
 
-    // 3) 中心圆同步展开。progress=1000 时与 R.31 的 116px 中心圆完全一致。
-    lv_draw_rect_dsc_t center = {};
-    lv_draw_rect_dsc_init(&center);
-    center.bg_color = lv_color_hex(0x05070B);
-    center.bg_opa = 245;
-    center.radius = LV_RADIUS_CIRCLE;
-    center.border_width = progress >= 500 ? 2 : 1;
-    center.border_color = lv_color_hex(0x161B27);
-    center.border_opa = geometry_opa;
-    const int32_t half = center_diameter / 2;
-    lv_area_t center_area = {cx - half, cy - half, cx + half, cy + half};
-    lv_draw_rect(layer, &center, &center_area);
-
-    const int32_t center_icon_scale = 78 + (54 * progress) / kLauncherAnimProgressMax;
-    player_home_launcher_draw_icon(
-        layer,
-        kLauncherItems[g_launcher_selected_index].icon,
-        cx + (kLauncherItems[g_launcher_selected_index].optical_x * progress) /
-            kLauncherAnimProgressMax,
-        cy + (kLauncherItems[g_launcher_selected_index].optical_y * progress) /
-            kLauncherAnimProgressMax,
-        lv_color_hex(kLauncherAccentRgb),
-        center_icon_scale,
-        geometry_opa);
+    g_launcher_cassette_scene_hidden = false;
+    g_launcher_visible = false;
+    g_launcher_motion = LauncherMotionState::Hidden;
+    g_launcher_anim_progress = 0;
+    g_launcher_frame_cache_active = false;
+    g_launcher_frame_index = kLauncherFrameInvalid;
+    g_artwork_resume_without_invalidation =
+        restored && g_music_visual_mode == MusicVisualMode::Artwork;
+    if (g_launcher != nullptr) {
+        lv_obj_add_flag(g_launcher, LV_OBJ_FLAG_HIDDEN);
+    }
+    player_home_launcher_release_surface_lease();
+    player_home_launcher_release_frame_lut();
+    now_playing_artwork_set_bounded_present_allowed(
+        g_music_visual_mode == MusicVisualMode::Artwork);
+    // show() 会在资源预检前直接暂停 Audio/Artwork timer；强制标成 suspended，
+    // 让 QoS 即使在 preflight 早退时也一定重新恢复 timer/Artwork/Cassette。
+    g_background_timers_running = false;
+    player_home_update_background_timer_qos();
+    ESP_LOGW(TAG,
+        "Launcher Flash单路径中止：reason=%s，未启用任何兜底菜单",
+        reason != nullptr ? reason : "unknown");
 }
 
 static void player_home_launcher_apply_selection()
 {
-    if (g_launcher_frame_cache_active) {
-        // 选中项变化只更新当前 Launcher 生命周期内的 LUT；若 LUT 异常丢失立即回退 LVGL。
-        if (!player_home_launcher_update_frame_lut()) {
-            player_home_launcher_switch_to_lvgl_fallback();
-            return;
-        }
-        const uint8_t frame = g_launcher_frame_index == kLauncherFrameInvalid
-            ? player_home_launcher_frame_for_progress(g_launcher_anim_progress)
-            : g_launcher_frame_index;
-        if (player_home_launcher_decode_cached_frame(frame) && g_launcher_bounded_session_active) {
-            if (!player_home_launcher_present_work_bounded()) {
-                player_home_launcher_switch_to_lvgl_fallback();
-            }
-        }
+    if (!g_launcher_frame_cache_active || !g_launcher_bounded_session_active) {
         return;
     }
-    if (g_launcher_panel != nullptr) {
-        lv_obj_invalidate(g_launcher_panel);
+    if (!player_home_launcher_update_frame_lut()) {
+        player_home_launcher_abort_single_path("selection-lut");
+        return;
     }
+    const uint8_t frame = g_launcher_frame_index == kLauncherFrameInvalid
+        ? player_home_launcher_frame_for_progress(g_launcher_anim_progress)
+        : g_launcher_frame_index;
+    (void)player_home_launcher_present_frame_bounded(frame);
 }
 
 static int8_t player_home_launcher_hit_test_geometry(
@@ -2551,27 +2290,17 @@ static int8_t player_home_launcher_hit_test(int32_t screen_x, int32_t screen_y)
 
 static void player_home_launcher_progress_anim_exec(void *var, int32_t value)
 {
-    lv_obj_t *panel = static_cast<lv_obj_t *>(var);
+    (void)var;
     g_launcher_anim_progress = value < 0
         ? 0
         : (value > kLauncherAnimProgressMax ? kLauncherAnimProgressMax : value);
 
-    if (g_launcher_frame_cache_active) {
-        const uint8_t next_frame = player_home_launcher_frame_for_progress(g_launcher_anim_progress);
-        if (next_frame != g_launcher_frame_index) {
-            if (g_launcher_bounded_session_active) {
-                (void) player_home_launcher_present_frame_bounded(next_frame);
-            }
-            else {
-                (void) player_home_launcher_decode_cached_frame(next_frame);
-            }
-        }
+    if (!g_launcher_frame_cache_active || !g_launcher_bounded_session_active) {
         return;
     }
-
-    if (panel != nullptr) {
-        // 预烘焙工作帧不可用时保留 R.32 实时圆弧作为安全回退。
-        lv_obj_invalidate(panel);
+    const uint8_t next_frame = player_home_launcher_frame_for_progress(g_launcher_anim_progress);
+    if (next_frame != g_launcher_frame_index) {
+        (void)player_home_launcher_present_frame_bounded(next_frame);
     }
 }
 
@@ -2584,16 +2313,14 @@ static void player_home_launcher_enter_done(lv_anim_t *anim)
     g_launcher_anim_progress = kLauncherAnimProgressMax;
     g_launcher_motion = LauncherMotionState::Shown;
     now_playing_artwork_set_bounded_present_allowed(false);
-    if (g_launcher_frame_cache_active) {
-        const uint8_t final_frame = static_cast<uint8_t>(kLauncherAnimationAssetFrameCount - 1U);
-        if (g_launcher_frame_index != final_frame) {
-            if (g_launcher_bounded_session_active) {
-                (void) player_home_launcher_present_frame_bounded(final_frame);
-            }
-            else {
-                (void) player_home_launcher_decode_cached_frame(final_frame);
-            }
-        }
+    if (!g_launcher_frame_cache_active || !g_launcher_bounded_session_active) {
+        player_home_launcher_abort_single_path("enter-state");
+        return;
+    }
+    const uint8_t final_frame = static_cast<uint8_t>(kLauncherAnimationAssetFrameCount - 1U);
+    if (g_launcher_frame_index != final_frame &&
+        !player_home_launcher_present_frame_bounded(final_frame)) {
+        return;
     }
 #if APP_DIAG_LAUNCHER_PERFORMANCE
     const uint32_t elapsed = static_cast<uint32_t>(lv_tick_get()) - g_launcher_anim_started_ms;
@@ -2644,7 +2371,7 @@ static void player_home_launcher_leave_done(lv_anim_t *anim)
     // C2.4.13：高速 Launcher 在 Cassette 模式下临时隐藏了整个磁带 root。
     // BoundedSPI 已结束后再重新绑定 Cassette，避免 LVGL 与 Launcher 直接写 GRAM 并发。
     if (g_music_visual_mode == MusicVisualMode::Cassette) {
-        // fallback 可能临时恢复了 Artwork；回到 Cassette 前明确关掉。
+        // Launcher 单路径结束后回到 Cassette 前明确关闭 Artwork。
         now_playing_artwork_set_active(false);
         if (g_launcher_cassette_scene_hidden) {
             (void)cassette_view_set_temporary_hidden(false);
@@ -2766,12 +2493,17 @@ static void player_home_launcher_show()
             launcher_lut_ready && player_home_launcher_prepare_surface_lease();
         const bool bounded_candidate =
             launcher_surface_ready && kLauncherBoundedSpiEnabled && display_launcher_bounded_spi_available();
+        if (!bounded_candidate || !player_home_launcher_update_frame_lut()) {
+            player_home_launcher_abort_single_path(
+                !launcher_lut_ready ? "preflight-lut" :
+                (!launcher_surface_ready ? "preflight-surface" : "preflight-bounded"));
+            return;
+        }
 
-        // Cassette 与 Artwork 使用同样的 Surface handoff：必须先让 Launcher pin 当前 Surface，
-        // 再隐藏/释放 Cassette 自己的 lease，避免出现 pin=0 窗口。仅高速候选路径隐藏整页；
-        // 如果 Surface/BoundedSPI 不可用，保留静态 Cassette 作为 LVGL fallback 背景。
+        // Cassette 与 Artwork 使用同样的 Surface handoff：先 pin 当前正常背景，再隐藏/释放
+        // Cassette 自己的 lease，避免出现 pin=0 窗口。单路径下资源不全就直接保持原页面。
         g_launcher_cassette_scene_hidden = false;
-        if (cassette_launcher && bounded_candidate) {
+        if (cassette_launcher) {
             // 与 Artwork 的 quiet suspend 一样，handoff 时不留下稍后才刷出的 460x460 LVGL
             // invalidation；否则 BoundedSPI 已接管 GRAM 后，迟到的主页重绘仍可能叠回磁带组件。
             lv_display_t *display = lv_display_get_default();
@@ -2786,44 +2518,17 @@ static void player_home_launcher_show()
         g_background_timers_running = false;
         g_artwork_resume_without_invalidation = false;
 
-        // R.36.6：pin 当前 dimmed CoverSurface 后直接启动 BoundedSPI Strip Session。
-        // 若 session 无法安全启动，不再创建 RGB565 Canvas，而是立即回退 R.32 LVGL 实时圆弧。
-        if (launcher_surface_ready && player_home_launcher_update_frame_lut()) {
-            g_launcher_frame_cache_active = true;
-            bool bounded_scene_started = false;
-            if (kLauncherBoundedSpiEnabled && display_launcher_bounded_spi_available()) {
-                bounded_scene_started = player_home_launcher_begin_bounded_scene();
-            }
-            if (!bounded_scene_started) {
-                g_launcher_bounded_session_active = false;
-                g_launcher_frame_cache_active = false;
-                // quiet suspend 只适用于真正接管物理 GRAM 的 BoundedSPI。若启动失败转 LVGL fallback，
-                // 立即恢复主页 Artwork source/lease，让 fallback 仍有合法背景。
-                if (bounded_candidate) {
-                    now_playing_artwork_set_active(true);
-                }
-            }
+        // Flash I4 + BoundedSPI 是唯一 Launcher 渲染路径。启动失败就恢复 Music，
+        // 不创建 Canvas，也不显示任何 LVGL 实时圆弧。
+        g_launcher_frame_cache_active = true;
+        if (!player_home_launcher_begin_bounded_scene()) {
+            g_launcher_frame_cache_active = false;
+            player_home_launcher_abort_single_path("session-begin");
+            return;
         }
 
-        // R.36.6 BoundedSPI 模式由 Strip Compositor 把中心圆/图标直接合成进 DMA strip；
-        // fallback 则由 R.32 panel DRAW_MAIN 实时绘制，不再维护 Canvas/center overlay。
-        if (!g_launcher_frame_cache_active) {
-            player_home_launcher_release_surface_lease();
-            player_home_launcher_release_frame_lut();
-            ESP_LOGW(TAG,
-                "Launcher Strip/Surface lease 不可用：track=%u，当前展开回退 LVGL 实时圆弧",
-                static_cast<unsigned>(player_state_is_ready() ? player_state_get_index() : 0U));
-        }
-        if (g_launcher_bounded_session_active) {
-            // BoundedSPI 模式下视觉由 GRAM strip stream 持有。Launcher LVGL 根对象从进入前
-            // 就保持 hidden，这里刻意不调用任何 LVGL visibility/style API；
-            // 点击改由 screen 回调复用同一径向 hit-test。这样全屏 Base 提交后不会再发生一次
-            // 460x460 LVGL repaint，也就不会形成“只有中间340x340半透明”的方形边界。
-        } else {
-            lv_obj_remove_flag(g_launcher, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_move_foreground(g_launcher);
-            screen_lock_simple_raise();
-        }
+        // 视觉由 GRAM strip stream 持有。Launcher LVGL 根对象始终 hidden；
+        // 点击由 screen 回调复用同一径向 hit-test，物理显示与输入完全解耦。
     }
 
     // 对象固定在最终位置；BoundedSPI 模式下 progress 只决定 12 个预烘焙帧中的哪一帧提交。
@@ -2831,9 +2536,6 @@ static void player_home_launcher_show()
         kLauncherAnimProgressMax,
         LauncherMotionState::Entering,
         player_home_launcher_enter_done);
-    if (!g_launcher_bounded_session_active && !g_launcher_frame_cache_active) {
-        player_home_launcher_apply_selection();
-    }
 }
 
 static void player_home_launcher_hide()
@@ -4727,8 +4429,8 @@ void player_home_create(lv_obj_t *screen)
     lv_obj_add_event_cb(
         g_overlay_backdrop, player_home_overlay_backdrop_tap_cb, LV_EVENT_CLICKED, nullptr);
 
-    // P1.5.3.2R.32：Launcher 根层、Backdrop、340x340 panel 三者都固定不动。
-    // 进入/退出只驱动 panel DRAW_MAIN 的径向展开 progress，消除移动对象造成的旧/新位置双重失效。
+    // Launcher 根层、Backdrop、340x340 panel 仅保留生命周期/命中几何，三者都固定不动。
+    // 进入/退出只驱动 Flash I4 frame progress；实际圆环不再由 panel DRAW_MAIN 绘制。
     g_launcher = lv_obj_create(screen);
     ui_common_lock_object(g_launcher);
     lv_obj_set_pos(g_launcher, 0, 0);
@@ -4774,17 +4476,9 @@ void player_home_create(lv_obj_t *screen)
         LV_EVENT_CLICKED,
         nullptr);
 
-    // R.36.6：不再分配 340x340 RGB565 PanelWork/Canvas。Flash I4 + 当前 dimmed Surface
-    // 直接按 SPI staging strip 现场合成；LVGL fallback 继续使用 R.32 panel DRAW_MAIN。
+    // R46.0.93：不分配 340x340 RGB565 PanelWork/Canvas。Flash I4 + 当前 dimmed Surface
+    // 直接按 SPI staging strip 现场合成；Launcher 不再注册第二套 LVGL DRAW_MAIN 圆环。
     g_launcher_frame_cache_ready = true;
-
-    // R.33.1 fallback callback 常驻，但缓存激活时开头立即 return；这样某一首封面暂时拿不到
-    // CoverSurface 时只回退这一次，不会永久关闭后续歌曲的纯 RGB565 快速动画路径。
-    lv_obj_add_event_cb(
-        g_launcher_panel,
-        player_home_launcher_panel_draw_cb,
-        LV_EVENT_DRAW_MAIN,
-        nullptr);
 
     lv_obj_add_flag(g_launcher, LV_OBJ_FLAG_HIDDEN);
 #if APP_DIAG_BOOT_VERBOSE
@@ -4796,7 +4490,7 @@ void player_home_create(lv_obj_t *screen)
         "Launcher：FlashI4=%uB FullBase=0B PanelWork=0B source=CoverSurface.dimmed producer=wire-order",
         static_cast<unsigned>(flash_bytes));
     HOME_BOOT_LOGI(
-        "显示传输：BoundedSPI=%s Launcher=wire-strip Cover=bounded LVGL-fallback=enabled",
+        "显示传输：BoundedSPI=%s Launcher=FlashI4-single-path Cover=bounded LVGL-fallback=removed",
         display_launcher_bounded_spi_available() ? "ready" : "unavailable");
 #endif
 

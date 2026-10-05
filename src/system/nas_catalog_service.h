@@ -30,10 +30,11 @@ struct NasCatalogSnapshot
 };
 
 
-// R46.0.78：播放端点只用于建立 NAS HTTP 音频 Source。
-// music_base_url 默认为配置中的 music_url；未配置时仅对 .../music-index 自动推导同级 .../music。
+// R46.0.96：优先使用静态 short-ID 别名 /track/<FNV1A64>.<ext>。
+// music_base_url 仅保留旧完整路径兼容；track_url 指向 DSM 静态别名目录。
 struct NasPlaybackEndpoint
 {
+    char track_base_url[256] = {};
     char music_base_url[256] = {};
     char username[64] = {};
     char password[96] = {};
@@ -52,8 +53,9 @@ const char *nas_catalog_service_state_name(NasCatalogState state);
 // 从 TF 配置解析播放端点；不联网。HTTP-only，与 Catalog Foundation 保持一致。
 esp_err_t nas_catalog_service_get_playback_endpoint(NasPlaybackEndpoint *out_endpoint);
 
-// 将 Catalog 中以 / 开头的 UTF-8 相对路径百分号编码后拼到 music_base_url。
-// out_url_size 必须容纳最坏 3x UTF-8 路径；超长返回 ESP_ERR_INVALID_SIZE。
+// R46.0.96：若配置/推导出 track_url，则按 Catalog UTF-8 相对路径计算稳定 FNV-1a 64-bit ID，
+// 构造固定长度 /track/<16hex>.<ext>，直接由 DSM 静态 HTTP 服务读取硬链接；
+// 仅旧配置缺少 short-ID 端点时保留完整路径百分号编码兼容。
 esp_err_t nas_catalog_service_build_track_url(
     const NasPlaybackEndpoint *endpoint,
     const char *relative_path,

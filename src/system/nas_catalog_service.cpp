@@ -46,6 +46,7 @@ static constexpr const char *kRemoteManifestName = "music_manifest_v2.bin";
 struct NasConfig
 {
     char base_url[kBaseUrlMax] = {};
+    char track_url[kBaseUrlMax] = {};
     char music_url[kBaseUrlMax] = {};
     char username[kUsernameMax] = {};
     char password[kPasswordMax] = {};
@@ -60,6 +61,7 @@ struct NasRemoteMeta
     uint32_t index_crc32 = 0U;
     uint32_t manifest_size = 0U;
     uint32_t manifest_crc32 = 0U;
+    uint32_t short_id_version = 0U;
 };
 
 struct NasSyncContext
@@ -195,6 +197,8 @@ static bool parse_config_text(char *text, NasConfig *config)
         char *value = trim(equals + 1);
         if (strcmp(key, "base_url") == 0) {
             snprintf(config->base_url, sizeof(config->base_url), "%s", value);
+        } else if (strcmp(key, "track_url") == 0) {
+            snprintf(config->track_url, sizeof(config->track_url), "%s", value);
         } else if (strcmp(key, "music_url") == 0) {
             snprintf(config->music_url, sizeof(config->music_url), "%s", value);
         } else if (strcmp(key, "username") == 0) {
@@ -207,6 +211,10 @@ static bool parse_config_text(char *text, NasConfig *config)
     while (length > 0U && config->base_url[length - 1U] == '/') {
         config->base_url[--length] = '\0';
     }
+    length = strlen(config->track_url);
+    while (length > 0U && config->track_url[length - 1U] == '/') {
+        config->track_url[--length] = '\0';
+    }
     length = strlen(config->music_url);
     while (length > 0U && config->music_url[length - 1U] == '/') {
         config->music_url[--length] = '\0';
@@ -215,8 +223,11 @@ static bool parse_config_text(char *text, NasConfig *config)
     if (strncmp(config->base_url, "http://", 7U) != 0 || strlen(config->base_url) <= 7U) {
         return false;
     }
-    return config->music_url[0] == '\0' ||
+    const bool track_url_ok = config->track_url[0] == '\0' ||
+        (strncmp(config->track_url, "http://", 7U) == 0 && strlen(config->track_url) > 7U);
+    const bool music_url_ok = config->music_url[0] == '\0' ||
         (strncmp(config->music_url, "http://", 7U) == 0 && strlen(config->music_url) > 7U);
+    return track_url_ok && music_url_ok;
 }
 
 static bool parse_remote_meta(char *text, NasRemoteMeta *meta)
@@ -251,6 +262,11 @@ static bool parse_remote_meta(char *text, NasRemoteMeta *meta)
             (void)parse_u32(value, &meta->manifest_size);
         } else if (strcmp(key, "manifest_crc32") == 0) {
             (void)parse_u32(value, &meta->manifest_crc32);
+        } else if (strcmp(key, "track_alias_version") == 0 || strcmp(key, "track_map_version") == 0) {
+            uint32_t version = 0U;
+            if (parse_u32(value, &version) && version > meta->short_id_version) {
+                meta->short_id_version = version;
+            }
         }
     }
     return magic_ok && meta->catalog_version == 6U && meta->revision != 0ULL &&
@@ -709,7 +725,36 @@ esp_err_t nas_catalog_service_get_playback_endpoint(NasPlaybackEndpoint *out_end
         heap_caps_free(text);
         return ESP_ERR_INVALID_ARG;
     }
+
+    NasRemoteMeta local_meta = {};
+    if (read_small_file(SystemPaths::kNasCatalogMeta, text, kMetaBufferBytes) == ESP_OK) {
+        (void)parse_remote_meta(text, &local_meta);
+    }
     heap_caps_free(text);
+
+    if (config.track_url[0] != '\0') {
+        snprintf(out_endpoint->track_base_url, sizeof(out_endpoint->track_base_url), "%s", config.track_url);
+    } else if (local_meta.short_id_version >= 1U) {
+        // DSM Web Station exposes /volume1/web as the HTTP document root.  Derive the
+        // static short-ID endpoint from the HTTP origin, not from the catalog path; e.g.
+        // http://host:8080/web/music-index -> http://host:8080/track.
+        static constexpr const char *kIndexSuffix = "/music-index";
+        const size_t base_len = strlen(config.base_url);
+        const size_t suffix_len = strlen(kIndexSuffix);
+        if (base_len > suffix_len &&
+            strcasecmp(config.base_url + base_len - suffix_len, kIndexSuffix) == 0) {
+            const char *scheme_end = strstr(config.base_url, "://");
+            const char *path_begin = scheme_end != nullptr ? strchr(scheme_end + 3, '/') : nullptr;
+            if (path_begin == nullptr) return ESP_ERR_INVALID_ARG;
+            const size_t origin_len = static_cast<size_t>(path_begin - config.base_url);
+            const int written = snprintf(
+                out_endpoint->track_base_url, sizeof(out_endpoint->track_base_url),
+                "%.*s/track", static_cast<int>(origin_len), config.base_url);
+            if (written <= 0 || static_cast<size_t>(written) >= sizeof(out_endpoint->track_base_url)) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+        }
+    }
 
     if (config.music_url[0] != '\0') {
         snprintf(out_endpoint->music_base_url, sizeof(out_endpoint->music_base_url), "%s", config.music_url);
@@ -738,6 +783,17 @@ esp_err_t nas_catalog_service_get_playback_endpoint(NasPlaybackEndpoint *out_end
     return ESP_OK;
 }
 
+static uint64_t nas_track_id_fnv1a64(const char *relative_path)
+{
+    uint64_t value = 0xCBF29CE484222325ULL;
+    if (relative_path == nullptr) return value;
+    for (const unsigned char *p = reinterpret_cast<const unsigned char *>(relative_path); *p != 0U; ++p) {
+        value ^= static_cast<uint64_t>(*p);
+        value *= 0x100000001B3ULL;
+    }
+    return value;
+}
+
 static bool nas_url_unreserved(unsigned char ch)
 {
     return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
@@ -751,10 +807,34 @@ esp_err_t nas_catalog_service_build_track_url(
     size_t out_url_size)
 {
     if (endpoint == nullptr || relative_path == nullptr || out_url == nullptr || out_url_size == 0U ||
-        endpoint->music_base_url[0] == '\0' || relative_path[0] == '\0') {
+        relative_path[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
 
+    if (endpoint->track_base_url[0] != '\0') {
+        const char *slash = strrchr(relative_path, '/');
+        const char *dot = strrchr(relative_path, '.');
+        if (dot == nullptr || dot[1] == '\0' || (slash != nullptr && dot < slash)) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        const size_t ext_len = strlen(dot);
+        if (ext_len < 2U || ext_len > 8U) return ESP_ERR_INVALID_ARG;
+        for (size_t i = 1U; i < ext_len; ++i) {
+            const unsigned char ch = static_cast<unsigned char>(dot[i]);
+            if (!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9'))) {
+                return ESP_ERR_INVALID_ARG;
+            }
+        }
+
+        const uint64_t track_id = nas_track_id_fnv1a64(relative_path);
+        const int written = snprintf(
+            out_url, out_url_size, "%s/%016llX%s", endpoint->track_base_url,
+            static_cast<unsigned long long>(track_id), dot);
+        return written > 0 && static_cast<size_t>(written) < out_url_size
+            ? ESP_OK : ESP_ERR_INVALID_SIZE;
+    }
+
+    if (endpoint->music_base_url[0] == '\0') return ESP_ERR_NOT_FOUND;
     size_t used = strlen(endpoint->music_base_url);
     if (used + 2U > out_url_size) return ESP_ERR_INVALID_SIZE;
     memcpy(out_url, endpoint->music_base_url, used);

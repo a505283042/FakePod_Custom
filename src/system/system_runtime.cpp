@@ -195,7 +195,7 @@ void system_runtime_update()
             wifi_service_set_ble_fallback_enabled(settings_snapshot.ble_enabled);
             if (settings_snapshot.wifi_enabled) {
                 if (wifi_ret == ESP_OK && wifi_service_has_credentials()) {
-                    const esp_err_t connect_ret = wifi_service_connect_saved();
+                    const esp_err_t connect_ret = wifi_service_connect_saved(true);
                     if (connect_ret == ESP_OK) {
                         ESP_LOGI(TAG, "开机无线策略：保存状态 Wi-Fi=开 BLE=关，启动Wi-Fi");
                     } else {

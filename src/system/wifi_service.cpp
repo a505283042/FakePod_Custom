@@ -28,6 +28,7 @@ static constexpr TickType_t kBleStopTimeout = pdMS_TO_TICKS(6000);
 static constexpr TickType_t kBleRestoreTimeout = pdMS_TO_TICKS(6000);
 static constexpr TickType_t kBlePollDelay = pdMS_TO_TICKS(20);
 static constexpr TickType_t kProvisionAckGrace = pdMS_TO_TICKS(350);
+static constexpr TickType_t kBootRebindDelay = pdMS_TO_TICKS(250);
 static constexpr TickType_t kConnectTimeout = pdMS_TO_TICKS(15000);
 static constexpr TickType_t kReconnectTimeout = pdMS_TO_TICKS(10000);
 static constexpr uint8_t kMaxConnectAttempts = 5U;
@@ -49,6 +50,7 @@ struct WifiCredentials {
 
 enum class WorkerMode : uint8_t {
     ConnectSaved = 0,
+    ConnectSavedBoot,
     Provision,
     Recover,
     Stop,
@@ -436,8 +438,10 @@ static void wifi_worker(void *)
 
     if (mode != WorkerMode::Recover) {
         set_state(WifiServiceState::WaitingBleOff);
-        ESP_LOGI(TAG, "%s：先完整停止BLE，再启动Wi-Fi",
-            mode == WorkerMode::Provision ? "手机配网" : "Wi-Fi开关恢复");
+        const char *reason = mode == WorkerMode::Provision
+            ? "手机配网"
+            : (mode == WorkerMode::ConnectSavedBoot ? "开机Wi-Fi恢复" : "Wi-Fi开关恢复");
+        ESP_LOGI(TAG, "%s：先完整停止BLE，再启动Wi-Fi", reason);
         ble_remote_service_set_enabled(false);
         ble_remote_service_update();
         if (!wait_ble_disabled(kBleStopTimeout)) {
@@ -500,6 +504,22 @@ static void wifi_worker(void *)
 
     ret = wait_for_connection(kConnectTimeout);
     if (ret != ESP_OK) goto failed;
+
+    if (mode == WorkerMode::ConnectSavedBoot) {
+        // 实机已确认：极少数冷启动会出现“已GOT_IP但业务数据面不通”，手动关/开Wi-Fi可恢复。
+        // 开机自动连接只在发布READY前做一次完整重绑定；运行期手动开Wi-Fi不走此路径，且绝不循环。
+        ESP_LOGI(TAG, "开机Wi-Fi首次获取IP：执行一次性数据面重绑定，%ums后重新连接",
+            static_cast<unsigned>(kBootRebindDelay * portTICK_PERIOD_MS));
+        cleanup_wifi();
+        vTaskDelay(kBootRebindDelay);
+
+        set_state(WifiServiceState::WifiInit);
+        ret = init_wifi_stack();
+        if (ret != ESP_OK) goto failed;
+        ret = wait_for_connection(kConnectTimeout);
+        if (ret != ESP_OK) goto failed;
+        ESP_LOGI(TAG, "开机Wi-Fi一次性数据面重绑定完成：准备启动业务Remote");
+    }
 
     ret = wifi_remote_service_start();
     if (ret != ESP_OK) {
@@ -632,13 +652,15 @@ void wifi_service_set_ble_fallback_enabled(bool enabled)
     portEXIT_CRITICAL(&g_lock);
 }
 
-esp_err_t wifi_service_connect_saved()
+esp_err_t wifi_service_connect_saved(bool boot_rebind_once)
 {
     portENTER_CRITICAL(&g_lock);
     const bool configured = g_ready && g_configured;
     portEXIT_CRITICAL(&g_lock);
     if (!configured) return ESP_ERR_NOT_FOUND;
-    return start_worker(WorkerMode::ConnectSaved);
+    return start_worker(boot_rebind_once
+        ? WorkerMode::ConnectSavedBoot
+        : WorkerMode::ConnectSaved);
 }
 
 esp_err_t wifi_service_stop()
