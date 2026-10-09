@@ -2876,6 +2876,20 @@ static void library_view_log_nas_search_playback_context(const LibraryRowBinding
         static_cast<unsigned long>(queue.track_index));
 }
 
+static bool library_view_nas_wifi_enabled_for_playback()
+{
+    if (!library_source_is_nas()) return true;
+
+    DeviceSettingsSnapshot settings = {};
+    if (!device_settings_get_snapshot(&settings) || settings.wifi_enabled) {
+        return true;
+    }
+
+    ui_common_show_notice("Wi-Fi 未开启", "请先在设置中开启后播放 NAS");
+    UI_PAGE_INTERACTION_LOGI("NAS播放已拦截：Wi-Fi开关=关");
+    return false;
+}
+
 static void library_view_row_clicked_cb(lv_event_t *event)
 {
     if (lv_event_get_code(event) != LV_EVENT_CLICKED || library_click_suppressed()) {
@@ -2894,6 +2908,11 @@ static void library_view_row_clicked_cb(lv_event_t *event)
         row->action == LibraryRowAction::PlayFolderTrack ||
         row->action == LibraryRowAction::PlayGroupTrack;
     if (selecting_track && !library_view_validate_nas_search_track_origin(*row)) {
+        return;
+    }
+    // NAS 浏览不依赖 Wi-Fi，但真正点歌时如果用户明确关闭了 Wi-Fi，
+    // 必须在提交 PlayerState 前提示并拦截，避免“旧音频继续播、当前歌曲却已切 NAS”的假状态。
+    if (selecting_track && library_source_is_nas() && !library_view_nas_wifi_enabled_for_playback()) {
         return;
     }
     // NAS 网络播放当前接入 MP3/FLAC。先在提交 PlayerState 之前做能力检查，

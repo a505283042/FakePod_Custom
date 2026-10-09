@@ -3815,6 +3815,34 @@ static void player_home_audio_timer_cb(lv_timer_t *timer)
     player_home_apply_audio_snapshot(snapshot);
 }
 
+static bool player_home_nas_wifi_enabled_for_new_playback()
+{
+    if (player_state_get_source() != PlayerMediaSource::Nas) return true;
+
+    DeviceSettingsSnapshot settings = {};
+    if (!device_settings_get_snapshot(&settings) || settings.wifi_enabled) {
+        return true;
+    }
+
+    ui_common_show_notice("Wi-Fi 未开启", "请先在设置中开启后播放 NAS");
+    HOME_INTERACTION_LOGI("NAS播放控制已拦截：Wi-Fi开关=关");
+    return false;
+}
+
+static bool player_home_play_action_needs_network()
+{
+    if (player_state_get_source() != PlayerMediaSource::Nas) return false;
+
+    AudioStateSnapshot snapshot = {};
+    if (!audio_service_get_snapshot(&snapshot) || !snapshot.ready) return true;
+    const bool selected_is_playing =
+        snapshot.source == AudioPlaybackSource::NasHttp &&
+        snapshot.track_index == player_state_get_index() &&
+        snapshot.state == AudioPlaybackState::Playing;
+    // 正在播时点击播放键是“暂停”，无需网络；其它状态都会启动/恢复 NAS 音频。
+    return !selected_is_playing;
+}
+
 static void player_home_prev_cb(lv_event_t *event)
 {
     if (lv_event_get_code(event) != LV_EVENT_CLICKED || player_home_click_suppressed()) {
@@ -3822,6 +3850,7 @@ static void player_home_prev_cb(lv_event_t *event)
     }
     player_home_overlay_show();
     HOME_INTERACTION_LOGI("控件命中：上一曲");
+    if (!player_home_nas_wifi_enabled_for_new_playback()) return;
     const size_t before_track = player_state_get_index();
     if (player_control_previous()) {
         if (player_state_get_index() != before_track) {
@@ -3841,6 +3870,7 @@ static void player_home_next_cb(lv_event_t *event)
     }
     player_home_overlay_show();
     HOME_INTERACTION_LOGI("控件命中：下一曲");
+    if (!player_home_nas_wifi_enabled_for_new_playback()) return;
     const size_t before_track = player_state_get_index();
     if (player_control_next()) {
         if (player_state_get_index() != before_track) {
@@ -3859,6 +3889,10 @@ static void player_home_play_cb(lv_event_t *event)
     }
     player_home_overlay_show();
     HOME_INTERACTION_LOGI("控件命中：播放/暂停");
+    if (player_home_play_action_needs_network() &&
+        !player_home_nas_wifi_enabled_for_new_playback()) {
+        return;
+    }
     if (!player_control_toggle_play_pause()) {
         ESP_LOGW(TAG, "播放控制请求未能入队");
     }
