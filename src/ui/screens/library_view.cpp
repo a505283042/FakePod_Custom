@@ -391,6 +391,7 @@ static void library_view_update_nas_load_stage_async(void *stage_value);
 static bool library_view_nas_catalog_needed_by_playback();
 static bool library_search_build_key_cache();
 static void library_search_rebuild_matches();
+static void library_search_release_cache();
 
 static int32_t library_abs(int32_t value)
 {
@@ -642,6 +643,43 @@ static bool library_view_folder_scope_active()
 static bool library_view_folder_browser_active()
 {
     return library_view_folder_scope_active() && g_state.folder_view != LibraryFolderView::Tracks;
+}
+
+static bool library_view_normalize_mode_for_folder_scope()
+{
+    if (!library_view_folder_scope_active() ||
+        (g_state.mode == LibraryBrowseMode::AllTracks &&
+         g_state.detail_type == PlayerListType::AllTracks &&
+         g_state.detail_group_index == UINT32_MAX)) {
+        return false;
+    }
+
+    const LibraryBrowseMode previous_mode = g_state.mode;
+    g_state.mode = LibraryBrowseMode::AllTracks;
+    g_state.detail_type = PlayerListType::AllTracks;
+    g_state.detail_group_index = UINT32_MAX;
+    g_state.detail_scroll_y = 0;
+    g_state.parent_scroll_y = 0;
+
+    // 歌手/专辑/年代只属于“总列表”顶层分类。切到一级/二级列表后，
+    // 旧分类搜索缓存也不再属于当前 BrowseContext，必须一起丢弃。
+    if (g_search.active) {
+        g_search.active = false;
+        g_search.key_index = static_cast<uint8_t>(LibrarySearchBucket::All);
+        g_search.query_length = 0U;
+        g_search.parent_scroll_y = 0;
+        g_search.scroll_y = 0;
+        g_search.match_count = 0U;
+        library_search_release_cache();
+        quick_index_keyboard_set_visible(&g_search_keyboard, false);
+    }
+
+    ESP_LOGI(TAG,
+        "%s曲库文件夹范围强制回歌曲列表：scope=%s old_mode=%u",
+        library_source_is_nas() ? "NAS" : "本地",
+        player_playlist_folder_scope_name(library_view_active_folder_scope()),
+        static_cast<unsigned>(previous_mode));
+    return true;
 }
 
 static size_t library_source_folder_option_count(PlayerFolderScope scope, const char *parent_path)
@@ -1238,7 +1276,17 @@ static void library_restore_persisted_source_state_if_needed()
     saved->valid = true;
     saved->generation = library_source_generation();
     saved->folder_scope = library_view_active_folder_scope();
-    saved->browse.mode = static_cast<LibraryBrowseMode>(persisted.browse_mode);
+    LibraryBrowseMode restored_mode = static_cast<LibraryBrowseMode>(persisted.browse_mode);
+    if (saved->folder_scope != PlayerFolderScope::All &&
+        restored_mode != LibraryBrowseMode::AllTracks) {
+        ESP_LOGI(TAG,
+            "修复%s曲库旧浏览模式：scope=%s persisted_mode=%u -> 歌曲",
+            library_source_is_nas() ? "NAS" : "本地",
+            player_playlist_folder_scope_name(saved->folder_scope),
+            static_cast<unsigned>(persisted.browse_mode));
+        restored_mode = LibraryBrowseMode::AllTracks;
+    }
+    saved->browse.mode = restored_mode;
     saved->browse.detail_type = PlayerListType::AllTracks;
     saved->browse.detail_group_index = UINT32_MAX;
     memcpy(saved->browse.top_scroll_y, persisted.top_scroll_y, sizeof(saved->browse.top_scroll_y));
@@ -1304,6 +1352,9 @@ static void library_remember_current_source_state()
         else if (g_state.detail_type == PlayerListType::Album) persist_mode = LibraryBrowseMode::Albums;
         else if (g_state.detail_type == PlayerListType::Decade) persist_mode = LibraryBrowseMode::Decades;
         else persist_mode = LibraryBrowseMode::AllTracks;
+    }
+    if (saved->folder_scope != PlayerFolderScope::All) {
+        persist_mode = LibraryBrowseMode::AllTracks;
     }
     persisted.browse_mode = static_cast<uint8_t>(persist_mode);
     persisted.folder_view = static_cast<uint8_t>(
@@ -2633,12 +2684,16 @@ static void library_view_render(bool preserve_scroll)
     }
 
     library_view_inertia_stop(false);
+    // 一级/二级列表只有“歌曲/文件夹”语义；歌手/专辑/年代是总列表分类。
+    // scope 在设置页变化时 UI 可能仍带着旧总列表 mode，这里作为最终不变量守门。
+    (void)library_view_normalize_mode_for_folder_scope();
     const int32_t target_scroll = preserve_scroll ? library_view_saved_scroll_position() : 0;
     library_view_set_header();
     library_view_apply_indicator();
     library_view_apply_list_layout();
     g_manual_scroll_y = library_view_clamp_scroll_y(target_scroll);
     library_view_refresh_virtual_rows(true);
+    library_view_scrollbar_update_position();
     library_view_show_empty_if_needed();
 }
 
@@ -2771,6 +2826,56 @@ static void library_view_queue_gesture(LibraryPendingGesture action, uint32_t ti
     }
 }
 
+static bool library_view_validate_nas_search_track_origin(const LibraryRowBinding &row)
+{
+    // 搜索只是当前 NAS 列表的显示过滤器。虚拟行绑定时 row.position 已经从
+    // display index 映射回搜索前原列表的真实 position；点歌前再守一次不变量，
+    // 防止以后 UI 改动误把“搜索结果第 N 项”当成播放队列第 N 项。
+    if (!library_source_is_nas() || !g_search.active) return true;
+
+    uint32_t expected_track = UINT32_MAX;
+    bool mapped = false;
+    switch (row.action) {
+        case LibraryRowAction::PlayAllTrack:
+        case LibraryRowAction::PlayFolderTrack:
+            mapped = library_view_top_track_index(row.position, &expected_track);
+            break;
+        case LibraryRowAction::PlayGroupTrack:
+            mapped = library_view_detail_track_index(row.position, &expected_track, nullptr);
+            break;
+        default:
+            return true;
+    }
+
+    if (!mapped || expected_track != row.track_index) {
+        ESP_LOGW(TAG,
+            "NAS搜索点歌队列映射失效：action=%u source_pos=%lu row_track=%lu expected=%lu；保持当前播放上下文",
+            static_cast<unsigned>(row.action),
+            static_cast<unsigned long>(row.position),
+            static_cast<unsigned long>(row.track_index),
+            static_cast<unsigned long>(expected_track));
+        return false;
+    }
+    return true;
+}
+
+static void library_view_log_nas_search_playback_context(const LibraryRowBinding &row)
+{
+    if (!library_source_is_nas() || !g_search.active) return;
+
+    PlayerFolderQueueSnapshot queue = {};
+    if (!player_state_get_folder_queue_snapshot(&queue) || !queue.ready) return;
+
+    ESP_LOGI(TAG,
+        "NAS搜索点歌继承原列表：scope=%s type=%s source_pos=%lu queue_pos=%lu/%lu track=%lu",
+        player_playlist_folder_scope_name(queue.effective_scope),
+        player_playlist_type_name(player_state_get_list_type()),
+        static_cast<unsigned long>(row.position),
+        static_cast<unsigned long>(queue.current_in_queue ? queue.position + 1U : 0U),
+        static_cast<unsigned long>(queue.track_count),
+        static_cast<unsigned long>(queue.track_index));
+}
+
 static void library_view_row_clicked_cb(lv_event_t *event)
 {
     if (lv_event_get_code(event) != LV_EVENT_CLICKED || library_click_suppressed()) {
@@ -2788,6 +2893,9 @@ static void library_view_row_clicked_cb(lv_event_t *event)
         row->action == LibraryRowAction::PlayAllTrack ||
         row->action == LibraryRowAction::PlayFolderTrack ||
         row->action == LibraryRowAction::PlayGroupTrack;
+    if (selecting_track && !library_view_validate_nas_search_track_origin(*row)) {
+        return;
+    }
     // NAS 网络播放当前接入 MP3/FLAC。先在提交 PlayerState 之前做能力检查，
     // 避免点击暂不支持的 OPUS 等格式后把统一“当前播放上下文”改成 NAS，
     // 而旧的 Local 音频实际上仍在播放。
@@ -2955,6 +3063,9 @@ static void library_view_row_clicked_cb(lv_event_t *event)
             return;
     }
 
+    if (selecting_track) {
+        library_view_log_nas_search_playback_context(*row);
+    }
     if (!player_control_play_current()) {
         ESP_LOGW(TAG, "曲库选歌后播放请求未能入队");
     }

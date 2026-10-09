@@ -8,6 +8,7 @@
 #include "lvgl.h"
 
 #include "board_pins.h"
+#include "audio_service.h"
 #include "persistent_state.h"
 #include "player/player_control.h"
 #include "device_settings.h"
@@ -191,9 +192,18 @@ void power_service_update()
 
     PersistentStateStatus status = {};
     (void)persistent_state_get_status(&status);
-    ESP_LOGI(TAG, "关机长按确认：hold>=%lums dirty=0x%08lX，开始显式NVS保存",
+    ESP_LOGI(TAG, "关机长按确认：hold>=%lums dirty=0x%08lX，开始音频静音收尾 + 显式NVS保存",
         static_cast<unsigned long>(POWER_KEY_SAVE_HOLD_TICKS * portTICK_PERIOD_MS),
         static_cast<unsigned long>(status.dirty_bits));
+
+    // EC190707 实机会在继续长按约 2 秒处硬断电。确认关机意图后立即异步提交 Stop，
+    // 让 AudioTask 与 NVS flush 并行执行 10ms PCM淡出 -> DAC soft mute -> 零PCM -> 耳放掉电。
+    // 这里不 wait，避免把约 0.9 秒的 Flash 保存余量消耗在音频同步等待上。
+    if (!audio_service_stop(false)) {
+        ESP_LOGW(TAG, "关机音频安全收尾提交失败；继续优先保存NVS");
+    } else {
+        ESP_LOGI(TAG, "关机音频安全收尾已提交：AudioTask后台执行pop-free Stop");
+    }
 
     const TickType_t flush_begin = xTaskGetTickCount();
     const esp_err_t ret = persistent_state_flush();

@@ -70,6 +70,7 @@ static constexpr size_t AUDIO_INLINE_PATH_SIZE = 384;
 static constexpr size_t AUDIO_MAX_PATH_SIZE = 4096;
 static constexpr size_t AUDIO_STREAM_FRAMES = 256;
 static constexpr uint32_t AUDIO_PCM_FADE_IN_MS = 30;
+static constexpr uint32_t AUDIO_PCM_FADE_OUT_MS = 10;
 static constexpr uint8_t AUDIO_PCM_UNMUTE_PRIME_BLOCKS = 4;
 static constexpr uint32_t AUDIO_I2S_WRITE_TIMEOUT_MS = 100;
 static constexpr uint32_t AUDIO_PCM_MUTE_SETTLE_MS = 150;
@@ -225,6 +226,14 @@ static bool g_pcm_unmute_pending = false;
 static uint32_t g_pcm_fade_in_total_frames = 0;
 static uint32_t g_pcm_fade_in_done_frames = 0;
 static bool g_pcm_fade_in_logged_done = true;
+// R46.0.110：记录最后一个真正提交到 Music I2S 的立体声样本。切歌/Stop 时先用
+// 一个极短数字淡出把波形收敛到 0，再交给 CS43131 soft-ramp mute，避免非零样本处硬切产生 pop。
+static int32_t g_music_last_pcm_left = 0;
+static int32_t g_music_last_pcm_right = 0;
+static bool g_music_last_pcm_valid = false;
+
+static void audio_task_reset_music_last_pcm();
+
 static uint8_t g_task_volume_percent = 50U;
 static volatile uint8_t g_nsf_gain_compensation_db = 3U;
 static AudioOutputMode g_task_output_mode = AudioOutputMode::NormalHeadphones;
@@ -836,6 +845,7 @@ static bool audio_task_try_recover_flac_starvation(esp_err_t decoder_error)
         audio_task_reset_flac_starve_grace();
         return false;
     }
+    audio_task_reset_music_last_pcm();
     return true;
 }
 
@@ -916,6 +926,7 @@ static bool audio_task_try_recover_http_mp3_starvation(esp_err_t decoder_error)
         audio_task_reset_http_mp3_starve_grace();
         return false;
     }
+    audio_task_reset_music_last_pcm();
 
     // 静音只维持硬件时钟，不推进媒体播放时钟。
     return true;
@@ -1105,6 +1116,75 @@ static void audio_task_apply_pcm_fade_in(int32_t *pcm, size_t frames)
     }
 }
 
+static void audio_task_reset_music_last_pcm()
+{
+    g_music_last_pcm_left = 0;
+    g_music_last_pcm_right = 0;
+    g_music_last_pcm_valid = false;
+}
+
+static void audio_task_note_music_pcm(const int32_t *pcm, size_t frames)
+{
+    if (pcm == nullptr || frames == 0U) {
+        return;
+    }
+    const size_t base = (frames - 1U) * 2U;
+    g_music_last_pcm_left = pcm[base];
+    g_music_last_pcm_right = pcm[base + 1U];
+    g_music_last_pcm_valid = true;
+}
+
+static esp_err_t audio_task_fade_music_output_to_zero(uint32_t sample_rate_hz)
+{
+    if (!g_music_last_pcm_valid || g_task_user_muted ||
+        !g_pipeline_headphone_enabled || !g_pipeline_i2s_started ||
+        !i2s_output_is_started()) {
+        return ESP_OK;
+    }
+
+    const uint32_t rate = sample_rate_hz > 0U ? sample_rate_hz : 48000U;
+    size_t total_frames = static_cast<size_t>(
+        (static_cast<uint64_t>(rate) * AUDIO_PCM_FADE_OUT_MS + 999ULL) / 1000ULL);
+    if (total_frames == 0U) {
+        total_frames = 1U;
+    }
+
+    const int32_t start_left = g_music_last_pcm_left;
+    const int32_t start_right = g_music_last_pcm_right;
+    size_t produced = 0U;
+    while (produced < total_frames) {
+        const size_t remaining_frames = total_frames - produced;
+        const size_t frames = remaining_frames < AUDIO_STREAM_FRAMES
+            ? remaining_frames : AUDIO_STREAM_FRAMES;
+        for (size_t i = 0; i < frames; ++i) {
+            const uint64_t absolute = static_cast<uint64_t>(produced + i);
+            const uint64_t denominator = total_frames > 1U
+                ? static_cast<uint64_t>(total_frames - 1U) : 1ULL;
+            const uint64_t remaining = absolute < denominator
+                ? denominator - absolute : 0ULL;
+            g_pcm_block[i * 2U] = static_cast<int32_t>(
+                (static_cast<int64_t>(start_left) * static_cast<int64_t>(remaining)) /
+                static_cast<int64_t>(denominator));
+            g_pcm_block[i * 2U + 1U] = static_cast<int32_t>(
+                (static_cast<int64_t>(start_right) * static_cast<int64_t>(remaining)) /
+                static_cast<int64_t>(denominator));
+        }
+        const esp_err_t ret = i2s_output_stream_write_pcm32(
+            g_pcm_block, frames, AUDIO_I2S_WRITE_TIMEOUT_MS);
+        if (ret != ESP_OK) {
+            audio_task_reset_music_last_pcm();
+            return ret;
+        }
+        produced += frames;
+    }
+
+    audio_task_reset_music_last_pcm();
+    AUDIO_POP_TRACE_LOG("PCM_FADE_OUT_DONE duration=%lums frames=%u",
+        static_cast<unsigned long>(AUDIO_PCM_FADE_OUT_MS),
+        static_cast<unsigned>(total_frames));
+    return ESP_OK;
+}
+
 static constexpr uint8_t audio_volume_interp_half_db_steps(
     uint8_t percent,
     uint8_t p0,
@@ -1244,45 +1324,65 @@ static esp_err_t audio_task_unmute_when_pcm_ready()
     return ESP_OK;
 }
 
-static esp_err_t audio_task_shutdown_output_hardware(
+static esp_err_t audio_task_quiesce_output_hardware(
     uint32_t active_rate_hz,
     const char *owner,
     uint32_t mute_settle_ms = AUDIO_PCM_MUTE_SETTLE_MS)
 {
+    if (!g_pipeline_headphone_enabled) {
+        return ESP_OK;
+    }
+
     esp_err_t first_error = ESP_OK;
     const uint32_t settle_rate = active_rate_hz > 0U ? active_rate_hz : 48000U;
 
     AUDIO_POP_TRACE_LOG(
-        "OUTPUT_SHUTDOWN_BEGIN owner=%s rate=%lu hp=%u asp=%u i2s=%u",
+        "OUTPUT_QUIESCE_BEGIN owner=%s rate=%lu fade=%lums settle=%lums",
         owner != nullptr ? owner : "unknown",
         static_cast<unsigned long>(settle_rate),
-        static_cast<unsigned>(g_pipeline_headphone_enabled),
-        static_cast<unsigned>(g_pipeline_asp_enabled),
-        static_cast<unsigned>(g_pipeline_i2s_started));
+        static_cast<unsigned long>(AUDIO_PCM_FADE_OUT_MS),
+        static_cast<unsigned long>(mute_settle_ms));
+
+    // R46.0.111：切歌与关机共用唯一的 anti-pop quiesce。Music 在 DAC mute 前先把
+    // 最后真实样本用 10ms 数字淡出收敛到 0；自然 EOF、Pause、欠载等已经输出过
+    // silence 的路径会提前清掉 valid 标记，因此不会重新“拉回”旧样本。
+    if (owner != nullptr && strcmp(owner, "Music") == 0) {
+        audio_task_remember_first_error(
+            audio_task_fade_music_output_to_zero(settle_rate), &first_error);
+    }
+
+    const esp_err_t mute_ret = cs43131_set_pcm_mute(true);
+    audio_task_remember_first_error(mute_ret, &first_error);
+
+    if (mute_ret == ESP_OK) {
+        const size_t settle_frames = static_cast<size_t>(
+            (static_cast<uint64_t>(settle_rate) * mute_settle_ms + 999ULL) / 1000ULL
+        );
+        if (g_pipeline_i2s_started && i2s_output_is_started()) {
+#if APP_DIAG_AUDIO_POP
+            ESP_LOGI(TAG, "PCM软静音收敛：owner=%s 保持%lums全零PCM，帧=%u",
+                owner != nullptr ? owner : "unknown",
+                static_cast<unsigned long>(mute_settle_ms),
+                static_cast<unsigned>(settle_frames));
+#endif
+            audio_task_remember_first_error(
+                i2s_output_stream_write_silence(settle_frames, AUDIO_I2S_WRITE_TIMEOUT_MS),
+                &first_error);
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(mute_settle_ms));
+        }
+    }
+
+    AUDIO_POP_TRACE_LOG("OUTPUT_QUIESCE_END owner=%s ret=%s",
+        owner != nullptr ? owner : "unknown", esp_err_to_name(first_error));
+    return first_error;
+}
+
+static esp_err_t audio_task_power_down_output_hardware(const char *owner)
+{
+    esp_err_t first_error = ESP_OK;
 
     if (g_pipeline_headphone_enabled) {
-        const esp_err_t mute_ret = cs43131_set_pcm_mute(true);
-        audio_task_remember_first_error(mute_ret, &first_error);
-
-        if (mute_ret == ESP_OK) {
-            const size_t settle_frames = static_cast<size_t>(
-                (static_cast<uint64_t>(settle_rate) * mute_settle_ms + 999ULL) / 1000ULL
-            );
-            if (g_pipeline_i2s_started && i2s_output_is_started()) {
-#if APP_DIAG_AUDIO_POP
-                ESP_LOGI(TAG, "PCM软静音收敛：owner=%s 保持%lums全零PCM，帧=%u",
-                    owner != nullptr ? owner : "unknown",
-                    static_cast<unsigned long>(mute_settle_ms),
-                    static_cast<unsigned>(settle_frames));
-#endif
-                audio_task_remember_first_error(
-                    i2s_output_stream_write_silence(settle_frames, AUDIO_I2S_WRITE_TIMEOUT_MS),
-                    &first_error);
-            } else {
-                vTaskDelay(pdMS_TO_TICKS(mute_settle_ms));
-            }
-        }
-
         audio_task_remember_first_error(cs43131_power_down_headphone_playback(), &first_error);
         g_pipeline_headphone_enabled = false;
         g_pipeline_asp_enabled = false;
@@ -1301,6 +1401,37 @@ static esp_err_t audio_task_shutdown_output_hardware(
 
     g_pcm_unmute_pending = false;
     audio_task_reset_pcm_fade_in();
+    audio_task_reset_music_last_pcm();
+    AUDIO_POP_TRACE_LOG("OUTPUT_POWER_DOWN_END owner=%s ret=%s",
+        owner != nullptr ? owner : "unknown", esp_err_to_name(first_error));
+    return first_error;
+}
+
+static esp_err_t audio_task_shutdown_output_hardware(
+    uint32_t active_rate_hz,
+    const char *owner,
+    uint32_t mute_settle_ms = AUDIO_PCM_MUTE_SETTLE_MS)
+{
+    esp_err_t first_error = ESP_OK;
+    const uint32_t settle_rate = active_rate_hz > 0U ? active_rate_hz : 48000U;
+
+    AUDIO_POP_TRACE_LOG(
+        "OUTPUT_SHUTDOWN_BEGIN owner=%s rate=%lu hp=%u asp=%u i2s=%u",
+        owner != nullptr ? owner : "unknown",
+        static_cast<unsigned long>(settle_rate),
+        static_cast<unsigned>(g_pipeline_headphone_enabled),
+        static_cast<unsigned>(g_pipeline_asp_enabled),
+        static_cast<unsigned>(g_pipeline_i2s_started));
+
+    // 先进入唯一的 anti-pop quiesce，再做硬件释放。切歌和关机都走这里，
+    // 因此淡出 / soft mute / zero-settle 的时序不会再各维护一份。
+    audio_task_remember_first_error(
+        audio_task_quiesce_output_hardware(settle_rate, owner, mute_settle_ms),
+        &first_error);
+    audio_task_remember_first_error(
+        audio_task_power_down_output_hardware(owner),
+        &first_error);
+
     AUDIO_POP_TRACE_LOG("OUTPUT_SHUTDOWN_END owner=%s ret=%s",
         owner != nullptr ? owner : "unknown", esp_err_to_name(first_error));
     return first_error;
@@ -1476,6 +1607,9 @@ static esp_err_t audio_task_start_output_hardware(
 {
     if (sample_rate_hz == 0U || channels == 0U) return ESP_ERR_INVALID_ARG;
     const char *label = owner != nullptr ? owner : "PCM";
+    if (owner != nullptr && strcmp(owner, "Music") == 0) {
+        audio_task_reset_music_last_pcm();
+    }
 
     AUDIO_POP_TRACE_LOG(
         "START_BEGIN format=%s rate=%lu bits=%u channels=%u",
@@ -2017,6 +2151,7 @@ static void audio_task_finish_stream()
             audio_task_set_state(AudioPlaybackState::Error, drain_ret);
             return;
         }
+        audio_task_reset_music_last_pcm();
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 
@@ -2084,6 +2219,7 @@ static void audio_task_service_pcm_playback()
         audio_task_fail_stream(ret, "I2S发送");
         return;
     }
+    audio_task_note_music_pcm(g_pcm_block, frames);
 
     // i2s_output_stream_write_pcm32() 成功表示整块真实 PCM 已复制进 DMA。
     // 启动 prime、暂停保持时钟和 EOF drain 都走 silence API，因此不会污染该计数。
@@ -4553,6 +4689,7 @@ static esp_err_t audio_task_fast_seek_flac(
     if (ret != ESP_OK) {
         return ret;
     }
+    audio_task_reset_music_last_pcm();
     ret = pcm_decoder_seek_frame(&g_decoder, target_frame, nullptr, out_result);
     if (ret != ESP_OK) {
         return ret;
@@ -4847,6 +4984,7 @@ static void audio_task_handle_pause(AudioRequest *request)
         return;
     }
     AUDIO_POP_TRACE_LOG("PAUSE_MUTE_DONE");
+    audio_task_reset_music_last_pcm();
     g_pcm_unmute_pending = false;
     audio_task_reset_pcm_fade_in();
 
