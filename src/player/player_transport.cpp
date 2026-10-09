@@ -610,7 +610,7 @@ bool player_transport_seek_ms(uint64_t target_ms)
         false);
 }
 
-static void player_transport_handle_finished(const AudioStateSnapshot &audio)
+void player_transport_handle_finished_event(const AudioStateSnapshot &audio)
 {
     if (
         audio.playback_revision == 0U ||
@@ -766,25 +766,36 @@ static void player_transport_handle_track_error(const AudioStateSnapshot &audio)
     }
 }
 
-void player_transport_update()
+bool player_transport_update(AudioStateSnapshot *out_finished)
 {
+    if (out_finished != nullptr) {
+        *out_finished = {};
+    }
+
     // Wi-Fi READY 与 AudioTask state_revision 无关；必须每拍先检查一次性 NAS 待播放请求。
     player_transport_update_deferred_nas_play();
 
     AudioStateSnapshot snapshot = {};
     if (!audio_service_get_snapshot(&snapshot) || !snapshot.ready) {
-        return;
+        return false;
     }
 
     if (snapshot.state_revision == g_last_audio_state_revision) {
-        return;
+        return false;
     }
     g_last_audio_state_revision = snapshot.state_revision;
 
     if (snapshot.state == AudioPlaybackState::Finished) {
-        player_transport_handle_finished(snapshot);
-    } else if (snapshot.state == AudioPlaybackState::Error &&
-               snapshot.failure_scope == AudioFailureScope::Track) {
+        if (out_finished != nullptr) {
+            *out_finished = snapshot;
+            return true;
+        }
+        return false;
+    }
+
+    if (snapshot.state == AudioPlaybackState::Error &&
+        snapshot.failure_scope == AudioFailureScope::Track) {
         player_transport_handle_track_error(snapshot);
     }
+    return false;
 }

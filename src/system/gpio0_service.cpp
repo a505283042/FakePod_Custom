@@ -5,6 +5,7 @@
 
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "lvgl.h"
 
 #include "board_pins.h"
 #include "screen_lock_simple.h"
@@ -32,6 +33,21 @@ static bool g_stable_pressed = false;
 static bool g_long_fired     = false;   // 本次按下中是否已达到 LONG_PRESS_MS
 static TickType_t g_raw_changed_tick   = 0;
 static TickType_t g_press_started_tick = 0;
+
+// 实体键由 SystemLoop 轮询。NAS transport 会继续进入 URL/端点/Playlist 调用链，
+// 不应把这条较深调用栈压在 6KB SystemLoop 上。屏幕上的切歌本来就在 LVGL task
+// 执行，因此实体键也只投递一个 LVGL async 动作，和触摸/屏幕按钮共用同一执行上下文。
+static void gpio0_next_track_async(void *)
+{
+    const AppId foreground = app_manager_foreground();
+    if (foreground != AppId::Music && foreground != AppId::Ebook) {
+        ESP_LOGI(TAG, "GPIO0 下一曲异步请求取消：前台=%s", app_manager_name(foreground));
+        return;
+    }
+    if (!player_control_next()) {
+        ESP_LOGW(TAG, "GPIO0 下一曲异步执行失败");
+    }
+}
 
 static bool gpio0_read_pressed()
 {
@@ -119,8 +135,9 @@ void gpio0_service_update()
                     // 切歌仅在音乐或电子书前台时生效，避免在其它 APP 误切歌。
                     const AppId foreground = app_manager_foreground();
                     if (foreground == AppId::Music || foreground == AppId::Ebook) {
-                        ESP_LOGI(TAG, "GPIO0 释放：短按 %lums → 下一曲", (unsigned long)held);
-                        (void)player_control_next();
+                        ESP_LOGI(TAG, "GPIO0 释放：短按 %lums → 下一曲（投递LVGL任务）",
+                            (unsigned long)held);
+                        (void)lv_async_call(gpio0_next_track_async, nullptr);
                     } else {
                         ESP_LOGI(TAG, "GPIO0 释放：短按 %lums → 非音乐/电子书前台，切歌不生效",
                             (unsigned long)held);

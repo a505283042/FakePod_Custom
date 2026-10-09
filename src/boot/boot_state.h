@@ -22,6 +22,7 @@ enum class BootState
     InitSDCard,
     ScanMediaLibrary,
     InitPlayer,
+    InitNasResume,
     InitUI,
     Ready,
     Error

@@ -101,14 +101,15 @@ static void system_ram_low_water_monitor_update()
 
     if (now - g_ram_mon_window_start_tick >= RAM_MON_REPORT_INTERVAL) {
         ESP_LOGI(TAG,
-            "RAM_MON: 60s internal_now=%uB min_60s=%uB below12k_60s=%lu below12k_total=%lu boot_min=%uB largest=%uB dma=%uB",
+            "RAM_MON: 60s internal_now=%uB min_60s=%uB below12k_60s=%lu below12k_total=%lu boot_min=%uB largest=%uB dma=%uB loop_stack_hwm=%uB",
             static_cast<unsigned>(internal_free),
             static_cast<unsigned>(g_ram_mon_min_60s),
             static_cast<unsigned long>(g_ram_mon_below_12k_60s),
             static_cast<unsigned long>(g_ram_mon_below_12k_total),
             static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
-            static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA)));
+            static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA)),
+            static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
 
         g_ram_mon_window_start_tick = now;
         g_ram_mon_min_60s = internal_free;
@@ -624,8 +625,8 @@ void system_loop_update()
     // 开机瞬态启动失败不能永久丢失封面服务；这里只在正常 TF owner 下低频补启动。
     system_artwork_service_health_update();
 
-    // Player transport 只观察 AudioTask POD Snapshot；自然 EOF 的续播决策在 loopTask 执行，
-    // AudioTask 本身不依赖 Player/Catalog，也不会直接选择下一首。
+    // Player transport 在 SystemLoop 只观察 AudioTask POD Snapshot；自然 EOF 仅投递一次事件，
+    // 真正的 Playlist/URL/Audio request 在统一 Player/LVGL 上下文执行。AudioTask 仍不依赖 Player/Catalog。
     player_control_update();
 
     // QMI8658 Motion Controls：Accel+Gyro burst限频100Hz；INT1 ISR只记边沿，播放器动作仍在loopTask串行执行。

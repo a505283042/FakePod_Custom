@@ -487,6 +487,13 @@ bool player_state_select_folder_queue_position(size_t position)
         : player_playlist_select_folder_queue_position(position), "目录播放范围选择");
 }
 
+bool player_state_select_local_folder_queue_position(size_t position)
+{
+    const bool ok = player_playlist_select_folder_queue_position(position);
+    if (ok) g_source = PlayerMediaSource::Local;
+    return player_state_select(ok, "本地目录播放范围选择");
+}
+
 bool player_state_select_all_tracks(size_t position)
 {
     const bool ok = player_playlist_bind_all(position);

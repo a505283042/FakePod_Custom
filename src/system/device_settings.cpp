@@ -14,8 +14,53 @@ static constexpr uint16_t kSchemaVersion = 1U;
 static constexpr const char *kNamespace = "device_cfg";
 
 static DeviceSettingsSnapshot g_settings = {};
-static DeviceMusicListSelection g_music_selection = {};
+static DeviceMusicListSelection g_music_selection[2] = {};
+static DeviceMusicBrowseState g_music_browse_state[2] = {};
 static bool g_wifi_setting_explicit = false;
+
+struct PersistedMusicBrowseV1 {
+    uint8_t version = 1U;
+    uint8_t valid = 0U;
+    uint8_t browse_mode = 0U;
+    uint8_t folder_view = 0U;
+    int32_t top_scroll_y[4] = {};
+    int32_t folder_scroll_y[3] = {};
+};
+
+static size_t music_source_index(DeviceMusicLibrarySource source)
+{
+    return source == DeviceMusicLibrarySource::Nas ? 1U : 0U;
+}
+
+static DeviceMusicListSelection &music_selection_for_source(DeviceMusicLibrarySource source)
+{
+    return g_music_selection[music_source_index(source)];
+}
+
+static DeviceMusicBrowseState &music_browse_for_source(DeviceMusicLibrarySource source)
+{
+    return g_music_browse_state[music_source_index(source)];
+}
+
+static const char *music_scope_key(DeviceMusicLibrarySource source)
+{
+    return source == DeviceMusicLibrarySource::Nas ? "nmscope" : "lmscope";
+}
+
+static const char *music_level1_key(DeviceMusicLibrarySource source)
+{
+    return source == DeviceMusicLibrarySource::Nas ? "nml1" : "lml1";
+}
+
+static const char *music_level2_key(DeviceMusicLibrarySource source)
+{
+    return source == DeviceMusicLibrarySource::Nas ? "nml2" : "lml2";
+}
+
+static const char *music_browse_key(DeviceMusicLibrarySource source)
+{
+    return source == DeviceMusicLibrarySource::Nas ? "nmbrowse" : "lmbrowse";
+}
 
 static DeviceMusicListSelection make_music_selection_defaults()
 {
@@ -98,6 +143,48 @@ static bool nsf_gain_compensation_valid(uint8_t db)
     return db <= 6U;
 }
 
+static bool load_music_selection_from_nvs(
+    nvs_handle_t handle, DeviceMusicLibrarySource source, DeviceMusicListSelection *out_selection)
+{
+    if (out_selection == nullptr) return false;
+    DeviceMusicListSelection loaded = make_music_selection_defaults();
+    uint8_t raw_scope = 0U;
+    if (nvs_get_u8(handle, music_scope_key(source), &raw_scope) != ESP_OK ||
+        !music_list_scope_valid(raw_scope)) {
+        return false;
+    }
+    loaded.scope = static_cast<DeviceMusicListScope>(raw_scope);
+    size_t bytes = sizeof(loaded.level1_path);
+    if (nvs_get_str(handle, music_level1_key(source), loaded.level1_path, &bytes) != ESP_OK) {
+        loaded.level1_path[0] = '\0';
+    }
+    bytes = sizeof(loaded.level2_path);
+    if (nvs_get_str(handle, music_level2_key(source), loaded.level2_path, &bytes) != ESP_OK) {
+        loaded.level2_path[0] = '\0';
+    }
+    *out_selection = loaded;
+    return true;
+}
+
+static void load_music_browse_from_nvs(
+    nvs_handle_t handle, DeviceMusicLibrarySource source, DeviceMusicBrowseState *out_state)
+{
+    if (out_state == nullptr) return;
+    *out_state = {};
+    PersistedMusicBrowseV1 stored = {};
+    size_t bytes = sizeof(stored);
+    if (nvs_get_blob(handle, music_browse_key(source), &stored, &bytes) != ESP_OK ||
+        bytes != sizeof(stored) || stored.version != 1U || stored.valid == 0U ||
+        stored.browse_mode > 3U || stored.folder_view > 3U) {
+        return;
+    }
+    out_state->valid = true;
+    out_state->browse_mode = stored.browse_mode;
+    out_state->folder_view = stored.folder_view;
+    memcpy(out_state->top_scroll_y, stored.top_scroll_y, sizeof(out_state->top_scroll_y));
+    memcpy(out_state->folder_scroll_y, stored.folder_scroll_y, sizeof(out_state->folder_scroll_y));
+}
+
 static esp_err_t open_rw(nvs_handle_t *out_handle)
 {
     if (out_handle == nullptr || !g_settings.ready) return ESP_ERR_INVALID_STATE;
@@ -141,7 +228,10 @@ esp_err_t device_settings_init()
 {
     if (g_settings.ready) return ESP_OK;
     g_settings = make_defaults();
-    g_music_selection = make_music_selection_defaults();
+    g_music_selection[0] = make_music_selection_defaults();
+    g_music_selection[1] = make_music_selection_defaults();
+    g_music_browse_state[0] = {};
+    g_music_browse_state[1] = {};
     g_wifi_setting_explicit = false;
 
     nvs_handle_t handle = 0;
@@ -200,22 +290,45 @@ esp_err_t device_settings_init()
     if (nvs_get_u8(handle, "anim", &u8) == ESP_OK && animation_mode_valid(u8)) {
         g_settings.animation_mode = static_cast<DeviceAnimationMode>(u8);
     }
-    if (nvs_get_u8(handle, "muscope", &u8) == ESP_OK && music_list_scope_valid(u8)) {
-        g_settings.music_list_scope = static_cast<DeviceMusicListScope>(u8);
-        g_music_selection.scope = g_settings.music_list_scope;
-    }
     if (nvs_get_u8(handle, "musrc", &u8) == ESP_OK && music_library_source_valid(u8)) {
         g_settings.music_library_source = static_cast<DeviceMusicLibrarySource>(u8);
     }
 
-    size_t path_bytes = sizeof(g_music_selection.level1_path);
-    if (nvs_get_str(handle, "mul1", g_music_selection.level1_path, &path_bytes) != ESP_OK) {
-        g_music_selection.level1_path[0] = '\0';
+    // R46.0.107：旧版只有一套 muscope/mul1/mul2。迁移时只归属到当时保存的 musrc，
+    // 另一来源从总列表开始，避免再次把 Local/NAS 目录互相污染。
+    DeviceMusicListSelection legacy_selection = make_music_selection_defaults();
+    bool legacy_selection_present = false;
+    if (nvs_get_u8(handle, "muscope", &u8) == ESP_OK && music_list_scope_valid(u8)) {
+        legacy_selection.scope = static_cast<DeviceMusicListScope>(u8);
+        legacy_selection_present = true;
     }
-    path_bytes = sizeof(g_music_selection.level2_path);
-    if (nvs_get_str(handle, "mul2", g_music_selection.level2_path, &path_bytes) != ESP_OK) {
-        g_music_selection.level2_path[0] = '\0';
+    size_t path_bytes = sizeof(legacy_selection.level1_path);
+    if (nvs_get_str(handle, "mul1", legacy_selection.level1_path, &path_bytes) == ESP_OK) {
+        legacy_selection_present = true;
+    } else {
+        legacy_selection.level1_path[0] = '\0';
     }
+    path_bytes = sizeof(legacy_selection.level2_path);
+    if (nvs_get_str(handle, "mul2", legacy_selection.level2_path, &path_bytes) == ESP_OK) {
+        legacy_selection_present = true;
+    } else {
+        legacy_selection.level2_path[0] = '\0';
+    }
+
+    bool local_selection_v2 = load_music_selection_from_nvs(
+        handle, DeviceMusicLibrarySource::Local, &g_music_selection[0]);
+    bool nas_selection_v2 = load_music_selection_from_nvs(
+        handle, DeviceMusicLibrarySource::Nas, &g_music_selection[1]);
+    if (legacy_selection_present) {
+        if (g_settings.music_library_source == DeviceMusicLibrarySource::Nas && !nas_selection_v2) {
+            g_music_selection[1] = legacy_selection;
+        } else if (g_settings.music_library_source == DeviceMusicLibrarySource::Local && !local_selection_v2) {
+            g_music_selection[0] = legacy_selection;
+        }
+    }
+    load_music_browse_from_nvs(handle, DeviceMusicLibrarySource::Local, &g_music_browse_state[0]);
+    load_music_browse_from_nvs(handle, DeviceMusicLibrarySource::Nas, &g_music_browse_state[1]);
+    g_settings.music_list_scope = music_selection_for_source(g_settings.music_library_source).scope;
     if (nvs_get_u8(handle, "castint", &u8) == ESP_OK && u8 <= 1U) {
         g_settings.cassette_dynamic_tint_enabled = u8 != 0U;
     }
@@ -242,7 +355,7 @@ esp_err_t device_settings_init()
         ESP_LOGW(TAG, "无线设置冲突：BLE/Wi-Fi同时为开，运行期收敛为Wi-Fi=开 BLE=关");
     }
 
-    ESP_LOGI(TAG, "Settings V1加载完成：USB=%s BLE=%s WiFi=%s audio=%s bright=%u aux=%s library=%s cassette=%s motion=%s nsfgain=+%udB",
+    ESP_LOGI(TAG, "Settings V1加载完成：USB=%s BLE=%s WiFi=%s audio=%s bright=%u aux=%s library=%s local_scope=%s nas_scope=%s cassette=%s motion=%s nsfgain=+%udB",
         device_settings_usb_mode_name(g_settings.usb_mode),
         g_settings.ble_enabled ? "开" : "关",
         g_settings.wifi_enabled ? "开" : "关",
@@ -250,6 +363,8 @@ esp_err_t device_settings_init()
         static_cast<unsigned>(g_settings.brightness_level),
         device_settings_aux_key_mode_name(g_settings.aux_key_mode),
         device_settings_music_library_source_name(g_settings.music_library_source),
+        device_settings_music_list_scope_name(g_music_selection[0].scope),
+        device_settings_music_list_scope_name(g_music_selection[1].scope),
         g_settings.cassette_dynamic_tint_enabled ? "封面变色" : "原装粉色",
         g_settings.motion_controls_enabled ? "开" : "关",
         static_cast<unsigned>(g_settings.nsf_gain_compensation_db));
@@ -395,12 +510,72 @@ esp_err_t device_settings_set_animation_mode(DeviceAnimationMode mode)
     return ret;
 }
 
+bool device_settings_get_music_list_selection_for_source(
+    DeviceMusicLibrarySource source,
+    DeviceMusicListSelection *out_selection)
+{
+    if (out_selection == nullptr || !g_settings.ready ||
+        !music_library_source_valid(static_cast<uint8_t>(source))) {
+        return false;
+    }
+    *out_selection = music_selection_for_source(source);
+    return true;
+}
+
 bool device_settings_get_music_list_selection(DeviceMusicListSelection *out_selection)
 {
-    if (out_selection == nullptr || !g_settings.ready) return false;
-    *out_selection = g_music_selection;
-    out_selection->scope = g_settings.music_list_scope;
-    return true;
+    return device_settings_get_music_list_selection_for_source(
+        g_settings.music_library_source, out_selection);
+}
+
+esp_err_t device_settings_set_music_list_selection_for_source(
+    DeviceMusicLibrarySource source,
+    DeviceMusicListScope scope,
+    const char *level1_path,
+    const char *level2_path)
+{
+    if (!music_library_source_valid(static_cast<uint8_t>(source)) ||
+        !music_list_scope_valid(static_cast<uint8_t>(scope))) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (level1_path == nullptr) level1_path = "";
+    if (level2_path == nullptr) level2_path = "";
+    DeviceMusicListSelection &selection = music_selection_for_source(source);
+    if (strlen(level1_path) >= sizeof(selection.level1_path) ||
+        strlen(level2_path) >= sizeof(selection.level2_path)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    const DeviceMusicListSelection old_selection = selection;
+    const DeviceMusicListScope old_active_scope = g_settings.music_list_scope;
+    selection.scope = scope;
+    snprintf(selection.level1_path, sizeof(selection.level1_path), "%s", level1_path);
+    snprintf(selection.level2_path, sizeof(selection.level2_path), "%s", level2_path);
+    if (source == g_settings.music_library_source) {
+        g_settings.music_list_scope = scope;
+    }
+
+    nvs_handle_t handle = 0;
+    esp_err_t ret = open_rw(&handle);
+    if (ret == ESP_OK) ret = nvs_set_u16(handle, "schema", kSchemaVersion);
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, music_scope_key(source), static_cast<uint8_t>(scope));
+    if (ret == ESP_OK) ret = nvs_set_str(handle, music_level1_key(source), selection.level1_path);
+    if (ret == ESP_OK) ret = nvs_set_str(handle, music_level2_key(source), selection.level2_path);
+    // 当前来源继续镜像旧 key，兼容已有诊断/降级固件；真正恢复始终优先新来源专属 key。
+    if (ret == ESP_OK && source == g_settings.music_library_source) {
+        ret = nvs_set_u8(handle, "muscope", static_cast<uint8_t>(scope));
+        if (ret == ESP_OK) ret = nvs_set_str(handle, "mul1", selection.level1_path);
+        if (ret == ESP_OK) ret = nvs_set_str(handle, "mul2", selection.level2_path);
+    }
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    if (handle != 0) nvs_close(handle);
+
+    if (ret != ESP_OK) {
+        selection = old_selection;
+        g_settings.music_list_scope = old_active_scope;
+        log_commit_failure(source == DeviceMusicLibrarySource::Nas ? "nas_music_list" : "local_music_list", ret);
+    }
+    return ret;
 }
 
 esp_err_t device_settings_set_music_list_selection(
@@ -408,53 +583,95 @@ esp_err_t device_settings_set_music_list_selection(
     const char *level1_path,
     const char *level2_path)
 {
-    if (!music_list_scope_valid(static_cast<uint8_t>(scope))) return ESP_ERR_INVALID_ARG;
-    if (level1_path == nullptr) level1_path = "";
-    if (level2_path == nullptr) level2_path = "";
-    if (strlen(level1_path) >= sizeof(g_music_selection.level1_path) ||
-        strlen(level2_path) >= sizeof(g_music_selection.level2_path)) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    const DeviceSettingsSnapshot old_settings = g_settings;
-    const DeviceMusicListSelection old_selection = g_music_selection;
-    g_settings.music_list_scope = scope;
-    g_music_selection.scope = scope;
-    snprintf(g_music_selection.level1_path, sizeof(g_music_selection.level1_path), "%s", level1_path);
-    snprintf(g_music_selection.level2_path, sizeof(g_music_selection.level2_path), "%s", level2_path);
-
-    nvs_handle_t handle = 0;
-    esp_err_t ret = open_rw(&handle);
-    if (ret == ESP_OK) ret = nvs_set_u16(handle, "schema", kSchemaVersion);
-    if (ret == ESP_OK) ret = nvs_set_u8(handle, "muscope", static_cast<uint8_t>(scope));
-    if (ret == ESP_OK) ret = nvs_set_str(handle, "mul1", g_music_selection.level1_path);
-    if (ret == ESP_OK) ret = nvs_set_str(handle, "mul2", g_music_selection.level2_path);
-    if (ret == ESP_OK) ret = nvs_commit(handle);
-    if (handle != 0) nvs_close(handle);
-
-    if (ret != ESP_OK) {
-        g_settings = old_settings;
-        g_music_selection = old_selection;
-        log_commit_failure("music_list", ret);
-    }
-    return ret;
+    return device_settings_set_music_list_selection_for_source(
+        g_settings.music_library_source, scope, level1_path, level2_path);
 }
 
 esp_err_t device_settings_set_music_list_scope(DeviceMusicListScope scope)
 {
+    const DeviceMusicListSelection &selection = music_selection_for_source(
+        g_settings.music_library_source);
     return device_settings_set_music_list_selection(
-        scope,
-        g_music_selection.level1_path,
-        g_music_selection.level2_path);
+        scope, selection.level1_path, selection.level2_path);
+}
+
+bool device_settings_get_music_browse_state(
+    DeviceMusicLibrarySource source,
+    DeviceMusicBrowseState *out_state)
+{
+    if (out_state == nullptr || !g_settings.ready ||
+        !music_library_source_valid(static_cast<uint8_t>(source))) {
+        return false;
+    }
+    *out_state = music_browse_for_source(source);
+    return out_state->valid;
+}
+
+esp_err_t device_settings_set_music_browse_state(
+    DeviceMusicLibrarySource source,
+    const DeviceMusicBrowseState &state)
+{
+    if (!music_library_source_valid(static_cast<uint8_t>(source)) ||
+        state.browse_mode > 3U || state.folder_view > 3U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    PersistedMusicBrowseV1 stored = {};
+    stored.version = 1U;
+    stored.valid = state.valid ? 1U : 0U;
+    stored.browse_mode = state.browse_mode;
+    stored.folder_view = state.folder_view;
+    memcpy(stored.top_scroll_y, state.top_scroll_y, sizeof(stored.top_scroll_y));
+    memcpy(stored.folder_scroll_y, state.folder_scroll_y, sizeof(stored.folder_scroll_y));
+
+    const DeviceMusicBrowseState old = music_browse_for_source(source);
+    music_browse_for_source(source) = state;
+    nvs_handle_t handle = 0;
+    esp_err_t ret = open_rw(&handle);
+    if (ret == ESP_OK) ret = nvs_set_u16(handle, "schema", kSchemaVersion);
+    if (ret == ESP_OK) ret = nvs_set_blob(handle, music_browse_key(source), &stored, sizeof(stored));
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    if (handle != 0) nvs_close(handle);
+    if (ret != ESP_OK) {
+        music_browse_for_source(source) = old;
+        log_commit_failure(source == DeviceMusicLibrarySource::Nas ? "nas_browse" : "local_browse", ret);
+    }
+    return ret;
 }
 
 esp_err_t device_settings_set_music_library_source(DeviceMusicLibrarySource source)
 {
     if (!music_library_source_valid(static_cast<uint8_t>(source))) return ESP_ERR_INVALID_ARG;
     const DeviceMusicLibrarySource old = g_settings.music_library_source;
+    const DeviceMusicListScope old_scope = g_settings.music_list_scope;
+    const DeviceMusicListSelection old_source_selection = music_selection_for_source(old);
+    const DeviceMusicListSelection &selection = music_selection_for_source(source);
     g_settings.music_library_source = source;
-    const esp_err_t ret = commit_u8("musrc", static_cast<uint8_t>(source));
-    if (ret != ESP_OK) g_settings.music_library_source = old;
+    g_settings.music_list_scope = selection.scope;
+
+    // 来源切换与目标来源自己的 scope/path 同事务落盘。否则首次迁移后只改 musrc，
+    // 下次启动会把旧全局 muscope 错认成新来源的上下文。
+    nvs_handle_t handle = 0;
+    esp_err_t ret = open_rw(&handle);
+    if (ret == ESP_OK) ret = nvs_set_u16(handle, "schema", kSchemaVersion);
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, "musrc", static_cast<uint8_t>(source));
+    // 先把旧来源也固化为来源专属 key，完成旧全局 muscope/mul1/mul2 的惰性迁移。
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, music_scope_key(old), static_cast<uint8_t>(old_source_selection.scope));
+    if (ret == ESP_OK) ret = nvs_set_str(handle, music_level1_key(old), old_source_selection.level1_path);
+    if (ret == ESP_OK) ret = nvs_set_str(handle, music_level2_key(old), old_source_selection.level2_path);
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, music_scope_key(source), static_cast<uint8_t>(selection.scope));
+    if (ret == ESP_OK) ret = nvs_set_str(handle, music_level1_key(source), selection.level1_path);
+    if (ret == ESP_OK) ret = nvs_set_str(handle, music_level2_key(source), selection.level2_path);
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, "muscope", static_cast<uint8_t>(selection.scope));
+    if (ret == ESP_OK) ret = nvs_set_str(handle, "mul1", selection.level1_path);
+    if (ret == ESP_OK) ret = nvs_set_str(handle, "mul2", selection.level2_path);
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    if (handle != 0) nvs_close(handle);
+
+    if (ret != ESP_OK) {
+        g_settings.music_library_source = old;
+        g_settings.music_list_scope = old_scope;
+    }
     log_commit_failure("musrc", ret);
     return ret;
 }
@@ -541,7 +758,10 @@ esp_err_t device_settings_reset_defaults()
     nvs_close(handle);
     if (ret == ESP_OK) {
         g_settings = make_defaults();
-        g_music_selection = make_music_selection_defaults();
+        g_music_selection[0] = make_music_selection_defaults();
+        g_music_selection[1] = make_music_selection_defaults();
+        g_music_browse_state[0] = {};
+        g_music_browse_state[1] = {};
         g_wifi_setting_explicit = true;
         g_settings.ready = true;
         g_settings.loaded_from_nvs = true;

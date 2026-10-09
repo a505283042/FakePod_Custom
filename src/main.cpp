@@ -1,8 +1,33 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "esp_log.h"
+
 #include "boot_state.h"
 #include "system_loop.h"
+
+namespace
+{
+static const char *TAG = "系统主循环";
+static constexpr uint32_t kRuntimeTaskStackBytes = 6144U;
+static constexpr UBaseType_t kRuntimeTaskPriority = 1U;
+static constexpr BaseType_t kRuntimeTaskCore = 0;
+
+static void runtime_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "运行期任务接管：stack=%uB priority=%u core=%d hwm=%uB",
+        static_cast<unsigned>(kRuntimeTaskStackBytes),
+        static_cast<unsigned>(kRuntimeTaskPriority),
+        static_cast<int>(kRuntimeTaskCore),
+        static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+
+    while (true) {
+        system_loop_update();
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+} // namespace
 
 extern "C" void app_main(void)
 {
@@ -34,7 +59,23 @@ extern "C" void app_main(void)
         }
     }
 
-    // NORMAL / DEGRADED 都共享同一运行期入口；后台服务仍由 READY 闸门统一启动。
+    // NORMAL / DEGRADED 的运行期从 IDF main task 迁到显式 6KB Core0/P1 任务。
+    // 这不是新增一条并行业务线：创建成功后 app_main 立即返回，IDF 会释放原 main task。
+    // 目的仅是给已经实测发生过 stack overflow 的运行期调用链留下可测量余量。
+    const BaseType_t created = xTaskCreatePinnedToCore(
+        runtime_task,
+        "SystemLoop",
+        kRuntimeTaskStackBytes,
+        nullptr,
+        kRuntimeTaskPriority,
+        nullptr,
+        kRuntimeTaskCore);
+    if (created == pdPASS) {
+        return;
+    }
+
+    // 极端内存不足时保留旧 main task 运行路径，避免因诊断修复本身导致无法进入 READY。
+    ESP_LOGE(TAG, "运行期任务创建失败，回退IDF main task");
     while (true) {
         system_loop_update();
         vTaskDelay(pdMS_TO_TICKS(10));

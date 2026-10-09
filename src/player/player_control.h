@@ -57,6 +57,7 @@ bool player_control_seek_ms(uint64_t target_ms);
 // 这里只切 Player Context，不先单独 Stop；后续 Play 由 AudioTask 串行关闭旧 pipeline。
 bool player_control_select_all_tracks(size_t position);
 bool player_control_select_folder_queue_position(size_t position);
+bool player_control_select_local_folder_queue_position(size_t position);
 bool player_control_select_artist_group(size_t group_index, size_t position);
 bool player_control_select_album_group(size_t group_index, size_t position);
 bool player_control_select_decade_group(size_t group_index, size_t position);

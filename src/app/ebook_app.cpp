@@ -767,6 +767,14 @@ static uint32_t ebook_page_index_layout_signature(ReaderViewMode mode)
 
 static void ebook_restore_page_index_cache(ReaderViewMode mode)
 {
+    // PageIndex cache 会同步进入 stdio/FAT/SDMMC；只允许 Ebook 真正处于前台时执行。
+    // Music/NAS 前台若残留任何旧 Reader 状态，也不得把同步 SD 调用压到运行期 SystemLoop 栈上。
+    const AppId foreground = app_manager_foreground();
+    if (foreground != AppId::Ebook) {
+        ESP_LOGW(TAG, "Reader页索引缓存恢复已阻止：foreground=%u",
+            static_cast<unsigned>(foreground));
+        return;
+    }
     if (g_book_path == nullptr || g_book_path[0] == '\0' || g_book_size == 0) return;
     ReaderPageIndex *index = ebook_page_index_for_mode(mode);
     if (index->count != 0 || index->starts != nullptr) return;

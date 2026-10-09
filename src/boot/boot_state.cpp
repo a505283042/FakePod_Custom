@@ -1,5 +1,9 @@
 #include "boot_state.h"
 
+#include <atomic>
+#include <stdio.h>
+#include <string.h>
+
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_psram.h"
@@ -25,6 +29,8 @@
 #include "usb_storage_service.h"
 #include "power_service.h"
 #include "gpio0_service.h"
+#include "nas_catalog_service.h"
+#include "nas_library_source.h"
 
 
 static const char *TAG =
@@ -66,6 +72,104 @@ static uint32_t g_optional_issues = 0U;
 static BootIssue g_fatal_issue = BootIssue::None;
 static esp_err_t g_fatal_error = ESP_OK;
 static bool g_usb_storage_requested = false;
+
+// NAS Resume V2：启动恢复比普通 Catalog Worker 多一层 Resume/Context 调用；4096B 已实测溢出，
+// 因此使用 6144B/Core1/P1 一次性临时 Worker。完整业务 UI 尚未创建；Worker 只向
+// Bootstrap UI 发布原子阶段，不直接调用任何 lv_* API，结束后任务栈立即释放。
+static constexpr uint32_t BOOT_NAS_RESUME_STACK_BYTES = 6144U;
+static constexpr UBaseType_t BOOT_NAS_RESUME_PRIORITY = 1U;
+static constexpr BaseType_t BOOT_NAS_RESUME_CORE = 1;
+static std::atomic<bool> g_nas_resume_worker_done{false};
+static bool g_nas_resume_worker_started = false;
+static esp_err_t g_nas_resume_worker_result = ESP_OK;
+static uint32_t g_nas_resume_worker_hwm = 0U;
+
+static PlayerFolderScope boot_folder_scope_from_setting(DeviceMusicListScope scope)
+{
+    switch (scope) {
+        case DeviceMusicListScope::Level1: return PlayerFolderScope::Level1;
+        case DeviceMusicListScope::Level2: return PlayerFolderScope::Level2;
+        case DeviceMusicListScope::All:
+        default: return PlayerFolderScope::All;
+    }
+}
+
+static void boot_apply_nas_browse_context(DeviceMusicListSelection *selection)
+{
+    if (selection == nullptr || !nas_library_source_ready()) return;
+    bool repaired = false;
+    if (selection->level1_path[0] != '\0' &&
+        !nas_library_source_set_folder_selection(
+            PlayerFolderScope::Level1, selection->level1_path)) {
+        selection->level1_path[0] = '\0';
+        repaired = true;
+    }
+    if (selection->level2_path[0] != '\0' &&
+        !nas_library_source_set_folder_selection(
+            PlayerFolderScope::Level2, selection->level2_path)) {
+        selection->level2_path[0] = '\0';
+        repaired = true;
+    }
+
+    PlayerFolderScope scope = boot_folder_scope_from_setting(selection->scope);
+    if (!nas_library_source_set_folder_scope(scope)) {
+        scope = PlayerFolderScope::All;
+        selection->scope = DeviceMusicListScope::All;
+        (void)nas_library_source_set_folder_scope(scope);
+        repaired = true;
+    }
+
+    char level1[DEVICE_MUSIC_FOLDER_PATH_MAX] = {};
+    char level2[DEVICE_MUSIC_FOLDER_PATH_MAX] = {};
+    (void)nas_library_source_copy_folder_selection(
+        PlayerFolderScope::Level1, level1, sizeof(level1));
+    (void)nas_library_source_copy_folder_selection(
+        PlayerFolderScope::Level2, level2, sizeof(level2));
+    if (strcmp(level1, selection->level1_path) != 0 ||
+        strcmp(level2, selection->level2_path) != 0) {
+        repaired = true;
+    }
+    snprintf(selection->level1_path, sizeof(selection->level1_path), "%s", level1);
+    snprintf(selection->level2_path, sizeof(selection->level2_path), "%s", level2);
+
+    if (repaired) {
+        const esp_err_t ret = device_settings_set_music_list_selection_for_source(
+            DeviceMusicLibrarySource::Nas, selection->scope,
+            selection->level1_path, selection->level2_path);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "启动修复NAS浏览上下文失败：%s", esp_err_to_name(ret));
+        }
+    }
+}
+
+static void boot_nas_resume_worker(void *)
+{
+    (void)ui_manager_show_nas_restore_progress(UiNasRestoreStage::LoadingCache, 0U);
+    esp_err_t result = nas_catalog_service_init();
+    if (result == ESP_OK) {
+        NasCatalogSnapshot snapshot = {};
+        if (!nas_catalog_service_get_snapshot(&snapshot) || !snapshot.cached || snapshot.track_count == 0U) {
+            result = ESP_ERR_NOT_FOUND;
+        } else {
+            (void)ui_manager_show_nas_restore_progress(
+                UiNasRestoreStage::BuildingCatalog, snapshot.track_count);
+            DeviceMusicListSelection nas_selection = {};
+            (void)device_settings_get_music_list_selection_for_source(
+                DeviceMusicLibrarySource::Nas, &nas_selection);
+            result = nas_library_source_open(
+                boot_folder_scope_from_setting(nas_selection.scope), nullptr, nullptr);
+            if (result == ESP_OK) {
+                boot_apply_nas_browse_context(&nas_selection);
+                (void)ui_manager_show_nas_restore_progress(
+                    UiNasRestoreStage::RestoringTrack, snapshot.track_count);
+            }
+        }
+    }
+    g_nas_resume_worker_result = result;
+    g_nas_resume_worker_hwm = static_cast<uint32_t>(uxTaskGetStackHighWaterMark(nullptr));
+    g_nas_resume_worker_done.store(true, std::memory_order_release);
+    vTaskDeleteWithCaps(xTaskGetCurrentTaskHandle());
+}
 
 static uint32_t boot_issue_mask(BootIssue issue)
 {
@@ -163,6 +267,10 @@ void boot_state_init()
     g_fatal_issue = BootIssue::None;
     g_fatal_error = ESP_OK;
     g_usb_storage_requested = false;
+    g_nas_resume_worker_started = false;
+    g_nas_resume_worker_done.store(false, std::memory_order_relaxed);
+    g_nas_resume_worker_result = ESP_OK;
+    g_nas_resume_worker_hwm = 0U;
 
 
     ESP_LOGI(
@@ -569,14 +677,75 @@ static void boot_state_update()
                 );
             }
 
-            if (control_ret == ESP_OK &&
-                !boot_issue_recorded(BootIssue::PersistenceUnavailable) &&
-                !persistent_state_restore_player()) {
-                ESP_LOGW(TAG, "NVS Player 恢复未完全命中，已保留可用默认/降级选择");
+            if (control_ret == ESP_OK && !boot_issue_recorded(BootIssue::PersistenceUnavailable)) {
+                if (persistent_state_resume_requires_nas()) {
+                    g_state = BootState::InitNasResume;
+                    break;
+                }
+                if (!persistent_state_restore_player()) {
+                    ESP_LOGW(TAG, "NVS Player 恢复未完全命中，已保留可用默认/降级选择");
+                }
             }
 
             g_state = BootState::InitUI;
 
+            break;
+        }
+
+        // ====================================================
+        // NAS Playback Resume V2（只读 TF 缓存，不依赖 Wi-Fi）
+        // ====================================================
+
+        case BootState::InitNasResume:
+        {
+            if (!g_nas_resume_worker_started) {
+                g_nas_resume_worker_started = true;
+                (void)ui_manager_show_nas_restore_progress(UiNasRestoreStage::LoadingCache, 0U);
+                TaskHandle_t task = nullptr;
+                const BaseType_t created = xTaskCreatePinnedToCoreWithCaps(
+                    boot_nas_resume_worker,
+                    "NasResume",
+                    BOOT_NAS_RESUME_STACK_BYTES,
+                    nullptr,
+                    BOOT_NAS_RESUME_PRIORITY,
+                    &task,
+                    BOOT_NAS_RESUME_CORE,
+                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                if (created != pdPASS) {
+                    g_nas_resume_worker_result = ESP_ERR_NO_MEM;
+                    g_nas_resume_worker_done.store(true, std::memory_order_release);
+                } else {
+                    ESP_LOGI(TAG,
+                        "NAS启动歌曲恢复：从TF缓存加载Catalog，worker_stack=%uB priority=%u core=%d",
+                        static_cast<unsigned>(BOOT_NAS_RESUME_STACK_BYTES),
+                        static_cast<unsigned>(BOOT_NAS_RESUME_PRIORITY),
+                        static_cast<int>(BOOT_NAS_RESUME_CORE));
+                }
+                break;
+            }
+
+            if (!g_nas_resume_worker_done.load(std::memory_order_acquire)) {
+                break;
+            }
+
+            if (g_nas_resume_worker_result != ESP_OK) {
+                (void)ui_manager_show_nas_restore_progress(UiNasRestoreStage::Failed, 0U);
+                ESP_LOGW(TAG,
+                    "NAS启动歌曲Catalog加载失败：%s；保留当前默认选择，不跨源伪造恢复",
+                    esp_err_to_name(g_nas_resume_worker_result));
+            } else {
+                ESP_LOGI(TAG,
+                    "NAS启动歌曲Catalog已就绪：tracks=%lu stack_hwm=%luB",
+                    static_cast<unsigned long>(nas_library_source_track_count()),
+                    static_cast<unsigned long>(g_nas_resume_worker_hwm));
+            }
+
+            if (!boot_issue_recorded(BootIssue::PersistenceUnavailable) &&
+                !persistent_state_restore_player()) {
+                ESP_LOGW(TAG, "NAS Player 恢复未完全命中，已保留可用默认/降级选择");
+            }
+
+            g_state = BootState::InitUI;
             break;
         }
 

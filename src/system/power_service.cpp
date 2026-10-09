@@ -5,6 +5,7 @@
 
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "lvgl.h"
 
 #include "board_pins.h"
 #include "persistent_state.h"
@@ -35,6 +36,20 @@ static bool g_stable_pressed = false;
 static bool g_save_attempted_this_press = false;
 static TickType_t g_raw_changed_tick = 0;
 static TickType_t g_press_started_tick = 0;
+
+// 与 GPIO0 下一曲一致：实体电源键由 SystemLoop 轮询，只负责投递媒体动作。
+// 真正的 Playlist/NAS transport 放到 6KB LVGL task 执行，避免上一曲路径继续压 SystemLoop 栈。
+static void power_previous_track_async(void *)
+{
+    const AppId foreground = app_manager_foreground();
+    if (foreground != AppId::Music && foreground != AppId::Ebook) {
+        ESP_LOGI(TAG, "电源键上一曲异步请求取消：前台=%s", app_manager_name(foreground));
+        return;
+    }
+    if (!player_control_previous()) {
+        ESP_LOGW(TAG, "电源键上一曲异步执行失败");
+    }
+}
 
 static bool power_service_read_pressed()
 {
@@ -130,9 +145,9 @@ void power_service_update()
                         // 切歌仅在音乐或电子书前台时生效，避免在其它 APP 误切歌。
                         const AppId foreground = app_manager_foreground();
                         if (foreground == AppId::Music || foreground == AppId::Ebook) {
-                            ESP_LOGI(TAG, "电源键短按释放：hold=%lums → 上一曲",
+                            ESP_LOGI(TAG, "电源键短按释放：hold=%lums → 上一曲（投递LVGL任务）",
                                 (unsigned long)held_ms);
-                            (void)player_control_previous();
+                            (void)lv_async_call(power_previous_track_async, nullptr);
                         } else {
                             ESP_LOGI(TAG, "电源键短按释放：hold=%lums → 非音乐/电子书前台，切歌不生效",
                                 (unsigned long)held_ms);

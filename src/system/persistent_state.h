@@ -4,7 +4,7 @@
 
 #include "esp_err.h"
 
-// NVS V1 只保存稳定身份：音量、播放模式、当前歌曲路径与播放列表身份。
+// NVS Playback Resume V2 保存稳定来源 + 稳定歌曲路径；旧 V1 没有 source key 时按 LOCAL 迁移。
 // 不保存播放进度、亮度、播放/暂停状态，也不保存任何运行时 index/generation。
 
 enum PersistentDirtyBits : uint32_t
@@ -33,6 +33,10 @@ bool persistent_state_restore_audio();
 // Catalog/Player 建立后恢复播放模式、歌曲与稳定 Playlist Context。
 // 只恢复选择状态，不自动播放；歌曲始终从 00:00 开始。
 bool persistent_state_restore_player();
+
+// Boot 在建立 Player 后查询：上次加载歌曲若来自 NAS，则需要先从 TF 缓存打开 NAS Catalog，
+// 再调用 persistent_state_restore_player()；该判断不依赖 Wi-Fi。
+bool persistent_state_resume_requires_nas();
 
 // READY 后观察当前运行态，只更新 RAM 快照并标 dirty；绝不调用 nvs_set/nvs_commit。
 void persistent_state_observe_runtime();

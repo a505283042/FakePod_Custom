@@ -57,6 +57,8 @@ bool player_state_copy_folder_selection(
 bool player_state_get_folder_queue_snapshot(PlayerFolderQueueSnapshot *out_snapshot);
 bool player_state_get_folder_queue_track_index_at_position(size_t position, size_t *out_track_index);
 bool player_state_select_folder_queue_position(size_t position);
+// 浏览源与当前播放源可能不同；Local 曲库点选目录歌曲必须显式绑定 Local。
+bool player_state_select_local_folder_queue_position(size_t position);
 
 // 切换播放上下文。position 是目标列表内的位置，不是全局 Track index。
 bool player_state_select_all_tracks(size_t position);

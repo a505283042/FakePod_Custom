@@ -625,6 +625,11 @@ static void sync_worker(void *arg)
 
 esp_err_t nas_catalog_service_init()
 {
+    NasCatalogSnapshot existing = {};
+    if (nas_catalog_service_get_snapshot(&existing) && existing.ready) {
+        return ESP_OK;
+    }
+
     char *text = static_cast<char *>(heap_caps_malloc(kMetaBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (text == nullptr) return ESP_ERR_NO_MEM;
 

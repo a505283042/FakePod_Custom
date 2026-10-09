@@ -2,6 +2,8 @@
 
 #include <stdint.h>
 
+#include "audio_types.h"
+
 // 播放模式。顺序/列表循环/单曲循环沿用既有 EOF 语义；随机模式同时接管
 // 自然 EOF 与手动下一曲，并在当前 Playlist Context 内随机选择。
 enum class PlayerLoopMode : uint8_t
@@ -12,8 +14,13 @@ enum class PlayerLoopMode : uint8_t
     Shuffle = 3,      // 随机播放：当前列表内随机，避免立即重复当前首
 };
 
-// 高频轻量更新：观察 AudioTask Snapshot 的 Finished 边沿并执行自动续播。
-void player_transport_update();
+// 高频轻量更新：观察 AudioTask Snapshot 的状态边沿。Finished 只复制为 POD 快照返回，
+// 不在 SystemLoop 调用栈中执行 Playlist/URL/Audio request；Track Error 仍保持原同步策略。
+bool player_transport_update(AudioStateSnapshot *out_finished);
+
+// 执行已经确认的自然 EOF 续播。调用方必须在统一 Player/LVGL 执行上下文并持有
+// Player transport 串行锁；函数内部仍会再次核对 source/track，旧 EOF 不会推进新列表。
+void player_transport_handle_finished_event(const AudioStateSnapshot &audio);
 
 // 当前选中歌曲的显式播放入口。不会先单独 Stop；新的 Play 命令由 AudioTask
 // 串行收回旧 pipeline，避免“Stop + Play 又二次 shutdown”。

@@ -73,6 +73,16 @@ static std::atomic<uint32_t> g_boot_library_update_added_count{0U};
 static std::atomic<uint32_t> g_boot_library_update_generation{0U};
 static uint32_t g_boot_library_update_applied_generation = 0U;
 static std::atomic<bool> g_boot_library_update_active{false};
+
+// NAS Resume V2 的 Catalog 仍由 Core1/P1 Worker 后台加载；这里仅保存轻量阶段快照。
+// 三段指示条对应“读取缓存 / 建立曲库 / 恢复歌曲”，不显示伪造百分比。
+static std::atomic<uint32_t> g_boot_nas_restore_stage{
+    static_cast<uint32_t>(UiNasRestoreStage::LoadingCache)};
+static std::atomic<uint32_t> g_boot_nas_restore_track_count{0U};
+static std::atomic<uint32_t> g_boot_nas_restore_generation{0U};
+static uint32_t g_boot_nas_restore_applied_generation = 0U;
+static std::atomic<bool> g_boot_nas_restore_active{false};
+static lv_obj_t *g_boot_nas_stage_segments[3] = {nullptr, nullptr, nullptr};
 static esp_lv_decoder_handle_t g_image_decoder = nullptr;
 static int16_t g_touch_last_x = 0;
 static int16_t g_touch_last_y = 0;
@@ -1178,10 +1188,103 @@ static void ui_manager_font_cache_write_started()
 }
 
 
+static void ui_manager_apply_nas_restore_progress_locked(
+    UiNasRestoreStage stage,
+    uint32_t track_count)
+{
+    if (g_boot_status == nullptr || g_boot_title == nullptr || g_boot_root == nullptr) {
+        return;
+    }
+
+    const lv_font_t *service_font = usb_service_font_get();
+    lv_label_set_text(g_boot_title, "NAS 音乐");
+    lv_obj_set_style_text_font(g_boot_title, service_font, 0);
+    lv_obj_set_style_text_color(g_boot_title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(g_boot_title, LV_ALIGN_CENTER, 0, -58);
+
+    char status[128] = {};
+    switch (stage) {
+        case UiNasRestoreStage::LoadingCache:
+            snprintf(status, sizeof(status), "恢复音乐\nNAS CACHE");
+            break;
+        case UiNasRestoreStage::BuildingCatalog:
+            if (track_count > 0U) {
+                snprintf(status, sizeof(status),
+                    "恢复音乐\n共 %lu 首歌曲",
+                    static_cast<unsigned long>(track_count));
+            } else {
+                snprintf(status, sizeof(status), "恢复音乐\nNAS CATALOG");
+            }
+            break;
+        case UiNasRestoreStage::RestoringTrack:
+            snprintf(status, sizeof(status), "恢复音乐\nLAST TRACK");
+            break;
+        case UiNasRestoreStage::Failed:
+        default:
+            snprintf(status, sizeof(status), "NAS 音乐库问题");
+            break;
+    }
+
+    lv_label_set_text(g_boot_status, status);
+    lv_obj_set_style_text_font(g_boot_status, service_font, 0);
+    lv_obj_set_style_text_color(
+        g_boot_status,
+        lv_color_hex(stage == UiNasRestoreStage::Failed ? 0xD7B3B3 : 0xC7D5E8),
+        0);
+    lv_obj_set_style_text_align(g_boot_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_line_space(g_boot_status, 8, 0);
+    lv_obj_set_width(g_boot_status, 410);
+    lv_obj_align(g_boot_status, LV_ALIGN_CENTER, 0, 8);
+
+    for (uint32_t i = 0U; i < 3U; ++i) {
+        if (g_boot_nas_stage_segments[i] == nullptr) {
+            g_boot_nas_stage_segments[i] = lv_obj_create(g_boot_root);
+            if (g_boot_nas_stage_segments[i] == nullptr) {
+                continue;
+            }
+            lv_obj_remove_style_all(g_boot_nas_stage_segments[i]);
+            lv_obj_set_size(g_boot_nas_stage_segments[i], 22, 4);
+            lv_obj_set_style_radius(g_boot_nas_stage_segments[i], 2, 0);
+            lv_obj_set_style_bg_opa(g_boot_nas_stage_segments[i], LV_OPA_COVER, 0);
+            lv_obj_align(
+                g_boot_nas_stage_segments[i],
+                LV_ALIGN_CENTER,
+                static_cast<int32_t>(i) * 30 - 30,
+                74);
+        }
+    }
+
+    const uint32_t active_stage = stage == UiNasRestoreStage::LoadingCache ? 0U :
+        (stage == UiNasRestoreStage::BuildingCatalog ? 1U : 2U);
+    for (uint32_t i = 0U; i < 3U; ++i) {
+        if (g_boot_nas_stage_segments[i] == nullptr) {
+            continue;
+        }
+        const uint32_t rgb = stage == UiNasRestoreStage::Failed
+            ? 0x765454
+            : (i <= active_stage ? 0xDDE7F0 : 0x34404D);
+        lv_obj_set_style_bg_color(g_boot_nas_stage_segments[i], lv_color_hex(rgb), 0);
+    }
+
+    lv_obj_invalidate(g_boot_root);
+}
+
 static void ui_manager_boot_library_progress_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
     if (g_boot_status == nullptr || g_boot_root == nullptr) {
+        return;
+    }
+
+    if (g_boot_nas_restore_active.load(std::memory_order_acquire)) {
+        const uint32_t generation = g_boot_nas_restore_generation.load(std::memory_order_acquire);
+        if (generation != g_boot_nas_restore_applied_generation) {
+            const UiNasRestoreStage stage = static_cast<UiNasRestoreStage>(
+                g_boot_nas_restore_stage.load(std::memory_order_relaxed));
+            const uint32_t track_count = g_boot_nas_restore_track_count.load(std::memory_order_relaxed);
+            ui_manager_apply_nas_restore_progress_locked(stage, track_count);
+            g_boot_nas_restore_applied_generation = generation;
+        }
         return;
     }
 
@@ -1383,6 +1486,15 @@ esp_err_t ui_manager_bootstrap_init()
     g_boot_library_update_generation.store(0U, std::memory_order_relaxed);
     g_boot_library_update_applied_generation = 0U;
     g_boot_library_update_active.store(false, std::memory_order_release);
+    g_boot_nas_restore_stage.store(
+        static_cast<uint32_t>(UiNasRestoreStage::LoadingCache), std::memory_order_relaxed);
+    g_boot_nas_restore_track_count.store(0U, std::memory_order_relaxed);
+    g_boot_nas_restore_generation.store(0U, std::memory_order_relaxed);
+    g_boot_nas_restore_applied_generation = 0U;
+    g_boot_nas_restore_active.store(false, std::memory_order_release);
+    for (auto &segment : g_boot_nas_stage_segments) {
+        segment = nullptr;
+    }
     g_boot_library_progress_timer = lv_timer_create(
         ui_manager_boot_library_progress_timer_cb, 100U, nullptr);
     if (g_boot_library_progress_timer == nullptr) {
@@ -1490,6 +1602,7 @@ esp_err_t ui_manager_init()
     const int64_t pages_started_us = esp_timer_get_time();
     g_boot_library_progress_active.store(false, std::memory_order_release);
     g_boot_library_update_active.store(false, std::memory_order_release);
+    g_boot_nas_restore_active.store(false, std::memory_order_release);
     if (g_boot_library_progress_timer != nullptr) {
         lv_timer_delete(g_boot_library_progress_timer);
         g_boot_library_progress_timer = nullptr;
@@ -1499,6 +1612,9 @@ esp_err_t ui_manager_init()
         g_boot_root = nullptr;
         g_boot_title = nullptr;
         g_boot_status = nullptr;
+        for (auto &segment : g_boot_nas_stage_segments) {
+            segment = nullptr;
+        }
     }
 
     player_home_create(lv_screen_active());
@@ -1714,6 +1830,23 @@ bool ui_manager_show_library_update_complete(const MediaLibraryChangeSummary &ch
     lv_obj_align(g_boot_status, LV_ALIGN_CENTER, 0, 24);
     lv_obj_invalidate(g_boot_root);
     lvgl_port_unlock();
+    return true;
+}
+
+bool ui_manager_show_nas_restore_progress(UiNasRestoreStage stage, uint32_t track_count)
+{
+    if (!g_bootstrap_ready || g_display == nullptr || g_boot_root == nullptr ||
+        g_boot_title == nullptr || g_boot_status == nullptr) {
+        return false;
+    }
+
+    // Worker/Boot 只发布阶段，不进入 LVGL。专用恢复页优先于此前的本地建库进度。
+    g_boot_library_progress_active.store(false, std::memory_order_release);
+    g_boot_library_update_active.store(false, std::memory_order_release);
+    g_boot_nas_restore_track_count.store(track_count, std::memory_order_relaxed);
+    g_boot_nas_restore_stage.store(static_cast<uint32_t>(stage), std::memory_order_relaxed);
+    g_boot_nas_restore_active.store(true, std::memory_order_release);
+    g_boot_nas_restore_generation.fetch_add(1U, std::memory_order_release);
     return true;
 }
 

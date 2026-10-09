@@ -12,6 +12,7 @@
 #include "device_settings.h"
 #include "media_groups_v2.h"
 #include "media_library.h"
+#include "nas_library_source.h"
 #include "player_control.h"
 #include "player_playlist.h"
 #include "player_state.h"
@@ -27,6 +28,7 @@ static constexpr const char *kResumeNamespace = "resume";
 struct PersistentResumeData
 {
     bool valid = false;
+    PlayerMediaSource source = PlayerMediaSource::Local;
     PlayerListType list_type = PlayerListType::AllTracks;
     char *track_path = nullptr;
     char *artist = nullptr;
@@ -135,6 +137,11 @@ static bool persistent_list_type_valid(uint8_t raw)
     return raw <= static_cast<uint8_t>(PlayerListType::Decade);
 }
 
+static bool persistent_media_source_valid(uint8_t raw)
+{
+    return raw <= static_cast<uint8_t>(PlayerMediaSource::Nas);
+}
+
 static bool persistent_loop_mode_valid(uint8_t raw)
 {
     return raw <= static_cast<uint8_t>(PlayerLoopMode::Shuffle);
@@ -193,6 +200,20 @@ static esp_err_t persistent_load_resume()
 
     PersistentResumeData loaded = {};
     loaded.list_type = static_cast<PlayerListType>(list_type_raw);
+
+    uint8_t source_raw = static_cast<uint8_t>(PlayerMediaSource::Local);
+    const esp_err_t source_ret = nvs_get_u8(handle, "source", &source_raw);
+    if (source_ret == ESP_ERR_NVS_NOT_FOUND) {
+        // Resume V1 迁移：旧数据没有 source key，历史上只能描述本地曲库。
+        loaded.source = PlayerMediaSource::Local;
+    } else if (source_ret != ESP_OK || !persistent_media_source_valid(source_raw)) {
+        persistent_resume_clear(&loaded);
+        nvs_close(handle);
+        return source_ret != ESP_OK ? source_ret : ESP_ERR_INVALID_RESPONSE;
+    } else {
+        loaded.source = static_cast<PlayerMediaSource>(source_raw);
+    }
+
     ret = persistent_nvs_read_string(handle, "track_path", &loaded.track_path);
     if (ret != ESP_OK || loaded.track_path == nullptr || loaded.track_path[0] == '\0') {
         persistent_resume_clear(&loaded);
@@ -305,10 +326,11 @@ esp_err_t persistent_state_init()
     }
 
     g_state.ready = true;
-    ESP_LOGI(TAG, "NVS V1 已加载：volume=%s loop=%s resume=%s",
+    ESP_LOGI(TAG, "NVS V1 已加载：volume=%s loop=%s resume=%s source=%s",
         g_state.has_volume ? "YES" : "NO",
         g_state.has_loop_mode ? "YES" : "NO",
-        g_state.resume.valid ? "YES" : "NO");
+        g_state.resume.valid ? "YES" : "NO",
+        g_state.resume.valid ? player_media_source_name(g_state.resume.source) : "NONE");
     return ESP_OK;
 }
 
@@ -355,6 +377,27 @@ static bool persistent_find_track_by_path(const char *path, size_t *out_track_in
     return false;
 }
 
+static bool persistent_find_nas_track_by_path(const char *path, size_t *out_track_index)
+{
+    if (path == nullptr || path[0] == '\0' || out_track_index == nullptr ||
+        !nas_library_source_ready()) {
+        return false;
+    }
+
+    const uint32_t count = nas_library_source_track_count();
+    for (uint32_t i = 0U; i < count; ++i) {
+        MediaTrackViewV2 view = {};
+        if (!nas_library_source_get_track_view(i, &view) || view.path == nullptr) {
+            continue;
+        }
+        if (strcasecmp(view.path, path) == 0) {
+            *out_track_index = static_cast<size_t>(i);
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool persistent_find_track_position(
     const uint32_t *indices, uint32_t count, size_t track_index, size_t *out_position)
 {
@@ -370,7 +413,7 @@ static bool persistent_find_track_position(
     return false;
 }
 
-static bool persistent_restore_context(size_t track_index)
+static bool persistent_restore_local_context(size_t track_index)
 {
     size_t position = 0U;
     switch (g_state.resume.list_type) {
@@ -415,6 +458,51 @@ static bool persistent_restore_context(size_t track_index)
     return false;
 }
 
+static bool persistent_restore_nas_context(size_t track_index)
+{
+    size_t position = 0U;
+    switch (g_state.resume.list_type) {
+        case PlayerListType::AllTracks:
+            return player_state_select_nas_all_tracks(track_index);
+
+        case PlayerListType::Artist:
+            for (size_t group = 0U; group < nas_library_source_artist_count(); ++group) {
+                MediaArtistGroupViewV2 view = {};
+                if (nas_library_source_get_artist(group, &view) &&
+                    persistent_string_equal(view.name, g_state.resume.artist) &&
+                    persistent_find_track_position(view.track_indices, view.track_count, track_index, &position)) {
+                    return player_state_select_nas_artist_group(group, position);
+                }
+            }
+            break;
+
+        case PlayerListType::Album:
+            for (size_t group = 0U; group < nas_library_source_album_count(); ++group) {
+                MediaAlbumGroupViewV2 view = {};
+                if (nas_library_source_get_album(group, &view) &&
+                    persistent_string_equal(view.title, g_state.resume.album_title) &&
+                    persistent_string_equal(view.artist, g_state.resume.album_artist) &&
+                    persistent_find_track_position(view.track_indices, view.track_count, track_index, &position)) {
+                    return player_state_select_nas_album_group(group, position);
+                }
+            }
+            break;
+
+        case PlayerListType::Decade:
+            for (size_t group = 0U; group < nas_library_source_decade_count(); ++group) {
+                MediaDecadeGroupViewV2 view = {};
+                if (nas_library_source_get_decade(group, &view) &&
+                    view.decade_start == g_state.resume.decade &&
+                    view.unknown == g_state.resume.decade_unknown &&
+                    persistent_find_track_position(view.track_indices, view.track_count, track_index, &position)) {
+                    return player_state_select_nas_decade_group(group, position);
+                }
+            }
+            break;
+    }
+    return false;
+}
+
 bool persistent_state_restore_player()
 {
     if (!g_state.ready) {
@@ -429,33 +517,64 @@ bool persistent_state_restore_player()
         }
     }
 
-    if (!g_state.schema_valid || !g_state.resume.valid || !player_state_is_ready() ||
-        media_library_get_count() == 0U) {
+    if (!g_state.schema_valid || !g_state.resume.valid) {
         return ok;
     }
 
     size_t track_index = 0U;
-    if (!persistent_find_track_by_path(g_state.resume.track_path, &track_index)) {
-        ESP_LOGW(TAG, "恢复歌曲已不存在，保留默认选择：%s", g_state.resume.track_path);
-        return false;
-    }
-
-    if (!persistent_restore_context(track_index)) {
-        ESP_LOGW(TAG, "原播放列表身份已失效，降级恢复到全部歌曲：%s", g_state.resume.track_path);
-        if (!player_state_select_all_tracks(track_index)) {
+    if (g_state.resume.source == PlayerMediaSource::Nas) {
+        if (!nas_library_source_ready()) {
+            ESP_LOGW(TAG, "NAS恢复Catalog不可用，无法建立NAS播放上下文：%s", g_state.resume.track_path);
             return false;
+        }
+        if (!persistent_find_nas_track_by_path(g_state.resume.track_path, &track_index)) {
+            ESP_LOGW(TAG, "NAS恢复歌曲已不存在，同源回退NAS全部歌曲首曲：%s", g_state.resume.track_path);
+            return nas_library_source_track_count() > 0U && player_state_select_nas_all_tracks(0U);
+        }
+        if (!persistent_restore_nas_context(track_index)) {
+            ESP_LOGW(TAG, "NAS原播放列表身份已失效，降级恢复到NAS全部歌曲：%s", g_state.resume.track_path);
+            if (!player_state_select_nas_all_tracks(track_index)) {
+                return false;
+            }
+        }
+    } else {
+        if (!player_state_is_ready() || media_library_get_count() == 0U ||
+            !persistent_find_track_by_path(g_state.resume.track_path, &track_index)) {
+            ESP_LOGW(TAG, "本地恢复歌曲已不存在，保留默认选择：%s", g_state.resume.track_path);
+            return false;
+        }
+        if (!persistent_restore_local_context(track_index)) {
+            ESP_LOGW(TAG, "本地原播放列表身份已失效，降级恢复到全部歌曲：%s", g_state.resume.track_path);
+            if (!player_state_select_all_tracks(track_index)) {
+                return false;
+            }
         }
     }
 
-    ESP_LOGI(TAG, "恢复当前歌曲：列表=%s path=%s（00:00，保持暂停）",
+    ESP_LOGI(TAG, "恢复当前歌曲：来源=%s 列表=%s path=%s（00:00，保持暂停）",
+        player_media_source_name(g_state.resume.source),
         player_playlist_type_name(player_state_get_list_type()), g_state.resume.track_path);
     return ok;
 }
 
+bool persistent_state_resume_requires_nas()
+{
+    return g_state.ready && g_state.schema_valid && g_state.resume.valid &&
+        g_state.resume.source == PlayerMediaSource::Nas;
+}
+
 static bool persistent_capture_resume()
 {
-    if (!player_state_is_ready() || media_library_get_count() == 0U) {
-        // TF 临时缺失/音乐库不可用时不能把旧恢复记录误判为“用户清空”。
+    if (!player_state_is_ready()) {
+        // TF/NAS Catalog 临时不可用时不能把旧恢复记录误判为“用户清空”。
+        return true;
+    }
+
+    const PlayerMediaSource source = player_state_get_source();
+    if (source == PlayerMediaSource::Local && media_library_get_count() == 0U) {
+        return true;
+    }
+    if (source == PlayerMediaSource::Nas && !nas_library_source_ready()) {
         return true;
     }
 
@@ -463,7 +582,7 @@ static bool persistent_capture_resume()
     if (!player_state_get_list_snapshot(&list) || list.track_index == UINT32_MAX) {
         return true;
     }
-    const char *path = media_library_get_path(list.track_index);
+    const char *path = player_state_get_path();
     if (path == nullptr || path[0] == '\0') {
         return true;
     }
@@ -481,8 +600,10 @@ static bool persistent_capture_resume()
         case PlayerListType::Artist:
         {
             MediaArtistGroupViewV2 view = {};
-            if (!media_groups_v2_get_artist(list.group_index, &view) ||
-                view.generation != list.catalog_generation || view.name == nullptr) {
+            const bool found = source == PlayerMediaSource::Nas
+                ? nas_library_source_get_artist(list.group_index, &view)
+                : media_groups_v2_get_artist(list.group_index, &view);
+            if (!found || view.generation != list.catalog_generation || view.name == nullptr) {
                 return false;
             }
             artist = view.name;
@@ -492,8 +613,10 @@ static bool persistent_capture_resume()
         case PlayerListType::Album:
         {
             MediaAlbumGroupViewV2 view = {};
-            if (!media_groups_v2_get_album(list.group_index, &view) ||
-                view.generation != list.catalog_generation || view.title == nullptr || view.artist == nullptr) {
+            const bool found = source == PlayerMediaSource::Nas
+                ? nas_library_source_get_album(list.group_index, &view)
+                : media_groups_v2_get_album(list.group_index, &view);
+            if (!found || view.generation != list.catalog_generation || view.title == nullptr || view.artist == nullptr) {
                 return false;
             }
             album_title = view.title;
@@ -508,6 +631,7 @@ static bool persistent_capture_resume()
     }
 
     const bool changed = !g_state.resume.valid ||
+        g_state.resume.source != source ||
         g_state.resume.list_type != list.type ||
         !persistent_string_equal(g_state.resume.track_path, path) ||
         !persistent_string_equal(g_state.resume.artist, artist) ||
@@ -526,6 +650,7 @@ static bool persistent_capture_resume()
         return false;
     }
     g_state.resume.valid = true;
+    g_state.resume.source = source;
     g_state.resume.list_type = list.type;
     g_state.resume.decade = decade;
     g_state.resume.decade_unknown = decade_unknown;
@@ -600,6 +725,7 @@ static esp_err_t persistent_flush_resume()
     }
 
     ret = nvs_set_str(handle, "track_path", g_state.resume.track_path);
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, "source", static_cast<uint8_t>(g_state.resume.source));
     if (ret == ESP_OK) ret = nvs_set_u8(handle, "list_type", static_cast<uint8_t>(g_state.resume.list_type));
 
     switch (g_state.resume.list_type) {

@@ -377,6 +377,7 @@ static lv_obj_t *g_nas_loading_hint = nullptr;
 
 static void library_view_render(bool preserve_scroll = true);
 static void library_view_refresh_virtual_rows(bool force = false);
+static bool library_view_focus_current_playback();
 static const char *library_search_scope_name();
 static void library_view_inertia_stop(bool store_position);
 static void library_view_store_scroll_position();
@@ -387,6 +388,7 @@ static LibraryBrowseMode library_view_category_mode_for_detail();
 static void library_view_return_to_parent_category();
 static void library_view_finish_nas_load_async(void *);
 static void library_view_update_nas_load_stage_async(void *stage_value);
+static bool library_view_nas_catalog_needed_by_playback();
 static bool library_search_build_key_cache();
 static void library_search_rebuild_matches();
 
@@ -423,6 +425,13 @@ static bool library_click_suppressed()
 static bool library_source_is_nas()
 {
     return g_source == LibraryDataSource::Nas;
+}
+
+static DeviceMusicLibrarySource library_device_source()
+{
+    return library_source_is_nas()
+        ? DeviceMusicLibrarySource::Nas
+        : DeviceMusicLibrarySource::Local;
 }
 
 static uint32_t library_source_generation()
@@ -479,7 +488,7 @@ static PlayerFolderScope library_view_active_folder_scope()
 {
     return library_source_is_nas()
         ? nas_library_source_folder_scope()
-        : player_control_get_folder_scope();
+        : player_playlist_get_folder_scope();
 }
 
 static LibraryThemeColors library_view_theme_colors()
@@ -626,7 +635,7 @@ static bool library_view_folder_scope_active()
         return nas_library_source_ready();
     }
     PlayerFolderQueueSnapshot queue = {};
-    return player_state_get_folder_queue_snapshot(&queue) &&
+    return player_playlist_get_folder_queue_snapshot(&queue) &&
         queue.ready && queue.effective_scope != PlayerFolderScope::All;
 }
 
@@ -670,7 +679,7 @@ static bool library_source_copy_folder_selection(
 {
     return library_source_is_nas()
         ? nas_library_source_copy_folder_selection(scope, out_path, out_path_size)
-        : player_control_copy_folder_selection(scope, out_path, out_path_size);
+        : player_playlist_copy_folder_selection(scope, out_path, out_path_size);
 }
 
 static const char *library_folder_leaf_in_place(char *path)
@@ -812,16 +821,51 @@ static bool library_view_persist_folder_selection(
         folder_path == nullptr || folder_path[0] == '\0') {
         return false;
     }
+
+    const DeviceMusicLibrarySource source = library_device_source();
+    DeviceMusicListSelection previous = {};
+    if (!device_settings_get_music_list_selection_for_source(source, &previous)) return false;
+
     if (library_source_is_nas()) {
-        return nas_library_source_set_folder_selection(scope, folder_path);
+        const PlayerFolderScope previous_runtime_scope = nas_library_source_folder_scope();
+        if (!nas_library_source_set_folder_selection(scope, folder_path) ||
+            !nas_library_source_set_folder_scope(scope)) {
+            return false;
+        }
+
+        char level1_path[PLAYER_FOLDER_PATH_MAX] = {};
+        char level2_path[PLAYER_FOLDER_PATH_MAX] = {};
+        (void)nas_library_source_copy_folder_selection(
+            PlayerFolderScope::Level1, level1_path, sizeof(level1_path));
+        (void)nas_library_source_copy_folder_selection(
+            PlayerFolderScope::Level2, level2_path, sizeof(level2_path));
+        const DeviceMusicListScope setting_scope = scope == PlayerFolderScope::Level1
+            ? DeviceMusicListScope::Level1 : DeviceMusicListScope::Level2;
+        const esp_err_t ret = device_settings_set_music_list_selection_for_source(
+            DeviceMusicLibrarySource::Nas, setting_scope, level1_path, level2_path);
+        if (ret == ESP_OK) {
+            if (player_state_get_source() == PlayerMediaSource::Nas) {
+                cassette_view_on_playback_queue_changed();
+            }
+            return true;
+        }
+
+        if (previous.level1_path[0] != '\0') {
+            (void)nas_library_source_set_folder_selection(
+                PlayerFolderScope::Level1, previous.level1_path);
+        }
+        if (previous.level2_path[0] != '\0') {
+            (void)nas_library_source_set_folder_selection(
+                PlayerFolderScope::Level2, previous.level2_path);
+        }
+        (void)nas_library_source_set_folder_scope(previous_runtime_scope);
+        ESP_LOGW(TAG, "保存NAS文件夹选择失败：%s", esp_err_to_name(ret));
+        return false;
     }
 
-    DeviceMusicListSelection previous = {};
-    if (!device_settings_get_music_list_selection(&previous)) return false;
-    const PlayerFolderScope previous_runtime_scope = player_control_get_folder_scope();
-
-    if (!player_control_set_folder_selection(scope, folder_path) ||
-        !player_control_set_folder_scope(scope)) {
+    const PlayerFolderScope previous_runtime_scope = player_playlist_get_folder_scope();
+    if (!player_playlist_set_folder_selection(scope, folder_path) ||
+        !player_playlist_set_folder_scope(scope)) {
         return false;
     }
 
@@ -831,25 +875,26 @@ static bool library_view_persist_folder_selection(
         ? folder_path : previous.level2_path;
     const DeviceMusicListScope setting_scope = scope == PlayerFolderScope::Level1
         ? DeviceMusicListScope::Level1 : DeviceMusicListScope::Level2;
-    const esp_err_t ret = device_settings_set_music_list_selection(
-        setting_scope, level1_path, level2_path);
+    const esp_err_t ret = device_settings_set_music_list_selection_for_source(
+        DeviceMusicLibrarySource::Local, setting_scope, level1_path, level2_path);
     if (ret == ESP_OK) {
-        // 一/二级文件夹改变后立即使旧 next-prefetch 失效；曲库覆盖期间不启动新的磁带后台预取。
-        cassette_view_on_playback_queue_changed();
+        if (player_state_get_source() == PlayerMediaSource::Local) {
+            cassette_view_on_playback_queue_changed();
+        }
         return true;
     }
 
     if (previous.level1_path[0] != '\0') {
-        (void)player_control_set_folder_selection(PlayerFolderScope::Level1, previous.level1_path);
+        (void)player_playlist_set_folder_selection(PlayerFolderScope::Level1, previous.level1_path);
     }
     if (previous.level2_path[0] != '\0') {
-        (void)player_control_set_folder_selection(PlayerFolderScope::Level2, previous.level2_path);
+        (void)player_playlist_set_folder_selection(PlayerFolderScope::Level2, previous.level2_path);
     }
-    (void)player_control_set_folder_scope(
+    (void)player_playlist_set_folder_scope(
         previous_runtime_scope != PlayerFolderScope::All
             ? previous_runtime_scope
             : library_folder_scope_from_setting(previous.scope));
-    ESP_LOGW(TAG, "保存主页文件夹选择失败：%s", esp_err_to_name(ret));
+    ESP_LOGW(TAG, "保存本地文件夹选择失败：%s", esp_err_to_name(ret));
     return false;
 }
 
@@ -857,7 +902,7 @@ static bool library_view_folder_queue_snapshot(PlayerFolderQueueSnapshot *out_sn
 {
     if (library_source_is_nas()) return false;
     return out_snapshot != nullptr &&
-        player_state_get_folder_queue_snapshot(out_snapshot) &&
+        player_playlist_get_folder_queue_snapshot(out_snapshot) &&
         out_snapshot->ready;
 }
 
@@ -1176,6 +1221,57 @@ static LibraryRememberedSourceState *library_remembered_state_for_current_source
     return *slot;
 }
 
+static void library_restore_persisted_source_state_if_needed()
+{
+    LibraryRememberedSourceState *saved = library_remembered_state_for_current_source(false);
+    if (saved != nullptr && saved->valid) return;
+
+    DeviceMusicBrowseState persisted = {};
+    if (!device_settings_get_music_browse_state(library_device_source(), &persisted) ||
+        !persisted.valid) {
+        return;
+    }
+
+    saved = library_remembered_state_for_current_source(true);
+    if (saved == nullptr) return;
+    *saved = {};
+    saved->valid = true;
+    saved->generation = library_source_generation();
+    saved->folder_scope = library_view_active_folder_scope();
+    saved->browse.mode = static_cast<LibraryBrowseMode>(persisted.browse_mode);
+    saved->browse.detail_type = PlayerListType::AllTracks;
+    saved->browse.detail_group_index = UINT32_MAX;
+    memcpy(saved->browse.top_scroll_y, persisted.top_scroll_y, sizeof(saved->browse.top_scroll_y));
+    memcpy(saved->browse.folder_scroll_y, persisted.folder_scroll_y, sizeof(saved->browse.folder_scroll_y));
+    LibraryFolderView persisted_view = static_cast<LibraryFolderView>(persisted.folder_view);
+    if (saved->folder_scope == PlayerFolderScope::All ||
+        (saved->folder_scope == PlayerFolderScope::Level1 &&
+            (persisted_view == LibraryFolderView::Level2Folders ||
+             persisted_view == LibraryFolderView::Level2Parents)) ||
+        (saved->folder_scope == PlayerFolderScope::Level2 &&
+            persisted_view == LibraryFolderView::Level1Folders)) {
+        persisted_view = LibraryFolderView::Tracks;
+    }
+    saved->browse.folder_view = persisted_view;
+
+    DeviceMusicListSelection selection = {};
+    if (device_settings_get_music_list_selection_for_source(library_device_source(), &selection)) {
+        snprintf(saved->level1_path, sizeof(saved->level1_path), "%s", selection.level1_path);
+        snprintf(saved->level2_path, sizeof(saved->level2_path), "%s", selection.level2_path);
+        if (saved->folder_scope == PlayerFolderScope::Level2 &&
+            selection.level1_path[0] != '\0') {
+            snprintf(saved->browse.level2_parent_path,
+                sizeof(saved->browse.level2_parent_path), "%s", selection.level1_path);
+        }
+    }
+
+    ESP_LOGI(TAG, "恢复%s曲库持久浏览状态：scope=%s mode=%u view=%u",
+        library_source_is_nas() ? "NAS" : "本地",
+        player_playlist_folder_scope_name(saved->folder_scope),
+        static_cast<unsigned>(persisted.browse_mode),
+        static_cast<unsigned>(persisted.folder_view));
+}
+
 static void library_remember_current_source_state()
 {
     LibraryRememberedSourceState *saved = library_remembered_state_for_current_source(true);
@@ -1198,6 +1294,33 @@ static void library_remember_current_source_state()
             PlayerFolderScope::Level1, saved->level1_path, sizeof(saved->level1_path));
         (void)nas_library_source_copy_folder_selection(
             PlayerFolderScope::Level2, saved->level2_path, sizeof(saved->level2_path));
+    }
+
+    DeviceMusicBrowseState persisted = {};
+    persisted.valid = true;
+    LibraryBrowseMode persist_mode = g_state.mode;
+    if (persist_mode == LibraryBrowseMode::GroupTracks) {
+        if (g_state.detail_type == PlayerListType::Artist) persist_mode = LibraryBrowseMode::Artists;
+        else if (g_state.detail_type == PlayerListType::Album) persist_mode = LibraryBrowseMode::Albums;
+        else if (g_state.detail_type == PlayerListType::Decade) persist_mode = LibraryBrowseMode::Decades;
+        else persist_mode = LibraryBrowseMode::AllTracks;
+    }
+    persisted.browse_mode = static_cast<uint8_t>(persist_mode);
+    persisted.folder_view = static_cast<uint8_t>(
+        saved->folder_scope == PlayerFolderScope::All
+            ? LibraryFolderView::Tracks
+            : g_state.folder_view);
+    memcpy(persisted.top_scroll_y, g_state.top_scroll_y, sizeof(persisted.top_scroll_y));
+    memcpy(persisted.folder_scroll_y, g_state.folder_scroll_y, sizeof(persisted.folder_scroll_y));
+    if (g_state.mode == LibraryBrowseMode::GroupTracks) {
+        const uint8_t mode = static_cast<uint8_t>(persist_mode);
+        if (mode < 4U) persisted.top_scroll_y[mode] = g_state.parent_scroll_y;
+    }
+    const esp_err_t browse_ret = device_settings_set_music_browse_state(
+        library_device_source(), persisted);
+    if (browse_ret != ESP_OK) {
+        ESP_LOGW(TAG, "保存%s曲库浏览位置失败：%s",
+            library_source_is_nas() ? "NAS" : "本地", esp_err_to_name(browse_ret));
     }
 }
 
@@ -1776,6 +1899,69 @@ static int32_t library_view_scroll_for_position(uint32_t position)
     return static_cast<int32_t>(top_position * static_cast<uint32_t>(LIBRARY_ROW_STEP));
 }
 
+static bool library_view_focus_current_playback()
+{
+    // 只在“当前播放源 == 当前浏览源”且当前页本身就是歌曲列表时定位。
+    // 不切换 BrowseContext，不恢复搜索，也不抢文件夹选择页的滚动位置。
+    if (!player_state_is_ready() || g_search.active || library_view_folder_browser_active()) {
+        return false;
+    }
+
+    const PlayerMediaSource expected_source =
+        library_source_is_nas() ? PlayerMediaSource::Nas : PlayerMediaSource::Local;
+    if (player_state_get_source() != expected_source) {
+        return false;
+    }
+
+    const uint32_t current_track = static_cast<uint32_t>(player_state_get_index());
+    uint32_t current_position = UINT32_MAX;
+
+    if (g_state.mode == LibraryBrowseMode::AllTracks) {
+        const uint32_t count = library_view_top_level_count(LibraryBrowseMode::AllTracks);
+        for (uint32_t position = 0U; position < count; ++position) {
+            uint32_t track_index = UINT32_MAX;
+            if (library_view_top_track_index(position, &track_index) && track_index == current_track) {
+                current_position = position;
+                break;
+            }
+        }
+        if (current_position != UINT32_MAX) {
+            g_state.top_scroll_y[0] = library_view_scroll_for_position(current_position);
+        }
+    } else if (g_state.mode == LibraryBrowseMode::GroupTracks) {
+        uint32_t count = 0U;
+        if (!library_view_get_detail_identity(nullptr, &count, nullptr)) {
+            return false;
+        }
+        for (uint32_t position = 0U; position < count; ++position) {
+            uint32_t track_index = UINT32_MAX;
+            if (library_view_detail_track_index(position, &track_index, nullptr) &&
+                track_index == current_track) {
+                current_position = position;
+                break;
+            }
+        }
+        if (current_position != UINT32_MAX) {
+            g_state.detail_scroll_y = library_view_scroll_for_position(current_position);
+        }
+    } else {
+        return false;
+    }
+
+    if (current_position == UINT32_MAX) {
+        return false;
+    }
+
+    ESP_LOGI(TAG,
+        "打开曲库定位当前播放：source=%s mode=%u position=%lu track=%lu scroll=%ld",
+        library_source_is_nas() ? "NAS" : "LOCAL",
+        static_cast<unsigned>(g_state.mode),
+        static_cast<unsigned long>(current_position),
+        static_cast<unsigned long>(current_track),
+        static_cast<long>(library_view_scroll_for_position(current_position)));
+    return true;
+}
+
 static const char *library_search_key_label(uint8_t key_index)
 {
     static const char *const alpha_labels[QUICK_INDEX_KEY_COUNT] = {
@@ -1900,20 +2086,13 @@ static void library_view_set_header()
             lv_label_set_text(g_header_title, parent_name != nullptr ? parent_name : "文件夹");
         }
     } else if (library_view_folder_scope_active()) {
-        char folder_label[96] = {};
-        if (library_source_is_nas()) {
-            char path[PLAYER_FOLDER_PATH_MAX] = {};
-            if (library_source_copy_folder_selection(
-                    library_view_active_folder_scope(), path, sizeof(path))) {
-                const char *leaf = library_folder_leaf_in_place(path);
-                lv_label_set_text(g_header_title, leaf != nullptr ? leaf : "NAS音乐");
-            } else {
-                lv_label_set_text(
-                    g_header_title,
-                    player_playlist_folder_scope_name(library_view_active_folder_scope()));
-            }
-        } else if (player_state_copy_list_label(folder_label, sizeof(folder_label))) {
-            lv_label_set_text(g_header_title, folder_label);
+        char path[PLAYER_FOLDER_PATH_MAX] = {};
+        if (library_source_copy_folder_selection(
+                library_view_active_folder_scope(), path, sizeof(path))) {
+            const char *leaf = library_folder_leaf_in_place(path);
+            lv_label_set_text(
+                g_header_title,
+                leaf != nullptr ? leaf : (library_source_is_nas() ? "NAS音乐" : "Music"));
         } else {
             lv_label_set_text(
                 g_header_title,
@@ -2671,7 +2850,7 @@ static void library_view_row_clicked_cb(lv_event_t *event)
         case LibraryRowAction::PlayFolderTrack:
             if (!(library_source_is_nas()
                     ? player_control_select_nas_folder_queue_position(row->position)
-                    : player_control_select_folder_queue_position(row->position))) {
+                    : player_control_select_local_folder_queue_position(row->position))) {
                 if (transition_hold) player_home_cancel_track_transition_hold();
                 ESP_LOGW(TAG, "选择目录列表位置失败：%lu", static_cast<unsigned long>(row->position));
                 return;
@@ -3123,7 +3302,11 @@ void library_view_open()
     if (library_source_is_nas()) {
         library_remember_current_source_state();
         library_search_release_cache();
-        nas_library_source_close();
+        // 浏览源切回 Local 不得破坏仍在播放的 NAS PlaybackContext；
+        // NAS Catalog 只有在当前播放源也不是 NAS 时才释放。
+        if (!library_view_nas_catalog_needed_by_playback()) {
+            nas_library_source_close();
+        }
     } else {
         library_search_release_cache();
     }
@@ -3143,6 +3326,7 @@ void library_view_open()
     g_search.scroll_y = 0;
     g_search.match_count = 0U;
     quick_index_keyboard_set_visible(&g_search_keyboard, false);
+    library_restore_persisted_source_state_if_needed();
     const bool restored = library_restore_remembered_source_state(g_local_remembered_state);
     if (!restored && library_view_folder_scope_active()) {
         PlayerFolderQueueSnapshot queue = {};
@@ -3154,7 +3338,8 @@ void library_view_open()
         }
     } else if (!restored) {
         PlayerListSnapshot playlist = {};
-        if (player_state_get_list_snapshot(&playlist) &&
+        if (player_state_get_source() == PlayerMediaSource::Local &&
+            player_state_get_list_snapshot(&playlist) &&
             playlist.catalog_generation == media_catalog_v2_generation() &&
             playlist.track_count > 0U) {
             if (playlist.type == PlayerListType::AllTracks) {
@@ -3177,13 +3362,14 @@ void library_view_open()
         }
     }
 
-    library_view_render(restored);
+    (void)library_view_focus_current_playback();
+    library_view_render(true);
     lv_obj_remove_flag(g_root, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(g_root);
     screen_lock_simple_raise();
-    UI_PAGE_INTERACTION_LOGI("打开本地曲库：generation=%lu list=%s resume=%s scroll=%ld",
+    UI_PAGE_INTERACTION_LOGI("打开本地曲库：generation=%lu scope=%s resume=%s scroll=%ld",
         static_cast<unsigned long>(media_catalog_v2_generation()),
-        player_playlist_type_name(player_state_get_list_type()),
+        player_playlist_folder_scope_name(player_playlist_get_folder_scope()),
         restored ? "YES" : "NO",
         static_cast<long>(library_view_saved_scroll_position()));
 }
@@ -3315,8 +3501,10 @@ static void library_view_activate_nas_ui()
     g_state.detail_group_index = UINT32_MAX;
     g_state.folder_view = LibraryFolderView::Tracks;
 
+    library_restore_persisted_source_state_if_needed();
     const bool restored = library_restore_remembered_source_state(g_nas_remembered_state);
-    library_view_render(restored);
+    (void)library_view_focus_current_playback();
+    library_view_render(true);
     library_view_destroy_nas_loading_overlay();
     lv_obj_remove_flag(g_root, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(g_root);
@@ -3371,6 +3559,57 @@ static void library_view_finish_nas_load_async(void *)
     ESP_LOGW(TAG, "打开NAS共享曲库数据源失败：%s", esp_err_to_name(result));
 }
 
+static void library_view_apply_nas_saved_selection(DeviceMusicListScope requested_scope)
+{
+    if (!nas_library_source_ready()) return;
+
+    DeviceMusicListSelection saved = {};
+    (void)device_settings_get_music_list_selection_for_source(
+        DeviceMusicLibrarySource::Nas, &saved);
+    saved.scope = requested_scope;
+
+    bool repaired = false;
+    if (saved.level1_path[0] != '\0' &&
+        !nas_library_source_set_folder_selection(PlayerFolderScope::Level1, saved.level1_path)) {
+        saved.level1_path[0] = '\0';
+        repaired = true;
+    }
+    if (saved.level2_path[0] != '\0' &&
+        !nas_library_source_set_folder_selection(PlayerFolderScope::Level2, saved.level2_path)) {
+        saved.level2_path[0] = '\0';
+        repaired = true;
+    }
+
+    PlayerFolderScope runtime_scope = library_folder_scope_from_setting(requested_scope);
+    if (!nas_library_source_set_folder_scope(runtime_scope)) {
+        runtime_scope = PlayerFolderScope::All;
+        saved.scope = DeviceMusicListScope::All;
+        (void)nas_library_source_set_folder_scope(runtime_scope);
+        repaired = true;
+    }
+
+    char actual_level1[PLAYER_FOLDER_PATH_MAX] = {};
+    char actual_level2[PLAYER_FOLDER_PATH_MAX] = {};
+    (void)nas_library_source_copy_folder_selection(
+        PlayerFolderScope::Level1, actual_level1, sizeof(actual_level1));
+    (void)nas_library_source_copy_folder_selection(
+        PlayerFolderScope::Level2, actual_level2, sizeof(actual_level2));
+    if (strcmp(saved.level1_path, actual_level1) != 0 ||
+        strcmp(saved.level2_path, actual_level2) != 0) {
+        repaired = true;
+    }
+    if (repaired) {
+        const esp_err_t save_ret = device_settings_set_music_list_selection_for_source(
+            DeviceMusicLibrarySource::Nas, saved.scope, actual_level1, actual_level2);
+        if (save_ret != ESP_OK) {
+            ESP_LOGW(TAG, "修复NAS浏览目录持久状态失败：%s", esp_err_to_name(save_ret));
+        } else {
+            ESP_LOGI(TAG, "NAS浏览目录已在NAS内部修复：scope=%s l1=%s l2=%s",
+                device_settings_music_list_scope_name(saved.scope), actual_level1, actual_level2);
+        }
+    }
+}
+
 static void library_view_nas_load_task(void *)
 {
     DeviceMusicListScope scope = DeviceMusicListScope::All;
@@ -3384,6 +3623,9 @@ static void library_view_nas_load_task(void *)
         initial_scope,
         library_view_nas_open_stage_cb,
         nullptr);
+    if (result == ESP_OK) {
+        library_view_apply_nas_saved_selection(scope);
+    }
     const uint32_t elapsed_ms =
         static_cast<uint32_t>((esp_timer_get_time() - started_us) / 1000LL);
     const uint32_t stack_hwm =
@@ -3404,8 +3646,7 @@ bool library_view_open_nas(DeviceMusicListScope scope)
     if (g_root == nullptr) return false;
 
     if (nas_library_source_ready()) {
-        const PlayerFolderScope requested_scope = library_folder_scope_from_setting(scope);
-        (void)nas_library_source_set_folder_scope(requested_scope);
+        library_view_apply_nas_saved_selection(scope);
         g_nas_load_elapsed_ms = 0U;
         g_nas_load_stack_hwm = 0U;
         ESP_LOGI(TAG,

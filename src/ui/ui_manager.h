@@ -1,9 +1,20 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 struct MediaLibraryChangeSummary;
+
+// NAS 启动恢复页只表达真实阶段，不显示伪百分比。调用方可以来自后台 Worker；
+// 接口只发布原子状态，实际 LVGL 更新由 taskLVGL 的启动页 timer 完成。
+enum class UiNasRestoreStage : uint8_t
+{
+    LoadingCache = 0,
+    BuildingCatalog,
+    RestoringTrack,
+    Failed
+};
 
 // 仅建立 LVGL 显示核心与黑色启动页；不依赖触摸、TF 卡或中文字体。
 esp_err_t ui_manager_bootstrap_init();
@@ -26,6 +37,9 @@ bool ui_manager_show_library_build_complete(const MediaLibraryChangeSummary &cha
 // 该接口只发布轻量状态，真正的 LVGL 文本更新由 taskLVGL 的进度 timer 完成。
 bool ui_manager_show_library_update_progress(uint32_t added_count = 0U);
 bool ui_manager_show_library_update_complete(const MediaLibraryChangeSummary &changes);
+
+// 上次播放来源为 NAS 时复用启动页显示专用轻量恢复界面。track_count=0 表示尚未知歌曲数。
+bool ui_manager_show_nas_restore_progress(UiNasRestoreStage stage, uint32_t track_count = 0U);
 
 // 一次性 TF 卡 USB MSC 服务模式复用启动页，不建立完整 Music/Settings UI。
 // 返回 false 仅表示提示页不可用，不影响 USB 服务本身。

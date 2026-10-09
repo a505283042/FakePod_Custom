@@ -1,5 +1,6 @@
 #include "player_control.h"
 
+#include <atomic>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
@@ -8,12 +9,22 @@
 #include "app_diag_config.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "lvgl.h"
 #include "audio_service.h"
 #include "device_settings.h"
 #include "player_state.h"
 
 static const char *TAG = "播放器控制";
 static SemaphoreHandle_t g_transport_lock = nullptr;
+
+// 自然 EOF 只在 SystemLoop 观察边沿；真正的 Playlist/Transport 续播统一投递到
+// LVGL/Player 上下文。状态 0=空闲，1=等待投递，2=已进入 LVGL async 队列。
+// 单槽足够：没有执行本次 EOF 前，不可能自然产生下一首的第二个 EOF。
+static std::atomic<uint8_t> g_auto_next_dispatch_state{0U};
+static AudioStateSnapshot g_auto_next_snapshot = {};
+static constexpr uint8_t AUTO_NEXT_IDLE = 0U;
+static constexpr uint8_t AUTO_NEXT_PENDING = 1U;
+static constexpr uint8_t AUTO_NEXT_QUEUED = 2U;
 
 static PlayerFolderScope player_control_scope_from_setting(DeviceMusicListScope scope)
 {
@@ -105,11 +116,12 @@ esp_err_t player_control_init()
     DeviceSettingsSnapshot settings = {};
     DeviceMusicListSelection selection = {};
     if (device_settings_get_snapshot(&settings)) {
-        (void)device_settings_get_music_list_selection(&selection);
+        (void)device_settings_get_music_list_selection_for_source(
+            DeviceMusicLibrarySource::Local, &selection);
         bool level1_ready = selection.level1_path[0] != '\0' &&
-            player_state_set_folder_selection(PlayerFolderScope::Level1, selection.level1_path);
+            player_playlist_set_folder_selection(PlayerFolderScope::Level1, selection.level1_path);
         bool level2_ready = selection.level2_path[0] != '\0' &&
-            player_state_set_folder_selection(PlayerFolderScope::Level2, selection.level2_path);
+            player_playlist_set_folder_selection(PlayerFolderScope::Level2, selection.level2_path);
         if (selection.level1_path[0] != '\0' && !level1_ready) {
             ESP_LOGW(TAG, "已保存一级目录当前不可用：%s", selection.level1_path);
         }
@@ -117,12 +129,12 @@ esp_err_t player_control_init()
             ESP_LOGW(TAG, "已保存二级目录当前不可用：%s", selection.level2_path);
         }
 
-        PlayerFolderScope scope = player_control_scope_from_setting(settings.music_list_scope);
+        PlayerFolderScope scope = player_control_scope_from_setting(selection.scope);
         bool repaired_selection = false;
         if (scope == PlayerFolderScope::Level1 && !level1_ready) {
             char resolved[PLAYER_FOLDER_PATH_MAX] = {};
             if (player_control_resolve_folder_path(scope, resolved, sizeof(resolved)) &&
-                player_state_set_folder_selection(scope, resolved)) {
+                player_playlist_set_folder_selection(scope, resolved)) {
                 snprintf(selection.level1_path, sizeof(selection.level1_path), "%s", resolved);
                 level1_ready = true;
                 repaired_selection = true;
@@ -131,7 +143,7 @@ esp_err_t player_control_init()
         } else if (scope == PlayerFolderScope::Level2 && !level2_ready) {
             char resolved[PLAYER_FOLDER_PATH_MAX] = {};
             if (player_control_resolve_folder_path(scope, resolved, sizeof(resolved)) &&
-                player_state_set_folder_selection(scope, resolved)) {
+                player_playlist_set_folder_selection(scope, resolved)) {
                 snprintf(selection.level2_path, sizeof(selection.level2_path), "%s", resolved);
                 level2_ready = true;
                 repaired_selection = true;
@@ -140,8 +152,9 @@ esp_err_t player_control_init()
         }
 
         if (repaired_selection) {
-            const esp_err_t save_ret = device_settings_set_music_list_selection(
-                settings.music_list_scope, selection.level1_path, selection.level2_path);
+            const esp_err_t save_ret = device_settings_set_music_list_selection_for_source(
+                DeviceMusicLibrarySource::Local, selection.scope,
+                selection.level1_path, selection.level2_path);
             if (save_ret != ESP_OK) {
                 ESP_LOGW(TAG, "保存自动建立的播放目录失败：%s", esp_err_to_name(save_ret));
             }
@@ -149,13 +162,19 @@ esp_err_t player_control_init()
 
         if ((scope == PlayerFolderScope::Level1 && !level1_ready) ||
             (scope == PlayerFolderScope::Level2 && !level2_ready)) {
-            ESP_LOGW(TAG, "播放列表目录尚不可用，本次运行回退总列表：setting=%s",
-                device_settings_music_list_scope_name(settings.music_list_scope));
+            ESP_LOGW(TAG, "本地播放列表目录尚不可用，持久状态回退本地总列表：setting=%s",
+                device_settings_music_list_scope_name(selection.scope));
             scope = PlayerFolderScope::All;
+            const esp_err_t save_ret = device_settings_set_music_list_selection_for_source(
+                DeviceMusicLibrarySource::Local, DeviceMusicListScope::All,
+                selection.level1_path, selection.level2_path);
+            if (save_ret != ESP_OK) {
+                ESP_LOGW(TAG, "保存本地总列表回退失败：%s", esp_err_to_name(save_ret));
+            }
         }
-        if (!player_state_set_folder_scope(scope)) {
+        if (!player_playlist_set_folder_scope(scope)) {
             ESP_LOGW(TAG, "应用音乐列表范围失败：%s",
-                device_settings_music_list_scope_name(settings.music_list_scope));
+                device_settings_music_list_scope_name(selection.scope));
         }
     }
 
@@ -177,14 +196,74 @@ static void player_control_unlock()
     }
 }
 
+static void player_control_auto_next_async(void *)
+{
+    if (g_auto_next_dispatch_state.load(std::memory_order_acquire) != AUTO_NEXT_QUEUED) {
+        return;
+    }
+    const AudioStateSnapshot snapshot = g_auto_next_snapshot;
+    if (!player_control_lock(pdMS_TO_TICKS(100))) {
+        // 不丢 EOF：锁暂时繁忙时退回 Pending，由下一拍 SystemLoop 再次投递。
+        g_auto_next_dispatch_state.store(AUTO_NEXT_PENDING, std::memory_order_release);
+        ESP_LOGW(TAG, "AUTO_NEXT_DISPATCH: LVGL取得Player锁超时，等待下一拍重投");
+        return;
+    }
+
+    player_transport_handle_finished_event(snapshot);
+    player_control_unlock();
+    g_auto_next_dispatch_state.store(AUTO_NEXT_IDLE, std::memory_order_release);
+}
+
+static void player_control_try_dispatch_auto_next()
+{
+    uint8_t expected = AUTO_NEXT_PENDING;
+    if (!g_auto_next_dispatch_state.compare_exchange_strong(
+            expected, AUTO_NEXT_QUEUED,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;
+    }
+
+    if (lv_async_call(player_control_auto_next_async, nullptr) != LV_RESULT_OK) {
+        // LVGL 队列偶发分配失败也不能吞掉自然 EOF；保持 Pending，下一拍再试。
+        g_auto_next_dispatch_state.store(AUTO_NEXT_PENDING, std::memory_order_release);
+        ESP_LOGW(TAG, "AUTO_NEXT_DISPATCH: LVGL投递失败，等待下一拍重投");
+    }
+}
+
 void player_control_update()
 {
-    // UI 与 loopTask 可能运行在不同任务；EOF 自动续播与手动切歌必须串行修改 Playlist Context。
+    // 先补投上一拍未能进入 LVGL 队列的自然 EOF；正常情况下这里为空操作。
+    player_control_try_dispatch_auto_next();
+
+    // SystemLoop 只做轻量 Snapshot 边沿检测。Track Error 仍沿用原同步处理；
+    // Finished 不再在这条 6KB SystemLoop 调用栈中执行深层 Playlist/URL/Audio request。
     if (!player_control_lock(0)) {
         return;
     }
-    player_transport_update();
+    AudioStateSnapshot finished = {};
+    const bool has_finished = player_transport_update(&finished);
     player_control_unlock();
+
+    if (!has_finished) {
+        return;
+    }
+
+    if (g_auto_next_dispatch_state.load(std::memory_order_acquire) != AUTO_NEXT_IDLE) {
+        // 理论上不会发生：上一首未真正续播前不可能自然产生第二个 EOF。
+        ESP_LOGW(TAG,
+            "AUTO_NEXT_DISPATCH: 已有待处理EOF，忽略重复边沿 track=%lu playback_rev=%lu",
+            static_cast<unsigned long>(finished.track_index),
+            static_cast<unsigned long>(finished.playback_revision));
+        return;
+    }
+
+    g_auto_next_snapshot = finished;
+    g_auto_next_dispatch_state.store(AUTO_NEXT_PENDING, std::memory_order_release);
+    ESP_LOGI(TAG,
+        "AUTO_NEXT_DISPATCH: 自然EOF已投递Player/LVGL track=%lu playback_rev=%lu",
+        static_cast<unsigned long>(finished.track_index),
+        static_cast<unsigned long>(finished.playback_revision));
+    player_control_try_dispatch_auto_next();
 }
 
 bool player_control_play_current()
@@ -413,6 +492,17 @@ bool player_control_select_folder_queue_position(size_t position)
     }
     const bool ok = player_control_select_context(
         player_state_select_folder_queue_position(position));
+    player_control_unlock();
+    return ok;
+}
+
+bool player_control_select_local_folder_queue_position(size_t position)
+{
+    if (!player_control_lock(pdMS_TO_TICKS(100))) {
+        return false;
+    }
+    const bool ok = player_control_select_context(
+        player_state_select_local_folder_queue_position(position));
     player_control_unlock();
     return ok;
 }

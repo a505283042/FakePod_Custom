@@ -51,6 +51,16 @@ struct DeviceMusicListSelection {
     char level2_path[DEVICE_MUSIC_FOLDER_PATH_MAX] = {};
 };
 
+// R46.0.107：本地/NAS 各自保存轻量浏览位置；搜索态不跨重启。
+// browse_mode 固定映射：0=歌曲 1=歌手 2=专辑 3=年代；folder_view 映射 LibraryFolderView。
+struct DeviceMusicBrowseState {
+    bool valid = false;
+    uint8_t browse_mode = 0U;
+    uint8_t folder_view = 0U;
+    int32_t top_scroll_y[4] = {};
+    int32_t folder_scroll_y[3] = {};
+};
+
 struct DeviceSettingsSnapshot {
     bool ready = false;
     bool loaded_from_nvs = false;
@@ -104,10 +114,25 @@ esp_err_t device_settings_set_ui_font_file(const char *filename);
 // 播放列表目录选择与范围一起提交到同一个 NVS 事务。路径使用 Catalog 中的规范化完整目录路径，
 // 以 '/' 结尾；总列表可传空路径。这样切换一级/二级列表时不会出现 scope 已保存但目录未保存的半状态。
 bool device_settings_get_music_list_selection(DeviceMusicListSelection *out_selection);
+// 明确来源版本：播放器 Local runtime 与 NAS 浏览恢复不得再共用同一个 scope/path。
+bool device_settings_get_music_list_selection_for_source(
+    DeviceMusicLibrarySource source,
+    DeviceMusicListSelection *out_selection);
 esp_err_t device_settings_set_music_list_selection(
     DeviceMusicListScope scope,
     const char *level1_path,
     const char *level2_path);
+esp_err_t device_settings_set_music_list_selection_for_source(
+    DeviceMusicLibrarySource source,
+    DeviceMusicListScope scope,
+    const char *level1_path,
+    const char *level2_path);
+bool device_settings_get_music_browse_state(
+    DeviceMusicLibrarySource source,
+    DeviceMusicBrowseState *out_state);
+esp_err_t device_settings_set_music_browse_state(
+    DeviceMusicLibrarySource source,
+    const DeviceMusicBrowseState &state);
 esp_err_t device_settings_set_remember_volume(bool enabled);
 
 // 恢复 Settings V1 默认值；只重置 device_cfg namespace，不触碰音乐持久化/TF 卡文件。
