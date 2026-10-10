@@ -9,6 +9,7 @@
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_log.h"
+#include "nvs.h"
 
 #include "board_pins.h"
 #include "persistent_state.h"
@@ -90,6 +91,146 @@ static const char *g_calibration_scheme = "NONE";
 static BatteryLogState g_log_state = BatteryLogState::Unknown;
 static BatterySnapshot g_snapshot = {};
 static portMUX_TYPE g_snapshot_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// R46.0.116：NVS 中单独保存 50% 的 ADC 实测电压，不动播放状态持久化 schema。
+// armed 持久化，保证充满电后在 50% 之前意外重启也不会失去本次记录机会。
+static constexpr char BATTERY_HALF_NVS_NAMESPACE[] = "bat50";
+static constexpr char BATTERY_HALF_NVS_KEY[] = "checkpoint";
+static constexpr uint8_t BATTERY_HALF_SCHEMA = 1U;
+static constexpr uint8_t BATTERY_HALF_REARM_PERCENT = 95U;
+static constexpr uint8_t BATTERY_HALF_INITIAL_ARM_PERCENT = 55U;
+static constexpr uint8_t BATTERY_HALF_CAPTURE_PERCENT = 50U;
+static constexpr uint8_t BATTERY_HALF_STABLE_SAMPLES = 3U;
+static constexpr TickType_t BATTERY_HALF_RETRY_INTERVAL = pdMS_TO_TICKS(30000);
+
+struct BatteryHalfStored
+{
+    uint8_t schema;
+    uint8_t valid;
+    uint8_t armed;
+    uint8_t percent;
+    uint16_t measured_mv;
+    uint16_t filtered_mv;
+};
+static_assert(sizeof(BatteryHalfStored) == 8U, "battery NVS format changed");
+
+static BatteryHalfStored g_half_stored = {BATTERY_HALF_SCHEMA, 0U, 0U, 0U, 0U, 0U};
+static portMUX_TYPE g_half_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool g_half_init_attempted = false;
+static bool g_half_storage_ready = false;
+static bool g_half_seen_above = false;
+static uint8_t g_half_high_count = 0U;
+static uint8_t g_half_low_count = 0U;
+static TickType_t g_half_retry_due = 0U;
+
+static bool battery_half_voltage_valid(uint32_t mv)
+{
+    return mv >= 2500U && mv <= 5000U;
+}
+
+static void battery_half_load_once()
+{
+    if (g_half_init_attempted) return;
+    g_half_init_attempted = true;
+    nvs_handle_t handle = 0;
+    const esp_err_t opened = nvs_open(BATTERY_HALF_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (opened == ESP_ERR_NVS_NOT_FOUND) {
+        g_half_storage_ready = true;
+        return;
+    }
+    if (opened != ESP_OK) return;
+
+    BatteryHalfStored loaded = {};
+    size_t bytes = sizeof(loaded);
+    const esp_err_t ret = nvs_get_blob(handle, BATTERY_HALF_NVS_KEY, &loaded, &bytes);
+    nvs_close(handle);
+    if (ret == ESP_ERR_NVS_NOT_FOUND) {
+        g_half_storage_ready = true;
+        return;
+    }
+    if (ret != ESP_OK || bytes != sizeof(loaded) || loaded.schema != BATTERY_HALF_SCHEMA ||
+        loaded.valid > 1U || loaded.armed > 1U ||
+        (loaded.valid && (loaded.percent > BATTERY_HALF_CAPTURE_PERCENT ||
+            !battery_half_voltage_valid(loaded.measured_mv) ||
+            !battery_half_voltage_valid(loaded.filtered_mv)))) {
+        // 旧/损坏/未知记录不自动覆盖；原有电池采样继续正常运行。
+        return;
+    }
+    portENTER_CRITICAL(&g_half_mux);
+    g_half_stored = loaded;
+    portEXIT_CRITICAL(&g_half_mux);
+    g_half_storage_ready = true;
+}
+
+static bool battery_half_commit(const BatteryHalfStored &new_value)
+{
+    nvs_handle_t handle = 0;
+    if (nvs_open(BATTERY_HALF_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        return false;
+    }
+    esp_err_t ret = nvs_set_blob(handle, BATTERY_HALF_NVS_KEY, &new_value, sizeof(new_value));
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    nvs_close(handle);
+    if (ret != ESP_OK) return false;
+    portENTER_CRITICAL(&g_half_mux);
+    g_half_stored = new_value;
+    portEXIT_CRITICAL(&g_half_mux);
+    return true;
+}
+
+static void battery_half_sample_update(const BatterySnapshot &snapshot)
+{
+    if (!g_half_storage_ready || !snapshot.valid || !snapshot.calibrated ||
+        !battery_half_voltage_valid(snapshot.battery_mv) ||
+        !battery_half_voltage_valid(snapshot.filtered_mv)) return;
+
+    const TickType_t now = xTaskGetTickCount();
+    if (g_half_retry_due != 0U && static_cast<int32_t>(now - g_half_retry_due) < 0) return;
+
+    const bool need_arm = !g_half_stored.armed &&
+        (snapshot.percent >= BATTERY_HALF_REARM_PERCENT ||
+         (!g_half_stored.valid && snapshot.percent >= BATTERY_HALF_INITIAL_ARM_PERCENT));
+    if (need_arm) {
+        if (g_half_high_count < BATTERY_HALF_STABLE_SAMPLES) ++g_half_high_count;
+        if (g_half_high_count >= BATTERY_HALF_STABLE_SAMPLES) {
+            BatteryHalfStored armed = g_half_stored;
+            armed.armed = 1U;
+            if (!battery_half_commit(armed)) {
+                g_half_retry_due = now + BATTERY_HALF_RETRY_INTERVAL;
+            } else {
+                g_half_retry_due = 0U;
+            }
+            g_half_high_count = 0U;
+        }
+    } else {
+        g_half_high_count = 0U;
+    }
+
+    // 即使 NVS 显示 armed=1，若本次开机直接处于 <=50%，也不能覆盖旧记录。
+    if (snapshot.percent > BATTERY_HALF_CAPTURE_PERCENT) {
+        g_half_seen_above = true;
+    }
+    if (!g_half_stored.armed || !g_half_seen_above ||
+        snapshot.percent > BATTERY_HALF_CAPTURE_PERCENT) {
+        g_half_low_count = 0U;
+        return;
+    }
+    if (g_half_low_count < BATTERY_HALF_STABLE_SAMPLES) ++g_half_low_count;
+    if (g_half_low_count < BATTERY_HALF_STABLE_SAMPLES) return;
+
+    BatteryHalfStored captured = g_half_stored;
+    captured.valid = 1U;
+    captured.armed = 0U;
+    captured.percent = snapshot.percent;
+    captured.measured_mv = snapshot.battery_mv;
+    captured.filtered_mv = snapshot.filtered_mv;
+    if (battery_half_commit(captured)) {
+        g_half_low_count = 0U;
+        g_half_retry_due = 0U;
+    } else {
+        g_half_retry_due = now + BATTERY_HALF_RETRY_INTERVAL;
+    }
+}
 
 static uint8_t battery_soc_from_mv(uint32_t mv)
 {
@@ -288,6 +429,7 @@ static esp_err_t battery_init_calibration(adc_unit_t unit, adc_channel_t channel
 
 esp_err_t battery_service_init()
 {
+    battery_half_load_once();
     if (g_ready) {
         return ESP_OK;
     }
@@ -377,6 +519,7 @@ void battery_service_update()
     }
 
     battery_update_log_state(snapshot);
+    battery_half_sample_update(snapshot);
 
 #if FAKEPOD_BATTERY_DIAGNOSTIC_LOG
     // 诊断模式才恢复每 2 秒 RAW / ADC / VBAT / 滤波 / SOC 详细遥测。
@@ -403,4 +546,18 @@ bool battery_service_get_snapshot(BatterySnapshot *out_snapshot)
     *out_snapshot = g_snapshot;
     portEXIT_CRITICAL(&g_snapshot_mux);
     return out_snapshot->valid;
+}
+
+bool battery_service_get_half_record(BatteryHalfRecord *out_record)
+{
+    if (out_record == nullptr) return false;
+    BatteryHalfStored stored = {};
+    portENTER_CRITICAL(&g_half_mux);
+    stored = g_half_stored;
+    portEXIT_CRITICAL(&g_half_mux);
+    if (!g_half_storage_ready || !stored.valid) return false;
+    out_record->measured_mv = stored.measured_mv;
+    out_record->filtered_mv = stored.filtered_mv;
+    out_record->percent = stored.percent;
+    return true;
 }

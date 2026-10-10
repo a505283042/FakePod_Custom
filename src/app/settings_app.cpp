@@ -16,6 +16,7 @@
 #include "app_build_info.h"
 #include "app_manager.h"
 #include "audio_service.h"
+#include "battery_service.h"
 #include "ble_remote_service.h"
 #include "device_settings.h"
 #include "font/font_manager.h"
@@ -284,7 +285,7 @@ static uint16_t detail_row_count_for_page(SettingsPage page)
         case SettingsPage::MusicPlayer: return 3U;
         case SettingsPage::ElectronicFlow: return 1U;
         case SettingsPage::System: return 6U;
-        case SettingsPage::About: return 5U;
+        case SettingsPage::About: return 8U;
         case SettingsPage::Main:
         default:
             return 0U;
@@ -2307,6 +2308,29 @@ static void create_about_page()
         snprintf(value, sizeof(value), "--");
     }
     add_detail_row(4, "TF卡容量", value, SettingsDetailIcon::SdCard);
+
+    BatterySnapshot battery = {};
+    if (battery_service_get_snapshot(&battery) && battery.valid) {
+        snprintf(value, sizeof(value), "%umV · %u%%",
+            static_cast<unsigned>(battery.battery_mv),
+            static_cast<unsigned>(battery.percent));
+    } else {
+        snprintf(value, sizeof(value), "--");
+    }
+    add_detail_row(5, "当前电池", value, SettingsDetailIcon::None);
+
+    BatteryHalfRecord half = {};
+    if (battery_service_get_half_record(&half)) {
+        snprintf(value, sizeof(value), "%umV (%u%%)",
+            static_cast<unsigned>(half.measured_mv),
+            static_cast<unsigned>(half.percent));
+        add_detail_row(6, "上次50%实测", value, SettingsDetailIcon::None);
+        snprintf(value, sizeof(value), "%umV", static_cast<unsigned>(half.filtered_mv));
+    } else {
+        add_detail_row(6, "上次50%实测", "待记录", SettingsDetailIcon::None);
+        snprintf(value, sizeof(value), "--");
+    }
+    add_detail_row(7, "上次50%滤波", value, SettingsDetailIcon::None);
 }
 
 static void show_page(SettingsPage page)
@@ -2475,6 +2499,30 @@ static void refresh_timer_cb(lv_timer_t *timer)
                 snprintf(value, sizeof(value), "--");
             }
             lv_label_set_text(g_detail_values[4], value);
+        }
+        if (g_detail_values[5] != nullptr) {
+            BatterySnapshot battery = {};
+            if (battery_service_get_snapshot(&battery) && battery.valid) {
+                snprintf(value, sizeof(value), "%umV · %u%%",
+                    static_cast<unsigned>(battery.battery_mv),
+                    static_cast<unsigned>(battery.percent));
+            } else {
+                snprintf(value, sizeof(value), "--");
+            }
+            lv_label_set_text(g_detail_values[5], value);
+        }
+        BatteryHalfRecord half = {};
+        if (battery_service_get_half_record(&half)) {
+            if (g_detail_values[6] != nullptr) {
+                snprintf(value, sizeof(value), "%umV (%u%%)",
+                    static_cast<unsigned>(half.measured_mv),
+                    static_cast<unsigned>(half.percent));
+                lv_label_set_text(g_detail_values[6], value);
+            }
+            if (g_detail_values[7] != nullptr) {
+                snprintf(value, sizeof(value), "%umV", static_cast<unsigned>(half.filtered_mv));
+                lv_label_set_text(g_detail_values[7], value);
+            }
         }
     }
 }
