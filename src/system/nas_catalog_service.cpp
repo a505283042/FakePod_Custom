@@ -287,7 +287,9 @@ static esp_http_client_handle_t http_open_get(const NasConfig &config, const cha
     http.url = url;
     http.timeout_ms = kHttpTimeoutMs;
     http.buffer_size = 512;
-    http.buffer_size_tx = 256;
+    // Authenticated WebDAV GET has an Authorization header. Increase only the
+    // short-lived index sync client's TX buffer; normal unauthenticated HTTP stays unchanged.
+    http.buffer_size_tx = config.username[0] != '\0' ? 512 : 256;
     http.keep_alive_enable = false;
     if (config.username[0] != '\0') {
         http.username = config.username;
@@ -739,7 +741,9 @@ esp_err_t nas_catalog_service_get_playback_endpoint(NasPlaybackEndpoint *out_end
 
     if (config.track_url[0] != '\0') {
         snprintf(out_endpoint->track_base_url, sizeof(out_endpoint->track_base_url), "%s", config.track_url);
-    } else if (local_meta.short_id_version >= 1U) {
+    } else if (config.music_url[0] == '\0' && local_meta.short_id_version >= 1U) {
+        // Only infer legacy short-ID aliases if no direct music_url is configured.
+        // R46.0.117 WebDAV uses the existing V2 paths and does NOT require /track links.
         // DSM Web Station exposes /volume1/web as the HTTP document root.  Derive the
         // static short-ID endpoint from the HTTP origin, not from the catalog path; e.g.
         // http://host:8080/web/music-index -> http://host:8080/track.

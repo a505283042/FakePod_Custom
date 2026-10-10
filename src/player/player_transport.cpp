@@ -385,7 +385,7 @@ static bool player_transport_play_current_internal(const char *reason)
         return false;
     }
     ESP_LOGI(TAG, "NAS播放URL：mode=%s len=%u track=%lu",
-        endpoint.track_base_url[0] != '\0' ? "SHORT_ID" : "LEGACY_PATH",
+        endpoint.track_base_url[0] != '\0' ? "SHORT_ID" : "DIRECT_PATH",
         static_cast<unsigned>(strlen(url)),
         static_cast<unsigned long>(track_index));
     const bool ok = audio_service_play_nas_track(

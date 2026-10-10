@@ -132,6 +132,23 @@ static char *dup_psram(const char *text)
     return copy;
 }
 
+static size_t nas_stream_http_tx_bytes(const BufferedHttpContext *context)
+{
+    if (context == nullptr || context->url == nullptr) return 0U;
+    // The old /track/<short-id> fit in 1KB.  Encoded WebDAV paths can be longer.
+    // Only enlarge the HTTP client's temporary INTERNAL TX buffer when required;
+    // reject pathological paths instead of silently truncating a GET request.
+    size_t needed = strlen(context->url) + 320U;
+    if (context->username != nullptr && context->username[0] != '\0') {
+        const size_t user_bytes = strlen(context->username);
+        const size_t pass_bytes = context->password != nullptr ? strlen(context->password) : 0U;
+        needed += ((user_bytes + pass_bytes + 3U) / 3U) * 4U + 32U;
+    }
+    if (needed > 4096U) return 0U;
+    if (needed <= kHttpTxBufferBytes) return kHttpTxBufferBytes;
+    return (needed + 255U) & ~static_cast<size_t>(255U);
+}
+
 static void nas_stream_task(void *arg)
 {
     BufferedHttpContext *context = static_cast<BufferedHttpContext *>(arg);
@@ -145,10 +162,17 @@ static void nas_stream_task(void *arg)
     }
 
     esp_http_client_config_t config = {};
+    const size_t tx_bytes = nas_stream_http_tx_bytes(context);
+    if (tx_bytes == 0U) {
+        ESP_LOGW(TAG, "NAS URL/认证请求头过长，拒绝建立连接：url=%uB",
+            static_cast<unsigned>(strlen(context->url)));
+        set_error(context, ESP_ERR_INVALID_SIZE);
+        goto finish;
+    }
     config.url = context->url;
     config.timeout_ms = kConnectHeaderTimeoutMs;
     config.buffer_size = kHttpRxBufferBytes;
-    config.buffer_size_tx = kHttpTxBufferBytes;
+    config.buffer_size_tx = tx_bytes;
     config.keep_alive_enable = false;
     if (context->username != nullptr && context->username[0] != '\0') {
         config.username = context->username;
@@ -245,7 +269,7 @@ static void nas_stream_task(void *arg)
             static_cast<unsigned>(context->start_target_bytes / 1024U),
             static_cast<unsigned>(strlen(context->url)),
             static_cast<unsigned>(kHttpRxBufferBytes),
-            static_cast<unsigned>(kHttpTxBufferBytes),
+            static_cast<unsigned>(tx_bytes),
             kStreamReadTimeoutMs,
             static_cast<unsigned>(kTaskPriority),
             static_cast<int>(kTaskCore));

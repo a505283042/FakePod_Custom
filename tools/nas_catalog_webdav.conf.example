@@ -1,0 +1,12 @@
+# R46.0.117 WebDAV 5005 for Synology DSM 5.2. Copy to /sdcard/System/nas_catalog.conf.
+# HTTP only; Basic credentials traverse the LAN without encryption. Use a READ-ONLY
+# NAS account and keep port 5005 confined to a trusted LAN; do not expose it to the Internet.
+# The existing V2 index files stay in NAS shared folder web/music-index.
+base_url=http://192.168.1.105:5005/web/music-index
+# Leave track_url EMPTY. Otherwise the legacy short-ID hardlinks take priority.
+track_url=
+# NAS shared folder "麦田广告" / Music. Percent-encode the non-ASCII share name.
+# This must be the same folder used as music_root in build_nas_catalog_v2.py.
+music_url=http://192.168.1.105:5005/%E9%BA%A6%E7%94%B0%E5%B9%BF%E5%91%8A/Music
+username=YOUR_READ_ONLY_NAS_ACCOUNT
+password=YOUR_NAS_PASSWORD
