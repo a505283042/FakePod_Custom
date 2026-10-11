@@ -47,6 +47,10 @@ esp_err_t nas_catalog_service_init();
 // 用户显式触发。只允许 Wi-Fi 已连接且 Music AudioTask 当前不持有播放源时同步。
 // Worker 为一次性 5KB Internal 栈；索引下载缓存与校验使用 TF + 临时 PSRAM，结束即释放。
 esp_err_t nas_catalog_service_request_sync();
+// 已经通过FPN2认证且写入 .pending 后调用：停止播放，使用待生效配置下载校验，成功后热切换。
+esp_err_t nas_catalog_service_request_pending_switch();
+// 阻止热切换期间打开旧曲库和启动新播放（普通手动 NAS 更新不受影响）。
+bool nas_catalog_service_is_server_switching();
 
 bool nas_catalog_service_get_snapshot(NasCatalogSnapshot *out_snapshot);
 const char *nas_catalog_service_state_name(NasCatalogState state);

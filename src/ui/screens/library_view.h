@@ -14,6 +14,10 @@ void library_view_open();
 bool library_view_open_nas(DeviceMusicListScope scope);
 bool library_view_is_nas_source();
 void library_view_close_nas();
+// 只在 LVGL 线程调用；返回 false 表示有 NAS 异步加载正在执行，禁止替换 TF 索引。
+bool library_view_prepare_nas_server_switch();
+// 只在 LVGL 线程调用；使用新索引打开 NAS，不恢复上一个服务器的浏览缓存。
+void library_view_finish_nas_server_switch();
 // R46.0.76：设置保存曲库来源后同步回收非当前 NAS 索引；
 // NAS 选中时 Catalog 跨 UI 关闭常驻，避免每次主页下拉重新读 1.17MB。
 void library_view_on_library_source_changed(DeviceMusicLibrarySource source);

@@ -330,6 +330,12 @@ bool player_state_rebind_after_catalog_reload(const char *preferred_path, size_t
     return true;
 }
 
+void player_state_forget_nas_context()
+{
+    g_nas = {};
+    if (g_source == PlayerMediaSource::Nas) g_source = PlayerMediaSource::Local;
+}
+
 PlayerMediaSource player_state_get_source() { return g_source; }
 
 size_t player_state_get_index()

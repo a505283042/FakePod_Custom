@@ -26,6 +26,7 @@
 #include "cassette_view.h"
 #include "player_playlist.h"
 #include "player_state.h"
+#include "persistent_state.h"
 #include "search/search_key_builder.h"
 #include "system/screen_lock_simple.h"
 #include "wifi_service.h"
@@ -3773,6 +3774,10 @@ static void library_view_nas_load_task(void *)
 
 bool library_view_open_nas(DeviceMusicListScope scope)
 {
+    if (nas_catalog_service_is_server_switching()) {
+        ESP_LOGW(TAG, "NAS连接配置切换中，暂不允许打开旧NAS曲库");
+        return false;
+    }
     if (g_root == nullptr) return false;
 
     if (nas_library_source_ready()) {
@@ -3899,6 +3904,47 @@ void library_view_close_nas()
             remembered_state_bytes,
             internal_free,
             psram_free);
+    }
+}
+
+bool library_view_prepare_nas_server_switch()
+{
+    bool loading = false;
+    taskENTER_CRITICAL(&g_nas_load_lock);
+    loading = g_nas_load_running;
+    taskEXIT_CRITICAL(&g_nas_load_lock);
+    if (loading) return false;
+
+    const bool was_visible_nas = library_source_is_nas() && library_view_is_visible();
+    if (library_source_is_nas()) library_view_close_nas();
+    player_state_forget_nas_context();
+    nas_library_source_close();
+    heap_caps_free(g_nas_remembered_state);
+    g_nas_remembered_state = nullptr;
+    g_nas_selected_track = UINT32_MAX;
+    if (was_visible_nas) player_home_resume_from_fullscreen_view("nas-server-switch");
+    ESP_LOGI(TAG, "旧NAS曲库已在LVGL线程退出：PSRAM已回收，NAS播放上下文已清理");
+    return true;
+}
+
+void library_view_finish_nas_server_switch()
+{
+    const esp_err_t resume_ret = persistent_state_discard_nas_resume();
+    if (resume_ret != ESP_OK) {
+        ESP_LOGW(TAG, "清理旧NAS播放恢复记录失败：%s", esp_err_to_name(resume_ret));
+    }
+    if (device_settings_music_library_source() != DeviceMusicLibrarySource::Nas) return;
+    // 新服务器的目录和滚动位置不能复用旧NAS持久化缓存。
+    const esp_err_t list_ret = device_settings_set_music_list_selection_for_source(
+        DeviceMusicLibrarySource::Nas, DeviceMusicListScope::All, "", "");
+    DeviceMusicBrowseState blank = {};
+    const esp_err_t browse_ret = device_settings_set_music_browse_state(DeviceMusicLibrarySource::Nas, blank);
+    if (list_ret != ESP_OK || browse_ret != ESP_OK) {
+        ESP_LOGW(TAG, "NAS浏览恢复位置重置失败：list=%s browse=%s",
+            esp_err_to_name(list_ret), esp_err_to_name(browse_ret));
+    }
+    if (!library_view_open_nas(DeviceMusicListScope::All)) {
+        ESP_LOGW(TAG, "新NAS索引已写入TF，但未能自动打开；可从主页重新进入NAS曲库");
     }
 }
 

@@ -29,6 +29,7 @@ idf_component_register(
         "system/wifi_service.cpp"
         "system/wifi_remote_service.cpp"
         "system/nas_catalog_service.cpp"
+        "system/nas_wifi_provisioning.cpp"
         "system/battery_service.cpp"
         "system/motion_service.cpp"
         "system/usb_storage_service.cpp"
@@ -172,6 +173,7 @@ idf_component_register(
         esp_netif
         esp_wifi
         esp_http_client
+        mbedtls
         lwip
 
 )

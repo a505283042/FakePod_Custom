@@ -31,6 +31,7 @@
 #include "usb_storage_service.h"
 #include "wifi_service.h"
 #include "nas_catalog_service.h"
+#include "nas_wifi_provisioning.h"
 #include "nas_library_source.h"
 #include "artwork_loader.h"
 #include "lyrics/lyrics_service.h"
@@ -113,6 +114,7 @@ static_assert(sizeof(kCategories) / sizeof(kCategories[0]) ==
 static bool g_usb_transition_pending = false;
 static bool g_usb_return_safe_ui = false;
 static lv_obj_t *g_usb_overlay = nullptr;
+static lv_obj_t *g_nas_pair_overlay = nullptr;
 static lv_obj_t *g_usb_overlay_status = nullptr;
 static lv_obj_t *g_usb_overlay_action = nullptr;
 
@@ -280,7 +282,7 @@ static void detail_apply_scroll_y(int32_t y)
 static uint16_t detail_row_count_for_page(SettingsPage page)
 {
     switch (page) {
-        case SettingsPage::Connection: return 5U;
+        case SettingsPage::Connection: return 6U;
         case SettingsPage::Applications: return 5U;
         case SettingsPage::MusicPlayer: return 3U;
         case SettingsPage::ElectronicFlow: return 1U;
@@ -1648,6 +1650,68 @@ static void nas_catalog_sync_click_cb(lv_event_t *event)
     }
 }
 
+static void nas_pair_dismiss_cb(lv_event_t *event)
+{
+    if (event == nullptr || lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    nas_wifi_provisioning_cancel();
+    if (g_nas_pair_overlay != nullptr && lv_obj_is_valid(g_nas_pair_overlay)) {
+        lv_obj_delete(g_nas_pair_overlay);
+    }
+    g_nas_pair_overlay = nullptr;
+}
+
+static void nas_pair_click_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event) || g_page != SettingsPage::Connection) return;
+    char code[7] = {};
+    const esp_err_t result = nas_wifi_provisioning_arm(code);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "NAS配对需要Wi-Fi已连接：%s", esp_err_to_name(result));
+        return;
+    }
+    if (g_nas_pair_overlay != nullptr && lv_obj_is_valid(g_nas_pair_overlay)) {
+        lv_obj_delete(g_nas_pair_overlay);
+    }
+    lv_obj_t *overlay = lv_obj_create(lv_screen_active());
+    if (overlay == nullptr) { nas_wifi_provisioning_cancel(); return; }
+    g_nas_pair_overlay = overlay;
+    lv_obj_set_size(overlay, LV_PCT(100), LV_PCT(100));
+    lv_obj_center(overlay);
+    lv_obj_set_style_bg_color(overlay, lv_color_hex(0x131820), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(overlay, 0, 0);
+    lv_obj_remove_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_move_foreground(overlay);
+    lv_obj_t *heading = make_label(overlay, "NAS Wi-Fi 配对", 0xFFFFFF, LV_TEXT_ALIGN_CENTER);
+    if (heading != nullptr) {
+        lv_obj_set_width(heading, 420);
+        lv_obj_align(heading, LV_ALIGN_TOP_MID, 0, 44);
+    }
+    // FPN2 只显示六位数字；复用“3分钟内有效”的系统 UI 字体，绝不缩放控件/字形。
+    lv_obj_t *code_label = make_label(overlay, code, 0xFFD166, LV_TEXT_ALIGN_CENTER);
+    if (code_label != nullptr) {
+        lv_obj_set_width(code_label, 430);
+        lv_obj_set_style_text_letter_space(code_label, 12, 0);
+        lv_obj_align(code_label, LV_ALIGN_CENTER, 0, -18);
+    }
+    lv_obj_t *hint = make_label(overlay,
+                                "手机输入6位授权码\n3分钟内有效，保存后重启生效",
+                                0xBAC8DB, LV_TEXT_ALIGN_CENTER);
+    if (hint != nullptr) {
+        lv_obj_set_width(hint, 420);
+        lv_obj_set_style_text_line_space(hint, 8, 0);
+        lv_obj_align(hint, LV_ALIGN_CENTER, 0, 100);
+    }
+    lv_obj_t *close_button = lv_button_create(overlay);
+    if (close_button != nullptr) {
+        lv_obj_set_size(close_button, 150, 48);
+        lv_obj_align(close_button, LV_ALIGN_BOTTOM_MID, 0, -45);
+        lv_obj_add_event_cb(close_button, nas_pair_dismiss_cb, LV_EVENT_CLICKED, nullptr);
+        lv_obj_t *label = make_label(close_button, "关闭", 0xFFFFFF, LV_TEXT_ALIGN_CENTER);
+        if (label != nullptr) lv_obj_center(label);
+    }
+}
+
 static void format_nas_catalog_value(char *buffer, size_t buffer_size)
 {
     if (buffer == nullptr || buffer_size == 0U) return;
@@ -1667,10 +1731,11 @@ static void format_nas_catalog_value(char *buffer, size_t buffer_size)
     if (nas.cached) {
         snprintf(buffer, buffer_size, "%lu首·%s",
             static_cast<unsigned long>(nas.track_count),
-            nas.state == NasCatalogState::Updated ? "已更新" : "已缓存");
+            nas.state == NasCatalogState::Updated ? "已更新" :
+            (nas.state == NasCatalogState::UpToDate ? "已最新" : "已缓存"));
         return;
     }
-    snprintf(buffer, buffer_size, "点击同步");
+    snprintf(buffer, buffer_size, "点击检查");
 }
 
 static void create_connection_page(const DeviceSettingsSnapshot &settings)
@@ -1712,7 +1777,8 @@ static void create_connection_page(const DeviceSettingsSnapshot &settings)
 
     char nas_value[64] = {};
     format_nas_catalog_value(nas_value, sizeof(nas_value));
-    add_clickable_detail_row(4, "NAS索引", nas_value, SettingsDetailIcon::Wifi, nas_catalog_sync_click_cb);
+    add_clickable_detail_row(4, "NAS更新", nas_value, SettingsDetailIcon::Wifi, nas_catalog_sync_click_cb);
+    add_clickable_detail_row(5, "NAS配对", "手机配置", SettingsDetailIcon::Wifi, nas_pair_click_cb);
 }
 
 static PlayerFolderScope player_folder_scope_from_setting(DeviceMusicListScope scope)

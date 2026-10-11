@@ -1,5 +1,6 @@
 #include "nas_catalog_service.h"
 
+#include <atomic>
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
@@ -16,6 +17,9 @@
 #include "freertos/task.h"
 
 #include "audio_service.h"
+#include "device_settings.h"
+#include "player_transport.h"
+#include "ui/screens/library_view.h"
 #include "media_catalog_store_v2.h"
 #include "storage_io.h"
 #include "system_paths.h"
@@ -66,6 +70,7 @@ struct NasRemoteMeta
 
 struct NasSyncContext
 {
+    bool pending_switch = false;
     NasConfig config = {};
     NasRemoteMeta remote = {};
     char meta_text[kMetaBufferBytes] = {};
@@ -83,6 +88,12 @@ static NasCatalogState g_state = NasCatalogState::Unconfigured;
 static esp_err_t g_last_error = ESP_OK;
 static uint32_t g_track_count = 0U;
 static uint64_t g_revision = 0ULL;
+static std::atomic<bool> g_server_switching{false};
+// 由旧NAS曲库 UI 的LVGL线程回收内存；0=等待、1=成功、-1=忙、-2=超时取消。
+static std::atomic<int> g_switch_ui_result{0};
+static std::atomic<uint32_t> g_switch_ui_sequence{0};
+static constexpr char kPendingConfig[] = "/sdcard/System/nas_catalog.conf.pending";
+static constexpr char kConfigBackup[] = "/sdcard/System/nas_catalog.conf.bak";
 
 static void publish_state(
     NasCatalogState state,
@@ -490,12 +501,12 @@ static esp_err_t commit_downloads(const char *meta_text)
     return ESP_FAIL;
 }
 
-static esp_err_t load_config(NasSyncContext *ctx)
+static esp_err_t load_config(NasSyncContext *ctx, const char *path)
 {
     if (ctx == nullptr) return ESP_ERR_INVALID_ARG;
     char *buffer = static_cast<char *>(heap_caps_malloc(kMetaBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (buffer == nullptr) return ESP_ERR_NO_MEM;
-    const esp_err_t ret = read_small_file(SystemPaths::kNasCatalogConfig, buffer, kMetaBufferBytes);
+    const esp_err_t ret = read_small_file(path, buffer, kMetaBufferBytes);
     bool ok = false;
     if (ret == ESP_OK) ok = parse_config_text(buffer, &ctx->config);
     heap_caps_free(buffer);
@@ -503,9 +514,84 @@ static esp_err_t load_config(NasSyncContext *ctx)
     return ok ? ESP_OK : ESP_ERR_INVALID_ARG;
 }
 
-static void finish_worker(NasSyncContext *ctx, NasCatalogState state, esp_err_t error,
-    bool cached, uint32_t tracks, uint64_t revision)
+static esp_err_t commit_pending_config(bool *old_backed)
 {
+    if (old_backed == nullptr) return ESP_ERR_INVALID_ARG;
+    *old_backed = false;
+    StorageSdLockGuard sd_lock(pdMS_TO_TICKS(2000));
+    if (!sd_lock.locked()) return ESP_ERR_TIMEOUT;
+    if (!file_exists(kPendingConfig)) return ESP_ERR_NOT_FOUND;
+    const bool existed = file_exists(SystemPaths::kNasCatalogConfig);
+    if (existed) {
+        if (remove(kConfigBackup) != 0 && errno != ENOENT) return ESP_FAIL;
+        if (rename(SystemPaths::kNasCatalogConfig, kConfigBackup) != 0) return ESP_FAIL;
+        *old_backed = true;
+    }
+    if (rename(kPendingConfig, SystemPaths::kNasCatalogConfig) == 0) return ESP_OK;
+    if (*old_backed) (void)rename(kConfigBackup, SystemPaths::kNasCatalogConfig);
+    return ESP_FAIL;
+}
+
+static void rollback_pending_config(bool old_backed)
+{
+    StorageSdLockGuard sd_lock(pdMS_TO_TICKS(2000));
+    if (!sd_lock.locked()) {
+        ESP_LOGE(TAG, "回滚NAS配置无法取得SD锁，需人工核对TF备份");
+        return;
+    }
+    (void)remove(SystemPaths::kNasCatalogConfig);
+    if (old_backed && rename(kConfigBackup, SystemPaths::kNasCatalogConfig) != 0) {
+        ESP_LOGE(TAG, "回滚NAS配置失败，旧配置备份保留：%s", kConfigBackup);
+    }
+}
+
+static void prepare_switch_on_lvgl(void *arg)
+{
+    const uint32_t sequence = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(arg));
+    // 旧任务超时后的迟到callback不能影响下一次切换。
+    if (sequence != g_switch_ui_sequence.load()) return;
+    int expected = 0;
+    if (!g_switch_ui_result.compare_exchange_strong(expected, 2)) return;
+    const bool ok = audio_idle_for_catalog_sync() && library_view_prepare_nas_server_switch();
+    g_switch_ui_result.store(ok ? 1 : -1);
+}
+
+static bool wait_lvgl_switch_prepared()
+{
+    const uint32_t sequence = g_switch_ui_sequence.fetch_add(1) + 1U;
+    g_switch_ui_result.store(0);
+    lv_async_call(prepare_switch_on_lvgl, reinterpret_cast<void *>(static_cast<uintptr_t>(sequence)));
+    for (unsigned i = 0; i < 200; ++i) {
+        const int result = g_switch_ui_result.load();
+        if (result == 1) return true;
+        if (result == -1) return false;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    // 如果LVGL callback已经开始，必须等它完成；不能一边释放旧Catalog一边回滚。
+    int expected = 0;
+    if (g_switch_ui_result.compare_exchange_strong(expected, -2)) return false;
+    while (g_switch_ui_result.load() == 2) vTaskDelay(pdMS_TO_TICKS(20));
+    return g_switch_ui_result.load() == 1;
+}
+
+static void open_new_nas_on_lvgl(void *)
+{
+    library_view_finish_nas_server_switch();
+}
+
+static void finish_worker(NasSyncContext *ctx, NasCatalogState state, esp_err_t error,
+    bool cached, uint32_t tracks, uint64_t revision, bool preserve_previous_cache = true)
+{
+    // 网络失败或校验失败时临时文件未提交；保留本次同步前已可用的 TF 缓存。
+    // 提交阶段若出错则保守地维持原有失败态，避免假定回滚一定成功。
+    if (state == NasCatalogState::Failed && preserve_previous_cache) {
+        NasCatalogSnapshot previous = {};
+        if (nas_catalog_service_get_snapshot(&previous) && previous.cached) {
+            cached = true;
+            tracks = previous.track_count;
+            revision = previous.revision;
+        }
+    }
     const UBaseType_t stack_hwm = uxTaskGetStackHighWaterMark(nullptr);
     ESP_LOGI(TAG,
         "同步结束：state=%s tracks=%lu error=%s stack_hwm=%u internal=%u min=%u psram=%u",
@@ -514,7 +600,20 @@ static void finish_worker(NasSyncContext *ctx, NasCatalogState state, esp_err_t 
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
         static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)));
-    publish_state(state, error, true, cached, false, tracks, revision);
+    const bool pending_switch = ctx != nullptr && ctx->pending_switch;
+    if (pending_switch && state == NasCatalogState::Failed) {
+        // 失败不可留下pending让下次开机绕过新服务器校验直接启用。
+        remove_file_locked(kPendingConfig);
+        ESP_LOGW(TAG, "NAS服务器热切换失败：%s；保留旧配置和旧TF曲库", esp_err_to_name(error));
+    }
+    NasCatalogSnapshot previous = {};
+    const bool was_configured = nas_catalog_service_get_snapshot(&previous) && previous.configured;
+    publish_state(state, error, state == NasCatalogState::Failed ? was_configured : true,
+        cached, false, tracks, revision);
+    g_server_switching.store(false);
+    if (pending_switch && state == NasCatalogState::Updated) {
+        lv_async_call(open_new_nas_on_lvgl, nullptr);
+    }
     heap_caps_free(ctx);
     vTaskDelete(nullptr);
 }
@@ -528,7 +627,14 @@ static void sync_worker(void *arg)
         return;
     }
 
-    esp_err_t ret = load_config(ctx);
+    if (ctx->pending_switch) {
+        player_transport_cancel_deferred_nas_play("NAS服务器切换");
+        if (!audio_service_stop(true) || !audio_idle_for_catalog_sync()) {
+            finish_worker(ctx, NasCatalogState::Failed, ESP_ERR_INVALID_STATE, false, 0U, 0ULL);
+            return;
+        }
+    }
+    esp_err_t ret = load_config(ctx, ctx->pending_switch ? kPendingConfig : SystemPaths::kNasCatalogConfig);
     if (ret != ESP_OK) {
         finish_worker(ctx, NasCatalogState::Failed, ret, false, 0U, 0ULL);
         return;
@@ -567,7 +673,7 @@ static void sync_worker(void *arg)
     }
     heap_caps_free(local_text);
 
-    if (local_meta.revision == ctx->remote.revision && local_meta.revision != 0ULL) {
+    if (!ctx->pending_switch && local_meta.revision == ctx->remote.revision && local_meta.revision != 0ULL) {
         uint32_t tracks = 0U;
         ret = validate_pair(SystemPaths::kNasMusicIndexV2, SystemPaths::kNasMusicManifestV2,
             ctx->remote, &tracks);
@@ -615,9 +721,32 @@ static void sync_worker(void *arg)
         return;
     }
 
+    // 同步期间用户可能已开始播放；提交前再次确认，避免运行中的音乐被换掉 TF 索引。
+    if (!audio_idle_for_catalog_sync()) {
+        remove_file_locked(SystemPaths::kNasMusicIndexV2Temp);
+        remove_file_locked(SystemPaths::kNasMusicManifestV2Temp);
+        finish_worker(ctx, NasCatalogState::Failed, ESP_ERR_INVALID_STATE, false, 0U, 0ULL);
+        return;
+    }
+
+    bool old_config_backed = false;
+    if (ctx->pending_switch) {
+        if (!wait_lvgl_switch_prepared() || !audio_idle_for_catalog_sync()) {
+            remove_file_locked(SystemPaths::kNasMusicIndexV2Temp);
+            remove_file_locked(SystemPaths::kNasMusicManifestV2Temp);
+            finish_worker(ctx, NasCatalogState::Failed, ESP_ERR_INVALID_STATE, false, 0U, 0ULL);
+            return;
+        }
+        ret = commit_pending_config(&old_config_backed);
+        if (ret != ESP_OK) {
+            finish_worker(ctx, NasCatalogState::Failed, ret, false, 0U, 0ULL);
+            return;
+        }
+    }
     ret = commit_downloads(ctx->meta_text);
+    if (ret != ESP_OK && ctx->pending_switch) rollback_pending_config(old_config_backed);
     if (ret != ESP_OK) {
-        finish_worker(ctx, NasCatalogState::Failed, ret, false, 0U, 0ULL);
+        finish_worker(ctx, NasCatalogState::Failed, ret, false, 0U, 0ULL, false);
         return;
     }
     finish_worker(ctx, NasCatalogState::Updated, ESP_OK, true, tracks, ctx->remote.revision);
@@ -631,6 +760,7 @@ esp_err_t nas_catalog_service_init()
     if (nas_catalog_service_get_snapshot(&existing) && existing.ready) {
         return ESP_OK;
     }
+    // 新版热切换校验失败不得被下次开机跳过；不再自动套用未验证的.pending。
 
     char *text = static_cast<char *>(heap_caps_malloc(kMetaBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (text == nullptr) return ESP_ERR_NO_MEM;
@@ -661,6 +791,38 @@ esp_err_t nas_catalog_service_init()
     ESP_LOGI(TAG, "Foundation就绪：配置=%s 缓存=%s tracks=%lu（未联网、未常驻Catalog）",
         configured ? "有" : "无", cached ? "有" : "无",
         static_cast<unsigned long>(cached ? local.track_count : 0U));
+    return ESP_OK;
+}
+
+bool nas_catalog_service_is_server_switching()
+{
+    return g_server_switching.load();
+}
+
+esp_err_t nas_catalog_service_request_pending_switch()
+{
+    NasCatalogSnapshot snapshot = {};
+    if (!nas_catalog_service_get_snapshot(&snapshot) || snapshot.syncing) return ESP_ERR_INVALID_STATE;
+    WifiServiceSnapshot wifi = {};
+    if (!wifi_service_get_snapshot(&wifi) || !wifi.connected) return ESP_ERR_INVALID_STATE;
+    if (!file_exists(kPendingConfig)) return ESP_ERR_NOT_FOUND;
+    bool expected = false;
+    if (!g_server_switching.compare_exchange_strong(expected, true)) return ESP_ERR_INVALID_STATE;
+    NasSyncContext *ctx = static_cast<NasSyncContext *>(
+        heap_caps_calloc(1, sizeof(NasSyncContext), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (ctx == nullptr) { g_server_switching.store(false); return ESP_ERR_NO_MEM; }
+    ctx->pending_switch = true;
+    publish_state(NasCatalogState::Syncing, ESP_OK, snapshot.configured, snapshot.cached, true,
+        snapshot.track_count, snapshot.revision);
+    if (xTaskCreatePinnedToCore(sync_worker, "NasSwitch", kWorkerStackBytes, ctx,
+        kWorkerPriority, nullptr, kWorkerCore) != pdPASS) {
+        heap_caps_free(ctx);
+        g_server_switching.store(false);
+        publish_state(NasCatalogState::Failed, ESP_ERR_NO_MEM, snapshot.configured, snapshot.cached, false,
+            snapshot.track_count, snapshot.revision);
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "NAS服务器热切换启动：先停音乐，再校验新索引，成功后才启用配置");
     return ESP_OK;
 }
 

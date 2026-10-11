@@ -5,6 +5,8 @@
 
 #include "driver/sdmmc_host.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "sdmmc_cmd.h"
@@ -20,6 +22,20 @@
 namespace {
 
 static const char *TAG = "USB存储";
+
+// Diagnostic only: MSC storage objects are allocated with MALLOC_CAP_DMA.
+// The system RAM_MON 'largest' is not necessarily the DMA-capable largest block.
+static void log_msc_dma_heap(const char *stage)
+{
+    ESP_LOGI(TAG,
+        "MSC_RAM: %s fifo=%u dma_free=%u dma_largest=%u internal_free=%u internal_largest=%u",
+        stage,
+        static_cast<unsigned>(CONFIG_TINYUSB_MSC_BUFSIZE),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+        static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+        static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
+}
 
 enum class TinyUsbProfile : uint8_t {
     None = 0,
@@ -329,6 +345,7 @@ esp_err_t usb_storage_service_start()
     g_service_start_tick = xTaskGetTickCount();
     g_host_release_tick = 0;
 
+    log_msc_dma_heap("before_raw_sd");
     esp_err_t ret = raw_sd_init();
     if (ret != ESP_OK) return ret;
 
@@ -339,8 +356,12 @@ esp_err_t usb_storage_service_start()
     storage_cfg.fat_fs.format_flags = 0;
     storage_cfg.medium.card = g_card;
 
+    log_msc_dma_heap("before_msc_new");
+    // MSC storage needs a contiguous DMA object.
+    // Keep the standard TinyUSB allocation; the project MSC FIFO is configured to 4096B.
     ret = tinyusb_msc_new_storage_sdmmc(&storage_cfg, &g_storage);
     if (ret != ESP_OK) {
+        log_msc_dma_heap("msc_new_failed");
         ESP_LOGE(TAG, "创建SDMMC MSC存储失败：%s", esp_err_to_name(ret));
         raw_sd_cleanup();
         return ret;

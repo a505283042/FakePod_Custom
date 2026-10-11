@@ -21,6 +21,7 @@
 #include "ble_remote_service.h"
 #include "wifi_service.h"
 #include "nas_catalog_service.h"
+#include "nas_library_source.h"
 #include "battery_service.h"
 #include "motion_service.h"
 #include "screen_lock_simple.h"
@@ -30,6 +31,11 @@ static const char *TAG = "运行期";
 
 static bool g_ready_published = false;
 static bool g_background_start_attempted = false;
+// 只由本次开机保存的 Wi-Fi 恢复任务置位；手动打开 Wi-Fi 不触发自动 NAS 检查。
+static bool g_boot_nas_sync_pending = false;
+static bool g_boot_nas_sync_deferred_logged = false;
+static TickType_t g_boot_nas_sync_due_tick = 0;
+static constexpr TickType_t BOOT_NAS_SYNC_POLL_INTERVAL = pdMS_TO_TICKS(1000);
 
 // READY 后的一次性启动若碰到 NO_MEM/I2C 瞬态错误，不应让可选服务永久失效。
 // 这里只补启动已证明幂等的轻量服务；App 注册、GPIO按键等带注册副作用的模块不在此重试。
@@ -85,6 +91,61 @@ static void runtime_optional_service_health_update()
     ESP_LOGI(TAG, "可选服务健康恢复完成：Battery/Motion/Lyrics 已按当前可用依赖补齐");
 }
 
+static void runtime_boot_nas_sync_update()
+{
+    if (!g_boot_nas_sync_pending || usb_storage_service_blocks_normal_runtime()) return;
+    const TickType_t now = xTaskGetTickCount();
+    if (g_boot_nas_sync_due_tick != 0 && !runtime_tick_due(now, g_boot_nas_sync_due_tick)) {
+        return;
+    }
+    g_boot_nas_sync_due_tick = now + BOOT_NAS_SYNC_POLL_INTERVAL;
+
+    WifiServiceSnapshot wifi = {};
+    if (!wifi_service_get_snapshot(&wifi) || wifi.transition_running) return;
+    if (!wifi.connected) {
+        g_boot_nas_sync_pending = false;
+        ESP_LOGI(TAG, "开机NAS检查跳过：Wi-Fi恢复失败，本次开机不再自动检查");
+        return;
+    }
+
+    NasCatalogSnapshot nas = {};
+    if (!nas_catalog_service_get_snapshot(&nas) || !nas.configured) {
+        g_boot_nas_sync_pending = false;
+        ESP_LOGI(TAG, "开机NAS检查跳过：未配置NAS曲库");
+        return;
+    }
+    if (nas.syncing || nas.state == NasCatalogState::Updated || nas.state == NasCatalogState::UpToDate) {
+        // 用户已经手动发起/完成同步，不再启动第二次。
+        g_boot_nas_sync_pending = false;
+        return;
+    }
+    // NAS Catalog 常驻 PSRAM 不等于正在播放。同步只替换 TF 索引，不释放当前内存曲库；
+    // 是否能同步仍由 request_sync() 检查 AudioTask 是否空闲。
+    const bool catalog_resident = nas_library_source_ready();
+
+    const esp_err_t ret = nas_catalog_service_request_sync();
+    if (ret == ESP_ERR_INVALID_STATE) {
+        // 和用户手动点击恰好交错时，若同步已开始则视为本次检查已完成。
+        NasCatalogSnapshot current = {};
+        if (nas_catalog_service_get_snapshot(&current) && current.syncing) {
+            g_boot_nas_sync_pending = false;
+        } else if (!g_boot_nas_sync_deferred_logged) {
+            ESP_LOGI(TAG, "开机NAS索引检查等待：播放尚未停止，空闲后再检查");
+            g_boot_nas_sync_deferred_logged = true;
+        }
+        return;  // 音乐播放中或瞬时状态变化，等待下一次安全空闲。
+    }
+    g_boot_nas_sync_pending = false;           // 成功启动或出错都只发起一次。
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "开机NAS索引检查已启动（本次开机不重复发起）");
+        if (catalog_resident) {
+            ESP_LOGI(TAG, "开机NAS索引检查：常驻曲库继续使用原有 PSRAM 快照，更新仅落地 TF 索引缓存");
+        }
+    } else {
+        ESP_LOGW(TAG, "开机NAS索引检查未启动：%s（本次开机不重试）", esp_err_to_name(ret));
+    }
+}
+
 static AudioOutputMode runtime_audio_output_mode(DeviceAudioOutputMode mode)
 {
     switch (mode) {
@@ -113,6 +174,7 @@ void system_runtime_update()
     if (g_background_start_attempted) {
         wifi_service_update();
         ble_remote_service_update();
+        runtime_boot_nas_sync_update();
         runtime_optional_service_health_update();
         return;
     }
@@ -197,7 +259,8 @@ void system_runtime_update()
                 if (wifi_ret == ESP_OK && wifi_service_has_credentials()) {
                     const esp_err_t connect_ret = wifi_service_connect_saved(true);
                     if (connect_ret == ESP_OK) {
-                        ESP_LOGI(TAG, "开机无线策略：保存状态 Wi-Fi=开 BLE=关，启动Wi-Fi");
+                        g_boot_nas_sync_pending = true;
+                        ESP_LOGI(TAG, "开机无线策略：保存状态 Wi-Fi=开 BLE=关，启动Wi-Fi；NAS索引将在Wi-Fi就绪后检查一次");
                     } else {
                         ESP_LOGW(TAG, "开机Wi-Fi任务启动失败：%s；保持保存状态，不自动开启BLE",
                             esp_err_to_name(connect_ret));

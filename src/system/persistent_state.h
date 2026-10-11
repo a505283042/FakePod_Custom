@@ -41,6 +41,9 @@ bool persistent_state_resume_requires_nas();
 // READY 后观察当前运行态，只更新 RAM 快照并标 dirty；绝不调用 nvs_set/nvs_commit。
 void persistent_state_observe_runtime();
 
+// NAS服务器成功换绑后只清除旧NAS恢复记录，不清空Settings/Wi-Fi等其他NVS数据。
+esp_err_t persistent_state_discard_nas_resume();
+
 // 显式写入当前 dirty 快照。PowerKey V1 在关机长按确认后调用；其余自动写入策略仍未启用。
 esp_err_t persistent_state_flush();
 

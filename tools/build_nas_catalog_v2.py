@@ -15,11 +15,13 @@ index and never scans the NAS music tree itself.
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import uuid
 import re
 import struct
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict, fields
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -107,7 +109,7 @@ def build_static_alias_script(tracks: List["TrackMeta"]) -> bytes:
         "#!/bin/sh",
         "set -eu",
         'MUSIC_ROOT="${1:-/volume1/music}"',
-        'TRACK_ROOT="${2:-/volume1/web/track}"',
+        'TRACK_ROOT="${2:-$MUSIC_ROOT/_FakePod/track}"',
         'PARENT="$(dirname "$TRACK_ROOT")"',
         'NAME="$(basename "$TRACK_ROOT")"',
         'TMP="$PARENT/.${NAME}.new.$$"',
@@ -127,6 +129,18 @@ def build_static_alias_script(tracks: List["TrackMeta"]) -> bytes:
         alias_name = shell_single_quote(f"{track.track_id:016X}{suffix}")
         lines.append(f'ln "$MUSIC_ROOT"/{src_tail} "$TMP"/{alias_name}')
     lines.extend([
+        # Existing aliases might include manual compatibility names for old
+        # V2 catalog paths. Preserve them when rebuilding rather than
+        # discarding them during the atomic directory swap.
+        'if [ -d "$TRACK_ROOT" ]; then',
+        '  for PREVIOUS_ALIAS in "$TRACK_ROOT"/*; do',
+        '    [ -f "$PREVIOUS_ALIAS" ] || continue',
+        '    ALIAS_NAME="${PREVIOUS_ALIAS##*/}"',
+        '    if [ ! -e "$TMP/$ALIAS_NAME" ]; then',
+        '      ln "$PREVIOUS_ALIAS" "$TMP/$ALIAS_NAME"',
+        '    fi',
+        '  done',
+        'fi',
         'if [ -d "$TRACK_ROOT" ]; then mv "$TRACK_ROOT" "$OLD"; fi',
         'if ! mv "$TMP" "$TRACK_ROOT"; then',
         '  if [ -d "$OLD" ]; then mv "$OLD" "$TRACK_ROOT"; fi',
@@ -553,37 +567,215 @@ def build_track_meta(path: Path, root: Path, fmt: int) -> TrackMeta:
     )
 
 
-def iter_tracks(root: Path) -> List[TrackMeta]:
-    paths: List[Tuple[Path, int]] = []
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        fmt = FORMAT_MAP.get(path.suffix.lower())
-        if fmt is not None:
-            paths.append((path, fmt))
-    paths.sort(key=lambda item: ascii_fold_key("/" + item[0].relative_to(root).as_posix()))
+CACHE_NAME = "fakepod_scan_cache_v1.json"
+REPORT_NAME = "fakepod_change_report_v1.json"
+INCREMENTAL_SCRIPT_NAME = "fakepod_incremental_update.sh"
+CACHE_VERSION = 1
 
-    rows: List[TrackMeta] = []
+
+def cache_fingerprint(root: Path) -> str:
+    # The root itself is not stored in the index; binds the cache to this SMB share.
+    return str(root).replace("\\", "/").rstrip("/").casefold()
+
+
+def read_scan_cache(path: Optional[Path], root: Path) -> Optional[dict]:
+    if path is None or not path.exists():
+        return None
+    if path.stat().st_size > 24 * 1024 * 1024:
+        raise ValueError("扫描缓存文件异常大，已停止，请先备份并检查")
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(obj, dict) or obj.get("version") != CACHE_VERSION:
+        raise ValueError("扫描缓存版本不匹配，请备份后使用 --force-full 重建缓存")
+    if obj.get("root") != cache_fingerprint(root):
+        raise ValueError("扫描缓存对应另一音乐根目录，请重新选择 Music 或使用 --force-full")
+    if not isinstance(obj.get("entries"), dict) or len(obj["entries"]) > 100000:
+        raise ValueError("扫描缓存条目异常，已停止以免错误删除短 ID")
+    return obj
+
+
+def track_from_cache(path: str, item: dict) -> TrackMeta:
+    allowed = {f.name for f in fields(TrackMeta)}
+    row = item.get("track")
+    if not isinstance(row, dict) or set(row) != allowed:
+        raise ValueError(f"损坏的扫描缓存：{path}")
+    result = TrackMeta(**row)
+    if result.path != path or result.track_id != stable_track_id(path):
+        raise ValueError(f"扫描缓存曲目不匹配：{path}")
+    return result
+
+
+def scan_incremental(root: Path, previous: Optional[dict]):
+    """Stat all files; only parse tags for changed/new ones; emit a full V2 snapshot."""
+    paths: List[Tuple[str, Path, int, os.stat_result]] = []
+    visited = 0
+    def on_walk_error(error: OSError) -> None:
+        raise error
+    for dirpath, dirnames, filenames in os.walk(root, onerror=on_walk_error):
+        visited += 1
+        if Path(dirpath) == root:
+            dirnames[:] = [name for name in dirnames if name != "_FakePod"]
+        for name in filenames:
+            path = Path(dirpath) / name
+            fmt = FORMAT_MAP.get(path.suffix.lower())
+            if fmt is None:
+                continue
+            if not path.is_file():
+                continue
+            st = path.stat()
+            relative = "/" + path.relative_to(root).as_posix()
+            paths.append((relative, path, fmt, st))
+        if visited % 30 == 0:
+            print(f"FAKEPOD_PROGRESS DISCOVER {visited} {len(paths)}", flush=True)
+    paths.sort(key=lambda item: ascii_fold_key(item[0]))
+    print(f"FAKEPOD_PROGRESS FOUND {len(paths)} {len(paths)}", flush=True)
+    if len(paths) > 100000:
+        raise ValueError(f"too many tracks for FakePod V2: {len(paths)} > 100000")
+    old = previous["entries"] if previous else {}
+    rows = []
+    new_entries = {}
+    added, modified, unchanged = [], [], []
     previous_key = None
-    seen_track_ids: Dict[int, str] = {}
-    for index, (path, fmt) in enumerate(paths, 1):
-        row = build_track_meta(path, root, fmt)
-        key = ascii_fold_key(row.path)
+    seen_ids: Dict[int, str] = {}
+    for n, (relative, path, fmt, st) in enumerate(paths, 1):
+        key = ascii_fold_key(relative)
         if key == previous_key:
-            raise ValueError(f"case-insensitive duplicate path is not valid in FakePod V2: {row.path}")
+            raise ValueError(f"case-insensitive duplicate path is not valid in FakePod V2: {relative}")
         previous_key = key
-        collided = seen_track_ids.get(row.track_id)
-        if collided is not None and collided != row.path:
-            raise ValueError(
-                f"stable track-id collision: {row.track_id:016X} maps to both {collided!r} and {row.path!r}"
-            )
-        seen_track_ids[row.track_id] = row.path
+        tid = stable_track_id(relative)
+        if tid in seen_ids and seen_ids[tid] != relative:
+            raise ValueError(f"stable track-id collision: {tid:016X} {seen_ids[tid]!r} {relative!r}")
+        seen_ids[tid] = relative
+        entry = old.get(relative)
+        if (entry and isinstance(entry, dict) and
+                entry.get("size") == st.st_size and entry.get("mtime_ns") == st.st_mtime_ns):
+            row = track_from_cache(relative, entry)
+            if row.fmt != fmt:
+                raise ValueError(f"扫描缓存格式不一致：{relative}")
+            unchanged.append(relative)
+        else:
+            row = build_track_meta(path, root, fmt)
+            # Abort on a moving source; otherwise we could publish mismatched metadata.
+            last = path.stat()
+            if (last.st_size, last.st_mtime_ns) != (st.st_size, st.st_mtime_ns):
+                raise RuntimeError(f"扫描过程中歌曲发生变化，请重新扫描：{relative}")
+            (modified if entry else added).append(relative)
         rows.append(row)
-        if index % 250 == 0 or index == len(paths):
-            print(f"metadata: {index}/{len(paths)}", flush=True)
-    if len(rows) > 100000:
-        raise ValueError(f"too many tracks for FakePod V2: {len(rows)} > 100000")
+        new_entries[relative] = {"size": st.st_size, "mtime_ns": st.st_mtime_ns, "track": asdict(row)}
+        if n % 25 == 0 or n == len(paths):
+            print(f"FAKEPOD_PROGRESS META {n} {len(paths)}", flush=True)
+        if n % 250 == 0 or n == len(paths):
+            print(f"metadata scan: {n}/{len(paths)} reused={len(unchanged)} parsed={len(added)+len(modified)}", flush=True)
+    deleted = sorted(set(old) - set(new_entries), key=ascii_fold_key)
+    mode = "incremental" if previous else "baseline"
+    report = {"version": 1, "mode": mode, "total": len(rows),
+              "added": added if previous else [], "modified": modified if previous else [],
+              "removed": deleted if previous else [], "unchanged": len(unchanged),
+              "initial": len(rows) if not previous else 0,
+              "prepare_paths": ([p for p in (added + modified) if Path(p).suffix.lower() in (".mp3", ".flac")]
+                                if previous else [t.path for t in rows if Path(t.path).suffix.lower() in (".mp3", ".flac")]),
+              "remove_aliases": ([f"{stable_track_id(p):016X}{Path(p).suffix}" for p in deleted
+                                  if Path(p).suffix.lower() in (".mp3", ".flac")]),
+              "id": uuid.uuid4().hex}
+    # Extra manually repaired aliases remain untouched. Deletion only considers
+    # old canonical names tracked in our own validated cache, never unknown files.
+    new_aliases = {f"{t.track_id:016X}{Path(t.path).suffix}" for t in rows
+                   if Path(t.path).suffix.lower() in (".mp3", ".flac")}
+    report["remove_aliases"] = [x for x in report["remove_aliases"] if x not in new_aliases]
+    cache = {"version": CACHE_VERSION, "root": cache_fingerprint(root), "entries": new_entries}
+    print("FAKEPOD_INCREMENTAL " + " ".join(f"{k}={v}" for k, v in
+          (("mode", mode), ("total", len(rows)), ("added", len(report["added"])),
+           ("modified", len(report["modified"])), ("removed", len(report["removed"])),
+           ("reused", len(unchanged)))), flush=True)
+    return rows, cache, report
+
+
+def iter_tracks(root: Path) -> List[TrackMeta]:
+    """Legacy full-scan API retained for callers and compatibility tests."""
+    rows, _, _ = scan_incremental(root, None)
     return rows
+
+
+def build_incremental_link_script(tracks: List[TrackMeta], report: dict) -> bytes:
+    """BusyBox script with explicit prepare/cleanup phases, never deletes unknown aliases."""
+    by_path = {row.path: row for row in tracks}
+    revision = report["revision"]
+    nonce = report["id"]
+    marker = ".fakepod_prepared_" + nonce + ".ok"
+    report["prepare_marker"] = marker
+    lines = [
+        "#!/bin/sh", "set -eu",
+        # DSM 5.2 non-interactive SSH commands may not load the login shell PATH.
+        # Prefix standard NAS locations without discarding vendor-added entries.
+        'PATH="/bin:/usr/bin:/sbin:/usr/sbin:/usr/syno/bin:${PATH:-}"',
+        'export PATH',
+        'MODE="${1:-}"', 'MUSIC_ROOT="${2:-/volume1/music}"',
+        'TRACK_ROOT="${3:-$MUSIC_ROOT/_FakePod/track}"',
+        'INDEX_ROOT="$MUSIC_ROOT/_FakePod/music-index"',
+        'MARKER="$INDEX_ROOT/' + marker + '"',
+        'case "$MODE" in prepare|cleanup) ;; *) echo "Usage: $0 prepare|cleanup MUSIC_ROOT TRACK_ROOT"; exit 2;; esac',
+        '[ -d "$MUSIC_ROOT" ] || { echo "Music root not found"; exit 1; }',
+        '[ -d "$INDEX_ROOT" ] || { echo "Index folder not found"; exit 1; }',
+        'mkdir -p "$TRACK_ROOT"',
+        'if [ "$MODE" = prepare ]; then',
+        # The old BusyBox ash non-interactive shell may fail `command -v ls`
+        # even when `ls -di` works. Probe the actual operations instead.
+        '  ls -di "$MUSIC_ROOT" >/dev/null 2>&1 || { echo "NAS ls -i unsupported or PATH invalid"; exit 1; }',
+        "  awk 'BEGIN {print 1}' >/dev/null 2>&1 || { echo 'NAS awk operation failed'; exit 1; }",
+        "  nas_inode() { ls -di \"$1\" | awk 'NR==1 {print $1}'; }",
+        '  echo "Preflight: checking changed/new audio sources"',
+    ]
+    prepared = [by_path[p] for p in report["prepare_paths"]]
+    for row in prepared:
+        lines.append('  [ -f "$MUSIC_ROOT"/' + shell_single_quote(row.path.lstrip('/')) +
+                     ' ] || { echo "Audio source missing"; exit 1; }')
+    lines += ['  echo "Preparing changed/new short-ID aliases"']
+    for row in prepared:
+        src = '"$MUSIC_ROOT"/' + shell_single_quote(row.path.lstrip('/'))
+        name = f"{row.track_id:016X}{Path(row.path).suffix}"
+        dest = '"$TRACK_ROOT"/' + shell_single_quote(name)
+        tmp = '"$TRACK_ROOT"/' + shell_single_quote('.' + name + '.incremental-tmp')
+        lines += [
+            '  SRC=' + src,
+            '  DST=' + dest,
+            '  TMP=' + tmp,
+            '  [ ! -d "$DST" ] || { echo "Alias path is a directory"; exit 1; }',
+            '  SAME_INODE=0',
+            '  if [ -f "$DST" ]; then',
+            '    SRC_INO=$(nas_inode "$SRC")',
+            '    DST_INO=$(nas_inode "$DST")',
+            '    [ -n "$SRC_INO" ] && [ -n "$DST_INO" ] || { echo "Cannot read inode"; exit 1; }',
+            '    [ "$SRC_INO" != "$DST_INO" ] || SAME_INODE=1',
+            '  fi',
+            '  if [ "$SAME_INODE" -eq 1 ]; then',
+            '    : # Existing alias is already the correct hard link; leave intact.',
+            '  else',
+            '    [ ! -e "$TMP" ] || { echo "Temporary alias already exists"; exit 1; }',
+            '    ln "$SRC" "$TMP"',
+            '    mv -f "$TMP" "$DST"',
+            '  fi',
+        ]
+    lines += [
+        '  printf "%s\\n" ' + shell_single_quote(nonce) + ' > "$MARKER.tmp.$$"',
+        '  mv "$MARKER.tmp.$$" "$MARKER"',
+        '  echo "FakePod incremental prepare OK; changed aliases: ' + str(len(prepared)) + '; marker: ' + marker + '"',
+        'else',
+        '  [ -f "$MARKER" ] || { echo "Prepare marker missing"; exit 1; }',
+        '  grep -Fqx ' + shell_single_quote('revision=' + revision) + ' "$INDEX_ROOT/fakepod_catalog.meta" || { echo "New V2 meta not published"; exit 1; }',
+        '  QUAR="$MUSIC_ROOT/_FakePod/quarantine-' + nonce[:12] + '"',
+    ]
+    aliases = report["remove_aliases"]
+    if aliases:
+        lines += ['  mkdir -p "$QUAR"', '  echo "Quarantining removed canonical aliases; no permanent deletion"']
+        for name in aliases:
+            quoted = shell_single_quote(name)
+            lines += [
+                '  if [ -f "$TRACK_ROOT"/' + quoted + ' ]; then',
+                '    [ ! -e "$QUAR"/' + quoted + ' ] || { echo "Quarantine collision"; exit 1; }',
+                '    mv "$TRACK_ROOT"/' + quoted + ' "$QUAR"/' + quoted,
+                '  fi',
+            ]
+    lines += ['  echo "FakePod incremental cleanup OK; quarantined candidates: ' + str(len(aliases)) + '"', 'fi', '']
+    return '\n'.join(lines).encode('utf-8')
 
 
 def pool_builder():
@@ -788,6 +980,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Build FakePod V2 NAS catalog files")
     parser.add_argument("music_root", type=Path, help="Root folder containing NAS music")
     parser.add_argument("output_dir", type=Path, help="Folder served over HTTP/WebDAV")
+    parser.add_argument("--cache-from", type=Path, help="Published scan cache for incremental metadata reuse")
+    parser.add_argument("--force-full", action="store_true", help="Ignore previous scan cache; rebuild baseline")
     args = parser.parse_args()
 
     root = args.music_root.resolve()
@@ -796,7 +990,10 @@ def main() -> int:
         parser.error(f"music_root is not a directory: {root}")
     out.mkdir(parents=True, exist_ok=True)
 
-    tracks = iter_tracks(root)
+    cache_source = None if args.force_full else args.cache_from
+    prior = read_scan_cache(cache_source, root)
+    tracks, scan_cache, report = scan_incremental(root, prior)
+    print("FAKEPOD_PROGRESS CATALOG 0 1", flush=True)
     index_file, manifest_file, index_crc, manifest_crc, artist_count, album_count = build_catalog(tracks)
 
     # R46.0.96: no Python/Docker runtime on DSM. Emit a BusyBox-compatible hard-link
@@ -808,6 +1005,11 @@ def main() -> int:
     revision = (((index_crc << 32) | manifest_crc) ^ ((alias_crc << 1) | 0x96)) & 0xFFFFFFFFFFFFFFFF
     if revision == 0:
         revision = 1
+    report["revision"] = f"0x{revision:016X}"
+    (out / CACHE_NAME).write_text(json.dumps(scan_cache, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    incremental = build_incremental_link_script(tracks, report)
+    (out / INCREMENTAL_SCRIPT_NAME).write_bytes(incremental)
+    (out / REPORT_NAME).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     (out / "music_index_v2.bin").write_bytes(index_file)
     (out / "music_manifest_v2.bin").write_bytes(manifest_file)
@@ -844,8 +1046,9 @@ def main() -> int:
     print(f"manifest={len(manifest_file)} bytes crc=0x{manifest_crc:08X}")
     alias_count = sum(1 for t in tracks if Path(t.path).suffix.lower() in (".mp3", ".flac"))
     print(f"static_alias_script={len(alias_script)} bytes crc=0x{alias_crc:08X} links={alias_count} ids=FNV1A64 collisions=0")
-    print("DSM: sh fakepod_make_static_track_links.sh /volume1/music /volume1/web/track")
+    print("DSM: sh fakepod_make_static_track_links.sh /path/to/Music /path/to/Music/_FakePod/track")
     print(f"revision=0x{revision:016X}")
+    print(f"incremental: {report['mode']} +{len(report['added'])} ~{len(report['modified'])} -{len(report['removed'])} unchanged={report['unchanged']}")
     print(f"output={out}")
     return 0
 

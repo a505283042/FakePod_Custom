@@ -305,6 +305,10 @@ void player_transport_cancel_deferred_nas_play(const char *reason)
 
 static bool player_transport_play_current_internal(const char *reason)
 {
+    if (nas_catalog_service_is_server_switching()) {
+        ESP_LOGW(TAG, "NAS服务器切换期间暂停新播放请求");
+        return false;
+    }
     if (!player_state_is_ready()) {
         ESP_LOGW(TAG, "播放当前歌曲失败：Player 尚未就绪");
         return false;

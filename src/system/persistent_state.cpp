@@ -784,6 +784,32 @@ static esp_err_t persistent_flush_schema()
     return ret;
 }
 
+esp_err_t persistent_state_discard_nas_resume()
+{
+    if (!g_state.ready) return ESP_ERR_INVALID_STATE;
+    // 老NAS的路径/歌手/专辑不能成为新NAS的播放恢复上下文。
+    if (g_state.resume.valid && g_state.resume.source == PlayerMediaSource::Nas) {
+        persistent_resume_clear(&g_state.resume);
+        g_state.dirty_bits &= ~PERSISTENT_DIRTY_RESUME;
+    }
+    nvs_handle_t handle = 0;
+    esp_err_t ret = nvs_open(kResumeNamespace, NVS_READWRITE, &handle);
+    if (ret == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+    if (ret != ESP_OK) return ret;
+    uint8_t stored_source = 0;
+    const esp_err_t source_ret = nvs_get_u8(handle, "source", &stored_source);
+    if (source_ret == ESP_OK && stored_source == static_cast<uint8_t>(PlayerMediaSource::Nas)) {
+        ret = nvs_erase_all(handle); // 只擦除 resume 命名空间，不触碰设备NVS设置。
+        if (ret == ESP_OK) ret = nvs_commit(handle);
+    } else if (source_ret == ESP_OK || source_ret == ESP_ERR_NVS_NOT_FOUND) {
+        ret = ESP_OK;
+    } else {
+        ret = source_ret;
+    }
+    nvs_close(handle);
+    return ret;
+}
+
 esp_err_t persistent_state_flush()
 {
     if (!g_state.ready) {

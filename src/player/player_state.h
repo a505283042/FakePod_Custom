@@ -23,6 +23,9 @@ bool player_state_is_ready();
 // 已删除时按旧全局索引回退到相邻有效歌曲，空库保持空列表，不自动播放。
 bool player_state_rebind_after_catalog_reload(const char *preferred_path, size_t fallback_track_index);
 
+// NAS服务器换绑后放弃旧NAS队列，切回本地已构建的播放上下文；不自动起播。
+void player_state_forget_nas_context();
+
 // 获取当前播放来源。浏览曲库来源与播放来源相互独立。
 PlayerMediaSource player_state_get_source();
 const char *player_media_source_name(PlayerMediaSource source);
