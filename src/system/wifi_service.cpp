@@ -28,7 +28,8 @@ static constexpr TickType_t kBleStopTimeout = pdMS_TO_TICKS(6000);
 static constexpr TickType_t kBleRestoreTimeout = pdMS_TO_TICKS(6000);
 static constexpr TickType_t kBlePollDelay = pdMS_TO_TICKS(20);
 static constexpr TickType_t kProvisionAckGrace = pdMS_TO_TICKS(350);
-static constexpr TickType_t kBootRebindDelay = pdMS_TO_TICKS(250);
+static constexpr TickType_t kRemoteStartRetryDelay = pdMS_TO_TICKS(200);
+static constexpr uint8_t kRemoteStartAttempts = 2U;
 static constexpr TickType_t kConnectTimeout = pdMS_TO_TICKS(15000);
 static constexpr TickType_t kReconnectTimeout = pdMS_TO_TICKS(10000);
 static constexpr uint8_t kMaxConnectAttempts = 5U;
@@ -326,7 +327,7 @@ static esp_err_t init_wifi_stack()
     init_config.static_rx_buf_num = kWifiStaticRxBuffers;
     init_config.dynamic_rx_buf_num = kWifiDynamicRxBuffers;
     init_config.dynamic_tx_buf_num = kWifiDynamicTxBuffers;
-    ESP_LOGI(TAG,
+    ESP_LOGD(TAG,
         "Wi-Fi Low RAM档：static_rx=%d dynamic_rx=%d dynamic_tx=%d rx_ba_win=%d",
         init_config.static_rx_buf_num,
         init_config.dynamic_rx_buf_num,
@@ -411,6 +412,24 @@ static void worker_finish_idle(esp_err_t error = ESP_OK)
     portEXIT_CRITICAL(&g_lock);
 }
 
+// Only retry application sockets here. A successful GOT_IP must not trigger
+// another Wi-Fi driver/netif initialization just to bring up the remote service.
+static esp_err_t start_remote_with_retry()
+{
+    esp_err_t ret = ESP_FAIL;
+    for (uint8_t attempt = 0; attempt < kRemoteStartAttempts; ++attempt) {
+        ret = wifi_remote_service_start();
+        if (ret == ESP_OK) return ESP_OK;
+
+        ESP_LOGW(TAG, "遥控Socket初始化失败：attempt=%u/%u error=%s；仅重试业务Socket",
+            static_cast<unsigned>(attempt + 1U),
+            static_cast<unsigned>(kRemoteStartAttempts), esp_err_to_name(ret));
+        wifi_remote_service_stop();
+        if (attempt + 1U < kRemoteStartAttempts) vTaskDelay(kRemoteStartRetryDelay);
+    }
+    return ret;
+}
+
 static void wifi_worker(void *)
 {
     WorkerMode mode = WorkerMode::ConnectSaved;
@@ -474,10 +493,13 @@ static void wifi_worker(void *)
     }
 
     if (mode == WorkerMode::Recover) {
+        // A real disconnect invalidates TCP/UDP sockets; release them before
+        // reconnecting the existing STA driver, without reinitializing Wi-Fi.
+        wifi_remote_service_stop();
         ESP_LOGI(TAG, "Wi-Fi掉线：尝试在10秒内恢复现有STA连接");
         ret = wait_for_connection(kReconnectTimeout);
         if (ret == ESP_OK) {
-            ret = wifi_remote_service_start();
+            ret = start_remote_with_retry();
             if (ret != ESP_OK) {
                 ESP_LOGE(TAG, "Wi-Fi已恢复但遥控服务启动失败：%s", esp_err_to_name(ret));
                 cleanup_wifi();
@@ -505,26 +527,25 @@ static void wifi_worker(void *)
     ret = wait_for_connection(kConnectTimeout);
     if (ret != ESP_OK) goto failed;
 
-    if (mode == WorkerMode::ConnectSavedBoot) {
-        // 实机已确认：极少数冷启动会出现“已GOT_IP但业务数据面不通”，手动关/开Wi-Fi可恢复。
-        // 开机自动连接只在发布READY前做一次完整重绑定；运行期手动开Wi-Fi不走此路径，且绝不循环。
-        ESP_LOGI(TAG, "开机Wi-Fi首次获取IP：执行一次性数据面重绑定，%ums后重新连接",
-            static_cast<unsigned>(kBootRebindDelay * portTICK_PERIOD_MS));
-        cleanup_wifi();
-        vTaskDelay(kBootRebindDelay);
-
-        set_state(WifiServiceState::WifiInit);
-        ret = init_wifi_stack();
-        if (ret != ESP_OK) goto failed;
-        ret = wait_for_connection(kConnectTimeout);
-        if (ret != ESP_OK) goto failed;
-        ESP_LOGI(TAG, "开机Wi-Fi一次性数据面重绑定完成：准备启动业务Remote");
-    }
-
-    ret = wifi_remote_service_start();
+    // Boot and manual activation now share a single STA connect. IP_EVENT_STA_GOT_IP
+    // gates remote socket startup; do not intentionally disconnect/rebind on boot.
+    ret = start_remote_with_retry();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Wi-Fi已连接但遥控服务启动失败：%s", esp_err_to_name(ret));
         goto failed;
+    }
+
+    // If STA dropped while sockets were starting, never report a false READY.
+    {
+        bool sta_has_ip = false;
+        portENTER_CRITICAL(&g_lock);
+        sta_has_ip = g_connected;
+        portEXIT_CRITICAL(&g_lock);
+        if (!sta_has_ip) {
+            ESP_LOGW(TAG, "遥控Socket就绪时STA已掉线，取消READY");
+            ret = ESP_ERR_INVALID_STATE;
+            goto failed;
+        }
     }
 
     if (mode == WorkerMode::Provision) {
@@ -615,7 +636,7 @@ esp_err_t wifi_service_init()
         g_configured = true;
         g_state = WifiServiceState::ConfiguredIdle;
         portEXIT_CRITICAL(&g_lock);
-        ESP_LOGI(TAG, "Wi-Fi配置已加载：ssid=%s", loaded.ssid);
+        ESP_LOGD(TAG, "Wi-Fi配置已加载：ssid=%s", loaded.ssid);
         return ESP_OK;
     }
     if (ret == ESP_ERR_NOT_FOUND || ret == ESP_ERR_INVALID_STATE) {
@@ -652,13 +673,13 @@ void wifi_service_set_ble_fallback_enabled(bool enabled)
     portEXIT_CRITICAL(&g_lock);
 }
 
-esp_err_t wifi_service_connect_saved(bool boot_rebind_once)
+esp_err_t wifi_service_connect_saved(bool boot_restore)
 {
     portENTER_CRITICAL(&g_lock);
     const bool configured = g_ready && g_configured;
     portEXIT_CRITICAL(&g_lock);
     if (!configured) return ESP_ERR_NOT_FOUND;
-    return start_worker(boot_rebind_once
+    return start_worker(boot_restore
         ? WorkerMode::ConnectSavedBoot
         : WorkerMode::ConnectSaved);
 }

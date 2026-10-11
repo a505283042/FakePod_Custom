@@ -1700,14 +1700,14 @@ static esp_err_t media_library_scan_with_scratch(
                 static_cast<unsigned>(added_count),
                 static_cast<unsigned>(updated_count),
                 static_cast<unsigned>(removed_count));
-            ESP_LOGI(TAG, "增量属性校验：模式=%s 跳过stat=%u 实际stat=%u",
+            ESP_LOGD(TAG, "增量属性校验：模式=%s 跳过stat=%u 实际stat=%u",
                 fast_boot_incremental ? "启动新增快扫" : "严格校验",
                 static_cast<unsigned>(fast_stat_skipped_count),
                 static_cast<unsigned>(strict_stat_count));
-            ESP_LOGI(TAG, "增量延迟克隆：扫描期跳过Metadata=%u Artwork=%u，本轮无变化无需补齐",
+            ESP_LOGD(TAG, "增量延迟克隆：扫描期跳过Metadata=%u Artwork=%u，本轮无变化无需补齐",
                 static_cast<unsigned>(deferred_metadata_clone_count),
                 static_cast<unsigned>(deferred_artwork_clone_count));
-            ESP_LOGI(TAG, "增量阶段耗时：目录扫描=%u ms Catalog重建=0 ms V2落盘=0 ms 总计=%u ms",
+            ESP_LOGD(TAG, "增量阶段耗时：目录扫描=%u ms Catalog重建=0 ms V2落盘=0 ms 总计=%u ms",
                 static_cast<unsigned>(walk_ms),
                 static_cast<unsigned>(elapsed_ms));
         }
@@ -1844,7 +1844,7 @@ static esp_err_t media_library_scan_with_scratch(
     const uint32_t deferred_hydrate_ms =
         static_cast<uint32_t>((esp_timer_get_time() - deferred_hydrate_started_us) / 1000LL);
     if (fast_boot_incremental) {
-        ESP_LOGI(TAG, "增量延迟克隆：扫描期跳过Metadata=%u Artwork=%u，重建前补齐Metadata=%u Artwork=%u，耗时=%u ms",
+        ESP_LOGD(TAG, "增量延迟克隆：扫描期跳过Metadata=%u Artwork=%u，重建前补齐Metadata=%u Artwork=%u，耗时=%u ms",
             static_cast<unsigned>(deferred_metadata_clone_count),
             static_cast<unsigned>(deferred_artwork_clone_count),
             static_cast<unsigned>(hydrated_metadata_clone_count),
@@ -2039,11 +2039,11 @@ static esp_err_t media_library_scan_with_scratch(
             static_cast<unsigned>(added_count),
             static_cast<unsigned>(updated_count),
             static_cast<unsigned>(removed_count));
-        ESP_LOGI(TAG, "增量属性校验：模式=%s 跳过stat=%u 实际stat=%u",
+        ESP_LOGD(TAG, "增量属性校验：模式=%s 跳过stat=%u 实际stat=%u",
             fast_boot_incremental ? "启动新增快扫" : "严格校验",
             static_cast<unsigned>(fast_stat_skipped_count),
             static_cast<unsigned>(strict_stat_count));
-        ESP_LOGI(TAG, "增量阶段耗时：目录扫描=%u ms Catalog重建=%u ms V2落盘=%u ms 总计=%u ms",
+        ESP_LOGD(TAG, "增量阶段耗时：目录扫描=%u ms Catalog重建=%u ms V2落盘=%u ms 总计=%u ms",
             static_cast<unsigned>(walk_ms),
             static_cast<unsigned>(build_ms),
             static_cast<unsigned>(commit_ms),

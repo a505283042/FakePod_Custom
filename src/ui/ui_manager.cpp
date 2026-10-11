@@ -903,7 +903,7 @@ static void ui_display_refresh_ready_cb(lv_event_t *event)
             g_boot_reveal_pending = false;
             g_boot_reveal_retry_started_us = 0;
             g_boot_reveal_retry_count = 0U;
-            ESP_LOGI(TAG, "启动页首帧已完成并揭屏");
+            ESP_LOGD(TAG, "启动页首帧已完成并揭屏");
         }
     }
 

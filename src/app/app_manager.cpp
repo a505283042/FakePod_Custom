@@ -151,7 +151,7 @@ esp_err_t app_manager_register(const AppDescriptor &descriptor)
     }
     slot->registered = true;
 
-    ESP_LOGI(TAG, "APP注册：id=%u name=%s background=%s",
+    ESP_LOGD(TAG, "APP注册：id=%u name=%s background=%s",
         static_cast<unsigned>(descriptor.id),
         slot->descriptor.name,
         slot->descriptor.supports_background ? "YES" : "NO");

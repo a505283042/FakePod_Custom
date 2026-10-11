@@ -2543,7 +2543,7 @@ esp_err_t ebook_app_register()
 
     const esp_err_t ret = app_manager_register(descriptor);
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Ebook APP已注册：双视图规范分页 + 自动书签 + 后台音乐 + 共享GestureRouter圆环Launcher");
+        ESP_LOGD(TAG, "Ebook APP已注册：双视图规范分页 + 自动书签 + 后台音乐 + 共享GestureRouter圆环Launcher");
     }
     return ret;
 }

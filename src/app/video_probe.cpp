@@ -185,7 +185,7 @@ esp_err_t init()
     const esp_extractor_err_t ret = esp_extractor_register_default();
     if (ret != ESP_EXTRACTOR_ERR_OK) return VideoMediaIo::map_extractor_error(ret);
     g_registered = true;
-    ESP_LOGI(TAG, "ESP Extractor已注册：AVI-only，共享Storage IO；MJPEG+MP3 metadata/seek + R.40.2 VIDEO benchmark");
+    ESP_LOGD(TAG, "ESP Extractor已注册：AVI-only，共享Storage IO；MJPEG+MP3 metadata/seek + R.40.2 VIDEO benchmark");
     return ESP_OK;
 }
 

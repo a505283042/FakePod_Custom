@@ -31,6 +31,16 @@ static void runtime_task(void *arg)
 
 extern "C" void app_main(void)
 {
+    // R46.0.120: normal boot does not need chip/driver buffer details.
+    // Keep WARN/ERROR from these IDF/vendor tags; project service status remains INFO.
+    static constexpr const char* kQuietBootTags[] = {
+        "wifi", "wifi_init", "pp", "net80211", "phy_init",
+        "esp_netif_handlers", "co5300_spi",
+    };
+    for (const char* tag : kQuietBootTags) {
+        esp_log_level_set(tag, ESP_LOG_WARN);
+    }
+
     // 初始化启动状态机
     boot_state_init();
 

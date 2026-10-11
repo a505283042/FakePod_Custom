@@ -2822,7 +2822,7 @@ esp_err_t visual_music_app_register()
 
     const esp_err_t ret = app_manager_register(descriptor);
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "电子音流 APP已注册：NSF 6502/2A03 + 统一AppManager生命周期");
+        ESP_LOGD(TAG, "电子音流 APP已注册：NSF 6502/2A03 + 统一AppManager生命周期");
     }
     return ret;
 }

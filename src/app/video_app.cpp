@@ -2241,7 +2241,7 @@ esp_err_t video_app_register()
     descriptor.lifecycle.destroy = video_destroy;
     const esp_err_t ret = app_manager_register(descriptor);
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Video APP已注册：AVI Browser + Dedicated Presenter + Audio Master + 自动下一视频核心");
+        ESP_LOGD(TAG, "Video APP已注册：AVI Browser + Dedicated Presenter + Audio Master + 自动下一视频核心");
     }
     return ret;
 }

@@ -2817,7 +2817,7 @@ esp_err_t settings_app_register()
 
     const esp_err_t ret = app_manager_register(descriptor);
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "设置APP已注册：2x2 四宫格主页 + 设备设置NVS模型");
+        ESP_LOGD(TAG, "设置APP已注册：2x2 四宫格主页 + 设备设置NVS模型");
     }
     return ret;
 }

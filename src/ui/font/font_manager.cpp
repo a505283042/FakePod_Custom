@@ -249,7 +249,7 @@ static esp_err_t font_manager_scan_available_fonts()
         g_available_font_count,
         sizeof(g_available_fonts[0]),
         font_manager_compare_entries);
-    ESP_LOGI(TAG, "可用界面字体：%u 个", static_cast<unsigned>(g_available_font_count));
+    ESP_LOGD(TAG, "可用界面字体：%u 个", static_cast<unsigned>(g_available_font_count));
     return ESP_OK;
 }
 
@@ -578,7 +578,7 @@ static esp_err_t font_manager_try_map_flash_cache(const struct stat &source_info
     g_context.data = static_cast<const uint8_t *>(mapped);
     g_context.size = static_cast<size_t>(header.font_size);
 
-    ESP_LOGI(TAG, "界面字体Flash缓存命中：%s %u KB mmap=%u ms metrics=%s",
+    ESP_LOGD(TAG, "界面字体Flash缓存命中：%s %u KB mmap=%u ms metrics=%s",
         g_selected_font_file,
         static_cast<unsigned>(g_context.size / 1024U),
         static_cast<unsigned>((esp_timer_get_time() - started_us) / 1000),
