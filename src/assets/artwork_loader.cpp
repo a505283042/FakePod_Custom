@@ -16,6 +16,10 @@
 
 #include "app_diag_config.h"
 #include "flac_decoder.h"
+#include "artwork_source_context.h"
+#include "nas_library_source.h"
+#include "nas_catalog_service.h"
+#include "esp_http_client.h"
 #include "media_catalog_v2.h"
 #include "media_library.h"
 #include "media_ogg_opus.h"
@@ -29,7 +33,8 @@ static const char *TAG = "封面加载";
 #define ARTWORK_LOAD_TRACE(...) APP_DIAG_DISCARDED_LOGI(TAG, "ARTWORK_LOAD_TRACE: " __VA_ARGS__)
 #endif
 
-static constexpr uint32_t ARTWORK_TASK_STACK_BYTES = 3584U;
+// HTTP Range runs on the same worker as local SD artwork; reserve an extra 1.5KB stack.
+static constexpr uint32_t ARTWORK_TASK_STACK_BYTES = 5120U;
 static constexpr UBaseType_t ARTWORK_TASK_PRIORITY = 2U;
 static constexpr BaseType_t ARTWORK_TASK_CORE = 1;
 // P1.2.9：压缩封面不再要求一次连续读完。ArtworkTask 只在 FLAC ring 有余量时
@@ -63,6 +68,7 @@ struct ArtworkLoadRequest
     uint32_t track_index = UINT32_MAX;
     ArtworkRefV2 ref = {};
     char *source_path = nullptr;
+    bool is_nas = false;
     bool has_artwork = false;
 };
 
@@ -210,7 +216,7 @@ static bool artwork_request_is_latest(const ArtworkLoadRequest *request)
     if (g_storage_handoff || request == nullptr || request->request_id != artwork_latest_request_id()) {
         return false;
     }
-    return request->catalog_generation == media_catalog_v2_generation();
+    return request->catalog_generation != 0U && request->catalog_generation == artwork_source_active_generation();
 }
 
 static bool artwork_flac_slice_plan(size_t *out_chunk, FlacStorageWindowSnapshot *out_window = nullptr)
@@ -679,6 +685,167 @@ static esp_err_t artwork_opus_io_callback(
     return ESP_OK;
 }
 
+// Network transport only. Compressed image validation, ID3 unsync, PSRAM cache,
+// RGB565 rendering and fallback remain shared with local artwork.
+static bool artwork_nas_http_status_retryable(int status)
+{
+    return status == 429 || status == 500 || status == 502 || status == 503 || status == 504;
+}
+
+// One bounded HTTP Range attempt. Never read a 200 response body: the server
+// could otherwise send the entire MP3/FLAC rather than the embedded artwork.
+static esp_err_t artwork_nas_fetch_range_once(const ArtworkLoadRequest *request,
+    const NasPlaybackEndpoint *endpoint, const char *url, uint8_t *data, bool *out_retryable)
+{
+    *out_retryable = false;
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.timeout_ms = 2000;
+    config.buffer_size = 1024;
+    config.buffer_size_tx = 1024;
+    config.keep_alive_enable = false;
+    if (endpoint->username[0] != '\0') {
+        config.username = endpoint->username;
+        config.password = endpoint->password;
+        config.auth_type = HTTP_AUTH_TYPE_BASIC;
+    }
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == nullptr) return ESP_ERR_NO_MEM;
+
+    const uint64_t begin = request->ref.data_offset;
+    const uint64_t end = begin + request->ref.data_size - 1ULL;
+    char range[64] = {};
+    snprintf(range, sizeof(range), "bytes=%llu-%llu",
+        static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end));
+    esp_err_t ret = esp_http_client_set_header(client, "Range", range);
+    if (ret == ESP_OK) ret = esp_http_client_open(client, 0);
+    if (ret != ESP_OK) {
+        *out_retryable = ret == ESP_ERR_HTTP_CONNECT || ret == ESP_ERR_TIMEOUT ||
+                         ret == ESP_ERR_HTTP_EAGAIN || ret == ESP_FAIL;
+    }
+    if (ret == ESP_OK) {
+        const int64_t header_len = esp_http_client_fetch_headers(client);
+        const int status = esp_http_client_get_status_code(client);
+        if (header_len < 0) {
+            ret = ESP_FAIL;
+            *out_retryable = true; // temporary header/connection failure
+        } else if (status != 206) {
+            // 200: Range unsupported/ignored; 401/403/404/416: stable error.
+            ret = status == 200 ? ESP_ERR_NOT_SUPPORTED : ESP_ERR_INVALID_RESPONSE;
+            *out_retryable = artwork_nas_http_status_retryable(status);
+            ESP_LOGW(TAG, "NAS封面Range请求未满足：track=%lu http=%d retryable=%u",
+                static_cast<unsigned long>(request->track_index), status,
+                static_cast<unsigned>(*out_retryable));
+        } else if (header_len > 0 && static_cast<uint64_t>(header_len) != request->ref.data_size) {
+            ret = ESP_ERR_INVALID_SIZE;
+            ESP_LOGW(TAG, "NAS封面Range长度不符：track=%lu expected=%lu got=%lld",
+                static_cast<unsigned long>(request->track_index),
+                static_cast<unsigned long>(request->ref.data_size),
+                static_cast<long long>(header_len));
+        }
+    }
+    size_t loaded = 0U;
+    uint8_t timeouts = 0U;
+    while (ret == ESP_OK && loaded < request->ref.data_size) {
+        if (!artwork_request_is_latest(request) || nas_catalog_service_is_server_switching()) {
+            ret = ESP_ERR_INVALID_STATE;
+            break;
+        }
+        size_t chunk = request->ref.data_size - loaded;
+        if (chunk > 4096U) chunk = 4096U;
+        const int got = esp_http_client_read(client, reinterpret_cast<char *>(data + loaded), chunk);
+        if (got > 0) {
+            loaded += static_cast<size_t>(got);
+            timeouts = 0U;
+            vTaskDelay(1); // yield to audio HTTP stream and LVGL
+        } else if (got == -ESP_ERR_HTTP_EAGAIN && ++timeouts < 3U) {
+            vTaskDelay(1);
+        } else {
+            ret = ESP_FAIL; // transient timeout or truncated response
+            *out_retryable = true;
+        }
+    }
+    if (ret == ESP_OK && loaded != request->ref.data_size) {
+        ret = ESP_ERR_INVALID_SIZE;
+        *out_retryable = true;
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    return ret;
+}
+
+static esp_err_t artwork_read_nas_blob(const ArtworkLoadRequest *request,
+    uint8_t **out_data, size_t *out_size, MediaArtworkFormatV2 *out_format,
+    uint16_t *out_width, uint16_t *out_height)
+{
+    if (request == nullptr || !request->is_nas || request->source_path == nullptr ||
+        request->ref.data_size == 0U || request->ref.data_size > MEDIA_ARTWORK_MAX_COMPRESSED_BYTES_V2 ||
+        request->ref.source == MediaArtworkSourceV2::OpusPicture) return ESP_ERR_NOT_SUPPORTED;
+    if (!artwork_request_is_latest(request) || nas_catalog_service_is_server_switching())
+        return ESP_ERR_INVALID_STATE;
+    if (request->ref.data_offset > UINT64_MAX - request->ref.data_size) return ESP_ERR_INVALID_SIZE;
+
+    NasPlaybackEndpoint *endpoint = static_cast<NasPlaybackEndpoint *>(
+        heap_caps_calloc(1, sizeof(NasPlaybackEndpoint), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    char *url = static_cast<char *>(heap_caps_calloc(1, 1024U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    uint8_t *data = static_cast<uint8_t *>(heap_caps_malloc(request->ref.data_size,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (endpoint == nullptr || url == nullptr || data == nullptr) {
+        heap_caps_free(endpoint); heap_caps_free(url); heap_caps_free(data);
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t ret = nas_catalog_service_get_playback_endpoint(endpoint);
+    if (ret == ESP_OK) {
+        // External image is not a short-ID audio track. Always use /music path.
+        if (request->ref.source == MediaArtworkSourceV2::ExternalFile)
+            endpoint->track_base_url[0] = '\0';
+        ret = nas_catalog_service_build_track_url(endpoint, request->source_path, url, 1024U);
+    }
+    if (ret == ESP_OK) {
+        for (unsigned attempt = 0U; attempt < 2U; ++attempt) {
+            if (!artwork_request_is_latest(request) || nas_catalog_service_is_server_switching()) {
+                ret = ESP_ERR_INVALID_STATE;
+                break;
+            }
+            bool retryable = false;
+            ret = artwork_nas_fetch_range_once(request, endpoint, url, data, &retryable);
+            if (ret == ESP_OK || !retryable || attempt != 0U) break;
+            ESP_LOGW(TAG, "NAS封面临时网络失败，200ms后最后重试一次：track=%lu result=%s",
+                static_cast<unsigned long>(request->track_index), esp_err_to_name(ret));
+            // Check cancellation during the short backoff; don't stall newer songs.
+            for (unsigned i = 0; i < 10U; ++i) {
+                if (!artwork_request_is_latest(request) || nas_catalog_service_is_server_switching()) {
+                    ret = ESP_ERR_INVALID_STATE;
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(20));
+            }
+            if (ret == ESP_ERR_INVALID_STATE) break;
+        }
+    }
+    heap_caps_free(endpoint);
+    heap_caps_free(url);
+    if (ret == ESP_OK && artwork_request_is_latest(request)) {
+        size_t logical_size = request->ref.data_size;
+        if ((request->ref.flags & MEDIA_ARTWORK_REF_NEEDS_ID3_UNSYNC_V2) != 0U)
+            logical_size = artwork_deunsynchronise_in_place(data, logical_size);
+        MediaArtworkFormatV2 format = MediaArtworkFormatV2::Unknown;
+        uint16_t width = 0U, height = 0U;
+        if (artwork_detect_image(data, logical_size, &format, &width, &height)) {
+            *out_data = data;
+            *out_size = logical_size;
+            *out_format = format;
+            *out_width = width;
+            *out_height = height;
+            return ESP_OK;
+        }
+        ret = ESP_ERR_INVALID_RESPONSE;
+    }
+    heap_caps_free(data);
+    return ret;
+}
+
 static __attribute__((noinline)) esp_err_t artwork_read_blob(
     const ArtworkLoadRequest *request,
     uint8_t **out_data,
@@ -698,6 +865,9 @@ static __attribute__((noinline)) esp_err_t artwork_read_blob(
     *out_width = 0U;
     *out_height = 0U;
 
+    if (request->is_nas) {
+        return artwork_read_nas_blob(request, out_data, out_size, out_format, out_width, out_height);
+    }
     if (request->ref.data_size == 0U || request->ref.data_size > MEDIA_ARTWORK_MAX_COMPRESSED_BYTES_V2) {
         return ESP_ERR_INVALID_SIZE;
     }
@@ -987,6 +1157,12 @@ static void artwork_task_main(void *)
 
         artwork_publish_state(ArtworkLoadState::Ready, request, ESP_OK, false, static_cast<uint32_t>(size),
             actual_format, actual_width, actual_height);
+        if (request->is_nas) {
+            ESP_LOGI(TAG, "NAS封面已读取：track=%lu bytes=%u format=%u stack_hwm=%u",
+                static_cast<unsigned long>(request->track_index),
+                static_cast<unsigned>(size), static_cast<unsigned>(actual_format),
+                static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+        }
         ARTWORK_LOAD_TRACE("READY request=%lu track=%lu bytes=%u format=%u stack_hwm=%u",
             static_cast<unsigned long>(request->request_id),
             static_cast<unsigned long>(request->track_index),
@@ -1092,7 +1268,8 @@ void artwork_loader_resume_storage_after_handoff()
 bool artwork_loader_request_track(uint32_t track_index, uint32_t *out_request_id)
 {
     if (g_storage_handoff || !artwork_loader_is_ready() || g_request_queue == nullptr || g_submit_mutex == nullptr ||
-        track_index >= media_library_get_count()) {
+        (artwork_source_is_nas() ? track_index >= nas_library_source_track_count()
+                                 : track_index >= media_library_get_count())) {
         return false;
     }
 
@@ -1106,14 +1283,27 @@ bool artwork_loader_request_track(uint32_t track_index, uint32_t *out_request_id
     request->track_index = track_index;
 
     // Catalog 指针只在这里短期使用；入队前把 locator 和 source path 全部复制出来。
-    const uint32_t generation_before = media_catalog_v2_generation();
+    const uint32_t generation_before = artwork_source_active_generation();
+    request->is_nas = artwork_source_is_nas();
+    if (generation_before == 0U ||
+        (request->is_nas && (nas_catalog_service_is_server_switching() ||
+                            track_index >= nas_library_source_track_count()))) {
+        artwork_request_release(request);
+        return false;
+    }
     MediaArtworkViewV2 view = {};
-    if (media_library_get_artwork_view(track_index, &view) && view.ref != nullptr) {
-        request->catalog_generation = view.generation;
+    const bool found = request->is_nas
+        ? nas_library_source_get_artwork_view(track_index, &view)
+        : media_library_get_artwork_view(track_index, &view);
+    if (found && view.ref != nullptr) {
+        request->catalog_generation = generation_before;
         request->ref = *view.ref;
+        MediaTrackViewV2 nas_track = {};
         const char *source_path = request->ref.source == MediaArtworkSourceV2::ExternalFile
             ? view.external_path
-            : media_library_get_path(track_index);
+            : request->is_nas
+                ? (nas_library_source_get_track_view(track_index, &nas_track) ? nas_track.path : nullptr)
+                : media_library_get_path(track_index);
         request->source_path = artwork_psram_strdup(source_path);
         if (request->source_path == nullptr) {
             artwork_request_release(request);
@@ -1125,7 +1315,7 @@ bool artwork_loader_request_track(uint32_t track_index, uint32_t *out_request_id
         request->has_artwork = false;
     }
 
-    if (request->catalog_generation != generation_before || media_catalog_v2_generation() != generation_before) {
+    if (request->catalog_generation != generation_before || artwork_source_active_generation() != generation_before) {
         artwork_request_release(request);
         return false;
     }
@@ -1214,7 +1404,7 @@ bool artwork_loader_acquire_cached(uint32_t track_index, ArtworkCacheLease *out_
     if (xSemaphoreTake(g_cache_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
         return false;
     }
-    const uint32_t generation = media_catalog_v2_generation();
+    const uint32_t generation = artwork_source_active_generation();
     const int index = cache_find_locked(generation, track_index);
     if (index < 0) {
         xSemaphoreGive(g_cache_mutex);

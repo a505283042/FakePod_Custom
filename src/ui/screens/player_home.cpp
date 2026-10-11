@@ -1094,16 +1094,12 @@ static bool player_home_launcher_acquire_surface(
     CoverSurfaceLease *out_lease,
     uint32_t *out_acquire_us)
 {
-    if (out_lease == nullptr) {
+    if (out_lease == nullptr || media_source != player_state_get_source()) {
         return false;
     }
     *out_lease = {};
     if (out_acquire_us != nullptr) {
         *out_acquire_us = 0U;
-    }
-    if (media_source != PlayerMediaSource::Local) {
-        // NAS 尚无 artwork provider。绝不能把 NAS track index 当成本地曲库 index。
-        return false;
     }
 
     const int64_t started_us = esp_timer_get_time();
@@ -1181,12 +1177,12 @@ static bool player_home_launcher_acquire_default_surface(
 {
     if (out_candidate == nullptr) return false;
 
-    if (media_source == PlayerMediaSource::Local) {
-        MediaArtworkViewV2 artwork = {};
-        if (media_library_get_artwork_view(track_index, &artwork)) {
-            // Local 有真实封面但 Surface 尚未 ready：本次菜单不展开，等待正常 Surface。
-            return false;
-        }
+    MediaArtworkViewV2 artwork = {};
+    if (media_source == PlayerMediaSource::Local
+            ? media_library_get_artwork_view(track_index, &artwork)
+            : nas_library_source_get_artwork_view(track_index, &artwork)) {
+        // Both sources must wait for a real pending surface rather than flashing a default.
+        return false;
     }
 
     const FallbackCoverImageKind kind =
@@ -2104,8 +2100,7 @@ static bool player_home_present_current_cover_bounded(const char *reason)
     const uint32_t track_index = static_cast<uint32_t>(player_state_get_index());
     const PlayerMediaSource media_source = player_state_get_source();
     CoverSurfaceLease lease = {};
-    const bool has_cover_surface = media_source == PlayerMediaSource::Local &&
-        cover_surface_cache_acquire(track_index, &lease);
+    const bool has_cover_surface = cover_surface_cache_acquire(track_index, &lease);
     const uint8_t *source = nullptr;
     FallbackCoverImageLease fallback = {};
     bool using_default = false;
@@ -2113,11 +2108,11 @@ static bool player_home_present_current_cover_bounded(const char *reason)
     if (has_cover_surface) {
         source = g_overlay_visible ? lease.dimmed_rgb565 : lease.normal_rgb565;
     } else {
-        if (media_source == PlayerMediaSource::Local) {
-            MediaArtworkViewV2 artwork = {};
-            if (media_library_get_artwork_view(track_index, &artwork)) {
-                return false;
-            }
+        MediaArtworkViewV2 artwork = {};
+        if (media_source == PlayerMediaSource::Local
+                ? media_library_get_artwork_view(track_index, &artwork)
+                : nas_library_source_get_artwork_view(track_index, &artwork)) {
+            return false;
         }
         if (!fallback_cover_image_acquire(FallbackCoverImageKind::Artwork, &fallback)) {
             return false;
@@ -3060,7 +3055,7 @@ static void player_home_update_background_timer_qos()
         g_cassette_visual_switch_pending = false;
     }
     const bool nas_playback = player_state_is_ready() && player_state_get_source() == PlayerMediaSource::Nas;
-    // NAS封面Provider尚未接入时统一退回 Artwork 的默认封面；绝不继续绑定上一首 Local 磁带/封面。
+    // NAS 使用共享 Artwork Surface；磁带机械模式暂保持 Local-only，避免下一首预取串源。
     const bool artwork_should_run = should_run &&
         (nas_playback || g_music_visual_mode == MusicVisualMode::Artwork || g_cassette_visual_switch_pending);
     const bool cassette_should_run = should_run && !nas_playback &&

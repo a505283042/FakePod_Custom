@@ -1,11 +1,13 @@
 #include "library_view.h"
 
+#include <atomic>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
 
 #include "esp_log.h"
+#include "app_manager.h"
 #include "esp_timer.h"
 #include "app_diag_config.h"
 #include "esp_heap_caps.h"
@@ -30,6 +32,7 @@
 #include "search/search_key_builder.h"
 #include "system/screen_lock_simple.h"
 #include "wifi_service.h"
+#include "usb_storage_service.h"
 #include "ui_common.h"
 #include "widgets/quick_index_keyboard.h"
 
@@ -371,6 +374,10 @@ static DeviceMusicListScope g_nas_load_scope = DeviceMusicListScope::All;
 static esp_err_t g_nas_load_result = ESP_OK;
 static uint32_t g_nas_load_stack_hwm = 0U;
 static uint32_t g_nas_load_elapsed_ms = 0U;
+static std::atomic<bool> g_nas_index_reload_pending{false};
+static bool g_nas_index_reload_active = false;
+static bool g_nas_index_reload_was_visible = false;
+static uint32_t g_nas_index_reload_old_track_count = 0U;
 static lv_obj_t *g_nas_loading_overlay = nullptr;
 static lv_obj_t *g_nas_loading_title = nullptr;
 static lv_obj_t *g_nas_loading_status = nullptr;
@@ -388,6 +395,7 @@ static bool library_view_inertia_audio_safe();
 static LibraryBrowseMode library_view_category_mode_for_detail();
 static void library_view_return_to_parent_category();
 static void library_view_finish_nas_load_async(void *);
+static void library_view_nas_index_reload_timer_cb(lv_timer_t *);
 static void library_view_update_nas_load_stage_async(void *stage_value);
 static bool library_view_nas_catalog_needed_by_playback();
 static bool library_search_build_key_cache();
@@ -3334,6 +3342,8 @@ void library_view_create(lv_obj_t *screen)
     if (g_inertia.timer != nullptr) {
         lv_timer_pause(g_inertia.timer);
     }
+    // 常驻轻量计时器仅在普通 NAS 同步真正提交新索引后尝试刷新 PSRAM。
+    (void)lv_timer_create(library_view_nas_index_reload_timer_cb, 1000, nullptr);
 
     if (!quick_index_keyboard_create(
             &g_search_keyboard,
@@ -3661,6 +3671,34 @@ static void library_view_finish_nas_load_async(void *)
     g_nas_load_running = false;
     taskEXIT_CRITICAL(&g_nas_load_lock);
 
+    if (g_nas_index_reload_active) {
+        g_nas_index_reload_active = false;
+        if (result == ESP_OK && nas_library_source_ready()) {
+            const bool playback_rebound = player_state_finish_nas_index_reload();
+            // 相同曲数通常只是封面/标签变化，可继续沿用轻量浏览状态；
+            // 曲数变化则放弃旧分组索引，通过已保存的浏览偏好重新定位。
+            if (g_nas_remembered_state != nullptr) {
+                if (nas_library_source_track_count() == g_nas_index_reload_old_track_count)
+                    g_nas_remembered_state->generation = nas_library_source_generation();
+                else
+                    g_nas_remembered_state->valid = false;
+            }
+            library_view_destroy_nas_loading_overlay();
+            if (g_nas_index_reload_was_visible && app_manager_foreground() == AppId::Music) {
+                library_view_activate_nas_ui();
+            }
+            ESP_LOGI(TAG, "NAS索引已热重载PSRAM：tracks=%lu generation=%lu playback=%s UI=%s",
+                static_cast<unsigned long>(nas_library_source_track_count()),
+                static_cast<unsigned long>(nas_library_source_generation()),
+                playback_rebound ? "已恢复" : "无NAS上下文/恢复失败",
+                g_nas_index_reload_was_visible ? "刷新" : "保持后台");
+            return;
+        }
+        (void)player_state_finish_nas_index_reload();
+        ESP_LOGW(TAG, "NAS索引同步成功但PSRAM重载失败：%s；重新打开NAS列表可重试", esp_err_to_name(result));
+        // 失败时不伪装成旧 NAS 列表，按原有加载失败流程显示错误。
+    }
+
     if (result == ESP_OK && nas_library_source_ready()) {
         library_view_activate_nas_ui();
         return;
@@ -3772,10 +3810,79 @@ static void library_view_nas_load_task(void *)
     vTaskDeleteWithCaps(xTaskGetCurrentTaskHandle());
 }
 
+void library_view_request_nas_index_reload()
+{
+    g_nas_index_reload_pending.store(true);
+}
+
+static void library_view_nas_index_reload_timer_cb(lv_timer_t *)
+{
+    if (!g_nas_index_reload_pending.load() || g_nas_index_reload_active ||
+        nas_catalog_service_is_server_switching() ||
+        usb_storage_service_blocks_normal_runtime() || g_root == nullptr) return;
+
+    bool loading = false;
+    taskENTER_CRITICAL(&g_nas_load_lock);
+    loading = g_nas_load_running;
+    taskEXIT_CRITICAL(&g_nas_load_lock);
+    if (loading) return;
+    if (!nas_library_source_ready()) {
+        // 无驻留快照：下次正常打开 NAS 会直接读取 TF 的最新索引。
+        g_nas_index_reload_pending.store(false);
+        return;
+    }
+    AudioStateSnapshot audio = {};
+    if (!audio_service_get_snapshot(&audio) ||
+        (audio.state != AudioPlaybackState::Ready &&
+         audio.state != AudioPlaybackState::Stopped &&
+         audio.state != AudioPlaybackState::Error &&
+         audio.state != AudioPlaybackState::Finished)) return;
+
+    g_nas_index_reload_was_visible = library_source_is_nas() && library_view_is_visible();
+    g_nas_index_reload_old_track_count = nas_library_source_track_count();
+    if (library_source_is_nas()) library_remember_current_source_state();
+    player_state_prepare_nas_index_reload();
+    // 确保所有旧 Catalogue 引用都先从 LVGL/PlayerState 脱离，再释放 PSRAM。
+    library_view_inertia_stop(false);
+    library_view_scrollbar_set_visible(false);
+    library_search_release_cache();
+    g_source = LibraryDataSource::Local;
+    g_nas_selected_track = UINT32_MAX;
+    lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
+    nas_library_source_close();
+
+    g_nas_index_reload_active = true;
+    taskENTER_CRITICAL(&g_nas_load_lock);
+    g_nas_load_running = true;
+    DeviceMusicListSelection selection = {};
+    g_nas_load_scope = device_settings_get_music_list_selection_for_source(
+        DeviceMusicLibrarySource::Nas, &selection) ? selection.scope : DeviceMusicListScope::All;
+    g_nas_load_result = ESP_OK;
+    taskEXIT_CRITICAL(&g_nas_load_lock);
+    if (g_nas_index_reload_was_visible) (void)library_view_show_nas_loading_overlay();
+    TaskHandle_t task = nullptr;
+    if (xTaskCreatePinnedToCoreWithCaps(library_view_nas_load_task, "nas_library",
+            NAS_LIBRARY_LOAD_TASK_STACK_BYTES, nullptr, NAS_LIBRARY_LOAD_TASK_PRIORITY,
+            &task, NAS_LIBRARY_LOAD_TASK_CORE, NAS_LIBRARY_LOAD_TASK_STACK_CAPS) != pdPASS) {
+        g_nas_index_reload_active = false;
+        taskENTER_CRITICAL(&g_nas_load_lock);
+        g_nas_load_running = false;
+        taskEXIT_CRITICAL(&g_nas_load_lock);
+        (void)player_state_finish_nas_index_reload();
+        library_view_destroy_nas_loading_overlay();
+        if (g_nas_index_reload_was_visible)
+            player_home_resume_from_fullscreen_view("nas-index-reload-no-mem");
+        ESP_LOGE(TAG, "NAS PSRAM重载任务创建失败：ESP_ERR_NO_MEM");
+    } else {
+        g_nas_index_reload_pending.store(false);
+        ESP_LOGI(TAG, "NAS索引更新已提交：安全空闲，开始重新读取PSRAM曲库");
+    }
+}
+
 bool library_view_open_nas(DeviceMusicListScope scope)
 {
-    if (nas_catalog_service_is_server_switching()) {
-        ESP_LOGW(TAG, "NAS连接配置切换中，暂不允许打开旧NAS曲库");
+    if (nas_catalog_service_is_server_switching() || g_nas_index_reload_active) {
+        ESP_LOGW(TAG, "NAS配置或索引重载中，暂不允许打开旧NAS曲库");
         return false;
     }
     if (g_root == nullptr) return false;
@@ -3909,6 +4016,8 @@ void library_view_close_nas()
 
 bool library_view_prepare_nas_server_switch()
 {
+    if (g_nas_index_reload_active) return false;
+    g_nas_index_reload_pending.store(false);
     bool loading = false;
     taskENTER_CRITICAL(&g_nas_load_lock);
     loading = g_nas_load_running;

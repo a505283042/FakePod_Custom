@@ -611,8 +611,15 @@ static void finish_worker(NasSyncContext *ctx, NasCatalogState state, esp_err_t 
     publish_state(state, error, state == NasCatalogState::Failed ? was_configured : true,
         cached, false, tracks, revision);
     g_server_switching.store(false);
-    if (pending_switch && state == NasCatalogState::Updated) {
-        lv_async_call(open_new_nas_on_lvgl, nullptr);
+    if (state == NasCatalogState::Updated) {
+        if (pending_switch) {
+            lv_async_call(open_new_nas_on_lvgl, nullptr);
+        } else {
+            // 仅提交了新索引才标记驻留曲库过期；相同 revision 不重复加载。
+            // 这里只置标志，不在 NAS 网络 worker 上触碰 LVGL / PSRAM Catalog。
+            library_view_request_nas_index_reload();
+            ESP_LOGI(TAG, "NAS索引已更新：PSRAM曲库将在安全空闲后自动重载");
+        }
     }
     heap_caps_free(ctx);
     vTaskDelete(nullptr);

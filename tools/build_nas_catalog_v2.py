@@ -25,6 +25,8 @@ from dataclasses import dataclass, asdict, fields
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from nas_artwork_locator_v2 import scan_artwork, find_directory_cover
+
 CATALOG_VERSION = 6
 MANIFEST_VERSION = 2
 SIGNATURE_MODE_FAST = 1
@@ -63,6 +65,7 @@ SECTION = struct.Struct("<IIIIHHI")
 ARTIST = struct.Struct("<II")
 ALBUM = struct.Struct("<IIIIIHH")
 ARTIST_REF = struct.Struct("<II")
+ARTWORK = struct.Struct("<QIIqIHHBBBB")
 TRACK = struct.Struct("<IIIIHHIHHIIIHHHHHHBBBBIQIIIQQQQIIHH")
 MANIFEST_HEADER = struct.Struct("<8sHHHHIIII")
 MANIFEST_ROW = struct.Struct("<IB3xQq")
@@ -72,6 +75,7 @@ assert SECTION.size == 24
 assert ARTIST.size == 8
 assert ALBUM.size == 24
 assert ARTIST_REF.size == 8
+assert ARTWORK.size == 36
 assert TRACK.size == 124
 assert MANIFEST_HEADER.size == 32
 assert MANIFEST_ROW.size == 24
@@ -463,6 +467,19 @@ class TrackMeta:
     release_year: int = 0
     original_year: int = 0
     metadata_flags: int = META_SCANNED
+    # NAS artwork uses the existing V2 artwork-ref section; none of these fields
+    # affect the 124-byte track row, playback URL, or stable short ID.
+    artwork_scanned: bool = False
+    artwork_source: int = 0
+    artwork_format: int = 0
+    artwork_offset: int = 0
+    artwork_size: int = 0
+    artwork_flags: int = 0
+    artwork_width: int = 0
+    artwork_height: int = 0
+    artwork_picture_type: int = 0
+    artwork_path: str = ""
+    artwork_mtime: int = 0
 
 
 def tags_for_file(path: Path, fmt: int) -> Dict[str, List[str]]:
@@ -596,7 +613,13 @@ def read_scan_cache(path: Optional[Path], root: Path) -> Optional[dict]:
 def track_from_cache(path: str, item: dict) -> TrackMeta:
     allowed = {f.name for f in fields(TrackMeta)}
     row = item.get("track")
-    if not isinstance(row, dict) or set(row) != allowed:
+    # Compatible with old T3.3 caches that predate artwork locators.
+    legacy = {f.name for f in fields(TrackMeta)} - {
+        "artwork_scanned", "artwork_source", "artwork_format", "artwork_offset",
+        "artwork_size", "artwork_flags", "artwork_width", "artwork_height",
+        "artwork_picture_type", "artwork_path", "artwork_mtime",
+    }
+    if not isinstance(row, dict) or set(row) not in (allowed, legacy):
         raise ValueError(f"损坏的扫描缓存：{path}")
     result = TrackMeta(**row)
     if result.path != path or result.track_id != stable_track_id(path):
@@ -632,6 +655,8 @@ def scan_incremental(root: Path, previous: Optional[dict]):
         raise ValueError(f"too many tracks for FakePod V2: {len(paths)} > 100000")
     old = previous["entries"] if previous else {}
     rows = []
+    folder_art_cache = {}
+    artwork_scanned = 0
     new_entries = {}
     added, modified, unchanged = [], [], []
     previous_key = None
@@ -651,14 +676,42 @@ def scan_incremental(root: Path, previous: Optional[dict]):
             row = track_from_cache(relative, entry)
             if row.fmt != fmt:
                 raise ValueError(f"扫描缓存格式不一致：{relative}")
+            # When only folder.jpg changes, the song's size/mtime does not.
+            # Check the directory once per scan and invalidate external locators.
+            if row.artwork_scanned and row.artwork_source in (0, 3):
+                directory = path.parent
+                if directory not in folder_art_cache:
+                    folder_art_cache[directory] = find_directory_cover(directory, root)
+                current_folder_art = folder_art_cache[directory]
+                current = (row.artwork_source, row.artwork_format, row.artwork_offset,
+                           row.artwork_size, row.artwork_flags, row.artwork_width,
+                           row.artwork_height, row.artwork_picture_type,
+                           row.artwork_path, row.artwork_mtime)
+                if row.artwork_source == 3 and current_folder_art != current:
+                    row.artwork_scanned = False
+                if row.artwork_source == 0 and current_folder_art is not None:
+                    row.artwork_scanned = False
             unchanged.append(relative)
         else:
             row = build_track_meta(path, root, fmt)
-            # Abort on a moving source; otherwise we could publish mismatched metadata.
-            last = path.stat()
-            if (last.st_size, last.st_mtime_ns) != (st.st_size, st.st_mtime_ns):
-                raise RuntimeError(f"扫描过程中歌曲发生变化，请重新扫描：{relative}")
             (modified if entry else added).append(relative)
+        if not row.artwork_scanned:
+            locator = scan_artwork(path, root, fmt, folder_art_cache)
+            row.artwork_source = row.artwork_format = row.artwork_offset = 0
+            row.artwork_size = row.artwork_flags = 0
+            row.artwork_width = row.artwork_height = row.artwork_picture_type = 0
+            row.artwork_path, row.artwork_mtime = "", 0
+            if locator:
+                (row.artwork_source, row.artwork_format, row.artwork_offset,
+                 row.artwork_size, row.artwork_flags, row.artwork_width,
+                 row.artwork_height, row.artwork_picture_type,
+                 row.artwork_path, row.artwork_mtime) = locator
+            row.artwork_scanned = True
+            artwork_scanned += 1
+        # Protect against concurrent SMB source edits while scanning.
+        last = path.stat()
+        if (last.st_size, last.st_mtime_ns) != (st.st_size, st.st_mtime_ns):
+            raise RuntimeError(f"扫描过程中歌曲发生变化，请重新扫描：{relative}")
         rows.append(row)
         new_entries[relative] = {"size": st.st_size, "mtime_ns": st.st_mtime_ns, "track": asdict(row)}
         if n % 25 == 0 or n == len(paths):
@@ -843,18 +896,23 @@ def build_catalog(tracks: List[TrackMeta]):
         artist_bytes.extend(ARTIST.pack(add(name), 0))
 
     album_bytes = bytearray()
-    for title, display_artist, aid in album_rows:
+    album_cover_track = {}
+    for track_index, (track, (_, alb_id)) in enumerate(zip(tracks, track_entity_rows)):
+        if alb_id != INVALID_ID and track.artwork_source and alb_id not in album_cover_track:
+            album_cover_track[alb_id] = track_index
+    for alb_index, (title, display_artist, aid) in enumerate(album_rows):
         album_bytes.extend(ALBUM.pack(
             add(title),
             add(display_artist),
             aid,
-            INVALID_ID,
+            album_cover_track.get(alb_index, INVALID_ID),
             0,
             0,
             0,
         ))
 
     artist_ref_bytes = bytearray()
+    artwork_bytes = bytearray()
     track_bytes = bytearray()
     manifest_rows = bytearray()
 
@@ -866,6 +924,17 @@ def build_catalog(tracks: List[TrackMeta]):
             artist_ref_bytes.extend(ARTIST_REF.pack(direct_artist_id, 0))
             artist_ref_count = 1
 
+        artwork_ref_id = INVALID_ID
+        if track.artwork_source and track.artwork_size:
+            artwork_ref_id = len(artwork_bytes) // ARTWORK.size
+            artwork_path_off = add(track.artwork_path) if track.artwork_source == 3 else 0
+            artwork_bytes.extend(ARTWORK.pack(
+                track.artwork_offset, track.artwork_size, artwork_path_off,
+                track.artwork_mtime if track.artwork_source == 3 else 0,
+                track.artwork_flags, track.artwork_width, track.artwork_height,
+                track.artwork_source, track.artwork_format,
+                track.artwork_picture_type, 0,
+            ))
         path_off = add(track.path)
         title_off = add(track.title)
         artist_off = add(track.artist)
@@ -879,7 +948,7 @@ def build_catalog(tracks: List[TrackMeta]):
                 0,
                 0, 0, 0,
                 alb_id,
-                INVALID_ID,
+                artwork_ref_id,
                 track.metadata_flags,
                 track.track_number,
                 track.track_total,
@@ -910,7 +979,7 @@ def build_catalog(tracks: List[TrackMeta]):
         bytes(album_bytes),
         bytes(artist_ref_bytes),
         b"",
-        b"",
+        bytes(artwork_bytes),
         bytes(track_bytes),
     ]
     section_types = [
@@ -922,14 +991,14 @@ def build_catalog(tracks: List[TrackMeta]):
         SEC_ARTWORK_REFS,
         SEC_TRACKS,
     ]
-    row_sizes = [1, ARTIST.size, ALBUM.size, ARTIST_REF.size, 28, 36, TRACK.size]
+    row_sizes = [1, ARTIST.size, ALBUM.size, ARTIST_REF.size, 28, ARTWORK.size, TRACK.size]
     counts = [
         len(pool),
         len(artist_names),
         len(album_rows),
         len(artist_ref_bytes) // ARTIST_REF.size,
         0,
-        0,
+        len(artwork_bytes) // ARTWORK.size,
         len(tracks),
     ]
 
@@ -955,7 +1024,7 @@ def build_catalog(tracks: List[TrackMeta]):
         len(album_rows),
         len(artist_ref_bytes) // ARTIST_REF.size,
         0,
-        0,
+        len(artwork_bytes) // ARTWORK.size,
     )
     index_file = header + bytes(sections) + payload
 
@@ -1042,6 +1111,9 @@ def main() -> int:
     year_tagged = sum(1 for t in tracks if t.release_year or t.original_year)
     print(f"FakePod NAS Catalog: tracks={len(tracks)} artists={artist_count} albums={album_count}")
     print(f"metadata: title={title_tagged} artist={artist_tagged} album={album_tagged} year={year_tagged}")
+    print(f"artwork refs={sum(bool(t.artwork_source) for t in tracks)} "
+          f"embedded={sum(t.artwork_source in (1, 2) for t in tracks)} "
+          f"external={sum(t.artwork_source == 3 for t in tracks)}")
     print(f"index={len(index_file)} bytes crc=0x{index_crc:08X}")
     print(f"manifest={len(manifest_file)} bytes crc=0x{manifest_crc:08X}")
     alias_count = sum(1 for t in tracks if Path(t.path).suffix.lower() in (".mp3", ".flac"))

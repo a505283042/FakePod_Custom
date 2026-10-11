@@ -383,6 +383,26 @@ bool nas_library_source_get_track_view(uint32_t track_index, MediaTrackViewV2 *o
     return true;
 }
 
+bool nas_library_source_get_artwork_view(uint32_t track_index, MediaArtworkViewV2 *out_view)
+{
+    if (!nas_library_source_ready() || out_view == nullptr || track_index >= g_catalog.track_count ||
+        g_catalog.artwork_refs == nullptr) return false;
+    const TrackRowV2 &track = g_catalog.tracks[track_index];
+    if (track.artwork_ref_id == MEDIA_CATALOG_INVALID_ID_V2 ||
+        track.artwork_ref_id >= g_catalog.artwork_ref_count) return false;
+    const ArtworkRefV2 &ref = g_catalog.artwork_refs[track.artwork_ref_id];
+    MediaArtworkViewV2 view = {};
+    view.generation = g_generation;
+    view.track_index = track_index;
+    view.ref = &ref;
+    if (ref.source == MediaArtworkSourceV2::ExternalFile) {
+        view.external_path = media_catalog_v2_pool_str(&g_catalog, ref.path_off);
+        if (view.external_path == nullptr || view.external_path[0] != '/') return false;
+    }
+    *out_view = view;
+    return true;
+}
+
 size_t nas_library_source_artist_count() { return nas_library_source_ready() ? g_catalog.artist_group_count : 0U; }
 size_t nas_library_source_album_count() { return nas_library_source_ready() ? g_catalog.album_group_count : 0U; }
 size_t nas_library_source_decade_count() { return nas_library_source_ready() ? g_catalog.decade_group_count : 0U; }

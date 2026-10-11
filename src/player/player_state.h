@@ -23,6 +23,11 @@ bool player_state_is_ready();
 // 已删除时按旧全局索引回退到相邻有效歌曲，空库保持空列表，不自动播放。
 bool player_state_rebind_after_catalog_reload(const char *preferred_path, size_t fallback_track_index);
 
+// 普通 NAS 索引更新：在 LVGL 线程捕获旧歌曲路径与播放列表，并在新 Catalog 就绪后重绑。
+// 不改变本地音乐上下文，不自动播放。
+void player_state_prepare_nas_index_reload();
+bool player_state_finish_nas_index_reload();
+
 // NAS服务器换绑后放弃旧NAS队列，切回本地已构建的播放上下文；不自动起播。
 void player_state_forget_nas_context();
 

@@ -16,6 +16,7 @@
 
 #include "app_diag_config.h"
 #include "artwork_loader.h"
+#include "artwork_source_context.h"
 #include "board_pins.h"
 #include "media_catalog_v2.h"
 
@@ -187,7 +188,7 @@ static bool cover_dimmed_retained()
 static bool cover_request_is_latest(const CoverRequest &request)
 {
     return request.request_id == cover_latest_request_id() &&
-        request.catalog_generation == media_catalog_v2_generation();
+        request.catalog_generation == artwork_source_active_generation();
 }
 
 static void cover_publish(
@@ -1008,7 +1009,7 @@ bool cover_surface_cache_request_track(uint32_t track_index, uint32_t *out_reque
 
     CoverRequest request = {};
     request.request_id = cover_next_request_id();
-    request.catalog_generation = media_catalog_v2_generation();
+    request.catalog_generation = artwork_source_active_generation();
     request.track_index = track_index;
     cover_set_latest_request_id(request.request_id);
 
@@ -1040,7 +1041,7 @@ static bool cover_surface_cache_acquire_internal(
     *out_lease = {};
     if (xSemaphoreTake(g_cache_mutex, pdMS_TO_TICKS(20)) != pdTRUE) return false;
 
-    const uint32_t generation = media_catalog_v2_generation();
+    const uint32_t generation = artwork_source_active_generation();
     const int index = cover_find_locked(generation, track_index);
     if (index < 0) {
         xSemaphoreGive(g_cache_mutex);
@@ -1270,5 +1271,5 @@ bool cover_surface_cache_restore_dimmed(uint32_t track_index)
 void cover_surface_cache_retain_track(uint32_t track_index)
 {
     if (track_index == UINT32_MAX) return;
-    cover_cache_release_unpinned_except(media_catalog_v2_generation(), track_index);
+    cover_cache_release_unpinned_except(artwork_source_active_generation(), track_index);
 }

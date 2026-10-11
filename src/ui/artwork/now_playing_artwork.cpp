@@ -9,6 +9,8 @@
 
 #include "app_diag_config.h"
 #include "artwork_loader.h"
+#include "artwork_source_context.h"
+#include "nas_library_source.h"
 #include "fallback_cover_images.h"
 #include "board_pins.h"
 #include "cover_surface_cache.h"
@@ -601,18 +603,21 @@ static void artwork_ui_sync_context(bool force)
 {
     if (g_container == nullptr || !player_state_is_ready()) return;
     const uint32_t track_index = static_cast<uint32_t>(player_state_get_index());
-    if (player_state_get_source() == PlayerMediaSource::Nas) {
-        if (!force && g_context_generation == 0x4E415300U && g_context_track == track_index) return;
-        g_context_generation = 0x4E415300U;
-        g_context_track = track_index;
-        g_context_has_artwork = false;
-        artwork_ui_release_transition_hold();
-        artwork_ui_release_all_sources();
-        artwork_ui_show_no_artwork_fallback();
+    const bool is_nas = artwork_source_is_nas();
+    if (is_nas && !nas_library_source_ready()) {
+        // NAS catalog is temporarily absent during boot/switch. Never keep a local cover visible.
+        if (force || g_context_generation != 0U || g_context_track != track_index) {
+            g_context_generation = 0U;
+            g_context_track = track_index;
+            g_context_has_artwork = false;
+            artwork_ui_release_transition_hold();
+            artwork_ui_release_all_sources();
+            artwork_ui_show_no_artwork_fallback();
+        }
         return;
     }
-    if (media_library_get_count() == 0U) return;
-    const uint32_t generation = media_catalog_v2_generation();
+    if (!is_nas && media_library_get_count() == 0U) return;
+    const uint32_t generation = artwork_source_active_generation();
     if (!force && generation == g_context_generation && track_index == g_context_track) return;
 
     g_context_generation = generation;
@@ -621,7 +626,9 @@ static void artwork_ui_sync_context(bool force)
     g_last_surface_state_revision = UINT32_MAX;
 
     MediaArtworkViewV2 artwork = {};
-    g_context_has_artwork = media_library_get_artwork_view(track_index, &artwork);
+    g_context_has_artwork = is_nas
+        ? nas_library_source_get_artwork_view(track_index, &artwork)
+        : media_library_get_artwork_view(track_index, &artwork);
     if (!g_context_has_artwork) {
         // Catalog 已经明确没有封面，不再尝试 Surface/Decoder；立即使用最终替补视觉。
         artwork_ui_release_transition_hold();
@@ -867,7 +874,8 @@ void now_playing_artwork_update()
         case ArtworkLoadState::Failed:
             artwork_ui_release_transition_hold();
             artwork_ui_release_all_sources();
-            artwork_ui_show_placeholder("封面加载失败");
+            if (artwork_source_is_nas()) artwork_ui_show_no_artwork_fallback();
+            else artwork_ui_show_placeholder("封面加载失败");
             break;
 
         case ArtworkLoadState::Stopped:

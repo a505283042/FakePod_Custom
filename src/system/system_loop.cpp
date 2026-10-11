@@ -21,6 +21,8 @@
 #include "media_catalog_v2.h"
 #include "sdcard.h"
 #include "artwork_loader.h"
+#include "artwork_source_context.h"
+#include "nas_library_source.h"
 #include "cover_surface_cache.h"
 #include "app_diag_config.h"
 #include "flac_decoder.h"
@@ -379,12 +381,9 @@ static void system_artwork_current_update()
     // 读取压缩图，并由 NowPlaying 直接走 LVGL compressed fallback。
     if (!artwork_loader_is_ready() || !player_state_is_ready()) return;
 
-    // Unified Playback Context：system_loop 当前这条 Artwork 编排链仍然只支持 Local/SD。
-    // NAS ArtworkProvider 尚未接入时，NowPlaying 会立即使用 no_cover fallback。这里必须完全
-    // 停止 Local ArtworkLoader 的 track-index 重试，否则 NAS 的 track_id 会被误当作 Local
-    // Catalog index，并形成 200/400/800/1600/3200ms 的永久退避循环。
-    // 同时清空本地封面编排上下文；以后重新切回 Local 时强制按真实 Local Track 重建。
-    if (player_state_get_source() != PlayerMediaSource::Local) {
+    // The same artwork scheduler now handles Local/SD and NAS via a shared
+    // source-aware generation. A missing NAS catalog must not trigger local lookups.
+    if (artwork_source_is_nas() && !nas_library_source_ready()) {
         g_artwork_context_generation = 0U;
         g_artwork_current_track = UINT32_MAX;
         g_artwork_stage = ArtworkCurrentStage::Idle;
@@ -398,7 +397,7 @@ static void system_artwork_current_update()
         return;
     }
 
-    if (!media_catalog_v2_ready()) return;
+    if (!artwork_source_is_nas() && !media_catalog_v2_ready()) return;
 
     // Music 进入 Background 后 UI 已不可见，不再为后台切曲读 TF / 解码封面 / 生成 Surface。
     // 已在执行的任务不强制取消；返回前台后会按当前 track 自动补齐资源。
@@ -407,7 +406,7 @@ static void system_artwork_current_update()
         return;
     }
 
-    const uint32_t generation = media_catalog_v2_generation();
+    const uint32_t generation = artwork_source_active_generation();
     const uint32_t current_track = static_cast<uint32_t>(player_state_get_index());
     if (generation != g_artwork_context_generation || current_track != g_artwork_current_track) {
         system_artwork_begin_context(generation, current_track);
@@ -581,7 +580,7 @@ bool system_artwork_current_uses_default_fallback(uint32_t track_index)
 {
     return track_index != UINT32_MAX &&
         g_artwork_current_track == track_index &&
-        g_artwork_context_generation == media_catalog_v2_generation() &&
+        g_artwork_context_generation == artwork_source_active_generation() &&
         g_artwork_surface_terminal_failure &&
         g_artwork_surface_terminal_result == ESP_ERR_INVALID_SIZE;
 }

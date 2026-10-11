@@ -119,9 +119,7 @@ static void runtime_boot_nas_sync_update()
         g_boot_nas_sync_pending = false;
         return;
     }
-    // NAS Catalog 常驻 PSRAM 不等于正在播放。同步只替换 TF 索引，不释放当前内存曲库；
-    // 是否能同步仍由 request_sync() 检查 AudioTask 是否空闲。
-    const bool catalog_resident = nas_library_source_ready();
+    // NAS Catalog 常驻不阻止网络校验；真正提交后由曲库 LVGL 任务在安全空闲期热重载。
 
     const esp_err_t ret = nas_catalog_service_request_sync();
     if (ret == ESP_ERR_INVALID_STATE) {
@@ -138,9 +136,6 @@ static void runtime_boot_nas_sync_update()
     g_boot_nas_sync_pending = false;           // 成功启动或出错都只发起一次。
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "开机NAS索引检查已启动（本次开机不重复发起）");
-        if (catalog_resident) {
-            ESP_LOGI(TAG, "开机NAS索引检查：常驻曲库继续使用原有 PSRAM 快照，更新仅落地 TF 索引缓存");
-        }
     } else {
         ESP_LOGW(TAG, "开机NAS索引检查未启动：%s（本次开机不重试）", esp_err_to_name(ret));
     }

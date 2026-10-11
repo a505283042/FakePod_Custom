@@ -5,6 +5,7 @@
 #include <strings.h>
 
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "nas_library_source.h"
 
 static const char *TAG = "播放器状态";
@@ -328,6 +329,127 @@ bool player_state_rebind_after_catalog_reload(const char *preferred_path, size_t
     g_source = previous_source == PlayerMediaSource::Nas && nas_context_valid()
         ? PlayerMediaSource::Nas : PlayerMediaSource::Local;
     return true;
+}
+
+// 只在 LVGL 线程使用。歌曲路径/分组名字复制到 PSRAM，不能跨 Catalog 释放保留原指针。
+struct NasIndexReloadRestore
+{
+    bool was_nas = false;
+    PlayerListSnapshot old_list = {};
+    char *path = nullptr;
+    char *group_name = nullptr;
+    char *album_artist = nullptr;
+};
+static NasIndexReloadRestore g_nas_index_restore = {};
+
+static char *nas_reload_copy(const char *text)
+{
+    if (text == nullptr || text[0] == '\0') return nullptr;
+    const size_t bytes = strlen(text) + 1U;
+    char *copy = static_cast<char *>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (copy != nullptr) memcpy(copy, text, bytes);
+    return copy;
+}
+
+static void nas_reload_release_restore()
+{
+    heap_caps_free(g_nas_index_restore.path);
+    heap_caps_free(g_nas_index_restore.group_name);
+    heap_caps_free(g_nas_index_restore.album_artist);
+    g_nas_index_restore = {};
+}
+
+void player_state_prepare_nas_index_reload()
+{
+    nas_reload_release_restore();
+    if (g_source != PlayerMediaSource::Nas) return;
+    g_nas_index_restore.was_nas = true;
+    (void)nas_get_list_snapshot(&g_nas_index_restore.old_list);
+    g_nas_index_restore.path = nas_reload_copy(player_state_get_path());
+    const PlayerListSnapshot &list = g_nas_index_restore.old_list;
+    if (list.ready && list.type == PlayerListType::Artist) {
+        MediaArtistGroupViewV2 group = {};
+        if (nas_library_source_get_artist(list.group_index, &group))
+            g_nas_index_restore.group_name = nas_reload_copy(group.name);
+    } else if (list.ready && list.type == PlayerListType::Album) {
+        MediaAlbumGroupViewV2 group = {};
+        if (nas_library_source_get_album(list.group_index, &group)) {
+            g_nas_index_restore.group_name = nas_reload_copy(group.title);
+            g_nas_index_restore.album_artist = nas_reload_copy(group.artist);
+        }
+    }
+    // 保留 NAS source 身份，但让旧代次的播放上下文失效。
+    // 重载期间用户/遥控的下一首不能误操作本地播放队列。
+    g_nas = {};
+}
+
+bool player_state_finish_nas_index_reload()
+{
+    const NasIndexReloadRestore saved = g_nas_index_restore;
+    // 保存指针的临时副本至本函数末尾再释放。
+    if (!saved.was_nas) { nas_reload_release_restore(); return true; }
+    if (!nas_library_source_ready() || nas_library_source_track_count() == 0U) {
+        nas_reload_release_restore();
+        return false;
+    }
+    uint32_t track = UINT32_MAX;
+    const uint32_t count = nas_library_source_track_count();
+    if (saved.path != nullptr) {
+        for (uint32_t i = 0; i < count; ++i) {
+            MediaTrackViewV2 view = {};
+            if (nas_library_source_get_track_view(i, &view) && view.path != nullptr &&
+                strcasecmp(view.path, saved.path) == 0) { track = i; break; }
+        }
+    }
+    if (track == UINT32_MAX) {
+        const uint32_t old = saved.old_list.ready ? saved.old_list.track_index : 0U;
+        track = old < count ? old : count - 1U;
+    }
+
+    bool bound = false;
+    if (saved.old_list.ready && saved.old_list.type == PlayerListType::Artist && saved.group_name) {
+        for (uint32_t i = 0; i < nas_library_source_artist_count() && !bound; ++i) {
+            MediaArtistGroupViewV2 group = {};
+            if (!nas_library_source_get_artist(i, &group) || group.name == nullptr ||
+                strcasecmp(group.name, saved.group_name) != 0) continue;
+            for (uint32_t j = 0; j < group.track_count; ++j) {
+                if (group.track_indices[j] == track) {
+                    bound = nas_bind(PlayerListType::Artist, i, j); break;
+                }
+            }
+        }
+    } else if (saved.old_list.ready && saved.old_list.type == PlayerListType::Album && saved.group_name) {
+        for (uint32_t i = 0; i < nas_library_source_album_count() && !bound; ++i) {
+            MediaAlbumGroupViewV2 group = {};
+            if (!nas_library_source_get_album(i, &group) || group.title == nullptr ||
+                strcasecmp(group.title, saved.group_name) != 0 ||
+                (saved.album_artist != nullptr && (group.artist == nullptr ||
+                    strcasecmp(group.artist, saved.album_artist) != 0))) continue;
+            for (uint32_t j = 0; j < group.track_count; ++j) {
+                if (group.track_indices[j] == track) {
+                    bound = nas_bind(PlayerListType::Album, i, j); break;
+                }
+            }
+        }
+    } else if (saved.old_list.ready && saved.old_list.type == PlayerListType::Decade) {
+        for (uint32_t i = 0; i < nas_library_source_decade_count() && !bound; ++i) {
+            MediaDecadeGroupViewV2 group = {};
+            if (!nas_library_source_get_decade(i, &group) ||
+                group.decade_start != saved.old_list.decade_start ||
+                group.unknown != saved.old_list.decade_unknown) continue;
+            for (uint32_t j = 0; j < group.track_count; ++j) {
+                if (group.track_indices[j] == track) {
+                    bound = nas_bind(PlayerListType::Decade, i, j); break;
+                }
+            }
+        }
+    }
+    if (!bound) bound = nas_bind(PlayerListType::AllTracks, UINT32_MAX, track);
+    ESP_LOGI(TAG, "NAS索引热重载播放上下文：old_type=%u new_type=%u track=%lu source=%s",
+        static_cast<unsigned>(saved.old_list.type), static_cast<unsigned>(g_nas.type),
+        static_cast<unsigned long>(track), bound ? "NAS" : "FAILED");
+    nas_reload_release_restore();
+    return bound;
 }
 
 void player_state_forget_nas_context()

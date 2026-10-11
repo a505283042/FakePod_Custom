@@ -14,6 +14,8 @@ void library_view_open();
 bool library_view_open_nas(DeviceMusicListScope scope);
 bool library_view_is_nas_source();
 void library_view_close_nas();
+// 由 NAS 同步 worker 调用：只标记已提交的 TF 索引待刷新；LVGL 定时器负责安全重载。
+void library_view_request_nas_index_reload();
 // 只在 LVGL 线程调用；返回 false 表示有 NAS 异步加载正在执行，禁止替换 TF 索引。
 bool library_view_prepare_nas_server_switch();
 // 只在 LVGL 线程调用；使用新索引打开 NAS，不恢复上一个服务器的浏览缓存。
