@@ -19,6 +19,8 @@
 #include "artwork_source_context.h"
 #include "nas_library_source.h"
 #include "nas_catalog_service.h"
+#include "device_settings.h"
+#include "wifi_service.h"
 #include "esp_http_client.h"
 #include "media_catalog_v2.h"
 #include "media_library.h"
@@ -685,6 +687,41 @@ static esp_err_t artwork_opus_io_callback(
     return ESP_OK;
 }
 
+// A persisted NAS track may be restored before the boot Wi-Fi worker receives an IP.
+// Wait only in ArtworkTask (never the LVGL/audio thread); newer tracks, server
+// switching and an explicit Wi-Fi off intent cancel the wait immediately.
+static esp_err_t artwork_nas_wait_wifi_ready(const ArtworkLoadRequest *request)
+{
+    const TickType_t started = xTaskGetTickCount();
+    bool waited = false;
+    for (;;) {
+        if (!artwork_request_is_latest(request) || nas_catalog_service_is_server_switching())
+            return ESP_ERR_INVALID_STATE;
+
+        DeviceSettingsSnapshot settings = {};
+        if (device_settings_get_snapshot(&settings) && !settings.wifi_enabled)
+            return ESP_ERR_INVALID_STATE;
+
+        WifiServiceSnapshot wifi = {};
+        if (wifi_service_get_snapshot(&wifi)) {
+            if (wifi.connected) {
+                if (waited) {
+                    ESP_LOGI(TAG, "NAS封面等待Wi-Fi READY完成：track=%lu",
+                        static_cast<unsigned long>(request->track_index));
+                }
+                return ESP_OK;
+            }
+            if (!wifi.configured || wifi.state == WifiServiceState::Failed ||
+                wifi.state == WifiServiceState::RestoringBle)
+                return ESP_ERR_INVALID_STATE;
+        }
+        if (xTaskGetTickCount() - started >= pdMS_TO_TICKS(12000))
+            return ESP_ERR_TIMEOUT;
+        waited = true;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
 // Network transport only. Compressed image validation, ID3 unsync, PSRAM cache,
 // RGB565 rendering and fallback remain shared with local artwork.
 static bool artwork_nas_http_status_retryable(int status)
@@ -784,6 +821,11 @@ static esp_err_t artwork_read_nas_blob(const ArtworkLoadRequest *request,
     if (!artwork_request_is_latest(request) || nas_catalog_service_is_server_switching())
         return ESP_ERR_INVALID_STATE;
     if (request->ref.data_offset > UINT64_MAX - request->ref.data_size) return ESP_ERR_INVALID_SIZE;
+
+    // The startup resume path can enqueue a NAS cover before Wi-Fi is READY.
+    // Do not spend either bounded HTTP attempt while STA is still offline.
+    const esp_err_t wifi_ret = artwork_nas_wait_wifi_ready(request);
+    if (wifi_ret != ESP_OK) return wifi_ret;
 
     NasPlaybackEndpoint *endpoint = static_cast<NasPlaybackEndpoint *>(
         heap_caps_calloc(1, sizeof(NasPlaybackEndpoint), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));

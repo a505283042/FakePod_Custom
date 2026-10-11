@@ -1177,14 +1177,8 @@ static bool player_home_launcher_acquire_default_surface(
 {
     if (out_candidate == nullptr) return false;
 
-    MediaArtworkViewV2 artwork = {};
-    if (media_source == PlayerMediaSource::Local
-            ? media_library_get_artwork_view(track_index, &artwork)
-            : nas_library_source_get_artwork_view(track_index, &artwork)) {
-        // Both sources must wait for a real pending surface rather than flashing a default.
-        return false;
-    }
-
+    // 即便索引声明有封面，实际 CoverSurface 尚未 ready（如 NAS 等联网/解码失败）
+    // 也允许 Launcher 使用 TF 默认封面；导航入口不依赖封面成功加载。
     const FallbackCoverImageKind kind =
         media_source == PlayerMediaSource::Nas
             ? FallbackCoverImageKind::Artwork
@@ -1232,6 +1226,8 @@ static bool player_home_launcher_acquire_default_surface(
     out_candidate->acquire_us = static_cast<uint32_t>(esp_timer_get_time() - started_us);
     out_candidate->media_source = media_source;
     out_candidate->is_default = true;
+    ESP_LOGI(TAG, "Launcher默认封面背景就绪：track=%u source=%u",
+        static_cast<unsigned>(track_index), static_cast<unsigned>(media_source));
     return true;
 }
 
@@ -1323,8 +1319,8 @@ static bool player_home_launcher_prepare_surface_lease()
         return false;
     }
 
-    // Local 真实封面继续 pin CoverSurface；Local/NAS 无封面时使用默认 JPG 背景。
-    // 圆环本身始终只有 Flash I4 + BoundedSPI 这一套，不存在第二套渲染菜单。
+    // Local/NAS 优先 pin 真实 CoverSurface；缺失/暂未完成时使用默认 JPG 背景。
+    // 圆环仍只有 Flash I4 + BoundedSPI 这一套，不增加第二套渲染菜单。
     player_home_launcher_commit_candidate(&candidate);
     return true;
 }
@@ -2098,7 +2094,6 @@ static bool player_home_present_current_cover_bounded(const char *reason)
         return false;
     }
     const uint32_t track_index = static_cast<uint32_t>(player_state_get_index());
-    const PlayerMediaSource media_source = player_state_get_source();
     CoverSurfaceLease lease = {};
     const bool has_cover_surface = cover_surface_cache_acquire(track_index, &lease);
     const uint8_t *source = nullptr;
@@ -2108,12 +2103,7 @@ static bool player_home_present_current_cover_bounded(const char *reason)
     if (has_cover_surface) {
         source = g_overlay_visible ? lease.dimmed_rgb565 : lease.normal_rgb565;
     } else {
-        MediaArtworkViewV2 artwork = {};
-        if (media_source == PlayerMediaSource::Local
-                ? media_library_get_artwork_view(track_index, &artwork)
-                : nas_library_source_get_artwork_view(track_index, &artwork)) {
-            return false;
-        }
+        // Launcher 退出同样允许用默认封面恢复 GRAM，不因 Surface 缺席强制整屏重绘。
         if (!fallback_cover_image_acquire(FallbackCoverImageKind::Artwork, &fallback)) {
             return false;
         }
