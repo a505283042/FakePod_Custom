@@ -191,9 +191,11 @@ static void wifi_event_handler(void *, esp_event_base_t base, int32_t event_id, 
         bool retry = false;
         bool fail = false;
         bool request_recovery = false;
+        bool unexpected_disconnect = false;
 
         portENTER_CRITICAL(&g_lock);
         if (!g_shutting_down) {
+            unexpected_disconnect = true;
             if (g_connecting) {
                 if (g_connect_attempts < kMaxConnectAttempts) {
                     ++g_connect_attempts;
@@ -210,6 +212,12 @@ static void wifi_event_handler(void *, esp_event_base_t base, int32_t event_id, 
         }
         portEXIT_CRITICAL(&g_lock);
 
+        if (unexpected_disconnect) {
+            const auto *disconnected = static_cast<const wifi_event_sta_disconnected_t *>(event_data);
+            ESP_LOGW(TAG, "Wi-Fi STA断线：reason=%u connecting_retry=%d recovery=%d",
+                static_cast<unsigned>(disconnected != nullptr ? disconnected->reason : 0U),
+                retry ? 1 : 0, request_recovery ? 1 : 0);
+        }
         if (retry) {
             (void)esp_wifi_connect();
         } else if (fail && g_wifi_events != nullptr) {
@@ -235,6 +243,13 @@ static void wifi_event_handler(void *, esp_event_base_t base, int32_t event_id, 
                 IP2STR(&event->ip_info.ip));
         } else {
             ESP_LOGI(TAG, "Wi-Fi已获取IP：ssid=%s，等待业务READY", g_saved.ssid);
+        }
+        wifi_ap_record_t ap = {};
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+            ESP_LOGI(TAG, "Wi-Fi关联信息：BSSID=%02X:%02X:%02X:%02X:%02X:%02X channel=%u RSSI=%ddBm",
+                ap.bssid[0], ap.bssid[1], ap.bssid[2],
+                ap.bssid[3], ap.bssid[4], ap.bssid[5],
+                static_cast<unsigned>(ap.primary), static_cast<int>(ap.rssi));
         }
         if (g_wifi_events != nullptr) xEventGroupSetBits(g_wifi_events, kConnectedBit);
     }
@@ -356,6 +371,15 @@ static esp_err_t init_wifi_stack()
     ret = esp_wifi_start();
     if (ret != ESP_OK) return ret;
     g_wifi_started = true;
+
+    // A/B诊断：关闭STA Modem Sleep，排除部分AP与省电唤醒时序不兼容。
+    // 不改变自动重连/网络READY规则；如功耗增加或无改善，可单独回退此补丁。
+    ret = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi省电诊断配置失败：%s，继续沿用驱动默认模式", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "Wi-Fi省电诊断：STA Modem Sleep=OFF");
+    }
     return ESP_OK;
 }
 

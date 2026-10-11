@@ -285,7 +285,7 @@ class App:
             ttk.Label(row, text=title).pack(side="left", padx=(0, 5))
             ttk.Entry(row, textvariable=var, width=width).pack(side="left", padx=(0, 18))
         phases = ttk.Frame(remote); phases.pack(fill="x", pady=(8, 3))
-        self.alias_button = ttk.Button(phases, text="① SSH 准备新增/修改短 ID", command=lambda: self.launch_ssh("prepare"), state="disabled")
+        self.alias_button = ttk.Button(phases, text="① SSH 准备音频/LRC短 ID", command=lambda: self.launch_ssh("prepare"), state="disabled")
         self.alias_button.pack(side="left")
         self.publish_button = ttk.Button(phases, text="② 验证后发布 V2 索引", command=self.publish, state="disabled")
         self.publish_button.pack(side="left", padx=9)
@@ -348,7 +348,7 @@ class App:
         self.generate_button.config(state="disabled" if value or not self.selected_smb else "normal")
         self.publish_button.config(state="disabled" if value or not self.staging or self.published else "normal")
         self.alias_button.config(state="disabled" if value or not self.staging or self.published or not self.report or
-                                 not (self.report["prepare_paths"] or self.report["remove_aliases"]) else "normal")
+                                 not (self.report["prepare_paths"] or self.report["prepare_lyrics"] or self.report["remove_aliases"]) else "normal")
         self.cleanup_button.config(state="disabled" if value or not self.published or not self.report or
                                    not self.report["remove_aliases"] else "normal")
 
@@ -530,8 +530,9 @@ class App:
         self.log(f"V2 索引生成完成：歌曲 {meta.get('tracks','?')} 首，歌手 {meta.get('artists','?')}，专辑 {meta.get('albums','?')}。")
         self.log("输出保存在 Windows 临时目录；尚未修改 NAS：" + str(temp))
         self.set_busy(False)
-        required = bool(report["prepare_paths"] or report["remove_aliases"])
-        next_action = "先点①准备硬链接，再点②发布索引" if required else "无短 ID 变化，可以直接点②发布索引"
+        required = bool(report["prepare_paths"] or report["prepare_lyrics"] or report["remove_aliases"])
+        self.log(f"LRC短ID待准备：{len(report['prepare_lyrics'])}；只创建硬链接，不复制歌词")
+        next_action = "先点①准备音频/LRC短ID，再点②发布索引" if required else "无短 ID 变化，可以直接点②发布索引"
         messagebox.showinfo("增量扫描完成", summary + "\n" + next_action)
 
 
@@ -563,7 +564,7 @@ class App:
 
         def verify_work():
             try:
-                if report["prepare_paths"] or report["remove_aliases"]:
+                if report["prepare_paths"] or report["prepare_lyrics"] or report["remove_aliases"]:
                     marker = target / report["prepare_marker"]
                     if not marker.is_file() or marker.read_text(encoding="utf-8").strip() != report["id"]:
                         raise ValueError("SSH 增量准备尚未成功。请先点①，在 SSH 终端完成准备，再重试发布")
@@ -643,7 +644,7 @@ class App:
             target = validated_target(Path(self.selected_smb))
             script = target / "fakepod_incremental_update.sh"
             if mode == "prepare":
-                if not (self.report["prepare_paths"] or self.report["remove_aliases"]):
+                if not (self.report["prepare_paths"] or self.report["prepare_lyrics"] or self.report["remove_aliases"]):
                     raise ValueError("本次没有短 ID 变化，直接发布 V2 即可")
                 # Publish only the PLAN SCRIPT first; do not update index/meta/cache.
                 stage_script = self.staging / script.name
@@ -660,7 +661,7 @@ class App:
             remote_track = linux + "/_FakePod/track"
             cmd = "sh " + " ".join(shell_quote(x) for x in (remote_script, mode, linux, remote_track))
             title = "准备新短 ID" if mode == "prepare" else "隔离旧短 ID"
-            help_text = ("这会在 NAS 内部创建/修复变化歌曲的硬链接，不复制音频，且完成后写入成功标记。"
+            help_text = ("这会在 NAS 内部创建/修复音频与同名LRC的短ID硬链接，不复制文件，完成后写入成功标记。"
                          if mode == "prepare" else
                          "只移动缓存明确识别为已删除歌曲的旧标准 ID 到 _FakePod/quarantine-*；不删除音频、不碰未知兼容别名。")
             if not messagebox.askyesno("确认 " + title,

@@ -115,7 +115,9 @@ static constexpr uint32_t LIBRARY_SCROLLBAR_TOUCH_UPDATE_MS = 48U;
 // R46.0.74：NAS Catalog 后台分步加载。Worker 与 CoverTask 同级，仅临时存在；
 // 真实 SD 访问由 cooperative loader 每约4KB释放一次全局锁，避免后台 FLAC 预取被饿死。
 // R46.0.84：5120B 实测 HWM=2280~2320B；收至4096B后仍保留约1.2KB实测余量。
-static constexpr uint32_t NAS_LIBRARY_LOAD_TASK_STACK_BYTES = 4096U;
+// R46.0.122: PSRAM hot-reload also restores folder selections in this worker.
+// 4096B overflowed after Catalog open; reuse the 6144B boot-load headroom.
+static constexpr uint32_t NAS_LIBRARY_LOAD_TASK_STACK_BYTES = 6144U;
 static constexpr UBaseType_t NAS_LIBRARY_LOAD_TASK_PRIORITY = 1U;
 static constexpr BaseType_t NAS_LIBRARY_LOAD_TASK_CORE = 1;
 static constexpr UBaseType_t NAS_LIBRARY_LOAD_TASK_STACK_CAPS =
@@ -3687,11 +3689,12 @@ static void library_view_finish_nas_load_async(void *)
             if (g_nas_index_reload_was_visible && app_manager_foreground() == AppId::Music) {
                 library_view_activate_nas_ui();
             }
-            ESP_LOGI(TAG, "NAS索引已热重载PSRAM：tracks=%lu generation=%lu playback=%s UI=%s",
+            ESP_LOGI(TAG, "NAS索引已热重载PSRAM：tracks=%lu generation=%lu playback=%s UI=%s stack_hwm=%luB",
                 static_cast<unsigned long>(nas_library_source_track_count()),
                 static_cast<unsigned long>(nas_library_source_generation()),
                 playback_rebound ? "已恢复" : "无NAS上下文/恢复失败",
-                g_nas_index_reload_was_visible ? "刷新" : "保持后台");
+                g_nas_index_reload_was_visible ? "刷新" : "保持后台",
+                static_cast<unsigned long>(g_nas_load_stack_hwm));
             return;
         }
         (void)player_state_finish_nas_index_reload();

@@ -134,6 +134,10 @@ def build_static_alias_script(tracks: List["TrackMeta"]) -> bytes:
         src_tail = shell_single_quote(relative)
         alias_name = shell_single_quote(f"{track.track_id:016X}{suffix}")
         lines.append(f'ln "$MUSIC_ROOT"/{src_tail} "$TMP"/{alias_name}')
+        if track.lyrics_path:
+            lrc_src = shell_single_quote(track.lyrics_path.lstrip("/"))
+            lrc_alias = shell_single_quote(f"{track.track_id:016X}.lrc")
+            lines.append(f'ln "$MUSIC_ROOT"/{lrc_src} "$TMP"/{lrc_alias}')
     lines.extend([
         # Existing aliases might include manual compatibility names for old
         # V2 catalog paths. Preserve them when rebuilding rather than
@@ -632,6 +636,33 @@ def track_from_cache(path: str, item: dict) -> TrackMeta:
     return result
 
 
+def matching_directory_lrc(song: Path, cache: dict) -> Optional[Path]:
+    """Resolve the real-cased, same-directory/same-stem LRC once per folder.
+
+    Windows SMB may treat ``song.lrc`` as present when the NAS actual filename
+    is ``song.LRC``.  Constructing the lowercase path would then fail on the
+    case-sensitive NAS SSH source, so enumerate actual directory entries.
+    MP3 and FLAC with the same stem intentionally return the *same* source.
+    """
+    folder = song.parent
+    if folder not in cache:
+        mapping = {}
+        for candidate in folder.iterdir():
+            if candidate.suffix.lower() != ".lrc" or not candidate.is_file():
+                continue
+            mapping.setdefault(candidate.stem.casefold(), []).append(candidate)
+        cache[folder] = mapping
+    matches = cache[folder].get(song.stem.casefold(), [])
+    exact = [p for p in matches if p.stem == song.stem]
+    if len(exact) == 1:
+        return exact[0]
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        raise ValueError(f"同目录存在多个无法唯一匹配的LRC：{song} -> {matches}")
+    return None
+
+
 def scan_incremental(root: Path, previous: Optional[dict]):
     """Stat all files; only parse tags for changed/new ones; emit a full V2 snapshot."""
     paths: List[Tuple[str, Path, int, os.stat_result]] = []
@@ -661,9 +692,10 @@ def scan_incremental(root: Path, previous: Optional[dict]):
     old = previous["entries"] if previous else {}
     rows = []
     folder_art_cache = {}
+    folder_lyrics_cache = {}
     artwork_scanned = 0
     new_entries = {}
-    added, modified, unchanged = [], [], []
+    added, modified, unchanged, prepare_lyrics = [], [], [], []
     previous_key = None
     seen_ids: Dict[int, str] = {}
     for n, (relative, path, fmt, st) in enumerate(paths, 1):
@@ -713,16 +745,21 @@ def scan_incremental(root: Path, previous: Optional[dict]):
                  row.artwork_path, row.artwork_mtime) = locator
             row.artwork_scanned = True
             artwork_scanned += 1
-        # External LRC changes independently of the song; stat it even when tags are cached.
-        # Keep the exact file case so DSM's case-sensitive URL resolves correctly.
+        # Enumerate real directory entries rather than probing guessed .lrc/.LRC
+        # spellings: a case-insensitive SMB client can otherwise invent a path
+        # which is absent on the NAS case-sensitive SSH filesystem.
         row.lyrics_path = ""
-        for suffix in (".lrc", ".LRC"):
-            candidate = path.with_suffix(suffix)
-            if candidate.is_file():
-                lrc_stat = candidate.stat()
-                if 0 < lrc_stat.st_size <= 256 * 1024:
-                    row.lyrics_path = "/" + candidate.relative_to(root).as_posix()
-                break
+        candidate = matching_directory_lrc(path, folder_lyrics_cache)
+        if candidate is not None:
+            lrc_stat = candidate.stat()
+            if 0 < lrc_stat.st_size <= 256 * 1024:
+                row.lyrics_path = "/" + candidate.relative_to(root).as_posix()
+                if fmt in (FORMAT_MAP[".mp3"], FORMAT_MAP[".flac"]):
+                    alias = root / "_FakePod" / "track" / f"{row.track_id:016X}.lrc"
+                    # Each format keeps its own short ID, but both short links
+                    # may point to this one, shared physical LRC file.
+                    if not alias.is_file() or not os.path.samefile(candidate, alias):
+                        prepare_lyrics.append(relative)
         # Protect against concurrent SMB source edits while scanning.
         last = path.stat()
         if (last.st_size, last.st_mtime_ns) != (st.st_size, st.st_mtime_ns):
@@ -741,13 +778,23 @@ def scan_incremental(root: Path, previous: Optional[dict]):
               "initial": len(rows) if not previous else 0,
               "prepare_paths": ([p for p in (added + modified) if Path(p).suffix.lower() in (".mp3", ".flac")]
                                 if previous else [t.path for t in rows if Path(t.path).suffix.lower() in (".mp3", ".flac")]),
+              "prepare_lyrics": prepare_lyrics,
               "remove_aliases": ([f"{stable_track_id(p):016X}{Path(p).suffix}" for p in deleted
-                                  if Path(p).suffix.lower() in (".mp3", ".flac")]),
+                                  if Path(p).suffix.lower() in (".mp3", ".flac")]
+                                 + [f"{stable_track_id(p):016X}.lrc" for p in deleted
+                                    if Path(p).suffix.lower() in (".mp3", ".flac")
+                                    and old[p].get("track", {}).get("lyrics_path")]
+                                 + [f"{t.track_id:016X}.lrc" for t in rows
+                                    if Path(t.path).suffix.lower() in (".mp3", ".flac")
+                                    and not t.lyrics_path and t.path in old
+                                    and old[t.path].get("track", {}).get("lyrics_path")]),
               "id": uuid.uuid4().hex}
     # Extra manually repaired aliases remain untouched. Deletion only considers
     # old canonical names tracked in our own validated cache, never unknown files.
     new_aliases = {f"{t.track_id:016X}{Path(t.path).suffix}" for t in rows
                    if Path(t.path).suffix.lower() in (".mp3", ".flac")}
+    new_aliases |= {f"{t.track_id:016X}.lrc" for t in rows if t.lyrics_path
+                    and Path(t.path).suffix.lower() in (".mp3", ".flac")}
     report["remove_aliases"] = [x for x in report["remove_aliases"] if x not in new_aliases]
     cache = {"version": CACHE_VERSION, "root": cache_fingerprint(root), "entries": new_entries}
     print("FAKEPOD_INCREMENTAL " + " ".join(f"{k}={v}" for k, v in
@@ -790,16 +837,33 @@ def build_incremental_link_script(tracks: List[TrackMeta], report: dict) -> byte
         '  ls -di "$MUSIC_ROOT" >/dev/null 2>&1 || { echo "NAS ls -i unsupported or PATH invalid"; exit 1; }',
         "  awk 'BEGIN {print 1}' >/dev/null 2>&1 || { echo 'NAS awk operation failed'; exit 1; }",
         "  nas_inode() { ls -di \"$1\" | awk 'NR==1 {print $1}'; }",
-        '  echo "Preflight: checking changed/new audio sources"',
+        '  echo "Preflight: checking changed/new audio/LRC sources"',
     ]
     prepared = [by_path[p] for p in report["prepare_paths"]]
-    for row in prepared:
-        lines.append('  [ -f "$MUSIC_ROOT"/' + shell_single_quote(row.path.lstrip('/')) +
-                     ' ] || { echo "Audio source missing"; exit 1; }')
-    lines += ['  echo "Preparing changed/new short-ID aliases"']
-    for row in prepared:
-        src = '"$MUSIC_ROOT"/' + shell_single_quote(row.path.lstrip('/'))
-        name = f"{row.track_id:016X}{Path(row.path).suffix}"
+    lyric_prepared = [by_path[p] for p in report["prepare_lyrics"]]
+    # LRC alias uses the AUDIO track's stable ID, not the LRC path's own hash.
+    # This lets LyricsRefV2 point to the same proven _FakePod/track route.
+    aliases = [(row.path, f"{row.track_id:016X}{Path(row.path).suffix}") for row in prepared]
+    aliases.extend((row.lyrics_path, f"{row.track_id:016X}.lrc") for row in lyric_prepared)
+    # The Windows SMB scan can see a file that the NAS SSH path cannot (e.g.
+    # a different /volumeN share mapping). Report the *first exact source* so
+    # the operator can diagnose it without changing any existing aliases.
+    for rel, _ in aliases:
+        src = '"$MUSIC_ROOT"/' + shell_single_quote(rel.lstrip('/'))
+        lines += [
+            '  if [ ! -f ' + src + ' ]; then',
+            '    echo "ERROR: Audio/LRC source missing or not a regular file:" >&2',
+            '    printf "  SSH path: %s\\n" ' + src + ' >&2',
+            '    echo "  Music root: $MUSIC_ROOT" >&2',
+            '    echo "  Check NAS /volumeN, SMB share mapping, case and permissions." >&2',
+            '    echo "  Parent/source listing:" >&2',
+            '    ls -ld "$(dirname ' + src + ')" ' + src + ' >&2 || :',
+            '    exit 1',
+            '  fi',
+        ]
+    lines += ['  echo "Preparing changed/new audio and LRC short-ID aliases"']
+    for rel, name in aliases:
+        src = '"$MUSIC_ROOT"/' + shell_single_quote(rel.lstrip('/'))
         dest = '"$TRACK_ROOT"/' + shell_single_quote(name)
         tmp = '"$TRACK_ROOT"/' + shell_single_quote('.' + name + '.incremental-tmp')
         lines += [
@@ -825,7 +889,7 @@ def build_incremental_link_script(tracks: List[TrackMeta], report: dict) -> byte
     lines += [
         '  printf "%s\\n" ' + shell_single_quote(nonce) + ' > "$MARKER.tmp.$$"',
         '  mv "$MARKER.tmp.$$" "$MARKER"',
-        '  echo "FakePod incremental prepare OK; changed aliases: ' + str(len(prepared)) + '; marker: ' + marker + '"',
+        '  echo "FakePod incremental prepare OK; changed audio: ' + str(len(prepared)) + '; lyrics: ' + str(len(lyric_prepared)) + '; marker: ' + marker + '"',
         'else',
         '  [ -f "$MARKER" ] || { echo "Prepare marker missing"; exit 1; }',
         '  grep -Fqx ' + shell_single_quote('revision=' + revision) + ' "$INDEX_ROOT/fakepod_catalog.meta" || { echo "New V2 meta not published"; exit 1; }',
@@ -954,8 +1018,13 @@ def build_catalog(tracks: List[TrackMeta]):
         lyrics_ref_start = len(lyrics_bytes) // LYRICS.size
         lyrics_ref_count = 0
         if track.lyrics_path:
-            # External + Synced, no embedded payload; keep LyricsRefV2 disk contract.
-            lyrics_bytes.extend(LYRICS.pack(0, 0, add(track.lyrics_path), 0, 0, 1, 2, 0, 0))
+            # External + Synced; _FakePod/track has the same WebDAV ACL as audio.
+            # Keep 28-byte LyricsRefV2 and catalog version unchanged. All supported
+            # MP3/FLAC LRC files are linked before the V2 index can be published.
+            lrc_path = (f"/_FakePod/track/{track.track_id:016X}.lrc"
+                        if track.fmt in (FORMAT_MAP[".mp3"], FORMAT_MAP[".flac"])
+                        else track.lyrics_path)
+            lyrics_bytes.extend(LYRICS.pack(0, 0, add(lrc_path), 0, 0, 1, 2, 0, 0))
             lyrics_ref_count = 1
         path_off = add(track.path)
         title_off = add(track.title)
@@ -1133,7 +1202,10 @@ def main() -> int:
     year_tagged = sum(1 for t in tracks if t.release_year or t.original_year)
     print(f"FakePod NAS Catalog: tracks={len(tracks)} artists={artist_count} albums={album_count}")
     print(f"metadata: title={title_tagged} artist={artist_tagged} album={album_tagged} year={year_tagged}")
-    print(f"NAS LRC refs={sum(bool(t.lyrics_path) for t in tracks)} (external synced)")
+    lyric_paths = [t.lyrics_path for t in tracks if t.lyrics_path]
+    print(f"NAS LRC refs={len(lyric_paths)} (external synced, short-ID for MP3/FLAC)")
+    print(f"NAS LRC shared={len(lyric_paths) - len(set(lyric_paths))} (extra songs reusing same-directory LRC)")
+    print(f"NAS LRC alias prepare={len(report['prepare_lyrics'])} (SSH before publish if nonzero)")
     print(f"artwork refs={sum(bool(t.artwork_source) for t in tracks)} "
           f"embedded={sum(t.artwork_source in (1, 2) for t in tracks)} "
           f"external={sum(t.artwork_source == 3 for t in tracks)}")
