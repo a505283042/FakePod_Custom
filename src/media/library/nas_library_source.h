@@ -34,6 +34,10 @@ size_t nas_library_source_psram_bytes();
 bool nas_library_source_get_track_view(uint32_t track_index, MediaTrackViewV2 *out_view);
 // Returns a borrowed locator view; callers must copy its fields immediately.
 bool nas_library_source_get_artwork_view(uint32_t track_index, MediaArtworkViewV2 *out_view);
+// Copy external synchronized LRC path from the resident NAS V2 locator pool.
+// The caller owns the copy and must not retain borrowed PSRAM pointers after reload.
+bool nas_library_source_copy_synced_lrc_path(
+    uint32_t track_index, uint32_t generation, char *out_path, size_t out_size);
 size_t nas_library_source_artist_count();
 size_t nas_library_source_album_count();
 size_t nas_library_source_decade_count();

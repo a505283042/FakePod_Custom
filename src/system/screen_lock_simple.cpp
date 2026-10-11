@@ -103,6 +103,7 @@ static lv_obj_t *g_aod_tip_lock   = nullptr;
 
 // AOD 刷新跟踪（只在数据变化时 set_text，避免每 5ms 重画烧屏）
 static uint32_t g_aod_last_track_idx       = UINT32_MAX;
+static bool g_aod_last_is_nas = false;
 static uint32_t g_aod_last_lyric_line_idx  = UINT32_MAX;
 static uint64_t g_aod_last_pos_ms          = UINT64_MAX;
 static uint64_t g_aod_last_total_ms        = UINT64_MAX;
@@ -542,16 +543,16 @@ static void aod_refresh_now_playing_if_due(const TickType_t now_tick)
         char comb[640] = {};
         snprintf(comb, sizeof(comb), "%s  -  %s", title, artist);
 
-        if (g_aod_last_track_idx != idx) {
+        const bool is_nas = player_state_get_source() == PlayerMediaSource::Nas;
+        if (g_aod_last_track_idx != idx || g_aod_last_is_nas != is_nas) {
             lv_label_set_text(g_aod_title, comb);
             g_aod_last_track_idx = idx;
+            g_aod_last_is_nas = is_nas;
             song_changed = true;
             // 新曲第一次显示：主动向 LyricsService 提交一次加载请求。
             // （否则歌词只在用户进入过歌词页才会被 LyricsTask 从 TF 卡取出，
             //   直接 AOD 的话一直拿不到 → 显示"暂无歌词"。）
-            if (player_state_get_source() == PlayerMediaSource::Local) {
-                (void)lyrics_service_request_track(static_cast<uint32_t>(idx));
-            }
+            (void)lyrics_service_request_track(static_cast<uint32_t>(idx));
             // 新曲强制刷新歌词行（避免沿用旧曲的"当前行索引"）
             g_aod_last_lyric_line_idx = UINT32_MAX;
         }
@@ -564,8 +565,7 @@ static void aod_refresh_now_playing_if_due(const TickType_t now_tick)
         uint32_t     curr_line   = UINT32_MAX;
         bool         have_curr   = false;
 
-        if (player_state_get_source() == PlayerMediaSource::Local &&
-            g_aod_last_track_idx != UINT32_MAX && lyrics_service_get_window(
+        if (g_aod_last_track_idx != UINT32_MAX && lyrics_service_get_window(
                 static_cast<uint32_t>(g_aod_last_track_idx),
                 static_cast<uint32_t>(snap.position_ms), &win)) {
             for (size_t i = 0; i < LYRICS_VIEW_WINDOW_LINES; ++i) {

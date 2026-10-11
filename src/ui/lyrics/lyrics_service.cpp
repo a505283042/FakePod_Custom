@@ -18,12 +18,17 @@
 #include "media_catalog_v2.h"
 #include "storage_io.h"
 #include "text_encoding.h"
+#include "nas_library_source.h"
+#include "nas_catalog_service.h"
+#include "player_state.h"
+#include "wifi_service.h"
+#include "esp_http_client.h"
 
 namespace {
 
 static const char *TAG = "歌词服务";
 
-static constexpr uint32_t LYRICS_TASK_STACK = 4096U;
+static constexpr uint32_t LYRICS_TASK_STACK = 5120U; // NAS HTTP client; same one LyricsTask
 static constexpr UBaseType_t LYRICS_TASK_PRIORITY = 1U;
 static constexpr BaseType_t LYRICS_TASK_CORE = 1;
 static constexpr size_t LYRICS_FILE_MAX_BYTES = 256U * 1024U;
@@ -37,6 +42,7 @@ struct LyricsLoadRequest
     uint32_t request_id = 0;
     uint32_t catalog_generation = 0;
     uint32_t track_index = UINT32_MAX;
+    bool is_nas = false;
 };
 
 struct LyricsLineRow
@@ -49,6 +55,7 @@ struct LyricsDocument
 {
     uint32_t catalog_generation = 0;
     uint32_t track_index = UINT32_MAX;
+    bool is_nas = false;
     LyricsLineRow *lines = nullptr;
     uint32_t line_count = 0;
     char *text_pool = nullptr;
@@ -68,6 +75,7 @@ static esp_err_t g_result = ESP_OK;
 static uint32_t g_revision = 1U;
 static uint32_t g_loading_generation = 0U;
 static uint32_t g_loading_track = UINT32_MAX;
+static bool g_loading_is_nas = false;
 static LyricsDocument g_document = {};
 
 
@@ -139,6 +147,7 @@ static void lyrics_publish_state(
     g_result = result;
     g_loading_generation = request.catalog_generation;
     g_loading_track = request.track_index;
+    g_loading_is_nas = request.is_nas;
     ++g_revision;
     xSemaphoreGive(g_mutex);
 }
@@ -153,6 +162,7 @@ static void lyrics_mark_loading(const LyricsLoadRequest &request)
         g_result = ESP_OK;
         g_loading_generation = request.catalog_generation;
         g_loading_track = request.track_index;
+        g_loading_is_nas = request.is_nas;
         ++g_revision;
     }
     xSemaphoreGive(g_mutex);
@@ -171,8 +181,12 @@ static bool lyrics_storage_window_open()
         static_cast<uint64_t>(window.capacity_bytes) * LYRICS_FLAC_SAFE_PERCENT;
 }
 
-static bool lyrics_copy_external_lrc_path(uint32_t track_index, uint32_t generation, char *out, size_t out_size)
+static bool lyrics_copy_external_lrc_path(const LyricsLoadRequest &request, char *out, size_t out_size)
 {
+    const uint32_t track_index = request.track_index;
+    const uint32_t generation = request.catalog_generation;
+    if (request.is_nas)
+        return nas_library_source_copy_synced_lrc_path(track_index, generation, out, out_size);
     if (out == nullptr || out_size == 0U || !media_catalog_v2_ready() ||
         media_catalog_v2_generation() != generation) {
         return false;
@@ -329,6 +343,116 @@ static esp_err_t lyrics_read_file(
     data[size] = '\0';
     *out_data = data;
     *out_size = size;
+    return ESP_OK;
+}
+
+// NAS transport only; parsing/encoding and five-line timing remain the local LRC pipeline.
+static esp_err_t lyrics_read_nas_lrc(const LyricsLoadRequest &request,
+    const char *path, char **out_data, size_t *out_size)
+{
+    if (path == nullptr || out_data == nullptr || out_size == nullptr) return ESP_ERR_INVALID_ARG;
+    *out_data = nullptr; *out_size = 0U;
+    const TickType_t start = xTaskGetTickCount();
+    for (;;) {
+        if (!lyrics_request_is_latest(request.request_id) ||
+            player_state_get_source() != PlayerMediaSource::Nas ||
+            nas_library_source_generation() != request.catalog_generation ||
+            nas_catalog_service_is_server_switching()) return ESP_ERR_INVALID_STATE;
+        WifiServiceSnapshot wifi = {};
+        if (wifi_service_get_snapshot(&wifi) && wifi.connected) break;
+        if (!wifi.configured || wifi.state == WifiServiceState::Failed ||
+            wifi.state == WifiServiceState::RestoringBle) return ESP_ERR_INVALID_STATE;
+        if (xTaskGetTickCount() - start >= pdMS_TO_TICKS(12000)) return ESP_ERR_TIMEOUT;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    NasPlaybackEndpoint *endpoint = static_cast<NasPlaybackEndpoint *>(
+        heap_caps_calloc(1, sizeof(NasPlaybackEndpoint), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    char *url = static_cast<char *>(heap_caps_calloc(1, 1024U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (endpoint == nullptr || url == nullptr) {
+        heap_caps_free(endpoint); heap_caps_free(url); return ESP_ERR_NO_MEM;
+    }
+    esp_err_t ret = nas_catalog_service_get_playback_endpoint(endpoint);
+    if (ret == ESP_OK) {
+        // LRC is a sibling file in Music, NOT an audio short-ID alias.
+        endpoint->track_base_url[0] = '\0';
+        ret = nas_catalog_service_build_track_url(endpoint, path, url, 1024U);
+    }
+    if (ret != ESP_OK) {
+        heap_caps_free(endpoint); heap_caps_free(url); return ret;
+    }
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.timeout_ms = 2000;
+    config.buffer_size = 1024;
+    config.buffer_size_tx = 1024;
+    config.keep_alive_enable = false;
+    if (endpoint->username[0] != '\0') {
+        config.username = endpoint->username;
+        config.password = endpoint->password;
+        config.auth_type = HTTP_AUTH_TYPE_BASIC;
+    }
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == nullptr) {
+        heap_caps_free(endpoint); heap_caps_free(url); return ESP_ERR_NO_MEM;
+    }
+    ret = esp_http_client_open(client, 0);
+    int64_t content_len = -1;
+    if (ret == ESP_OK) {
+        content_len = esp_http_client_fetch_headers(client);
+        const int status = esp_http_client_get_status_code(client);
+        if (content_len < 0) ret = ESP_FAIL;
+        else if (status == 404) ret = ESP_ERR_NOT_FOUND;
+        else if (status != 200) {
+            ESP_LOGW(TAG, "NAS LRC HTTP响应：track=%lu http=%d",
+                static_cast<unsigned long>(request.track_index), status);
+            ret = ESP_ERR_INVALID_RESPONSE;
+        } else if (content_len > static_cast<int64_t>(LYRICS_FILE_MAX_BYTES))
+            ret = ESP_ERR_INVALID_SIZE;
+    }
+    char *data = nullptr;
+    size_t loaded = 0U;
+    if (ret == ESP_OK) {
+        const size_t capacity = content_len > 0
+            ? static_cast<size_t>(content_len) : LYRICS_FILE_MAX_BYTES;
+        data = static_cast<char *>(heap_caps_malloc(capacity + 1U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (data == nullptr) ret = ESP_ERR_NO_MEM;
+        unsigned empty_reads = 0U;
+        while (ret == ESP_OK && loaded < capacity) {
+            if (!lyrics_request_is_latest(request.request_id) ||
+                player_state_get_source() != PlayerMediaSource::Nas ||
+                nas_library_source_generation() != request.catalog_generation ||
+                nas_catalog_service_is_server_switching()) {
+                ret = ESP_ERR_INVALID_STATE; break;
+            }
+            const size_t wanted = std::min(LYRICS_READ_CHUNK_BYTES, capacity - loaded);
+            const int got = esp_http_client_read(client, data + loaded, wanted);
+            if (got > 0) {
+                loaded += static_cast<size_t>(got);
+                empty_reads = 0U;
+                vTaskDelay(1); // audio HTTP always gets a chance to run
+            } else if (got == -ESP_ERR_HTTP_EAGAIN && ++empty_reads < 4U) {
+                vTaskDelay(1);
+            } else if (got == 0 && content_len <= 0) {
+                break; // unknown-length response EOF
+            } else {
+                ret = ESP_FAIL;
+            }
+        }
+        if (ret == ESP_OK && content_len > 0 && loaded != static_cast<size_t>(content_len))
+            ret = ESP_ERR_INVALID_SIZE;
+        if (ret == ESP_OK && loaded == 0U) ret = ESP_ERR_NOT_FOUND;
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    heap_caps_free(endpoint);
+    heap_caps_free(url);
+    if (ret != ESP_OK) {
+        heap_caps_free(data); return ret;
+    }
+    data[loaded] = '\0';
+    *out_data = data;
+    *out_size = loaded;
     return ESP_OK;
 }
 
@@ -766,7 +890,7 @@ static void lyrics_task(void *arg)
         lyrics_mark_loading(request);
 
         char path[512] = {};
-        if (!lyrics_copy_external_lrc_path(request.track_index, request.catalog_generation, path, sizeof(path))) {
+        if (!lyrics_copy_external_lrc_path(request, path, sizeof(path))) {
             ESP_LOGI(TAG, "当前曲没有 External Synced LRC：track=%lu generation=%lu",
                 static_cast<unsigned long>(request.track_index),
                 static_cast<unsigned long>(request.catalog_generation));
@@ -779,7 +903,9 @@ static void lyrics_task(void *arg)
 
         char *file_data = nullptr;
         size_t file_size = 0U;
-        esp_err_t ret = lyrics_read_file(request, path, &file_data, &file_size);
+        esp_err_t ret = request.is_nas
+            ? lyrics_read_nas_lrc(request, path, &file_data, &file_size)
+            : lyrics_read_file(request, path, &file_data, &file_size);
         if (ret != ESP_OK) {
             if (ret != ESP_ERR_INVALID_STATE) {
                 ESP_LOGW(TAG, "LRC 读取失败：track=%lu err=%s",
@@ -809,6 +935,7 @@ static void lyrics_task(void *arg)
 
         parsed.catalog_generation = request.catalog_generation;
         parsed.track_index = request.track_index;
+        parsed.is_nas = request.is_nas;
         const uint32_t line_count = parsed.line_count;
         const uint32_t pool_size = parsed.text_pool_size;
         lyrics_publish_state(request, LyricsLoadState::Ready, ESP_OK, &parsed);
@@ -919,14 +1046,17 @@ void lyrics_service_resume_storage_after_handoff()
 
 bool lyrics_service_request_track(uint32_t track_index)
 {
-    if (g_storage_handoff || !g_ready || g_queue == nullptr || g_mutex == nullptr || !media_catalog_v2_ready() ||
-        track_index >= media_catalog_v2_current()->track_count) {
+    const bool is_nas = player_state_get_source() == PlayerMediaSource::Nas;
+    if (g_storage_handoff || !g_ready || g_queue == nullptr || g_mutex == nullptr ||
+        (is_nas ? (!nas_library_source_ready() || track_index >= nas_library_source_track_count())
+                : (!media_catalog_v2_ready() || track_index >= media_catalog_v2_current()->track_count))) {
         return false;
     }
 
     LyricsLoadRequest request = {};
-    request.catalog_generation = media_catalog_v2_generation();
+    request.catalog_generation = is_nas ? nas_library_source_generation() : media_catalog_v2_generation();
     request.track_index = track_index;
+    request.is_nas = is_nas;
 
     if (xSemaphoreTake(g_mutex, portMAX_DELAY) != pdTRUE) {
         return false;
@@ -937,7 +1067,8 @@ bool lyrics_service_request_track(uint32_t track_index)
     // 此时必须允许恢复后重新提交，而不能被一个已经失效的 Loading 状态永久挡住。
     const bool same_track =
         g_loading_generation == request.catalog_generation &&
-        g_loading_track == request.track_index;
+        g_loading_track == request.track_index &&
+        g_loading_is_nas == request.is_nas;
     if (same_track &&
         (g_state == LyricsLoadState::Ready ||
          g_state == LyricsLoadState::NoLyrics ||
@@ -955,6 +1086,7 @@ bool lyrics_service_request_track(uint32_t track_index)
     g_result = ESP_OK;
     g_loading_generation = request.catalog_generation;
     g_loading_track = request.track_index;
+    g_loading_is_nas = request.is_nas;
     ++g_revision;
     xSemaphoreGive(g_mutex);
 
@@ -977,8 +1109,11 @@ bool lyrics_service_get_window(uint32_t track_index, uint64_t position_ms, Lyric
     out_snapshot->revision = g_revision;
     out_snapshot->catalog_generation = g_loading_generation;
     out_snapshot->track_index = g_loading_track;
+    out_snapshot->is_nas = g_loading_is_nas;
 
     if (g_state != LyricsLoadState::Ready || g_document.track_index != track_index ||
+        g_document.is_nas != (player_state_get_source() == PlayerMediaSource::Nas) ||
+        g_document.catalog_generation != g_loading_generation ||
         g_document.lines == nullptr || g_document.line_count == 0U) {
         xSemaphoreGive(g_mutex);
         return true;

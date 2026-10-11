@@ -36,6 +36,7 @@ struct LyricsWindowSnapshot
     uint32_t revision = 0;
     uint32_t catalog_generation = 0;
     uint32_t track_index = UINT32_MAX;
+    bool is_nas = false;
     uint32_t line_count = 0;
     uint32_t current_line_index = UINT32_MAX;
     LyricsWindowLine lines[LYRICS_VIEW_WINDOW_LINES] = {};

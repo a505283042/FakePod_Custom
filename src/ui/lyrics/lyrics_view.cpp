@@ -11,6 +11,7 @@
 #include "gesture/gesture_router.h"
 #include "input/touch_input.h"
 #include "lyrics_service.h"
+#include "nas_library_source.h"
 #include "lyrics_text_layout.h"
 #include "media_catalog_v2.h"
 #include "player_control.h"
@@ -985,12 +986,17 @@ static void lyrics_view_apply_window_state(
     lv_obj_remove_flag(g_status, LV_OBJ_FLAG_HIDDEN);
 }
 
+static bool g_requested_is_nas = false;
+static uint32_t g_requested_generation = 0U;
+
 static void lyrics_view_request_if_needed(uint32_t track_index)
 {
-    if (!lyrics_service_is_ready() || track_index == UINT32_MAX || track_index == g_requested_track) {
-        return;
-    }
-    g_requested_track = track_index;
+    const bool is_nas = player_state_get_source() == PlayerMediaSource::Nas;
+    const uint32_t generation = is_nas
+        ? nas_library_source_generation() : media_catalog_v2_generation();
+    if (!lyrics_service_is_ready() || track_index == UINT32_MAX ||
+        (track_index == g_requested_track && is_nas == g_requested_is_nas &&
+         generation == g_requested_generation)) return;
     g_last_document_revision = 0U;
     g_last_current_line = UINT32_MAX;
     g_last_time_second = UINT32_MAX;
@@ -999,8 +1005,10 @@ static void lyrics_view_request_if_needed(uint32_t track_index)
     g_clock_track = UINT32_MAX;
     g_clock_observed_position_ms = UINT64_MAX;
     lyrics_view_cancel_motion(false);
-    if (!lyrics_service_request_track(track_index)) {
-        ESP_LOGW(TAG, "歌词请求未能入队：track=%lu", static_cast<unsigned long>(track_index));
+    if (lyrics_service_request_track(track_index)) {
+        g_requested_track = track_index;
+        g_requested_is_nas = is_nas;
+        g_requested_generation = generation;
     }
 }
 
@@ -1102,15 +1110,6 @@ static void lyrics_view_timer_cb(lv_timer_t *timer)
         return;
     }
     lyrics_view_refresh_header(track_index);
-    if (player_state_get_source() == PlayerMediaSource::Nas) {
-        lyrics_view_clear_lines();
-        g_requested_track = track_index;
-        if (g_status != nullptr) {
-            lv_label_set_text(g_status, "暂无同步歌词");
-            lv_obj_remove_flag(g_status, LV_OBJ_FLAG_HIDDEN);
-        }
-        return;
-    }
     lyrics_view_request_if_needed(track_index);
 
     AudioStateSnapshot audio = {};

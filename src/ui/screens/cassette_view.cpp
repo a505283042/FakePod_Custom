@@ -26,6 +26,7 @@
 #include "system/device_settings.h"
 #include "system/screen_lock_simple.h"
 #include "lyrics/lyrics_service.h"
+#include "nas_library_source.h"
 #include "lyrics/lyrics_text_layout.h"
 #include "gesture/gesture_router.h"
 #include "ui_common.h"
@@ -287,6 +288,7 @@ static bool g_launcher_suspended = false;
 
 static uint32_t g_text_track = UINT32_MAX;
 static uint32_t g_lyrics_requested_track = UINT32_MAX;
+static bool g_lyrics_requested_is_nas = false;
 static uint32_t g_last_lyrics_revision = 0U;
 static uint32_t g_last_lyrics_line = UINT32_MAX;
 
@@ -655,10 +657,20 @@ static void cassette_view_update_mini_lyrics()
         return;
     }
 
-    if (window.track_index == track && window.state != LyricsLoadState::Idle) {
+    const bool is_nas = player_state_get_source() == PlayerMediaSource::Nas;
+    const uint32_t catalog_generation = is_nas
+        ? nas_library_source_generation() : media_catalog_v2_generation();
+    if (window.track_index == track && window.is_nas == is_nas &&
+        window.catalog_generation == catalog_generation &&
+        window.state != LyricsLoadState::Idle) {
         g_lyrics_requested_track = track;
-    } else if (g_lyrics_requested_track != track && lyrics_service_request_track(track)) {
+        g_lyrics_requested_is_nas = player_state_get_source() == PlayerMediaSource::Nas;
+    } else if ((g_lyrics_requested_track != track ||
+                g_lyrics_requested_is_nas != is_nas ||
+                window.catalog_generation != catalog_generation) &&
+               lyrics_service_request_track(track)) {
         g_lyrics_requested_track = track;
+        g_lyrics_requested_is_nas = player_state_get_source() == PlayerMediaSource::Nas;
     }
 
     // Controls 显示期间只提前加载当前曲歌词，不更新隐藏中的歌词标签。

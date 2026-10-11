@@ -66,6 +66,7 @@ ARTIST = struct.Struct("<II")
 ALBUM = struct.Struct("<IIIIIHH")
 ARTIST_REF = struct.Struct("<II")
 ARTWORK = struct.Struct("<QIIqIHHBBBB")
+LYRICS = struct.Struct("<QIIIIBBBB")
 TRACK = struct.Struct("<IIIIHHIHHIIIHHHHHHBBBBIQIIIQQQQIIHH")
 MANIFEST_HEADER = struct.Struct("<8sHHHHIIII")
 MANIFEST_ROW = struct.Struct("<IB3xQq")
@@ -76,6 +77,7 @@ assert ARTIST.size == 8
 assert ALBUM.size == 24
 assert ARTIST_REF.size == 8
 assert ARTWORK.size == 36
+assert LYRICS.size == 28
 assert TRACK.size == 124
 assert MANIFEST_HEADER.size == 32
 assert MANIFEST_ROW.size == 24
@@ -480,6 +482,8 @@ class TrackMeta:
     artwork_picture_type: int = 0
     artwork_path: str = ""
     artwork_mtime: int = 0
+    # Same-name external synchronized .lrc; kept as a V2 LyricsRef locator.
+    lyrics_path: str = ""
 
 
 def tags_for_file(path: Path, fmt: int) -> Dict[str, List[str]]:
@@ -617,9 +621,10 @@ def track_from_cache(path: str, item: dict) -> TrackMeta:
     legacy = {f.name for f in fields(TrackMeta)} - {
         "artwork_scanned", "artwork_source", "artwork_format", "artwork_offset",
         "artwork_size", "artwork_flags", "artwork_width", "artwork_height",
-        "artwork_picture_type", "artwork_path", "artwork_mtime",
+        "artwork_picture_type", "artwork_path", "artwork_mtime", "lyrics_path",
     }
-    if not isinstance(row, dict) or set(row) not in (allowed, legacy):
+    pre_lyrics = allowed - {"lyrics_path"}
+    if not isinstance(row, dict) or set(row) not in (allowed, legacy, pre_lyrics):
         raise ValueError(f"损坏的扫描缓存：{path}")
     result = TrackMeta(**row)
     if result.path != path or result.track_id != stable_track_id(path):
@@ -708,6 +713,16 @@ def scan_incremental(root: Path, previous: Optional[dict]):
                  row.artwork_path, row.artwork_mtime) = locator
             row.artwork_scanned = True
             artwork_scanned += 1
+        # External LRC changes independently of the song; stat it even when tags are cached.
+        # Keep the exact file case so DSM's case-sensitive URL resolves correctly.
+        row.lyrics_path = ""
+        for suffix in (".lrc", ".LRC"):
+            candidate = path.with_suffix(suffix)
+            if candidate.is_file():
+                lrc_stat = candidate.stat()
+                if 0 < lrc_stat.st_size <= 256 * 1024:
+                    row.lyrics_path = "/" + candidate.relative_to(root).as_posix()
+                break
         # Protect against concurrent SMB source edits while scanning.
         last = path.stat()
         if (last.st_size, last.st_mtime_ns) != (st.st_size, st.st_mtime_ns):
@@ -913,6 +928,7 @@ def build_catalog(tracks: List[TrackMeta]):
 
     artist_ref_bytes = bytearray()
     artwork_bytes = bytearray()
+    lyrics_bytes = bytearray()
     track_bytes = bytearray()
     manifest_rows = bytearray()
 
@@ -935,6 +951,12 @@ def build_catalog(tracks: List[TrackMeta]):
                 track.artwork_source, track.artwork_format,
                 track.artwork_picture_type, 0,
             ))
+        lyrics_ref_start = len(lyrics_bytes) // LYRICS.size
+        lyrics_ref_count = 0
+        if track.lyrics_path:
+            # External + Synced, no embedded payload; keep LyricsRefV2 disk contract.
+            lyrics_bytes.extend(LYRICS.pack(0, 0, add(track.lyrics_path), 0, 0, 1, 2, 0, 0))
+            lyrics_ref_count = 1
         path_off = add(track.path)
         title_off = add(track.title)
         artist_off = add(track.artist)
@@ -946,7 +968,7 @@ def build_catalog(tracks: List[TrackMeta]):
                 artist_ref_start,
                 artist_ref_count,
                 0,
-                0, 0, 0,
+                lyrics_ref_start, lyrics_ref_count, 0,
                 alb_id,
                 artwork_ref_id,
                 track.metadata_flags,
@@ -978,7 +1000,7 @@ def build_catalog(tracks: List[TrackMeta]):
         bytes(artist_bytes),
         bytes(album_bytes),
         bytes(artist_ref_bytes),
-        b"",
+        bytes(lyrics_bytes),
         bytes(artwork_bytes),
         bytes(track_bytes),
     ]
@@ -991,13 +1013,13 @@ def build_catalog(tracks: List[TrackMeta]):
         SEC_ARTWORK_REFS,
         SEC_TRACKS,
     ]
-    row_sizes = [1, ARTIST.size, ALBUM.size, ARTIST_REF.size, 28, ARTWORK.size, TRACK.size]
+    row_sizes = [1, ARTIST.size, ALBUM.size, ARTIST_REF.size, LYRICS.size, ARTWORK.size, TRACK.size]
     counts = [
         len(pool),
         len(artist_names),
         len(album_rows),
         len(artist_ref_bytes) // ARTIST_REF.size,
-        0,
+        len(lyrics_bytes) // LYRICS.size,
         len(artwork_bytes) // ARTWORK.size,
         len(tracks),
     ]
@@ -1023,7 +1045,7 @@ def build_catalog(tracks: List[TrackMeta]):
         len(artist_names),
         len(album_rows),
         len(artist_ref_bytes) // ARTIST_REF.size,
-        0,
+        len(lyrics_bytes) // LYRICS.size,
         len(artwork_bytes) // ARTWORK.size,
     )
     index_file = header + bytes(sections) + payload
@@ -1111,6 +1133,7 @@ def main() -> int:
     year_tagged = sum(1 for t in tracks if t.release_year or t.original_year)
     print(f"FakePod NAS Catalog: tracks={len(tracks)} artists={artist_count} albums={album_count}")
     print(f"metadata: title={title_tagged} artist={artist_tagged} album={album_tagged} year={year_tagged}")
+    print(f"NAS LRC refs={sum(bool(t.lyrics_path) for t in tracks)} (external synced)")
     print(f"artwork refs={sum(bool(t.artwork_source) for t in tracks)} "
           f"embedded={sum(t.artwork_source in (1, 2) for t in tracks)} "
           f"external={sum(t.artwork_source == 3 for t in tracks)}")

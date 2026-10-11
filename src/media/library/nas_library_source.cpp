@@ -403,6 +403,28 @@ bool nas_library_source_get_artwork_view(uint32_t track_index, MediaArtworkViewV
     return true;
 }
 
+bool nas_library_source_copy_synced_lrc_path(
+    uint32_t track_index, uint32_t generation, char *out_path, size_t out_size)
+{
+    if (out_path == nullptr || out_size == 0U || !nas_library_source_ready() ||
+        g_generation != generation || track_index >= g_catalog.track_count) return false;
+    const TrackRowV2 &track = g_catalog.tracks[track_index];
+    for (uint16_t i = 0U; i < track.lyrics_ref_count; ++i) {
+        const uint32_t idx = track.lyrics_ref_start + i;
+        if (idx >= g_catalog.lyrics_ref_count) break;
+        const LyricsRefV2 &ref = g_catalog.lyrics_refs[idx];
+        if (ref.source != MediaLyricsSourceV2::ExternalFile ||
+            ref.kind != MediaLyricsKindV2::Synced) continue;
+        const char *path = media_catalog_v2_pool_str(&g_catalog, ref.path_off);
+        if (path == nullptr || path[0] != '/') continue;
+        const size_t length = strlen(path);
+        if (length + 1U > out_size) return false;
+        memcpy(out_path, path, length + 1U);
+        return true;
+    }
+    return false;
+}
+
 size_t nas_library_source_artist_count() { return nas_library_source_ready() ? g_catalog.artist_group_count : 0U; }
 size_t nas_library_source_album_count() { return nas_library_source_ready() ? g_catalog.album_group_count : 0U; }
 size_t nas_library_source_decade_count() { return nas_library_source_ready() ? g_catalog.decade_group_count : 0U; }

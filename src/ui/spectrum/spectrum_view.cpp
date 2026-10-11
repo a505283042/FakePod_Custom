@@ -12,6 +12,7 @@
 #include "gesture/gesture_router.h"
 #include "media/library/media_catalog_v2.h"
 #include "lyrics_service.h"
+#include "nas_library_source.h"
 #include "lyrics_text_layout.h"
 #include "player/player_playlist.h"
 #include "player/player_state.h"
@@ -168,6 +169,7 @@ uint32_t g_frame = 0U;
 uint32_t g_last_pcm_revision = 0U;
 uint32_t g_last_track = UINT32_MAX;
 uint32_t g_lyrics_requested_track = UINT32_MAX;
+bool g_lyrics_requested_is_nas = false;
 uint32_t g_last_lyrics_document_revision = 0U;
 uint32_t g_last_lyrics_line = UINT32_MAX;
 uint16_t g_bar_height[SPECTRUM_BAR_COUNT] = {};
@@ -327,22 +329,30 @@ static void spectrum_request_lyrics_if_needed(
     uint32_t track_index,
     const LyricsWindowSnapshot &window)
 {
-    if (!lyrics_service_is_ready() || track_index == UINT32_MAX ||
-        player_state_get_source() == PlayerMediaSource::Nas) {
+    if (!lyrics_service_is_ready() || track_index == UINT32_MAX) {
         return;
     }
 
+    const bool is_nas = player_state_get_source() == PlayerMediaSource::Nas;
+    const uint32_t generation = is_nas
+        ? nas_library_source_generation() : media_catalog_v2_generation();
     // LyricsService 是共享数据服务。若歌词页刚加载过同一首，这里直接复用，
     // 不重复读取 LRC；只有服务当前目标不是本曲时才提交请求。
-    if (window.track_index == track_index && window.state != LyricsLoadState::Idle) {
+    if (window.track_index == track_index &&
+        window.is_nas == is_nas && window.catalog_generation == generation &&
+        window.state != LyricsLoadState::Idle) {
         g_lyrics_requested_track = track_index;
+        g_lyrics_requested_is_nas = player_state_get_source() == PlayerMediaSource::Nas;
         return;
     }
-    if (g_lyrics_requested_track == track_index) {
+    if (g_lyrics_requested_track == track_index &&
+        g_lyrics_requested_is_nas == is_nas &&
+        window.catalog_generation == generation) {
         return;
     }
     if (lyrics_service_request_track(track_index)) {
         g_lyrics_requested_track = track_index;
+        g_lyrics_requested_is_nas = player_state_get_source() == PlayerMediaSource::Nas;
     }
 }
 
@@ -350,8 +360,7 @@ static void spectrum_update_current_lyric(
     const AudioStateSnapshot &audio,
     uint32_t track_index)
 {
-    if (g_lyric == nullptr || !lyrics_service_is_ready() || track_index == UINT32_MAX ||
-        player_state_get_source() == PlayerMediaSource::Nas) {
+    if (g_lyric == nullptr || !lyrics_service_is_ready() || track_index == UINT32_MAX) {
         spectrum_clear_current_lyric(false);
         return;
     }
