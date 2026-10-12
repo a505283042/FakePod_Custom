@@ -6,7 +6,7 @@ FakePod 是基于 ESP32-S3 的便携音乐播放器，支持 TF 卡与 NAS 音�
 
 ## 一、烧录与 TF 卡
 
-使用乐鑫 `flash_download_tool`，选择项目生成的完整镜像 `FakePod_Full.bin`。烧录地址为 `0x0000`，SPI 模式 `DIO`、速度 `80MHz`、Flash 大小 `16MB`。完整镜像可由 `tools/merge_fakepod_full.bat` 合并生成；不要把普通 APP 固件误当作完整镜像烧到 `0x0000`。
+使用乐鑫 `flash_download_tool`，选择项目生成的完整镜像 `FakePod_Full.bin`。烧录地址为 `0x0000`，SPI 模式 `DIO`、速度 `80MHz`、Flash 大小 `16MB`。完整镜像可由 `tools/firmware/merge_fakepod_full.bat` 合并生成；不要把普通 APP 固件误当作完整镜像烧到 `0x0000`。
 
 TF 卡根目录常用文件夹如下：
 
@@ -66,7 +66,7 @@ NAS 音乐从 NAS 服务器通过 HTTP 读取，支持 MP3 / FLAC 播放，以�
 
 ### 在电脑上更新 NAS 曲库
 
-双击 `tools/启动NAS曲库管理器.bat`。先扫描增量变化；需要新建或修复音频、歌词短链接时，执行 **① SSH 准备**，确认成功后执行 **② 验证并发布 V2 索引**。最后在设备上同步或重启检查。正常增量更新不必每次重建全部歌曲元数据。
+双击 `tools/nas/启动NAS曲库管理器.bat`。先扫描增量变化；需要新建或修复音频、歌词短链接时，执行 **① SSH 准备**，确认成功后执行 **② 验证并发布 V2 索引**。最后在设备上同步或重启检查。正常增量更新不必每次重建全部歌曲元数据。
 
 NAS 管理器的网络路径、共享目录和 SSH 权限设置，详见 `tools/nas/FakePod_NAS_GUI_使用说明.md`。
 
