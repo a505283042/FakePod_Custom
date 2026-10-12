@@ -6,10 +6,13 @@
 #include <unistd.h>
 
 #include "audio_service.h"
+#include "app/app_manager.h"
 #include "battery_service.h"
 #include "media_catalog_v2.h"
 #include "nas_library_source.h"
 #include "player_control.h"
+#include "ui/screens/player_home.h"
+#include "screen_lock_simple.h"
 #include "player_state.h"
 #include "video_app.h"
 #include "visual_music_app.h"
@@ -171,6 +174,12 @@ static void ensure_nsf_metadata(const NsfRemoteSnapshot &nsf)
     }
 }
 
+static bool music_remote_ui_available()
+{
+    return app_manager_foreground() == AppId::Music &&
+        !visual_music_app_remote_control_active() && !video_app_remote_control_active();
+}
+
 static void build_status(uint8_t packet[kStatusPacketSize])
 {
     memset(packet, 0, kStatusPacketSize);
@@ -213,6 +222,7 @@ static void build_status(uint8_t packet[kStatusPacketSize])
     if (track != UINT32_MAX) flags |= 0x04U;
     if (video_valid) flags |= 0x08U;
     if (nsf_valid) flags |= 0x10U;
+    if (music_remote_ui_available()) flags |= 0x20U; // Music APP foreground
     packet[5] = flags;
 
     write_u32_le(&packet[6], track);
@@ -251,8 +261,28 @@ static bool execute_command(const uint8_t *payload, size_t size)
         case 0x04U: return size == 1U && player_control_volume_up(1U);
         case 0x05U: return size == 1U && player_control_volume_down(1U);
         case 0x06U: return size == 2U && payload[1] <= 100U && player_control_set_volume(payload[1]);
+        case 0x10U: return size == 2U && payload[1] <= 3U &&
+            music_remote_ui_available() &&
+            player_control_set_loop_mode(static_cast<PlayerLoopMode>(payload[1]));
+        case 0x11U: return size == 2U && payload[1] <= 3U &&
+            music_remote_ui_available() &&
+            player_home_remote_request_view(payload[1]);
+        case 0x12U: return size == 1U && music_remote_ui_available() && screen_lock_simple_remote_request(1U); // wake/unlock
+        case 0x13U: return size == 1U && music_remote_ui_available() && screen_lock_simple_remote_request(2U); // lock
+        case 0x14U: return size == 1U && music_remote_ui_available() && screen_lock_simple_remote_request(3U); // AOD
+        case 0x15U: return size == 1U && music_remote_ui_available() && screen_lock_simple_remote_request(4U); // display off
         default: return false;
     }
+}
+
+// V1 optional extension; legacy 20-byte playback status remains unchanged.
+static void build_remote_ui_status(uint8_t packet[6])
+{
+    packet[0] = 0x03U; packet[1] = kProtocolVersion;
+    packet[2] = static_cast<uint8_t>(player_control_get_loop_mode());
+    packet[3] = player_home_remote_get_view();
+    packet[4] = static_cast<uint8_t>(screen_lock_simple_get_power());
+    packet[5] = static_cast<uint8_t>(screen_lock_simple_get_lock());
 }
 
 static bool send_all(int fd, const uint8_t *data, size_t size)
@@ -487,6 +517,13 @@ static void service_task(void *)
                     rx_size = 0U;
                 } else {
                     status_due = now + kStatusInterval;
+                    uint8_t ui_status[6] = {};
+                    build_remote_ui_status(ui_status);
+                    if (!send_frame(g_client_fd, ui_status, sizeof(ui_status))) {
+                        close_fd(g_client_fd);
+                        rx_size = 0U;
+                        continue;
+                    }
                     if (sent_metadata_sequence != g_metadata_sequence) {
                         if (send_metadata(g_client_fd)) {
                             sent_metadata_sequence = g_metadata_sequence;

@@ -62,6 +62,9 @@ void screen_lock_simple_set_lock(ScreenLockState lock);
 void screen_lock_set_power(ScreenPowerState power);          // 老别名
 void screen_lock_set_lock(ScreenLockState lock);             // 老别名
 void screen_lock_toggle_lock(void);
+// Remote display requests are delivered by Wi-Fi/BLE tasks; system loop owns LVGL transition.
+bool screen_lock_simple_remote_request(uint8_t action); // 1=wake+unlock, 2=lock, 3=AOD, 4=off
+void screen_lock_simple_remote_update();
 void screen_lock_wake_if_needed(void);
 
 // ============================================================

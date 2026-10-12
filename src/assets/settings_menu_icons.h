@@ -35,6 +35,9 @@ enum class SettingsDetailIcon : uint8_t {
     InternalRam,
     Psram,
     SdCard,
+    NasSync,
+    NasPair,
+    UiFont,
     Count,
 };
 

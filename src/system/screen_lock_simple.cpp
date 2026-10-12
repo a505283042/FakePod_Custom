@@ -1,4 +1,5 @@
 #include "screen_lock_simple.h"
+#include <atomic>
 
 #include <stdio.h>
 #include <string.h>
@@ -84,6 +85,8 @@ static int8_t            g_jitter_y      = 0;
 static bool g_aod_prev_was_fullscreen = false;
 static bool g_aod_prev_library_visible = false;
 static bool g_aod_prev_music_foreground = true;
+// AOD -> Off 时页面仍在后台；必须记住，等 Off -> Normal 再恢复。
+static bool g_aod_music_pages_suspended = false;
 
 // LVGL 对象（AOD / 锁 悬浮层）
 static lv_obj_t *g_aod_root        = nullptr;   // AOD 全屏容器（屏态 = AOD 才显示）
@@ -719,39 +722,35 @@ static void aod_restore_music_pages_from_background()
 
 static void apply_power_ui(ScreenPowerState prev, ScreenPowerState next)
 {
-    // ── AOD "独立页面"模式：进入时把音乐页全后台，退出时按线索恢复 ──
-    const bool was_aod = (prev == ScreenPowerAOD);
-    const bool to_aod  = (next == ScreenPowerAOD);
-
-    if (!was_aod && to_aod) {
-        // 第一次切进 AOD：保存 + 关页面 + 信息卡立即刷新 + 置顶一次
-        aod_push_music_pages_to_background();
+    if (next == ScreenPowerAOD) {
+        // Normal -> AOD 只后台化一次；AOD -> Off -> AOD 不应覆盖原恢复线索。
+        if (!g_aod_music_pages_suspended) {
+            aod_push_music_pages_to_background();
+            g_aod_music_pages_suspended = true;
+        }
         obj_set_visible(g_aod_root, true);
         lv_obj_move_foreground(g_aod_root);
         g_aod_last_refresh_tick = 0U;
-        g_last_jitter_tick      = 0;
-        const TickType_t now    = xTaskGetTickCount();
+        g_last_jitter_tick = 0;
+        const TickType_t now = xTaskGetTickCount();
         aod_refresh_now_playing_if_due(now);
         aod_apply_jitter_if_due(now);
-    } else if (was_aod && !to_aod) {
-        // 从 AOD 切到 Normal 或 Off：隐藏 AOD + 恢复原页面
+        return;
+    }
+
+    // AOD -> Off 只隐藏信息卡，不能丢失此前保存的前台页面恢复线索。
+    if (prev == ScreenPowerAOD) {
         obj_set_visible(g_aod_root, false);
-        if (next == ScreenPowerNormal) {
-            aod_restore_music_pages_from_background();
-            // 恢复后立即把 Normal 右上角锁（如已锁）置顶
-            apply_lock_ui();
-        }
-    } else if (to_aod) {
-        // AOD → AOD（保持态）：如果切歌后信息卡曾被任何兄弟盖过，这里再提一次顶
-        // （正常 AOD->AOD 不会走这里，只是 defensive，防止别人中途改状态）
-        if (g_aod_root != nullptr) lv_obj_move_foreground(g_aod_root);
-    } else {
-        // Normal <-> Off 等其他切换：保持右上角 [锁] 置顶
-        if (g_lock_icon != nullptr) {
-            lv_obj_t *cap = lv_obj_get_parent(g_lock_icon);
-            if (cap != nullptr) lv_obj_move_foreground(cap);
-            else                lv_obj_move_foreground(g_lock_icon);
-        }
+    }
+    // Off -> Normal 同样需要恢复在 AOD 阶段后台化的音乐页面。
+    if (next == ScreenPowerNormal && g_aod_music_pages_suspended) {
+        aod_restore_music_pages_from_background();
+        g_aod_music_pages_suspended = false;
+        apply_lock_ui();
+    } else if (g_lock_icon != nullptr) {
+        lv_obj_t *cap = lv_obj_get_parent(g_lock_icon);
+        if (cap != nullptr) lv_obj_move_foreground(cap);
+        else                lv_obj_move_foreground(g_lock_icon);
     }
 }
 
@@ -962,6 +961,7 @@ esp_err_t screen_lock_simple_create()
     g_normal_brightness_last_attempt_tick = 0;
     g_press_row        = -1;
     g_press_x = 0; g_press_y = 0;
+    g_aod_music_pages_suspended = false;
 
     if (!lvgl_port_lock(200)) {
         ESP_LOGW(TAG, "screen_lock_simple_create 获取 LVGL 锁超时");
@@ -1014,11 +1014,36 @@ void screen_lock_simple_destroy()
     g_menu_open       = false;
     g_auto_screen_off_seconds = 0U;
     g_auto_screen_off_to_aod = true;
+    g_aod_music_pages_suspended = false;
     g_last_user_activity_tick = 0;
     g_normal_brightness_apply_pending = false;
     g_normal_brightness_last_attempt_tick = 0;
     lvgl_port_unlock();
     g_ready = false;
+}
+
+
+static std::atomic<uint8_t> g_remote_screen_action{0U};
+static bool screen_lock_simple_set_normal_with_lock(ScreenLockState lock);
+
+bool screen_lock_simple_remote_request(uint8_t action)
+{
+    if (action < 1U || action > 4U) return false;
+    g_remote_screen_action.store(action, std::memory_order_release);
+    return true;
+}
+
+void screen_lock_simple_remote_update()
+{
+    const uint8_t action = g_remote_screen_action.exchange(0U, std::memory_order_acq_rel);
+    if (action == 0U) return;
+    switch (action) {
+        case 1U: (void)screen_lock_simple_wake_and_unlock(); break;
+        case 2U: (void)screen_lock_simple_set_normal_with_lock(ScreenLockLocked); break;
+        case 3U: screen_lock_simple_set_power(ScreenPowerAOD); break;
+        case 4U: screen_lock_simple_set_power(ScreenPowerOff); break;
+        default: break;
+    }
 }
 
 // ----------- 查询（老 + 新命名都提供） -----------
@@ -1225,51 +1250,46 @@ void screen_lock_wake_if_needed(void)
 // 不复用现有 set_power() / set_lock()：复合唤醒只获取一次 LVGL 锁，避免两次独立
 // 锁获取之间出现 Normal+Locked 等中间态。
 // ============================================================
-bool screen_lock_simple_wake_and_unlock(void)
+static bool screen_lock_simple_set_normal_with_lock(ScreenLockState target_lock)
 {
     if (!g_ready) return false;
 
-    // 幂等：已经是 Normal + Unlocked 就直接成功
-    if (g_power == ScreenPowerNormal && g_lock == ScreenLockUnlocked) {
+    // 远程“锁屏”= 正常显示 + 锁定；“唤醒”= 正常显示 + 解锁。
+    // 两者都一次提交，不允许从 AOD/Off 切换时留下半套状态。
+    if (g_power == ScreenPowerNormal && g_lock == target_lock) {
         g_last_user_activity_tick = xTaskGetTickCount();
         return true;
     }
 
-    const ScreenPowerState prev_power = g_power;
-    const ScreenLockState  prev_lock  = g_lock;
-
-    // 所有 C++ 状态、LVGL UI 与 panel 命令都在同一把锁内提交。
     constexpr TickType_t kWakeLockTimeoutMs = pdMS_TO_TICKS(500);
-    constexpr int        kWakeMaxRetry      = 1;  // 首次 + 1 次重试
-
+    constexpr int kWakeMaxRetry = 1;
     for (int attempt = 0; attempt <= kWakeMaxRetry; ++attempt) {
         if (lvgl_port_lock(kWakeLockTimeoutMs)) {
-            // 状态变量：锁内赋值，确保与 apply_*_ui 原子一致
+            const ScreenPowerState prev_power = g_power;
+            const ScreenLockState prev_lock = g_lock;
             g_power = ScreenPowerNormal;
-            g_lock  = ScreenLockUnlocked;
+            g_lock = target_lock;
             g_last_user_activity_tick = xTaskGetTickCount();
 
-            // UI：AOD→Normal 恢复音乐页面，锁图标显/隐同步。
             apply_power_ui(prev_power, ScreenPowerNormal);
             apply_lock_ui();
             apply_power_hw(ScreenPowerNormal);
-
             lvgl_port_unlock();
-            ESP_LOGI(TAG,
-                "复合唤醒成功：%s + %s → Normal + Unlocked（attempt=%d）",
-                prev_power == ScreenPowerNormal ? "Normal" :
-                prev_power == ScreenPowerAOD    ? "AOD"    : "OFF",
-                prev_lock  == ScreenLockLocked   ? "LOCKED" : "FREE",
-                attempt);
+            ESP_LOGI(TAG, "屏幕复合切换成功：power=%u lock=%u -> Normal + %s（attempt=%d）",
+                static_cast<unsigned>(prev_power), static_cast<unsigned>(prev_lock),
+                target_lock == ScreenLockLocked ? "Locked" : "Unlocked", attempt);
             return true;
         }
-        ESP_LOGW(TAG, "复合唤醒 LVGL 锁超时（attempt=%d/%d，%lums）",
-            attempt + 1, kWakeMaxRetry + 1,
-            static_cast<unsigned long>(pdMS_TO_TICKS(500) * portTICK_PERIOD_MS));
+        ESP_LOGW(TAG, "屏幕复合切换 LVGL 锁超时（attempt=%d/%d）",
+            attempt + 1, kWakeMaxRetry + 1);
     }
-
-    ESP_LOGE(TAG, "复合唤醒失败：LVGL 锁多次超时；状态/UI/硬件均未提交，下次 GPIO0 长按可重试");
+    ESP_LOGE(TAG, "屏幕复合切换失败：LVGL 锁超时；状态/UI/硬件均未提交");
     return false;
+}
+
+bool screen_lock_simple_wake_and_unlock(void)
+{
+    return screen_lock_simple_set_normal_with_lock(ScreenLockUnlocked);
 }
 
 // ----------- Render -----------

@@ -95,7 +95,9 @@ static constexpr int16_t kTapeAmountWidth = 159;
 static constexpr int16_t kTapeAmountHeight = 41;
 static constexpr int16_t kTapeAmountBaseX = 150;
 static constexpr int16_t kTapeAmountY = 104;
-static constexpr int16_t kTapeAmountTravelPx = 25;
+// R46.0.130: 新曲起始磁带量再少一点；保持终点不变。
+static constexpr int16_t kTapeAmountStartShiftPx = -34;
+static constexpr int16_t kTapeAmountEndShiftPx = 25;
 static constexpr int64_t kMechanicsFramePeriodUs = 50000LL;  // C2.3：20 Hz，12帧大轮真正显示5°中间相位
 static constexpr uint32_t kMechanicsTimerPeriodMs = 50U;
 // C2.4.15：96/192 kHz FLAC 给解码/I2S 留更大的实时预算：机械 timer 仍保持 50ms，
@@ -1475,17 +1477,18 @@ static void cassette_view_update_tape_amount(const AudioStateSnapshot &audio)
 
     // 换曲时 player_state 会先切到新曲，而 audio snapshot 可能仍短暂保留旧曲。
     // 过渡态直接显示新磁带的起始量，避免先回中间再跳到左边最少。
-    int16_t shift = -kTapeAmountTravelPx;
+    int16_t shift = kTapeAmountStartShiftPx;
     const uint64_t total_ms = cassette_view_audio_total_ms(audio);
     const bool same_track = cassette_view_audio_matches_current(audio);
     if (audio.ready && same_track && total_ms > 0U) {
         // C2 实机确认磁带量方向反了。C2.1 完全反转平移方向：
-        // 进度0%：图向左25px；100%：图向右25px。
+        // 0% 向左 31px；100% 向右 25px，两端按进度线性平移。
         const uint64_t position_ms = audio.position_ms < total_ms ? audio.position_ms : total_ms;
-        const uint64_t travel = static_cast<uint64_t>(kTapeAmountTravelPx) * 2ULL;
+        const uint64_t travel = static_cast<uint64_t>(
+            kTapeAmountEndShiftPx - kTapeAmountStartShiftPx);
         const uint64_t moved = (position_ms * travel) / total_ms;
         shift = static_cast<int16_t>(
-            -kTapeAmountTravelPx + static_cast<int32_t>(moved));
+            kTapeAmountStartShiftPx + static_cast<int32_t>(moved));
     }
 
     if (shift == g_last_tape_shift) return;
@@ -2275,7 +2278,7 @@ static bool cassette_view_compose_cache_job(
             dst, g_tape_amount_pixels,
             static_cast<uint16_t>(kTapeAmountWidth), static_cast<uint16_t>(kTapeAmountHeight),
             0U, static_cast<uint16_t>(kTapeAmountWidth),
-            static_cast<int16_t>(kCassetteX + kTapeAmountBaseX - kTapeAmountTravelPx),
+            static_cast<int16_t>(kCassetteX + kTapeAmountBaseX + kTapeAmountStartShiftPx),
             static_cast<int16_t>(kCassetteY + kTapeAmountY));
         cassette_view_blit_rgb565a8_frame(
             dst, g_big_reel_pixels,
@@ -3541,7 +3544,7 @@ esp_err_t cassette_view_create(lv_obj_t *parent)
     lv_obj_set_pos(
         g_tape_amount_image,
         // 初始即使用新磁带 0% 状态，避免对象第一次显示时短暂位于中间。
-        kCassetteX + kTapeAmountBaseX - kTapeAmountTravelPx,
+        kCassetteX + kTapeAmountBaseX + kTapeAmountStartShiftPx,
         kCassetteY + kTapeAmountY);
     lv_obj_add_flag(g_tape_amount_image, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(g_tape_amount_image, LV_OBJ_FLAG_CLICKABLE);

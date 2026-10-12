@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <algorithm>
+#include <atomic>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +42,7 @@
 static const char *TAG = "首页";
 
 static void player_home_refresh();
+
 
 #if APP_DIAG_BOOT_VERBOSE
 #define HOME_BOOT_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
@@ -3125,6 +3127,111 @@ static bool player_home_handle_vertical_track_swipe(
     return true;
 }
 
+static bool player_home_set_visual_mode(MusicVisualMode mode);
+static std::atomic<uint8_t> g_remote_view_request{0U}; // 0=none, 1..4=requested view
+static std::atomic<uint8_t> g_remote_view_actual{0U};
+
+bool player_home_remote_request_view(uint8_t view)
+{
+    if (view > 3U) return false;
+    g_remote_view_request.store(static_cast<uint8_t>(view + 1U), std::memory_order_release);
+    return true;
+}
+
+uint8_t player_home_remote_get_view()
+{
+    return g_remote_view_actual.load(std::memory_order_acquire);
+}
+
+static void player_home_update_remote_view_status()
+{
+    const uint8_t view = lyrics_view_is_visible() ? 2U :
+        (spectrum_view_is_visible() ? 3U :
+         (g_music_visual_mode == MusicVisualMode::Cassette ? 1U : 0U));
+    g_remote_view_actual.store(view, std::memory_order_release);
+}
+
+static void player_home_consume_remote_view()
+{
+    const uint8_t request = g_remote_view_request.load(std::memory_order_acquire);
+    if (request == 0U || !g_app_foreground || library_view_is_visible() ||
+        g_launcher_visible || screen_lock_simple_get_power() != ScreenPowerNormal) return;
+
+    // Keep an unfinished transition pending. A cassette -> artwork handoff can
+    // temporarily fail while a surface is pinned or being prepared.
+    static int64_t retry_after_us = 0;
+    if (esp_timer_get_time() < retry_after_us) return;
+    const uint8_t selected = g_remote_view_request.load(std::memory_order_acquire);
+    if (selected == 0U) return;
+    // Fullscreen lyrics/spectrum currently hides Home. Prepare cassette behind
+    // that opaque page and commit it BEFORE revealing Home; otherwise an
+    // Artwork -> Cassette request exposes the full-screen cover for a frame.
+    const bool fullscreen_visible = lyrics_view_is_visible() || spectrum_view_is_visible();
+    if (selected == 2U && fullscreen_visible) {
+        if (g_music_visual_mode != MusicVisualMode::Cassette) {
+            if (!player_home_set_visual_mode(MusicVisualMode::Cassette)) {
+                retry_after_us = esp_timer_get_time() + 250000;
+                return;
+            }
+            if (g_cassette_visual_switch_pending) {
+                cassette_view_update();
+                if (!player_home_finish_cassette_switch_if_ready()) {
+                    retry_after_us = esp_timer_get_time() + 250000;
+                    return;
+                }
+            }
+        } else {
+            // Returning to an already-selected cassette can require restoring
+            // its temporary hidden Surface after a fullscreen page covered it.
+            if (!cassette_view_is_active() && !cassette_view_set_active(true)) {
+                retry_after_us = esp_timer_get_time() + 250000;
+                return;
+            }
+            cassette_view_update();
+            if (!cassette_view_is_present_ready()) {
+                retry_after_us = esp_timer_get_time() + 250000;
+                return;
+            }
+        }
+        // A newer phone request may arrive while the cassette is preparing.
+        if (g_remote_view_request.load(std::memory_order_acquire) != selected) return;
+    }
+    if (lyrics_view_is_visible()) {
+        lyrics_view_close();
+        player_home_resume_from_fullscreen_view("remote-lyrics");
+    }
+    if (spectrum_view_is_visible()) {
+        spectrum_view_close();
+        player_home_resume_from_fullscreen_view("remote-spectrum");
+    }
+    bool completed = false;
+    switch (selected - 1U) {
+        case 0U: completed = player_home_set_visual_mode(MusicVisualMode::Artwork); break;
+        case 1U: completed = player_home_set_visual_mode(MusicVisualMode::Cassette); break;
+        case 2U:
+            player_home_overlay_hide();
+            lyrics_view_open();
+            completed = lyrics_view_is_visible();
+            break;
+        case 3U:
+            player_home_overlay_hide();
+            spectrum_view_open();
+            completed = spectrum_view_is_visible();
+            break;
+        default: break;
+    }
+    if (completed) {
+        // Do not erase a newer command that arrived while preparing this view.
+        uint8_t expected = selected;
+        (void)g_remote_view_request.compare_exchange_strong(
+            expected, 0U, std::memory_order_acq_rel, std::memory_order_acquire);
+        retry_after_us = 0;
+    } else {
+        retry_after_us = esp_timer_get_time() + 250000;
+    }
+}
+
+
 static void player_home_gesture_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
@@ -3132,6 +3239,14 @@ static void player_home_gesture_timer_cb(lv_timer_t *timer)
         return;
     }
     player_home_update_background_timer_qos();
+    player_home_consume_remote_view();
+    player_home_update_remote_view_status();
+    static PlayerLoopMode last_loop_mode = player_control_get_loop_mode();
+    const PlayerLoopMode loop_mode = player_control_get_loop_mode();
+    if (loop_mode != last_loop_mode) {
+        last_loop_mode = loop_mode;
+        cassette_view_on_playback_mode_changed();
+    }
     if (library_view_is_visible()) {
         return;
     }
@@ -3967,6 +4082,8 @@ static bool player_home_set_visual_mode(MusicVisualMode mode)
     // Cassette -> Artwork：旧的压暗静态磁带必须继续留在前台，直到 dimmed Artwork
     // 已从当前 normal Surface 恢复并成功绑定。只有目标背景 ready 后才关闭 Cassette。
     cover_surface_cache_set_dimmed_retained(true);
+    // A plain cover does not need the 413KiB dimmed surface. Cassette mode
+    // deliberately releases it; only an open control overlay needs it rebuilt.
     bool require_dimmed_surface = false;
     bool use_default_fallback = false;
     if (player_state_is_ready() &&
@@ -3975,9 +4092,10 @@ static bool player_home_set_visual_mode(MusicVisualMode mode)
             : media_library_get_count() > player_state_get_index())) {
         const uint32_t track = static_cast<uint32_t>(player_state_get_index());
         MediaArtworkViewV2 artwork = {};
-        require_dimmed_surface = player_state_get_source() == PlayerMediaSource::Nas
-            ? nas_library_source_get_artwork_view(track, &artwork)
-            : media_library_get_artwork_view(track, &artwork);
+        require_dimmed_surface = g_overlay_visible && (
+            player_state_get_source() == PlayerMediaSource::Nas
+                ? nas_library_source_get_artwork_view(track, &artwork)
+                : media_library_get_artwork_view(track, &artwork));
         use_default_fallback =
             require_dimmed_surface && system_artwork_current_uses_default_fallback(track);
         if (use_default_fallback) {
@@ -4004,7 +4122,7 @@ static bool player_home_set_visual_mode(MusicVisualMode mode)
     if (should_run) {
         now_playing_artwork_refresh_context();
         now_playing_artwork_update();
-        const bool dimmed_bound = !g_overlay_visible || now_playing_artwork_set_dimmed(true);
+        const bool dimmed_bound = now_playing_artwork_set_dimmed(g_overlay_visible);
         if (require_dimmed_surface && !dimmed_bound) {
             now_playing_artwork_set_active(false);
             cover_surface_cache_set_dimmed_retained(false);

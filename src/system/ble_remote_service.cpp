@@ -8,9 +8,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "audio_service.h"
+#include "app/app_manager.h"
 #include "battery_service.h"
 #include "media_catalog_v2.h"
 #include "player_control.h"
+#include "ui/screens/player_home.h"
+#include "screen_lock_simple.h"
 #include "player_state.h"
 #include "wifi_service.h"
 #include "app/video_app.h"
@@ -159,8 +162,20 @@ static const char *control_command_name(uint8_t command)
         case 0x04U: return "音量+";
         case 0x05U: return "音量-";
         case 0x06U: return "音量设置";
+        case 0x10U: return "循环模式";
+        case 0x11U: return "音乐视图";
+        case 0x12U: return "唤醒解锁";
+        case 0x13U: return "锁屏";
+        case 0x14U: return "AOD";
+        case 0x15U: return "息屏";
         default: return "未知";
     }
+}
+
+static bool music_remote_ui_available()
+{
+    return app_manager_foreground() == AppId::Music &&
+        !visual_music_app_remote_control_active() && !video_app_remote_control_active();
 }
 
 static bool execute_control_command(uint8_t command, uint8_t value = 0U)
@@ -185,6 +200,13 @@ static bool execute_control_command(uint8_t command, uint8_t value = 0U)
         case 0x04U: return player_control_volume_up(1U);
         case 0x05U: return player_control_volume_down(1U);
         case 0x06U: return value <= 100U && player_control_set_volume(value);
+        case 0x10U: return value <= 3U && music_remote_ui_available() &&
+            player_control_set_loop_mode(static_cast<PlayerLoopMode>(value));
+        case 0x11U: return value <= 3U && music_remote_ui_available() && player_home_remote_request_view(value);
+        case 0x12U: return music_remote_ui_available() && screen_lock_simple_remote_request(1U);
+        case 0x13U: return music_remote_ui_available() && screen_lock_simple_remote_request(2U);
+        case 0x14U: return music_remote_ui_available() && screen_lock_simple_remote_request(3U);
+        case 0x15U: return music_remote_ui_available() && screen_lock_simple_remote_request(4U);
         default: return false;
     }
 }
@@ -364,6 +386,7 @@ static void build_status_packet(
     if (track_index != UINT32_MAX) flags |= 0x04U;
     if (video_valid) flags |= 0x08U; // media context = VIDEO
     if (nsf_valid) flags |= 0x10U;   // R46.0.50: media context = NSF
+    if (music_remote_ui_available()) flags |= 0x20U; // Music APP foreground
     packet[5] = flags;
 
     write_u32_le(&packet[6], track_index);
@@ -456,6 +479,18 @@ static bool send_next_metadata_chunk(uint16_t conn_handle)
     return g_metadata_chunk_index < g_metadata_chunk_count;
 }
 
+static uint8_t g_last_remote_ui_status[6] = {0xFFU, 0, 0, 0, 0, 0};
+static TickType_t g_remote_ui_resend_due = 0;
+
+static void build_remote_ui_status(uint8_t packet[6])
+{
+    packet[0] = 0x03U; packet[1] = kPhoneEventProtocolVersion;
+    packet[2] = static_cast<uint8_t>(player_control_get_loop_mode());
+    packet[3] = player_home_remote_get_view();
+    packet[4] = static_cast<uint8_t>(screen_lock_simple_get_power());
+    packet[5] = static_cast<uint8_t>(screen_lock_simple_get_lock());
+}
+
 static void update_phone_state_notify(TickType_t now)
 {
     uint16_t conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -476,6 +511,17 @@ static void update_phone_state_notify(TickType_t now)
 
     if (!notify_enabled || conn_handle == BLE_HS_CONN_HANDLE_NONE ||
         g_control_event_val_handle == 0U || !connection_is_encrypted(conn_handle)) {
+        return;
+    }
+
+    uint8_t ui_status[6] = {};
+    build_remote_ui_status(ui_status);
+    if (memcmp(ui_status, g_last_remote_ui_status, sizeof(ui_status)) != 0 ||
+        g_remote_ui_resend_due == 0 || tick_due(now, g_remote_ui_resend_due)) {
+        if (notify_phone_event(conn_handle, ui_status, sizeof(ui_status)) == 0) {
+            memcpy(g_last_remote_ui_status, ui_status, sizeof(ui_status));
+            g_remote_ui_resend_due = now + pdMS_TO_TICKS(15000);
+        }
         return;
     }
 
@@ -654,7 +700,11 @@ static int control_command_access(
             ESP_LOGW(TAG, "BLE手机控制音量越界：%u%%", static_cast<unsigned>(payload[1]));
             return BLE_ATT_ERR_UNLIKELY;
         }
-    } else if (payload_len != 1U || command < 0x01U || command > 0x05U) {
+    } else if (command == 0x10U || command == 0x11U) {
+        if (payload_len != 2U || payload[1] > 3U) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    } else if (payload_len != 1U ||
+        !((command >= 0x01U && command <= 0x05U) ||
+          (command >= 0x12U && command <= 0x15U))) {
         ESP_LOGW(TAG, "BLE手机控制未知命令：0x%02X len=%u",
             static_cast<unsigned>(command),
             static_cast<unsigned>(payload_len));
@@ -768,6 +818,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *)
                 g_force_metadata_refresh = false;
                 g_status_notify_due_tick = 0;
                 g_status_event_poll_due_tick = 0;
+                g_last_remote_ui_status[0] = 0xFFU; // New BLE session must receive its own UI snapshot.
                 set_state_locked(BleRemoteState::Connected);
                 portEXIT_CRITICAL(&g_lock);
                 ESP_LOGI(TAG, "手机已连接：handle=%u", static_cast<unsigned>(event->connect.conn_handle));

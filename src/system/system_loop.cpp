@@ -649,6 +649,9 @@ void system_loop_update()
     // 完全轮询实现，无 ISR；与 GPIO48 独立。
     gpio0_service_update();
 
+    // Radio task only queues screen actions; commit in system loop, never inside NimBLE/TCP callbacks.
+    screen_lock_simple_remote_update();
+
     // 自动熄屏只负责从 Normal 进入 AOD/Off；触摸和实体键会重置空闲计时。
     screen_lock_simple_idle_update();
 

@@ -11,6 +11,11 @@
 // Overlay 使用一次性显隐而非全屏 alpha 动画，复用 Stage 11.2 Seek 与既有 Player/AudioTask 控制链。
 void player_home_create(lv_obj_t *screen);
 
+// Remote requests are queued from Wi-Fi/BLE, then applied by LVGL timer (only Music foreground).
+// view: 0=cover, 1=cassette, 2=lyrics, 3=spectrum. UI owner remains player_home.
+bool player_home_remote_request_view(uint8_t view);
+uint8_t player_home_remote_get_view();
+
 // 歌词/频谱/曲库等全屏页面隐藏后使用统一恢复事务。
 // 先恢复主页 timer/Artwork lease 与 LVGL source；Launcher 自 R46.0.93 起只有 Flash I4 +
 // BoundedSPI 单路径，异常时直接保持/恢复主页，不再切换第二套 LVGL Launcher。

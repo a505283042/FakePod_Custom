@@ -589,15 +589,20 @@ static lv_obj_t *create_row(
 
     lv_obj_t *title_label = make_label(row, title, kHeaderRgb);
     if (title_label != nullptr) {
-        lv_obj_set_width(title_label, icon_dsc != nullptr ? 190 : 220);
+        // NAS状态较长，给右侧数量与更新结果预留独立空间。
+        lv_obj_set_width(title_label, icon_id == SettingsDetailIcon::NasSync
+            ? 128 : (icon_dsc != nullptr ? 190 : 220));
         lv_label_set_long_mode(title_label, LV_LABEL_LONG_DOT);
         lv_obj_align(title_label, LV_ALIGN_LEFT_MID, icon_dsc != nullptr ? 52 : 16, 0);
     }
 
     lv_obj_t *value_label = make_label(row, value, kValueRgb, LV_TEXT_ALIGN_RIGHT);
     if (value_label != nullptr) {
-        lv_obj_set_width(value_label, 145);
-        lv_label_set_long_mode(value_label, LV_LABEL_LONG_DOT);
+        const bool nas_status = icon_id == SettingsDetailIcon::NasSync;
+        lv_obj_set_width(value_label, nas_status ? 228 : 145);
+        // 此栏必须同一行显示“4227首·已更新”，不能自动换行。
+        lv_label_set_long_mode(value_label, nas_status ? LV_LABEL_LONG_CLIP : LV_LABEL_LONG_DOT);
+        if (nas_status) lv_obj_set_style_text_letter_space(value_label, -1, 0);
         lv_obj_align(value_label, LV_ALIGN_RIGHT_MID, -16, 0);
     }
     return value_label;
@@ -1777,8 +1782,8 @@ static void create_connection_page(const DeviceSettingsSnapshot &settings)
 
     char nas_value[64] = {};
     format_nas_catalog_value(nas_value, sizeof(nas_value));
-    add_clickable_detail_row(4, "NAS更新", nas_value, SettingsDetailIcon::Wifi, nas_catalog_sync_click_cb);
-    add_clickable_detail_row(5, "NAS配对", "手机配置", SettingsDetailIcon::Wifi, nas_pair_click_cb);
+    add_clickable_detail_row(4, "NAS更新", nas_value, SettingsDetailIcon::NasSync, nas_catalog_sync_click_cb);
+    add_clickable_detail_row(5, "NAS配对", "手机配置", SettingsDetailIcon::NasPair, nas_pair_click_cb);
 }
 
 static PlayerFolderScope player_folder_scope_from_setting(DeviceMusicListScope scope)
@@ -2355,7 +2360,7 @@ static void create_system_page(const DeviceSettingsSnapshot &settings)
         5,
         "界面字体(重启)",
         font_name,
-        SettingsDetailIcon::None,
+        SettingsDetailIcon::UiFont,
         ui_font_click_cb);
 }
 
