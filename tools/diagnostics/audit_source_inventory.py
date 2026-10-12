@@ -11,7 +11,7 @@ from collections import defaultdict
 from pathlib import Path
 import re
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "src"
 CODE_SUFFIXES = {".c", ".cpp", ".h", ".hpp"}
 LOG_RE = re.compile(r"ESP_LOG[EWIDV]\s*\(")

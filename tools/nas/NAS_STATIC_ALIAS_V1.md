@@ -6,7 +6,7 @@ The existing DSM static HTTP service serves hard links named by stable 64-bit ID
 ## 1. Build the catalog on Windows
 
 ```powershell
-python tools\build_nas_catalog_v2.py "\\192.168.1.105\music" "\\192.168.1.105\web\music-index"
+python tools\nas\build_nas_catalog_v2.py "\\192.168.1.105\music" "\\192.168.1.105\web\music-index"
 ```
 
 Besides the normal V2 catalog, the builder writes `fakepod_make_static_track_links.sh`.

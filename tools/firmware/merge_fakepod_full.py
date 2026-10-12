@@ -158,7 +158,7 @@ def merge_images(build_dir: Path, output_path: Path, offsets: dict[str, int]) ->
 
 def main() -> int:
     script_path = Path(__file__).resolve()
-    project_root = script_path.parent.parent
+    project_root = script_path.parents[2]
 
     parser = argparse.ArgumentParser(description="合并 FakePod ESP32-S3 完整固件")
     parser.add_argument("--env", default=DEFAULT_ENV, help=f"PlatformIO 环境名，默认 {DEFAULT_ENV}")

@@ -18,7 +18,7 @@ not DLNA. The old HTTP 8080 setup stays valid as a rollback.
 2. On DSM, enable WebDAV HTTP on LAN port 5005. Create a dedicated NAS user with
    read-only permission to shares `web` and `麦田广告`, but no write/admin access.
 3. On TF card, BACK UP `/sdcard/System/nas_catalog.conf`, then replace only its
-   content with `tools/nas_catalog_webdav.conf.example` using the new account.
+   content with `tools/nas/nas_catalog_webdav.conf.example` using the new account.
    The `track_url=` line must be empty. **Do not keep the old 8080 URL there.**
    `music_url` contains the percent-encoded `麦田广告` share name and `/Music`.
 4. Do not rebuild V2 solely to change the protocol; V2 stores paths relative to

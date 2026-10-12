@@ -41,7 +41,7 @@
 ## 五、可选命令行
 
 ```powershell
-python .\tools\build_nas_catalog_v2.py "\\192.168.1.105\麦田广告\Music" "C:\FakePod_Stage" --cache-from "\\192.168.1.105\麦田广告\Music\_FakePod\music-index\fakepod_scan_cache_v1.json"
+python .\tools\nas\build_nas_catalog_v2.py "\\192.168.1.105\麦田广告\Music" "C:\FakePod_Stage" --cache-from "\\192.168.1.105\麦田广告\Music\_FakePod\music-index\fakepod_scan_cache_v1.json"
 ```
 
 命令仅在 `C:\FakePod_Stage` 创建**待发布**索引和报告，不直接修改 NAS。建议用 GUI 执行后续准备、验证、发布和隔离，以防操作顺序错误。
