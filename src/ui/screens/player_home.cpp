@@ -1176,15 +1176,13 @@ static bool player_home_launcher_acquire_default_surface(
     LauncherSurfaceCandidate *out_candidate)
 {
     if (out_candidate == nullptr) return false;
+    (void)media_source;
 
     // 即便索引声明有封面，实际 CoverSurface 尚未 ready（如 NAS 等联网/解码失败）
     // 也允许 Launcher 使用 TF 默认封面；导航入口不依赖封面成功加载。
     const FallbackCoverImageKind kind =
-        media_source == PlayerMediaSource::Nas
-            ? FallbackCoverImageKind::Artwork
-            : (g_music_visual_mode == MusicVisualMode::Cassette
-                ? FallbackCoverImageKind::Cassette
-                : FallbackCoverImageKind::Artwork);
+        g_music_visual_mode == MusicVisualMode::Cassette
+            ? FallbackCoverImageKind::Cassette : FallbackCoverImageKind::Artwork;
 
     const int64_t started_us = esp_timer_get_time();
     FallbackCoverImageLease fallback = {};
@@ -2983,8 +2981,7 @@ static void player_home_artwork_fast_rebind(const char *reason)
     const uint32_t track_index = static_cast<uint32_t>(player_state_get_index());
 
     const int64_t started_us = esp_timer_get_time();
-    const bool use_cassette = g_music_visual_mode == MusicVisualMode::Cassette &&
-        player_state_get_source() == PlayerMediaSource::Local;
+    const bool use_cassette = g_music_visual_mode == MusicVisualMode::Cassette;
     if (use_cassette) {
         cassette_view_update();
         // Overlay 保持打开并切歌时，缓存会先失效再重建；同步切换兜底/快路径。
@@ -3044,11 +3041,10 @@ static void player_home_update_background_timer_qos()
         // 页面被 Launcher/曲库等完整覆盖时取消尚未完成的首次切换，返回主页后仍保持 Artwork。
         g_cassette_visual_switch_pending = false;
     }
-    const bool nas_playback = player_state_is_ready() && player_state_get_source() == PlayerMediaSource::Nas;
-    // NAS 使用共享 Artwork Surface；磁带机械模式暂保持 Local-only，避免下一首预取串源。
+    // Local/NAS share the same cassette scene and normal CoverSurface pipeline.
     const bool artwork_should_run = should_run &&
-        (nas_playback || g_music_visual_mode == MusicVisualMode::Artwork || g_cassette_visual_switch_pending);
-    const bool cassette_should_run = should_run && !nas_playback &&
+        (g_music_visual_mode == MusicVisualMode::Artwork || g_cassette_visual_switch_pending);
+    const bool cassette_should_run = should_run &&
         (g_music_visual_mode == MusicVisualMode::Cassette || g_cassette_visual_switch_pending);
     const bool quiet_resume = artwork_should_run && g_artwork_resume_without_invalidation;
     now_playing_artwork_set_active(artwork_should_run, quiet_resume);
@@ -3973,10 +3969,15 @@ static bool player_home_set_visual_mode(MusicVisualMode mode)
     cover_surface_cache_set_dimmed_retained(true);
     bool require_dimmed_surface = false;
     bool use_default_fallback = false;
-    if (player_state_is_ready() && media_library_get_count() > 0U) {
+    if (player_state_is_ready() &&
+        (player_state_get_source() == PlayerMediaSource::Nas
+            ? nas_library_source_ready() && nas_library_source_track_count() > player_state_get_index()
+            : media_library_get_count() > player_state_get_index())) {
         const uint32_t track = static_cast<uint32_t>(player_state_get_index());
         MediaArtworkViewV2 artwork = {};
-        require_dimmed_surface = media_library_get_artwork_view(track, &artwork);
+        require_dimmed_surface = player_state_get_source() == PlayerMediaSource::Nas
+            ? nas_library_source_get_artwork_view(track, &artwork)
+            : media_library_get_artwork_view(track, &artwork);
         use_default_fallback =
             require_dimmed_surface && system_artwork_current_uses_default_fallback(track);
         if (use_default_fallback) {

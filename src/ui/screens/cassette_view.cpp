@@ -14,6 +14,7 @@
 #include "freertos/task.h"
 
 #include "artwork_loader.h"
+#include "artwork_source_context.h"
 #include "audio_service.h"
 #include "board_pins.h"
 #include "cover_surface_cache.h"
@@ -287,6 +288,7 @@ static bool g_seek_frozen = false;
 static bool g_launcher_suspended = false;
 
 static uint32_t g_text_track = UINT32_MAX;
+static uint32_t g_text_generation = 0U;
 static uint32_t g_lyrics_requested_track = UINT32_MAX;
 static bool g_lyrics_requested_is_nas = false;
 static uint32_t g_last_lyrics_revision = 0U;
@@ -601,10 +603,37 @@ static void cassette_view_clear_lyrics()
     g_last_lyrics_line = UINT32_MAX;
 }
 
+// Both catalogues feed the same ArtworkLoader -> CoverSurface -> Cassette pipeline.
+// The existing source-aware generation puts NAS in a separate namespace from TF.
+static bool cassette_view_current_track_valid()
+{
+    if (!player_state_is_ready()) return false;
+    const size_t track = player_state_get_index();
+    return artwork_source_is_nas()
+        ? nas_library_source_ready() && track < nas_library_source_track_count()
+        : track < media_library_get_count();
+}
+
+static bool cassette_view_get_artwork_view(uint32_t track, MediaArtworkViewV2 *view)
+{
+    return artwork_source_is_nas()
+        ? nas_library_source_get_artwork_view(track, view)
+        : media_library_get_artwork_view(track, view);
+}
+
+static bool cassette_view_audio_matches_current(const AudioStateSnapshot &audio)
+{
+    return cassette_view_current_track_valid() &&
+        audio.track_index == static_cast<uint32_t>(player_state_get_index()) &&
+        audio.source == (artwork_source_is_nas()
+            ? AudioPlaybackSource::NasHttp : AudioPlaybackSource::Local);
+}
+
 static void cassette_view_update_track_text()
 {
-    if (!player_state_is_ready() || media_library_get_count() == 0U) {
+    if (!cassette_view_current_track_valid()) {
         g_text_track = UINT32_MAX;
+        g_text_generation = 0U;
         cassette_view_set_text_if_changed(g_title_label, "暂无歌曲");
         cassette_view_set_text_if_changed(g_artist_label, "");
         cassette_view_clear_lyrics();
@@ -612,15 +641,19 @@ static void cassette_view_update_track_text()
     }
 
     const uint32_t track = static_cast<uint32_t>(player_state_get_index());
-    if (track == g_text_track) return;
+    const uint32_t generation = artwork_source_active_generation();
+    if (track == g_text_track && generation == g_text_generation) return;
 
     MediaTrackViewV2 view = {};
-    const bool have_view = media_catalog_v2_get_track_view(track, &view);
+    const bool have_view = artwork_source_is_nas()
+        ? nas_library_source_get_track_view(track, &view)
+        : media_catalog_v2_get_track_view(track, &view);
     char title_fallback[512] = {};
     const char *title = nullptr;
     if (have_view && view.title != nullptr && view.title[0] != '\0') {
         title = view.title;
-    } else if (media_library_copy_display_name(track, title_fallback, sizeof(title_fallback))) {
+    } else if (!artwork_source_is_nas() &&
+               media_library_copy_display_name(track, title_fallback, sizeof(title_fallback))) {
         title = title_fallback;
     } else {
         snprintf(title_fallback, sizeof(title_fallback), "歌曲 %lu",
@@ -635,14 +668,14 @@ static void cassette_view_update_track_text()
     cassette_view_set_text_if_changed(g_artist_label, artist);
 
     g_text_track = track;
+    g_text_generation = generation;
     g_lyrics_requested_track = UINT32_MAX;
     cassette_view_clear_lyrics();
 }
 
 static void cassette_view_update_mini_lyrics()
 {
-    if (!lyrics_service_is_ready() || !player_state_is_ready() ||
-        media_library_get_count() == 0U) {
+    if (!lyrics_service_is_ready() || !cassette_view_current_track_valid()) {
         return;
     }
 
@@ -650,7 +683,8 @@ static void cassette_view_update_mini_lyrics()
     AudioStateSnapshot audio = {};
     const bool audio_ok = audio_service_get_snapshot(&audio);
     const uint64_t position_ms =
-        audio_ok && audio.ready && audio.track_index == track ? audio.position_ms : 0U;
+        audio_ok && audio.ready && cassette_view_audio_matches_current(audio)
+            ? audio.position_ms : 0U;
 
     LyricsWindowSnapshot window = {};
     if (!lyrics_service_get_window(track, position_ms, &window)) {
@@ -765,10 +799,10 @@ static bool cassette_view_controls_cache_matches_visible_visual()
 static bool cassette_view_controls_cache_matches_current()
 {
     if (!cassette_view_controls_cache_matches_visible_visual() ||
-        !player_state_is_ready() || media_library_get_count() == 0U) {
+        !cassette_view_current_track_valid()) {
         return false;
     }
-    return g_cover_generation == media_catalog_v2_generation() &&
+    return g_cover_generation == artwork_source_active_generation() &&
         g_cover_track == static_cast<uint32_t>(player_state_get_index());
 }
 
@@ -1443,9 +1477,7 @@ static void cassette_view_update_tape_amount(const AudioStateSnapshot &audio)
     // 过渡态直接显示新磁带的起始量，避免先回中间再跳到左边最少。
     int16_t shift = -kTapeAmountTravelPx;
     const uint64_t total_ms = cassette_view_audio_total_ms(audio);
-    const bool same_track =
-        player_state_is_ready() &&
-        audio.track_index == static_cast<uint32_t>(player_state_get_index());
+    const bool same_track = cassette_view_audio_matches_current(audio);
     if (audio.ready && same_track && total_ms > 0U) {
         // C2 实机确认磁带量方向反了。C2.1 完全反转平移方向：
         // 进度0%：图向左25px；100%：图向右25px。
@@ -1467,9 +1499,7 @@ static void cassette_view_update_tape_amount(const AudioStateSnapshot &audio)
 static uint32_t cassette_view_progress_q16(const AudioStateSnapshot &audio)
 {
     const uint64_t total_ms = cassette_view_audio_total_ms(audio);
-    const bool same_track =
-        player_state_is_ready() &&
-        audio.track_index == static_cast<uint32_t>(player_state_get_index());
+    const bool same_track = cassette_view_audio_matches_current(audio);
     // 新曲音频快照尚未 ready / 尚未切到当前 track 时，按 0% 起始状态显示。
     // 不再使用 50% 中位兜底，避免切歌瞬间走带几何先回中间。
     if (!audio.ready || !same_track || total_ms == 0U) return 0U;
@@ -1513,9 +1543,9 @@ static void cassette_view_update_mechanics()
     const uint32_t progress_q16 = cassette_view_progress_q16(audio);
     cassette_view_update_tape_path_geometry(progress_q16);
 
-    const bool moving =
-        audio.state == AudioPlaybackState::Playing ||
-        audio.state == AudioPlaybackState::Seeking;
+    const bool moving = cassette_view_audio_matches_current(audio) &&
+        (audio.state == AudioPlaybackState::Playing ||
+         audio.state == AudioPlaybackState::Seeking);
     const int64_t now_us = esp_timer_get_time();
     if (!moving) {
         // Pause/Stopped 时机械运动与亮点跳动都冻结；恢复后不补跑暂停期间的相位。
@@ -2444,8 +2474,8 @@ static void cassette_view_handle_cache_result()
         if (result.fallback_lease.slot_index != 0xFFU) {
             fallback_cover_image_release(&result.fallback_lease);
         }
-        const bool still_current = player_state_is_ready() && media_library_get_count() > 0U &&
-            media_catalog_v2_generation() == result.generation &&
+        const bool still_current = cassette_view_current_track_valid() &&
+            artwork_source_active_generation() == result.generation &&
             static_cast<uint32_t>(player_state_get_index()) == result.track &&
             g_cover_generation == result.generation && g_cover_track == result.track;
         if (!result.ok || !still_current || g_controls_cache_back_pixels == nullptr) {
@@ -2606,7 +2636,7 @@ static bool cassette_view_schedule_current_cache()
     }
     // 当前快照始终优先于 next 预取，但不销毁已经准备好的 next。
     // 后台任务单实例串行执行，因此 current/next 可以安全长期各保留一张快照。
-    const uint32_t generation = media_catalog_v2_generation();
+    const uint32_t generation = artwork_source_active_generation();
     const uint32_t track = static_cast<uint32_t>(player_state_get_index());
     CassetteCacheBuildJob job = {};
     job.role = CassetteCacheBuildRole::Current;
@@ -2676,7 +2706,7 @@ static bool cassette_view_schedule_next_build()
 
 static bool cassette_view_current_lyrics_settled()
 {
-    if (!lyrics_service_is_ready() || !player_state_is_ready() || media_library_get_count() == 0U) {
+    if (!lyrics_service_is_ready() || !cassette_view_current_track_valid()) {
         return true;
     }
 
@@ -2688,7 +2718,10 @@ static bool cassette_view_current_lyrics_settled()
 
     // 下一首封面只是后台优化。当前曲歌词尚未完成读取/解析时先让出 TF 与 Core 1，
     // 等歌词进入终态后再启动下一首预缓存；当前曲封面加载不受这里限制。
-    if (window.track_index != track) {
+    const bool is_nas = artwork_source_is_nas();
+    if (window.track_index != track || window.is_nas != is_nas ||
+        window.catalog_generation != (is_nas
+            ? nas_library_source_generation() : media_catalog_v2_generation())) {
         return false;
     }
     return window.state != LyricsLoadState::Idle && window.state != LyricsLoadState::Loading;
@@ -2696,9 +2729,7 @@ static bool cassette_view_current_lyrics_settled()
 
 static void cassette_view_service_next_prefetch()
 {
-    if (!g_active || g_cache_build_busy ||
-        !player_state_is_ready() || player_state_get_source() == PlayerMediaSource::Nas ||
-        media_library_get_count() == 0U) {
+    if (!g_active || g_cache_build_busy || !cassette_view_current_track_valid()) {
         return;
     }
 
@@ -2713,7 +2744,7 @@ static void cassette_view_service_next_prefetch()
         }
         return;
     }
-    const uint32_t generation = media_catalog_v2_generation();
+    const uint32_t generation = artwork_source_active_generation();
 
     if (g_next_prefetch.state != CassetteNextPrefetchState::Idle &&
         (g_next_prefetch.track != next_track || g_next_prefetch.generation != generation)) {
@@ -2727,7 +2758,7 @@ static void cassette_view_service_next_prefetch()
         g_next_prefetch.generation = generation;
         g_next_prefetch.track = next_track;
         MediaArtworkViewV2 artwork = {};
-        if (!media_library_get_artwork_view(next_track, &artwork)) {
+        if (!cassette_view_get_artwork_view(next_track, &artwork)) {
             // 缺省封面也进入完整 next 预热：Core1 提前读/解 460x460 JPG，
             // 同时生成粉色磁带壳和压暗静态磁带，真正切歌时只做资源提升。
             g_next_prefetch.no_artwork = true;
@@ -2869,9 +2900,9 @@ static void cassette_view_tick_shell_tint_chunk()
 
     // TintJob 可能在 100ms 封面轮询发现切歌之前先跑完。提交前再核对一次真实曲目，
     // 过期结果只丢弃，绝不能把上一首的新颜色覆盖到当前歌曲。
-    const bool still_current = player_state_is_ready() && media_library_get_count() > 0U &&
+    const bool still_current = cassette_view_current_track_valid() &&
         static_cast<uint32_t>(player_state_get_index()) == completed_track &&
-        media_catalog_v2_generation() == completed_generation;
+        artwork_source_active_generation() == completed_generation;
     if (!still_current) {
         if (g_pending_cover_valid && g_pending_cover_generation == completed_generation &&
             g_pending_cover_track == completed_track) {
@@ -3012,9 +3043,9 @@ static void cassette_view_sync_tint_setting()
         return;
     }
 
-    if (!player_state_is_ready() || media_library_get_count() == 0U) return;
+    if (!cassette_view_current_track_valid()) return;
     const uint32_t current_track = static_cast<uint32_t>(player_state_get_index());
-    const uint32_t current_generation = media_catalog_v2_generation();
+    const uint32_t current_generation = artwork_source_active_generation();
 
     // 新封面已经 acquire 但尚未上屏：只允许它自己的 TintJob 继续跑。
     // 显示层此时仍保持上一首完整封面+壳体，不能因为 g_cover_track 还是上一首而误取消任务。
@@ -3318,11 +3349,11 @@ static bool cassette_view_try_promote_next_visual(uint32_t generation, uint32_t 
 
 static bool cassette_view_bind_current_cover()
 {
-    if (!player_state_is_ready() || media_library_get_count() == 0U || g_cover_image == nullptr) {
+    if (!cassette_view_current_track_valid() || g_cover_image == nullptr) {
         return false;
     }
 
-    const uint32_t generation = media_catalog_v2_generation();
+    const uint32_t generation = artwork_source_active_generation();
     const uint32_t track = static_cast<uint32_t>(player_state_get_index());
 
     // next 预缓存本来就应该与“当前正在播放/显示的歌曲”不同。
@@ -3333,7 +3364,9 @@ static bool cassette_view_bind_current_cover()
         g_cover_generation != generation || g_cover_track != track;
     if (target_changed_from_visible &&
         g_next_prefetch.state != CassetteNextPrefetchState::Idle &&
-        g_next_prefetch.track != track) {
+        (g_next_prefetch.track != track || g_next_prefetch.generation != generation)) {
+        // Same numeric track ID may belong to a different Local/NAS catalogue.
+        // Release the old pinned next Surface before fetching the new source.
         cassette_view_cancel_next_prefetch("当前目标未命中预缓存");
     }
 
@@ -3358,7 +3391,7 @@ static bool cassette_view_bind_current_cover()
     // “没有封面”与“封面仍在后台准备”必须分开处理：
     // 前者提交磁带专用 fallback + 粉色壳体；后者继续保留上一套完整视觉。
     MediaArtworkViewV2 artwork = {};
-    if (!media_library_get_artwork_view(track, &artwork)) {
+    if (!cassette_view_get_artwork_view(track, &artwork)) {
         return cassette_view_bind_no_artwork_label(generation, track);
     }
 
@@ -3413,7 +3446,8 @@ static bool cassette_view_bind_current_cover()
     }
 
     ESP_LOGI(TAG,
-        "磁带封面已准备：track=%lu source=%ux%u dynamic=%d；等待与壳体同帧提交",
+        "磁带封面已准备：source=%s track=%lu image=%ux%u dynamic=%d；等待与壳体同帧提交",
+        artwork_source_is_nas() ? "NAS" : "LOCAL",
         static_cast<unsigned long>(track),
         static_cast<unsigned>(next.width),
         static_cast<unsigned>(next.height),
@@ -3423,8 +3457,8 @@ static bool cassette_view_bind_current_cover()
 
 static bool cassette_view_current_visual_ready()
 {
-    if (!player_state_is_ready() || media_library_get_count() == 0U) return false;
-    const uint32_t generation = media_catalog_v2_generation();
+    if (!cassette_view_current_track_valid()) return false;
+    const uint32_t generation = artwork_source_active_generation();
     const uint32_t track = static_cast<uint32_t>(player_state_get_index());
     if (g_cover_generation != generation || g_cover_track != track) return false;
     if (g_cover_is_no_artwork_fallback) return true;
@@ -3630,10 +3664,6 @@ esp_err_t cassette_view_create(lv_obj_t *parent)
 static bool cassette_view_set_active_internal(bool active, bool preserve_next_prefetch)
 {
     if (g_root == nullptr) return false;
-    if (active && player_state_get_source() == PlayerMediaSource::Nas) {
-        if (g_active) (void)cassette_view_set_active_internal(false, preserve_next_prefetch);
-        return false;
-    }
     if (active) {
         if (!cassette_view_prepare_shell()) {
             return false;
@@ -3704,6 +3734,7 @@ static bool cassette_view_set_active_internal(bool active, bool preserve_next_pr
     cassette_view_release_cover(preserve_next_prefetch);
     cassette_view_release_transition_hold();
     g_text_track = UINT32_MAX;
+    g_text_generation = 0U;
     g_lyrics_requested_track = UINT32_MAX;
     cassette_view_clear_lyrics();
     cassette_view_apply_aux_visibility();
@@ -3728,8 +3759,7 @@ bool cassette_view_set_temporary_hidden(bool hidden)
 bool cassette_view_prepare_track_transition_hold()
 {
     cassette_view_release_transition_hold();
-    if (!player_state_is_ready() || player_state_get_source() == PlayerMediaSource::Nas ||
-        media_library_get_count() == 0U || !cover_surface_cache_is_ready()) {
+    if (!cassette_view_current_track_valid() || !cover_surface_cache_is_ready()) {
         return false;
     }
 
@@ -3829,8 +3859,7 @@ void cassette_view_update()
 
 static void cassette_view_revalidate_next_prefetch(const char *cancel_reason)
 {
-    if (!player_state_is_ready() || player_state_get_source() == PlayerMediaSource::Nas ||
-        media_library_get_count() == 0U) {
+    if (!cassette_view_current_track_valid()) {
         return;
     }
 
@@ -3842,7 +3871,7 @@ static void cassette_view_revalidate_next_prefetch(const char *cancel_reason)
     }
 
     const uint32_t current_track = static_cast<uint32_t>(player_state_get_index());
-    const uint32_t generation = media_catalog_v2_generation();
+    const uint32_t generation = artwork_source_active_generation();
     const bool next_available = next_track != UINT32_MAX && next_track != current_track;
 
     if (g_next_prefetch.state != CassetteNextPrefetchState::Idle &&
