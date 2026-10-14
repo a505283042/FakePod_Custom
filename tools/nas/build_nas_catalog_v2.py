@@ -53,6 +53,17 @@ META_HAS_ARTIST_TAG = 1 << 8
 META_HAS_ALBUM_TAG = 1 << 9
 META_HAS_ALBUM_ARTIST_TAG = 1 << 10
 
+# Keep these bit values byte-compatible with MediaTechnicalFlags in
+# src/media/library/media_types.h.  NAS V2 already stores the full technical
+# payload in each 124-byte track row; older NAS builders simply wrote zeros.
+TECH_PARSED = 1 << 0
+TECH_HAS_VBR_HEADER = 1 << 2
+TECH_DURATION_ESTIMATED = 1 << 3
+
+MP3_SCAN_BUFFER_BYTES = 8192
+MP3_MAX_LEADING_SCAN_BYTES = 256 * 1024
+FLAC_MAX_METADATA_BLOCK_COUNT = 256
+
 FORMAT_MAP = {
     ".mp3": 1,
     ".flac": 2,
@@ -455,6 +466,227 @@ def joined(tags: Dict[str, List[str]], *keys: str) -> str:
     return ""
 
 
+def read_be24(data: bytes) -> int:
+    return int.from_bytes(data, "big", signed=False)
+
+
+def parse_mp3_frame_header(header: bytes) -> Optional[dict]:
+    """Mirror the local media_probe.cpp Layer III header parser."""
+    if len(header) < 4 or header[0] != 0xFF or (header[1] & 0xE0) != 0xE0:
+        return None
+    version_id = (header[1] >> 3) & 0x03
+    layer = (header[1] >> 1) & 0x03
+    if version_id == 1 or layer != 1:
+        return None
+    bitrate_index = (header[2] >> 4) & 0x0F
+    sample_index = (header[2] >> 2) & 0x03
+    if bitrate_index in (0, 15) or sample_index == 3:
+        return None
+
+    bitrate_mpeg1 = (0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0)
+    bitrate_mpeg2 = (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0)
+    mpeg1_rates = (44100, 48000, 32000)
+    sample_rate = mpeg1_rates[sample_index]
+    if version_id == 2:
+        sample_rate //= 2
+    elif version_id == 0:
+        sample_rate //= 4
+
+    mpeg1 = version_id == 3
+    bitrate = (bitrate_mpeg1 if mpeg1 else bitrate_mpeg2)[bitrate_index]
+    padding = (header[2] >> 1) & 0x01
+    frame_size = ((144000 if mpeg1 else 72000) * bitrate) // sample_rate + padding
+    if frame_size < 24:
+        return None
+    return {
+        "sample_rate_hz": sample_rate,
+        "bitrate_kbps": bitrate,
+        "frame_size_bytes": frame_size,
+        "samples_per_frame": 1152 if mpeg1 else 576,
+        "channels": 1 if ((header[3] >> 6) & 0x03) == 3 else 2,
+        "version_id": version_id,
+        "has_crc": (header[1] & 0x01) == 0,
+    }
+
+
+def mp3_headers_compatible(a: dict, b: dict) -> bool:
+    return (a["sample_rate_hz"] == b["sample_rate_hz"] and
+            a["samples_per_frame"] == b["samples_per_frame"] and
+            a["version_id"] == b["version_id"])
+
+
+def find_mp3_first_frame(f, search_start: int, file_size: int) -> Tuple[int, Optional[dict]]:
+    search_limit = min(file_size, search_start + MP3_MAX_LEADING_SCAN_BYTES)
+    cursor = search_start
+    while cursor + 4 <= search_limit:
+        f.seek(cursor)
+        data = f.read(min(MP3_SCAN_BUFFER_BYTES, search_limit - cursor))
+        if len(data) < 4:
+            break
+        for i in range(len(data) - 3):
+            first = parse_mp3_frame_header(data[i:i + 4])
+            if first is None:
+                continue
+            frame_offset = cursor + i
+            next_offset = frame_offset + first["frame_size_bytes"]
+            if next_offset + 4 > file_size:
+                continue
+            f.seek(next_offset)
+            second = parse_mp3_frame_header(f.read(4))
+            if second is not None and mp3_headers_compatible(first, second):
+                return frame_offset, first
+        if len(data) < min(MP3_SCAN_BUFFER_BYTES, search_limit - cursor):
+            break
+        cursor += max(1, len(data) - 3)
+    return 0, None
+
+
+def mp3_side_info_size(header: dict) -> int:
+    if header["version_id"] == 3:
+        return 17 if header["channels"] == 1 else 32
+    return 9 if header["channels"] == 1 else 17
+
+
+def mp3_xing_frame_count(f, frame_offset: int, header: dict) -> int:
+    offset = frame_offset + 4 + (2 if header["has_crc"] else 0) + mp3_side_info_size(header)
+    f.seek(offset)
+    prefix = f.read(12)
+    if len(prefix) != 12 or prefix[:4] not in (b"Xing", b"Info"):
+        return 0
+    flags = int.from_bytes(prefix[4:8], "big", signed=False)
+    return int.from_bytes(prefix[8:12], "big", signed=False) if flags & 1 else 0
+
+
+def mp3_vbri_frame_count(f, frame_offset: int) -> int:
+    f.seek(frame_offset + 36)
+    header = f.read(18)
+    if len(header) != 18 or header[:4] != b"VBRI":
+        return 0
+    return int.from_bytes(header[14:18], "big", signed=False)
+
+
+def probe_mp3_technical(path: Path, file_size: int) -> dict:
+    with path.open("rb") as f:
+        first10 = f.read(10)
+        if len(first10) < 4:
+            return {}
+        search_start = 0
+        if first10[:3] == b"ID3":
+            if len(first10) < 10 or any(b & 0x80 for b in first10[6:10]):
+                return {}
+            search_start = 10 + syncsafe32(first10[6:10]) + (10 if first10[5] & 0x10 else 0)
+        frame_offset, frame = find_mp3_first_frame(f, search_start, file_size)
+        if frame is None:
+            return {}
+
+        flags = TECH_PARSED
+        total_frames = 0
+        duration_ms = 0
+        frame_count = mp3_xing_frame_count(f, frame_offset, frame)
+        if frame_count == 0:
+            frame_count = mp3_vbri_frame_count(f, frame_offset)
+        if frame_count:
+            flags |= TECH_HAS_VBR_HEADER
+            total_frames = frame_count * frame["samples_per_frame"]
+            duration_ms = (total_frames * 1000) // frame["sample_rate_hz"]
+        elif frame["bitrate_kbps"] and file_size > frame_offset:
+            # Same conservative fallback as the local probe: duration is marked
+            # estimated because a VBR file without Xing/VBRI cannot be exact.
+            duration_ms = ((file_size - frame_offset) * 8) // frame["bitrate_kbps"]
+            total_frames = (duration_ms * frame["sample_rate_hz"]) // 1000
+            flags |= TECH_DURATION_ESTIMATED
+
+        return {
+            "technical_flags": flags,
+            "sample_rate_hz": frame["sample_rate_hz"],
+            "bitrate_kbps": frame["bitrate_kbps"],
+            "duration_ms": min(duration_ms, 0xFFFFFFFF),
+            "total_frames": total_frames,
+            "audio_data_offset": frame_offset,
+            "metadata_end_offset": frame_offset,
+            "max_frame_size": 0,
+            "max_block_size": 0,
+            "samples_per_frame": frame["samples_per_frame"],
+            "channels": frame["channels"],
+            "bits_per_sample": 16,
+        }
+
+
+def probe_flac_technical(path: Path) -> dict:
+    with path.open("rb") as f:
+        first10 = f.read(10)
+        if len(first10) < 4:
+            return {}
+        flac_offset = 0
+        if first10[:3] == b"ID3":
+            if len(first10) < 10 or any(b & 0x80 for b in first10[6:10]):
+                return {}
+            flac_offset = 10 + syncsafe32(first10[6:10]) + (10 if first10[5] & 0x10 else 0)
+        f.seek(flac_offset)
+        if f.read(4) != b"fLaC":
+            return {}
+
+        result = {}
+        last = False
+        block_count = 0
+        while not last:
+            block_count += 1
+            if block_count > FLAC_MAX_METADATA_BLOCK_COUNT:
+                return {}
+            header = f.read(4)
+            if len(header) != 4:
+                return {}
+            last = bool(header[0] & 0x80)
+            block_type = header[0] & 0x7F
+            length = read_be24(header[1:4])
+            if block_type == 0:
+                if length != 34:
+                    return {}
+                streaminfo = f.read(34)
+                if len(streaminfo) != 34:
+                    return {}
+                sample_rate = ((streaminfo[10] << 12) |
+                               (streaminfo[11] << 4) |
+                               (streaminfo[12] >> 4))
+                channels = ((streaminfo[12] >> 1) & 0x07) + 1
+                bits = (((streaminfo[12] & 0x01) << 4) | (streaminfo[13] >> 4)) + 1
+                total_frames = ((streaminfo[13] & 0x0F) << 32) | int.from_bytes(streaminfo[14:18], "big")
+                if sample_rate == 0 or channels == 0:
+                    return {}
+                result = {
+                    "technical_flags": TECH_PARSED,
+                    "sample_rate_hz": sample_rate,
+                    "bitrate_kbps": 0,
+                    "duration_ms": min((total_frames * 1000) // sample_rate, 0xFFFFFFFF),
+                    "total_frames": total_frames,
+                    "max_frame_size": read_be24(streaminfo[7:10]),
+                    "max_block_size": int.from_bytes(streaminfo[2:4], "big"),
+                    "samples_per_frame": 0,
+                    "channels": channels,
+                    "bits_per_sample": bits,
+                }
+            else:
+                f.seek(length, os.SEEK_CUR)
+
+        if not result:
+            return {}
+        audio_offset = f.tell()
+        result["audio_data_offset"] = audio_offset
+        result["metadata_end_offset"] = audio_offset
+        return result
+
+
+def probe_technical(path: Path, fmt: int, file_size: int) -> dict:
+    try:
+        if fmt == FORMAT_MAP[".mp3"]:
+            return probe_mp3_technical(path, file_size)
+        if fmt == FORMAT_MAP[".flac"]:
+            return probe_flac_technical(path)
+    except (OSError, ValueError, OverflowError):
+        pass
+    return {}
+
+
 @dataclass
 class TrackMeta:
     path: str
@@ -473,6 +705,20 @@ class TrackMeta:
     release_year: int = 0
     original_year: int = 0
     metadata_flags: int = META_SCANNED
+    # Byte-compatible MediaTechnicalInfo payload already present in TrackDiskRowV2.
+    # Only MP3/FLAC are populated in this phase; other formats retain zeros.
+    technical_flags: int = 0
+    sample_rate_hz: int = 0
+    bitrate_kbps: int = 0
+    duration_ms: int = 0
+    total_frames: int = 0
+    audio_data_offset: int = 0
+    metadata_end_offset: int = 0
+    max_frame_size: int = 0
+    max_block_size: int = 0
+    samples_per_frame: int = 0
+    channels: int = 0
+    bits_per_sample: int = 0
     # NAS artwork uses the existing V2 artwork-ref section; none of these fields
     # affect the 124-byte track row, playback URL, or stable short ID.
     artwork_scanned: bool = False
@@ -621,14 +867,20 @@ def read_scan_cache(path: Optional[Path], root: Path) -> Optional[dict]:
 def track_from_cache(path: str, item: dict) -> TrackMeta:
     allowed = {f.name for f in fields(TrackMeta)}
     row = item.get("track")
-    # Compatible with old T3.3 caches that predate artwork locators.
-    legacy = {f.name for f in fields(TrackMeta)} - {
+    # Compatible with caches that predate artwork/LRC/technical locators. Core
+    # identity/metadata fields remain mandatory so a damaged cache is rejected.
+    optional = {
         "artwork_scanned", "artwork_source", "artwork_format", "artwork_offset",
         "artwork_size", "artwork_flags", "artwork_width", "artwork_height",
         "artwork_picture_type", "artwork_path", "artwork_mtime", "lyrics_path",
+        "technical_flags", "sample_rate_hz", "bitrate_kbps", "duration_ms",
+        "total_frames", "audio_data_offset", "metadata_end_offset",
+        "max_frame_size", "max_block_size", "samples_per_frame", "channels",
+        "bits_per_sample",
     }
-    pre_lyrics = allowed - {"lyrics_path"}
-    if not isinstance(row, dict) or set(row) not in (allowed, legacy, pre_lyrics):
+    required = allowed - optional
+    if (not isinstance(row, dict) or not required.issubset(row) or
+            not set(row).issubset(allowed)):
         raise ValueError(f"损坏的扫描缓存：{path}")
     result = TrackMeta(**row)
     if result.path != path or result.track_id != stable_track_id(path):
@@ -696,6 +948,8 @@ def scan_incremental(root: Path, previous: Optional[dict]):
     artwork_scanned = 0
     new_entries = {}
     added, modified, unchanged, prepare_lyrics = [], [], [], []
+    technical_parsed = 0
+    technical_failed = 0
     previous_key = None
     seen_ids: Dict[int, str] = {}
     for n, (relative, path, fmt, st) in enumerate(paths, 1):
@@ -732,6 +986,16 @@ def scan_incremental(root: Path, previous: Optional[dict]):
         else:
             row = build_track_meta(path, root, fmt)
             (modified if entry else added).append(relative)
+        # Older scan caches have no technical payload. Refresh only that payload
+        # once; do not classify the audio as modified and do not rebuild aliases.
+        if fmt in (FORMAT_MAP[".mp3"], FORMAT_MAP[".flac"]) and not (row.technical_flags & TECH_PARSED):
+            technical = probe_technical(path, fmt, st.st_size)
+            if technical:
+                for name, value in technical.items():
+                    setattr(row, name, value)
+                technical_parsed += 1
+            else:
+                technical_failed += 1
         if not row.artwork_scanned:
             locator = scan_artwork(path, root, fmt, folder_art_cache)
             row.artwork_source = row.artwork_format = row.artwork_offset = 0
@@ -801,6 +1065,8 @@ def scan_incremental(root: Path, previous: Optional[dict]):
           (("mode", mode), ("total", len(rows)), ("added", len(report["added"])),
            ("modified", len(report["modified"])), ("removed", len(report["removed"])),
            ("reused", len(unchanged)))), flush=True)
+    if technical_parsed or technical_failed:
+        print(f"FAKEPOD_TECH_SCAN parsed={technical_parsed} failed={technical_failed}", flush=True)
     return rows, cache, report
 
 
@@ -1048,15 +1314,22 @@ def build_catalog(tracks: List[TrackMeta]):
                 track.release_year,
                 track.original_year,
                 track.fmt,
-                0, 0, 0,
+                track.channels,
+                track.bits_per_sample,
                 0,
+                track.technical_flags,
                 track.size,
-                0, 0, 0,
+                track.sample_rate_hz,
+                track.bitrate_kbps,
+                track.duration_ms,
+                track.total_frames,
+                track.audio_data_offset,
+                track.metadata_end_offset,
                 0,
-                0, 0, 0,
                 0,
-                0,
-                0, 0,
+                track.max_frame_size,
+                track.max_block_size,
+                track.samples_per_frame,
             )
         )
         manifest_rows.extend(MANIFEST_ROW.pack(index, track.fmt, track.size, track.mtime))
@@ -1202,6 +1475,14 @@ def main() -> int:
     year_tagged = sum(1 for t in tracks if t.release_year or t.original_year)
     print(f"FakePod NAS Catalog: tracks={len(tracks)} artists={artist_count} albums={album_count}")
     print(f"metadata: title={title_tagged} artist={artist_tagged} album={album_tagged} year={year_tagged}")
+    mp3_tracks = [t for t in tracks if t.fmt == FORMAT_MAP[".mp3"]]
+    flac_tracks = [t for t in tracks if t.fmt == FORMAT_MAP[".flac"]]
+    mp3_parsed = sum(bool(t.technical_flags & TECH_PARSED) for t in mp3_tracks)
+    flac_parsed = sum(bool(t.technical_flags & TECH_PARSED) for t in flac_tracks)
+    mp3_vbr = sum(bool(t.technical_flags & TECH_HAS_VBR_HEADER) for t in mp3_tracks)
+    mp3_estimated = sum(bool(t.technical_flags & TECH_DURATION_ESTIMATED) for t in mp3_tracks)
+    print(f"technical MP3: parsed={mp3_parsed}/{len(mp3_tracks)} vbr_header={mp3_vbr} estimated={mp3_estimated}")
+    print(f"technical FLAC: parsed={flac_parsed}/{len(flac_tracks)}")
     lyric_paths = [t.lyrics_path for t in tracks if t.lyrics_path]
     print(f"NAS LRC refs={len(lyric_paths)} (external synced, short-ID for MP3/FLAC)")
     print(f"NAS LRC shared={len(lyric_paths) - len(set(lyric_paths))} (extra songs reusing same-directory LRC)")
