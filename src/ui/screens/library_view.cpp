@@ -398,6 +398,7 @@ static LibraryBrowseMode library_view_category_mode_for_detail();
 static void library_view_return_to_parent_category();
 static void library_view_finish_nas_load_async(void *);
 static void library_view_nas_index_reload_timer_cb(lv_timer_t *);
+static void library_view_nas_index_reload_async(void *);
 static void library_view_update_nas_load_stage_async(void *stage_value);
 static bool library_view_nas_catalog_needed_by_playback();
 static bool library_search_build_key_cache();
@@ -3816,6 +3817,11 @@ static void library_view_nas_load_task(void *)
 void library_view_request_nas_index_reload()
 {
     g_nas_index_reload_pending.store(true);
+    // 同步 worker 已经提交 TF 后立刻在 LVGL 线程尝试一次热重载；
+    // 若此刻仍不安全，1s 常驻计时器会保留 pending 并继续重试。
+    if (g_root != nullptr) {
+        lv_async_call(library_view_nas_index_reload_async, nullptr);
+    }
 }
 
 static void library_view_nas_index_reload_timer_cb(lv_timer_t *)
@@ -3880,6 +3886,11 @@ static void library_view_nas_index_reload_timer_cb(lv_timer_t *)
         g_nas_index_reload_pending.store(false);
         ESP_LOGI(TAG, "NAS索引更新已提交：安全空闲，开始重新读取PSRAM曲库");
     }
+}
+
+static void library_view_nas_index_reload_async(void *)
+{
+    library_view_nas_index_reload_timer_cb(nullptr);
 }
 
 bool library_view_open_nas(DeviceMusicListScope scope)

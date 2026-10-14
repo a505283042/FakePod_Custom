@@ -211,6 +211,8 @@ void system_runtime_update()
     }
 
     const esp_err_t device_settings_ret = device_settings_init();
+    WifiServiceSnapshot boot_wifi = {};
+    const bool wifi_prepared_during_boot = wifi_service_get_snapshot(&boot_wifi);
     const esp_err_t ble_ret = ble_remote_service_init();
     const esp_err_t wifi_ret = wifi_service_init();
     const esp_err_t nas_catalog_ret = nas_catalog_service_init();
@@ -251,7 +253,17 @@ void system_runtime_update()
 
             wifi_service_set_ble_fallback_enabled(settings_snapshot.ble_enabled);
             if (settings_snapshot.wifi_enabled) {
-                if (wifi_ret == ESP_OK && wifi_service_has_credentials()) {
+                if (wifi_prepared_during_boot) {
+                    WifiServiceSnapshot current_wifi = {};
+                    (void)wifi_service_get_snapshot(&current_wifi);
+                    if (current_wifi.connected) {
+                        ESP_LOGI(TAG,
+                            "开机无线策略：NAS启动恢复阶段已完成Wi-Fi连接和索引预检；不重复连接/不重复检查");
+                    } else {
+                        ESP_LOGW(TAG,
+                            "开机无线策略：NAS启动恢复阶段已完成本次Wi-Fi尝试但未连接；不在READY后重复尝试");
+                    }
+                } else if (wifi_ret == ESP_OK && wifi_service_has_credentials()) {
                     const esp_err_t connect_ret = wifi_service_connect_saved(true);
                     if (connect_ret == ESP_OK) {
                         g_boot_nas_sync_pending = true;

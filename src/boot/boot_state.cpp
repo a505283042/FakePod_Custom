@@ -29,6 +29,8 @@
 #include "usb_storage_service.h"
 #include "power_service.h"
 #include "gpio0_service.h"
+#include "ble_remote_service.h"
+#include "wifi_service.h"
 #include "nas_catalog_service.h"
 #include "nas_library_source.h"
 
@@ -142,11 +144,83 @@ static void boot_apply_nas_browse_context(DeviceMusicListSelection *selection)
     }
 }
 
+static void boot_nas_preflight_remote_cache()
+{
+    NasCatalogSnapshot nas = {};
+    DeviceSettingsSnapshot settings = {};
+    if (!nas_catalog_service_get_snapshot(&nas) || !nas.configured ||
+        !device_settings_get_snapshot(&settings) || !settings.wifi_enabled) {
+        ESP_LOGI(TAG, "NAS启动恢复预检跳过：未配置NAS或Wi-Fi保存状态为关；直接使用现有TF缓存");
+        return;
+    }
+
+    const esp_err_t ble_ret = ble_remote_service_init();
+    const esp_err_t wifi_ret = wifi_service_init();
+    wifi_service_set_ble_fallback_enabled(settings.ble_enabled);
+    if (ble_ret != ESP_OK || wifi_ret != ESP_OK || !wifi_service_has_credentials()) {
+        ESP_LOGW(TAG,
+            "NAS启动恢复预检无法启动网络：BLE=%s WiFi=%s credentials=%d；直接使用现有TF缓存",
+            esp_err_to_name(ble_ret), esp_err_to_name(wifi_ret),
+            wifi_service_has_credentials() ? 1 : 0);
+        return;
+    }
+
+    const esp_err_t connect_ret = wifi_service_connect_saved(true);
+    if (connect_ret != ESP_OK) {
+        ESP_LOGW(TAG, "NAS启动恢复预检Wi-Fi任务未启动：%s；直接使用现有TF缓存",
+            esp_err_to_name(connect_ret));
+        return;
+    }
+
+    ESP_LOGI(TAG, "NAS启动恢复预检：PSRAM暂不加载，先等待Wi-Fi并核对远端 revision");
+    for (;;) {
+        wifi_service_update();
+        ble_remote_service_update();
+        WifiServiceSnapshot wifi = {};
+        if (!wifi_service_get_snapshot(&wifi)) return;
+        if (!wifi.transition_running) {
+            if (!wifi.connected) {
+                ESP_LOGW(TAG,
+                    "NAS启动恢复预检：Wi-Fi未连接（%s），放弃本次联网检查并使用现有TF缓存",
+                    esp_err_to_name(wifi.last_error));
+                return;
+            }
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    const esp_err_t sync_ret = nas_catalog_service_request_boot_sync();
+    if (sync_ret != ESP_OK) {
+        ESP_LOGW(TAG, "NAS启动恢复预检未启动：%s；继续使用现有TF缓存",
+            esp_err_to_name(sync_ret));
+        return;
+    }
+
+    for (;;) {
+        NasCatalogSnapshot current = {};
+        if (!nas_catalog_service_get_snapshot(&current)) return;
+        if (!current.syncing) {
+            ESP_LOGI(TAG,
+                "NAS启动恢复预检结束：state=%s revision=0x%016llX error=%s；随后只加载一次TF->PSRAM",
+                nas_catalog_service_state_name(current.state),
+                static_cast<unsigned long long>(current.revision),
+                esp_err_to_name(current.last_error));
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
 static void boot_nas_resume_worker(void *)
 {
     (void)ui_manager_show_nas_restore_progress(UiNasRestoreStage::LoadingCache, 0U);
     esp_err_t result = nas_catalog_service_init();
     if (result == ESP_OK) {
+        // 开机恢复必须先把远端/TF状态收口，再从最终 TF 快照构建一次 PSRAM Catalog。
+        // 网络失败不阻塞恢复：预检只记录失败并回退现有 TF 缓存。
+        boot_nas_preflight_remote_cache();
+
         NasCatalogSnapshot snapshot = {};
         if (!nas_catalog_service_get_snapshot(&snapshot) || !snapshot.cached || snapshot.track_count == 0U) {
             result = ESP_ERR_NOT_FOUND;
@@ -693,7 +767,7 @@ static void boot_state_update()
         }
 
         // ====================================================
-        // NAS Playback Resume V2（只读 TF 缓存，不依赖 Wi-Fi）
+        // NAS Playback Resume V2（先远端预检/必要时更新TF，再从最终TF快照单次加载PSRAM）
         // ====================================================
 
         case BootState::InitNasResume:
@@ -716,7 +790,7 @@ static void boot_state_update()
                     g_nas_resume_worker_done.store(true, std::memory_order_release);
                 } else {
                     ESP_LOGI(TAG,
-                        "NAS启动歌曲恢复：从TF缓存加载Catalog，worker_stack=%uB priority=%u core=%d",
+                        "NAS启动歌曲恢复：从最终TF缓存加载Catalog，worker_stack=%uB priority=%u core=%d",
                         static_cast<unsigned>(BOOT_NAS_RESUME_STACK_BYTES),
                         static_cast<unsigned>(BOOT_NAS_RESUME_PRIORITY),
                         static_cast<int>(BOOT_NAS_RESUME_CORE));

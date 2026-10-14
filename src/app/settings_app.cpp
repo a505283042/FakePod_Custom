@@ -25,6 +25,7 @@
 #include "persistent_state.h"
 #include "player_control.h"
 #include "player_playlist.h"
+#include "player_transport.h"
 #include "player_state.h"
 #include "sdcard.h"
 #include "storage_io.h"
@@ -1645,13 +1646,26 @@ static void wifi_switch_click_cb(lv_event_t *event)
 static void nas_catalog_sync_click_cb(lv_event_t *event)
 {
     if (!click_is_valid(event) || g_page != SettingsPage::Connection) return;
+
+    NasCatalogSnapshot nas = {};
+    WifiServiceSnapshot wifi = {};
+    if (!nas_catalog_service_get_snapshot(&nas) || !nas.configured ||
+        !wifi_service_get_snapshot(&wifi) || !wifi.connected) {
+        ESP_LOGW(TAG, "NAS索引同步未启动：需要已配置NAS且Wi-Fi已连接");
+        return;
+    }
+
+    // NAS更新是用户显式维护操作。旧逻辑在音乐仍播放时直接拒绝同步，
+    // 设置页却继续显示上一次“已最新”，看起来像按钮没有生效。
+    player_transport_cancel_deferred_nas_play("手动NAS更新");
+    if (!audio_service_stop(true)) {
+        ESP_LOGW(TAG, "NAS索引同步未启动：停止音乐失败");
+        return;
+    }
+
     const esp_err_t ret = nas_catalog_service_request_sync();
     if (ret != ESP_OK) {
-        NasCatalogSnapshot nas = {};
-        (void)nas_catalog_service_get_snapshot(&nas);
-        ESP_LOGW(TAG,
-            "NAS索引同步未启动：%s（配置=%s Wi-Fi需已连接，且音乐需停止）",
-            esp_err_to_name(ret), nas.configured ? "有" : "无");
+        ESP_LOGW(TAG, "NAS索引同步未启动：%s", esp_err_to_name(ret));
     }
 }
 

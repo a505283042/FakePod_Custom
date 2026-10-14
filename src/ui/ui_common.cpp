@@ -1,5 +1,7 @@
 #include "ui_common.h"
 
+#include <atomic>
+
 #include "esp_log.h"
 #include "font/font_manager.h"
 
@@ -11,6 +13,9 @@ static lv_obj_t *g_notice_card = nullptr;
 static lv_obj_t *g_notice_title = nullptr;
 static lv_obj_t *g_notice_detail = nullptr;
 static lv_timer_t *g_notice_timer = nullptr;
+
+static std::atomic<bool> g_nas_sync_block_requested{false};
+static lv_obj_t *g_nas_sync_block_overlay = nullptr;
 
 static void ui_common_notice_timer_cb(lv_timer_t *timer)
 {
@@ -89,6 +94,100 @@ void ui_common_show_notice(const char *title, const char *detail)
         lv_timer_reset(g_notice_timer);
         lv_timer_resume(g_notice_timer);
     }
+}
+
+static bool ui_common_nas_sync_block_ensure_created()
+{
+    if (g_nas_sync_block_overlay != nullptr && lv_obj_is_valid(g_nas_sync_block_overlay)) {
+        return true;
+    }
+
+    lv_obj_t *layer = lv_layer_top();
+    if (layer == nullptr) return false;
+
+    g_nas_sync_block_overlay = lv_obj_create(layer);
+    if (g_nas_sync_block_overlay == nullptr) return false;
+    ui_common_lock_object(g_nas_sync_block_overlay);
+    lv_obj_set_size(g_nas_sync_block_overlay, LV_PCT(100), LV_PCT(100));
+    lv_obj_center(g_nas_sync_block_overlay);
+    lv_obj_set_style_bg_color(g_nas_sync_block_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(g_nas_sync_block_overlay, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(g_nas_sync_block_overlay, 0, 0);
+    lv_obj_set_style_pad_all(g_nas_sync_block_overlay, 0, 0);
+    lv_obj_add_flag(g_nas_sync_block_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *card = lv_obj_create(g_nas_sync_block_overlay);
+    if (card == nullptr) {
+        lv_obj_delete(g_nas_sync_block_overlay);
+        g_nas_sync_block_overlay = nullptr;
+        return false;
+    }
+    ui_common_lock_object(card);
+    lv_obj_set_size(card, 382, 176);
+    lv_obj_center(card);
+    lv_obj_set_style_radius(card, 18, 0);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x151A21), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x2A3442), 0);
+    lv_obj_set_style_pad_all(card, 0, 0);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_CLICKABLE);
+
+    const lv_font_t *font = font_manager_get_ui_font();
+    lv_obj_t *title = lv_label_create(card);
+    lv_obj_t *detail = lv_label_create(card);
+    lv_obj_t *hint = lv_label_create(card);
+    if (title == nullptr || detail == nullptr || hint == nullptr) {
+        lv_obj_delete(g_nas_sync_block_overlay);
+        g_nas_sync_block_overlay = nullptr;
+        return false;
+    }
+
+    lv_label_set_text(title, "正在更新 NAS 曲库");
+    lv_obj_set_width(title, 340);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0xF2F3F5), 0);
+    if (font != nullptr) lv_obj_set_style_text_font(title, font, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 26);
+
+    lv_label_set_text(detail, "正在写入 TF 卡…");
+    lv_obj_set_width(detail, 340);
+    lv_obj_set_style_text_align(detail, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(detail, lv_color_hex(0x79B9FF), 0);
+    if (font != nullptr) lv_obj_set_style_text_font(detail, font, 0);
+    lv_obj_align(detail, LV_ALIGN_CENTER, 0, 3);
+
+    lv_label_set_text(hint, "请稍候，完成前请勿操作");
+    lv_obj_set_width(hint, 340);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(hint, lv_color_hex(0x8A94A5), 0);
+    if (font != nullptr) lv_obj_set_style_text_font(hint, font, 0);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -26);
+
+    lv_obj_add_flag(g_nas_sync_block_overlay, LV_OBJ_FLAG_HIDDEN);
+    return true;
+}
+
+static void ui_common_apply_nas_sync_block_async(void *)
+{
+    const bool visible = g_nas_sync_block_requested.load();
+    if (visible) {
+        if (!ui_common_nas_sync_block_ensure_created()) return;
+        lv_obj_remove_flag(g_nas_sync_block_overlay, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(g_nas_sync_block_overlay);
+        lv_obj_invalidate(g_nas_sync_block_overlay);
+        return;
+    }
+
+    if (g_nas_sync_block_overlay != nullptr && lv_obj_is_valid(g_nas_sync_block_overlay)) {
+        lv_obj_add_flag(g_nas_sync_block_overlay, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+void ui_common_set_nas_sync_blocking(bool visible)
+{
+    g_nas_sync_block_requested.store(visible);
+    (void)lv_async_call(ui_common_apply_nas_sync_block_async, nullptr);
 }
 
 // 如果 LVGL 仍产生滚动偏移，立即把对象拉回原点。

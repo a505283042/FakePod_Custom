@@ -47,6 +47,9 @@ esp_err_t nas_catalog_service_init();
 // 用户显式触发。只允许 Wi-Fi 已连接且 Music AudioTask 当前不持有播放源时同步。
 // Worker 为一次性 5KB Internal 栈；索引下载缓存与校验使用 TF + 临时 PSRAM，结束即释放。
 esp_err_t nas_catalog_service_request_sync();
+// 仅供启动 NAS 播放恢复：完成远端校验/必要的 NAS->TF 更新，但不触发 PSRAM 热重载；
+// Boot 随后从最终 TF 缓存只加载一次 Catalog。
+esp_err_t nas_catalog_service_request_boot_sync();
 // 已经通过FPN2认证且写入 .pending 后调用：停止播放，使用待生效配置下载校验，成功后热切换。
 esp_err_t nas_catalog_service_request_pending_switch();
 // 阻止热切换期间打开旧曲库和启动新播放（普通手动 NAS 更新不受影响）。

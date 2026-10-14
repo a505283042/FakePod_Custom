@@ -21,8 +21,10 @@
 #include "player_transport.h"
 #include "ui/screens/library_view.h"
 #include "media_catalog_store_v2.h"
+#include "nas_library_source.h"
 #include "storage_io.h"
 #include "system_paths.h"
+#include "ui_common.h"
 #include "wifi_service.h"
 
 static const char *TAG = "NAS索引";
@@ -71,6 +73,8 @@ struct NasRemoteMeta
 struct NasSyncContext
 {
     bool pending_switch = false;
+    bool boot_preload = false;
+    bool download_ui_locked = false;
     NasConfig config = {};
     NasRemoteMeta remote = {};
     char meta_text[kMetaBufferBytes] = {};
@@ -437,6 +441,19 @@ static bool audio_idle_for_catalog_sync()
     }
 }
 
+static uint32_t nas_generation_from_index_crc(uint32_t index_crc32)
+{
+    uint32_t generation = index_crc32 ^ 0x80000000U;
+    if (generation == 0U) generation = 1U;
+    return generation;
+}
+
+static bool resident_nas_catalog_matches(uint32_t index_crc32)
+{
+    if (!nas_library_source_ready()) return true;
+    return nas_library_source_generation() == nas_generation_from_index_crc(index_crc32);
+}
+
 static esp_err_t validate_pair(
     const char *index_path,
     const char *manifest_path,
@@ -582,6 +599,11 @@ static void open_new_nas_on_lvgl(void *)
 static void finish_worker(NasSyncContext *ctx, NasCatalogState state, esp_err_t error,
     bool cached, uint32_t tracks, uint64_t revision, bool preserve_previous_cache = true)
 {
+    if (ctx != nullptr && ctx->download_ui_locked) {
+        ctx->download_ui_locked = false;
+        ui_common_set_nas_sync_blocking(false);
+    }
+
     // 网络失败或校验失败时临时文件未提交；保留本次同步前已可用的 TF 缓存。
     // 提交阶段若出错则保守地维持原有失败态，避免假定回滚一定成功。
     if (state == NasCatalogState::Failed && preserve_previous_cache) {
@@ -601,6 +623,7 @@ static void finish_worker(NasSyncContext *ctx, NasCatalogState state, esp_err_t 
         static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)));
     const bool pending_switch = ctx != nullptr && ctx->pending_switch;
+    const bool boot_preload = ctx != nullptr && ctx->boot_preload;
     if (pending_switch && state == NasCatalogState::Failed) {
         // 失败不可留下pending让下次开机绕过新服务器校验直接启用。
         remove_file_locked(kPendingConfig);
@@ -614,12 +637,29 @@ static void finish_worker(NasSyncContext *ctx, NasCatalogState state, esp_err_t 
     if (state == NasCatalogState::Updated) {
         if (pending_switch) {
             lv_async_call(open_new_nas_on_lvgl, nullptr);
+        } else if (boot_preload) {
+            // 开机恢复严格保持顺序：先更新 TF，再由 Boot 从最终 TF 只加载一次 PSRAM。
+            ESP_LOGI(TAG,
+                "开机NAS预检已更新TF：crc=0x%08lX；不触发PSRAM热重载，等待启动恢复单次加载",
+                static_cast<unsigned long>(ctx != nullptr ? ctx->remote.index_crc32 : 0U));
         } else {
-            // 仅提交了新索引才标记驻留曲库过期；相同 revision 不重复加载。
-            // 这里只置标志，不在 NAS 网络 worker 上触碰 LVGL / PSRAM Catalog。
+            // TF 已提交新索引，驻留 PSRAM 必须随之换代。这里只置标志，
+            // 由 LVGL 线程在安全空闲点释放旧 Catalog 并从 TF 重新读取。
             library_view_request_nas_index_reload();
-            ESP_LOGI(TAG, "NAS索引已更新：PSRAM曲库将在安全空闲后自动重载");
+            ESP_LOGI(TAG,
+                "NAS索引已更新：TF crc=0x%08lX，PSRAM generation=%lu，等待安全重载",
+                static_cast<unsigned long>(ctx != nullptr ? ctx->remote.index_crc32 : 0U),
+                static_cast<unsigned long>(nas_library_source_generation()));
         }
+    } else if (state == NasCatalogState::UpToDate && !pending_switch && !boot_preload && ctx != nullptr &&
+        nas_library_source_ready() && !resident_nas_catalog_matches(ctx->remote.index_crc32)) {
+        // “远端/TF已最新”不代表常驻 PSRAM 已经是同一代；旧 generation 也要热重载。
+        library_view_request_nas_index_reload();
+        ESP_LOGW(TAG,
+            "NAS索引文件已最新但PSRAM仍旧：TF crc=0x%08lX expected_generation=%lu current_generation=%lu；请求热重载",
+            static_cast<unsigned long>(ctx->remote.index_crc32),
+            static_cast<unsigned long>(nas_generation_from_index_crc(ctx->remote.index_crc32)),
+            static_cast<unsigned long>(nas_library_source_generation()));
     }
     heap_caps_free(ctx);
     vTaskDelete(nullptr);
@@ -690,6 +730,12 @@ static void sync_worker(void *arg)
         }
         ESP_LOGW(TAG, "本地 NAS Catalog revision 命中但校验失败：%s；重新下载", esp_err_to_name(ret));
     }
+
+    // 从这里开始才进入真正的 NAS -> TF 高占用下载/校验/提交阶段。
+    // 手动更新、开机自动更新和服务器热切换共用同一阻塞提示；
+    // 仅远端 meta 检查或“已最新”快路径不锁 UI。
+    ctx->download_ui_locked = true;
+    ui_common_set_nas_sync_blocking(true);
 
     remove_file_locked(SystemPaths::kNasMusicIndexV2Temp);
     remove_file_locked(SystemPaths::kNasMusicManifestV2Temp);
@@ -833,7 +879,7 @@ esp_err_t nas_catalog_service_request_pending_switch()
     return ESP_OK;
 }
 
-esp_err_t nas_catalog_service_request_sync()
+static esp_err_t nas_catalog_service_request_sync_internal(bool boot_preload)
 {
     NasCatalogSnapshot snapshot = {};
     if (!nas_catalog_service_get_snapshot(&snapshot)) return ESP_ERR_INVALID_STATE;
@@ -847,6 +893,7 @@ esp_err_t nas_catalog_service_request_sync()
     NasSyncContext *ctx = static_cast<NasSyncContext *>(
         heap_caps_calloc(1, sizeof(NasSyncContext), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (ctx == nullptr) return ESP_ERR_NO_MEM;
+    ctx->boot_preload = boot_preload;
 
     publish_state(NasCatalogState::Syncing, ESP_OK, true, snapshot.cached, true,
         snapshot.track_count, snapshot.revision);
@@ -858,10 +905,21 @@ esp_err_t nas_catalog_service_request_sync()
             snapshot.track_count, snapshot.revision);
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "开始同步：worker_stack=%uB meta=%uB io=%uB（meta/io均在PSRAM）",
+    ESP_LOGI(TAG, "%s：worker_stack=%uB meta=%uB io=%uB（meta/io均在PSRAM）",
+        boot_preload ? "开始开机NAS预检" : "开始同步",
         static_cast<unsigned>(kWorkerStackBytes), static_cast<unsigned>(kMetaBufferBytes),
         static_cast<unsigned>(kIoBufferBytes));
     return ESP_OK;
+}
+
+esp_err_t nas_catalog_service_request_sync()
+{
+    return nas_catalog_service_request_sync_internal(false);
+}
+
+esp_err_t nas_catalog_service_request_boot_sync()
+{
+    return nas_catalog_service_request_sync_internal(true);
 }
 
 bool nas_catalog_service_get_snapshot(NasCatalogSnapshot *out_snapshot)
