@@ -95,9 +95,9 @@ static constexpr int16_t kTapeAmountWidth = 159;
 static constexpr int16_t kTapeAmountHeight = 41;
 static constexpr int16_t kTapeAmountBaseX = 150;
 static constexpr int16_t kTapeAmountY = 104;
-// R46.0.130: 新曲起始磁带量再少一点；保持终点不变。
+// 右侧磁带量补宽后同步增加终点行程；起始位置保持实机确认的 -34px。
 static constexpr int16_t kTapeAmountStartShiftPx = -34;
-static constexpr int16_t kTapeAmountEndShiftPx = 25;
+static constexpr int16_t kTapeAmountEndShiftPx = 33;
 static constexpr int64_t kMechanicsFramePeriodUs = 50000LL;  // C2.3：20 Hz，12帧大轮真正显示5°中间相位
 static constexpr uint32_t kMechanicsTimerPeriodMs = 50U;
 // C2.4.15：96/192 kHz FLAC 给解码/I2S 留更大的实时预算：机械 timer 仍保持 50ms，
