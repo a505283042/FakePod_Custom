@@ -1439,6 +1439,12 @@ def main() -> int:
     if revision == 0:
         revision = 1
     report["revision"] = f"0x{revision:016X}"
+
+    # The GUI stages long NAS scans under a disposable directory.  Re-create it
+    # immediately before committing generated artifacts in case the directory
+    # disappeared while the scan was running (for example, an external temp
+    # cleanup).  This is safe because the stage contains no published data yet.
+    out.mkdir(parents=True, exist_ok=True)
     (out / CACHE_NAME).write_text(json.dumps(scan_cache, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     incremental = build_incremental_link_script(tracks, report)
     (out / INCREMENTAL_SCRIPT_NAME).write_bytes(incremental)
