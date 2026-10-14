@@ -1714,7 +1714,7 @@ static void nas_pair_click_cb(lv_event_t *event)
         lv_obj_align(code_label, LV_ALIGN_CENTER, 0, -30);
     }
     lv_obj_t *hint = make_label(overlay,
-                                "手机输入6位授权码\n3分钟内有效，保存后重启生效",
+                                "6位授权码，3分钟有效\n配对成功后自动切换NAS服务器",
                                 0xBAC8DB, LV_TEXT_ALIGN_CENTER);
     if (hint != nullptr) {
         lv_obj_set_width(hint, 420);
@@ -1796,8 +1796,8 @@ static void create_connection_page(const DeviceSettingsSnapshot &settings)
 
     char nas_value[64] = {};
     format_nas_catalog_value(nas_value, sizeof(nas_value));
-    add_clickable_detail_row(4, "NAS更新", nas_value, SettingsDetailIcon::NasSync, nas_catalog_sync_click_cb);
-    add_clickable_detail_row(5, "NAS配对", "手机配置", SettingsDetailIcon::NasPair, nas_pair_click_cb);
+    add_clickable_detail_row(4, "NAS曲库更新", nas_value, SettingsDetailIcon::NasSync, nas_catalog_sync_click_cb);
+    add_clickable_detail_row(5, "NAS服务器配对", "手机配置", SettingsDetailIcon::NasPair, nas_pair_click_cb);
 }
 
 static PlayerFolderScope player_folder_scope_from_setting(DeviceMusicListScope scope)
