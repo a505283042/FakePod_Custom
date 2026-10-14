@@ -1711,7 +1711,7 @@ static void nas_pair_click_cb(lv_event_t *event)
     if (code_label != nullptr) {
         lv_obj_set_width(code_label, 430);
         lv_obj_set_style_text_letter_space(code_label, 12, 0);
-        lv_obj_align(code_label, LV_ALIGN_CENTER, 0, -18);
+        lv_obj_align(code_label, LV_ALIGN_CENTER, 0, -30);
     }
     lv_obj_t *hint = make_label(overlay,
                                 "手机输入6位授权码\n3分钟内有效，保存后重启生效",
@@ -1719,7 +1719,7 @@ static void nas_pair_click_cb(lv_event_t *event)
     if (hint != nullptr) {
         lv_obj_set_width(hint, 420);
         lv_obj_set_style_text_line_space(hint, 8, 0);
-        lv_obj_align(hint, LV_ALIGN_CENTER, 0, 100);
+        lv_obj_align(hint, LV_ALIGN_CENTER, 0, 45);
     }
     lv_obj_t *close_button = lv_button_create(overlay);
     if (close_button != nullptr) {
