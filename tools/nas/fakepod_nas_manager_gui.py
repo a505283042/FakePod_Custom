@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 from urllib.parse import quote, unquote, urlparse
@@ -230,6 +231,12 @@ class App:
         self.busy = False
         self.publish_writing = False
         self.events = queue.Queue()
+        self.scan_process = None
+        self.scan_cancel = threading.Event()
+        self.display_lock = threading.Lock()
+        self.pending_display = {}
+        self.scan_detail = None
+        self.last_display = 0
         self.build()
         self.window.protocol("WM_DELETE_WINDOW", self.on_close)
         self.window.after(100, self.flush_events)
@@ -270,13 +277,15 @@ class App:
         line = ttk.Frame(actions); line.pack(fill="x")
         self.generate_button = ttk.Button(line, text="扫描并预览增量更新", command=self.generate, state="disabled")
         self.generate_button.pack(side="left")
+        self.cancel_scan_button = ttk.Button(line, text="取消扫描", command=self.cancel_scan, state="disabled")
+        self.cancel_scan_button.pack(side="left", padx=6)
         self.force_full = tk.BooleanVar(value=False)
         ttk.Checkbutton(line, text="重建全部元数据缓存", variable=self.force_full).pack(side="left", padx=10)
         self.change_label = ttk.Label(actions, text="尚未生成增量报告", foreground="#265f76", wraplength=920)
         self.change_label.pack(fill="x", pady=(8, 0))
         self.progress = ttk.Progressbar(actions, mode="determinate", maximum=100)
         self.progress.pack(fill="x", pady=(10, 4))
-        self.progress_label = ttk.Label(actions, text="等待扫描")
+        self.progress_label = ttk.Label(actions, text="等待扫描", wraplength=900)
         self.progress_label.pack(anchor="w")
         remote = ttk.LabelFrame(main, text="3. 安全应用：准备链接 → 发布索引 → 隔离删除", padding=10)
         remote.pack(fill="x", pady=5)
@@ -302,7 +311,23 @@ class App:
         if self.publish_writing:
             messagebox.showwarning("NAS 索引正在发布", "正在写入索引文件，请等待完成后再关闭工具。")
             return
+        self.scan_cancel.set()
+        process = self.scan_process
+        if process is not None and process.poll() is None: process.terminate()
         self.window.destroy()
+
+    def cancel_scan(self):
+        self.scan_cancel.set()
+        self.cancel_scan_button.config(state="disabled")
+        self.progress_label.config(text="正在取消扫描，已完成歌曲可在下次复用…")
+        process = self.scan_process
+        if process is not None and process.poll() is None: process.terminate()
+
+    def on_scan_cancelled(self):
+        self.progress.stop()
+        self.cancel_scan_button.config(state="disabled")
+        self.set_busy(False)
+        self.progress_label.config(text="扫描已取消，检查点已保留；未发布索引")
 
     def log(self, msg):
         self.logbox.configure(state="normal")
@@ -311,12 +336,31 @@ class App:
         self.logbox.configure(state="disabled")
 
     def emit(self, event, *args):
-        self.events.put((event, args))
+        if event in ("progress", "scan_status"):
+            with self.display_lock: self.pending_display[event] = args
+        else: self.events.put((event, args))
+
+    def flush_scan_display(self, force=False):
+        now = time.monotonic()
+        if not force and now - self.last_display < 1: return
+        self.last_display = now
+        with self.display_lock:
+            pending, self.pending_display = self.pending_display, {}
+        if "progress" in pending: self.update_progress(*pending["progress"])
+        if "scan_status" in pending: self.scan_detail = (pending["scan_status"][0], now)
+        if self.scan_detail is not None and not self.scan_cancel.is_set():
+            detail, since = self.scan_detail
+            done, total = detail['done'], detail['total']
+            self.progress_label.config(text=f"{done}/{total} 首 · {done * 100 // max(1,total)}% · {detail['stage']} · 已等待 {int(now-since)} 秒\n{detail['path']}")
 
     def flush_events(self):
+        self.flush_scan_display()
         try:
             for _ in range(120):
                 event, args = self.events.get_nowait()
+                if event in ("generated", "error", "cancelled", "publish_verified", "published"):
+                    self.flush_scan_display(force=True)
+                    self.scan_detail = None
                 if event == "log": self.log(args[0])
                 elif event == "folders": self.show_folders(*args)
                 elif event == "progress": self.update_progress(*args)
@@ -324,6 +368,7 @@ class App:
                 elif event == "publish_verified": self.on_publish_verified(*args)
                 elif event == "published": self.on_published(*args)
                 elif event == "error": self.on_error(*args)
+                elif event == "cancelled": self.on_scan_cancelled()
         except queue.Empty:
             pass
         if self.window.winfo_exists():
@@ -468,7 +513,11 @@ class App:
                     "强制完整扫描会舍弃本轮增量变更对比。\n这次不会自动识别应隔离的旧短 ID。\n确定继续？"):
                 self.set_busy(False)
                 return
-        self.log("开始扫描并生成 V2 索引，临时目录存储，不覆盖 NAS。")
+        self.scan_cancel.clear()
+        self.scan_detail = None
+        with self.display_lock: self.pending_display.clear()
+        self.cancel_scan_button.config(state="normal")
+        self.log("开始扫描并生成 V2 索引；断点检查点保存在电脑本地，不覆盖 NAS。")
         def work():
             temp = Path(tempfile.mkdtemp(prefix="fakepod_v2_stage_"))
             try:
@@ -481,6 +530,8 @@ class App:
                 process = subprocess.Popen(command,
                                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                            text=True, encoding="utf-8", errors="replace", bufsize=1)
+                self.scan_process = process
+                if self.scan_cancel.is_set(): process.terminate()
                 assert process.stdout is not None
                 messages = []
                 for line in process.stdout:
@@ -491,11 +542,15 @@ class App:
                         if len(parts) == 4:
                             try: self.emit("progress", parts[1], int(parts[2]), int(parts[3]))
                             except ValueError: pass
+                    elif line.startswith("FAKEPOD_STATUS "):
+                        self.emit("scan_status", json.loads(line[len("FAKEPOD_STATUS "):]))
                     elif line.startswith("FAKEPOD_INCREMENTAL "):
                         self.emit("log", "增量扫描报告：" + line.removeprefix("FAKEPOD_INCREMENTAL "))
                     else:
                         messages.append(line)
-                if process.wait(): raise RuntimeError("生成器退出失败：" + "；".join(messages[-12:]))
+                code = process.wait()
+                if self.scan_cancel.is_set(): raise RuntimeError("扫描已取消")
+                if code: raise RuntimeError("生成器退出失败：" + "；".join(messages[-12:]))
                 meta = parse_meta(temp / "fakepod_catalog.meta")
                 if int(meta.get("tracks", "0")) < 1:
                     raise RuntimeError("没有找到音乐文件，已阻止发布空索引")
@@ -503,10 +558,14 @@ class App:
                 self.emit("generated", root, temp, meta, report)
             except Exception as exc:
                 shutil.rmtree(temp, ignore_errors=True)
-                self.emit("error", "生成失败：" + str(exc))
+                if self.scan_cancel.is_set(): self.emit("cancelled")
+                else: self.emit("error", "生成失败：" + str(exc))
+            finally:
+                self.scan_process = None
         threading.Thread(target=work, daemon=True).start()
 
     def on_error(self, message):
+        self.cancel_scan_button.config(state="disabled")
         self.publish_writing = False
         self.progress.stop()
         self.set_busy(False)
@@ -514,13 +573,15 @@ class App:
         messagebox.showerror("操作失败", message)
 
     def on_generated(self, root, temp, meta, report):
+        self.cancel_scan_button.config(state="disabled")
         self.progress.stop()
         self.staging, self.generated_smb, self.generated_meta, self.report = temp, str(root), meta, report
         self.set_busy(False)
         baseline = report["mode"] == "baseline"
-        summary = (f"首次建立缓存：全量解析 {report['initial']} 首，下次启用增量"
+        summary = (f"首次建立缓存：共 {report['initial']} 首，下次启用增量"
                    if baseline else
                    f"总计 {report['total']} 首｜新增 {len(report['added'])}｜修改 {len(report['modified'])}｜删除 {len(report['removed'])}｜复用 {report['unchanged']}")
+        summary += f"｜断点复用 {report.get('resumed', 0)}"
         self.change_label.config(text=summary)
         self.progress_label.config(text="扫描完毕；按顺序先准备短 ID，再发布索引")
         self.log(summary)

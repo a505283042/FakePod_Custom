@@ -15,17 +15,20 @@ index and never scans the NAS music tree itself.
 from __future__ import annotations
 
 import argparse
+import time
 import json
 import os
 import uuid
 import re
 import struct
+import stat as stat_module
 import zlib
 from dataclasses import dataclass, asdict, fields
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from nas_artwork_locator_v2 import scan_artwork, find_directory_cover
+from desktop_scan_support import AudioSession, ScanJournal, ScanProgress, checkpoint_home, retry_io
 
 CATALOG_VERSION = 6
 MANIFEST_VERSION = 2
@@ -915,10 +918,12 @@ def matching_directory_lrc(song: Path, cache: dict) -> Optional[Path]:
     return None
 
 
-def scan_incremental(root: Path, previous: Optional[dict]):
+def scan_incremental(root: Path, previous: Optional[dict], checkpoint_dir=None, reset_checkpoint=False):
     """Stat all files; only parse tags for changed/new ones; emit a full V2 snapshot."""
     paths: List[Tuple[str, Path, int, os.stat_result]] = []
     visited = 0
+    companions = {}
+    last_discover = time.monotonic()
     def on_walk_error(error: OSError) -> None:
         raise error
     for dirpath, dirnames, filenames in os.walk(root, onerror=on_walk_error):
@@ -929,145 +934,164 @@ def scan_incremental(root: Path, previous: Optional[dict]):
             path = Path(dirpath) / name
             fmt = FORMAT_MAP.get(path.suffix.lower())
             if fmt is None:
+                if path.suffix.lower() in ('.lrc', '.jpg', '.jpeg', '.png'):
+                    companion_stat = retry_io(path.stat)
+                    companions['/' + path.relative_to(root).as_posix()] = (companion_stat.st_size, companion_stat.st_mtime_ns)
                 continue
-            if not path.is_file():
-                continue
-            st = path.stat()
+            st = retry_io(path.stat)
+            if not stat_module.S_ISREG(st.st_mode): continue
             relative = "/" + path.relative_to(root).as_posix()
             paths.append((relative, path, fmt, st))
-        if visited % 30 == 0:
+        if time.monotonic() - last_discover >= 1:
             print(f"FAKEPOD_PROGRESS DISCOVER {visited} {len(paths)}", flush=True)
+            last_discover = time.monotonic()
     paths.sort(key=lambda item: ascii_fold_key(item[0]))
     print(f"FAKEPOD_PROGRESS FOUND {len(paths)} {len(paths)}", flush=True)
     if len(paths) > 100000:
         raise ValueError(f"too many tracks for FakePod V2: {len(paths)} > 100000")
     old = previous["entries"] if previous else {}
-    rows = []
-    folder_art_cache = {}
-    folder_lyrics_cache = {}
-    artwork_scanned = 0
-    new_entries = {}
-    added, modified, unchanged, prepare_lyrics = [], [], [], []
-    technical_parsed = 0
-    technical_failed = 0
-    previous_key = None
-    seen_ids: Dict[int, str] = {}
-    for n, (relative, path, fmt, st) in enumerate(paths, 1):
-        key = ascii_fold_key(relative)
-        if key == previous_key:
-            raise ValueError(f"case-insensitive duplicate path is not valid in FakePod V2: {relative}")
-        previous_key = key
-        tid = stable_track_id(relative)
-        if tid in seen_ids and seen_ids[tid] != relative:
-            raise ValueError(f"stable track-id collision: {tid:016X} {seen_ids[tid]!r} {relative!r}")
-        seen_ids[tid] = relative
-        entry = old.get(relative)
-        if (entry and isinstance(entry, dict) and
-                entry.get("size") == st.st_size and entry.get("mtime_ns") == st.st_mtime_ns):
-            row = track_from_cache(relative, entry)
-            if row.fmt != fmt:
-                raise ValueError(f"扫描缓存格式不一致：{relative}")
-            # When only folder.jpg changes, the song's size/mtime does not.
-            # Check the directory once per scan and invalidate external locators.
-            if row.artwork_scanned and row.artwork_source in (0, 3):
-                directory = path.parent
-                if directory not in folder_art_cache:
-                    folder_art_cache[directory] = find_directory_cover(directory, root)
-                current_folder_art = folder_art_cache[directory]
-                current = (row.artwork_source, row.artwork_format, row.artwork_offset,
-                           row.artwork_size, row.artwork_flags, row.artwork_width,
-                           row.artwork_height, row.artwork_picture_type,
-                           row.artwork_path, row.artwork_mtime)
-                if row.artwork_source == 3 and current_folder_art != current:
-                    row.artwork_scanned = False
-                if row.artwork_source == 0 and current_folder_art is not None:
-                    row.artwork_scanned = False
-            unchanged.append(relative)
-        else:
-            row = build_track_meta(path, root, fmt)
-            (modified if entry else added).append(relative)
-        # Older scan caches have no technical payload. Refresh only that payload
-        # once; do not classify the audio as modified and do not rebuild aliases.
-        if fmt in (FORMAT_MAP[".mp3"], FORMAT_MAP[".flac"]) and not (row.technical_flags & TECH_PARSED):
-            technical = probe_technical(path, fmt, st.st_size)
-            if technical:
-                for name, value in technical.items():
-                    setattr(row, name, value)
-                technical_parsed += 1
-            else:
-                technical_failed += 1
-        if not row.artwork_scanned:
-            locator = scan_artwork(path, root, fmt, folder_art_cache)
-            row.artwork_source = row.artwork_format = row.artwork_offset = 0
-            row.artwork_size = row.artwork_flags = 0
-            row.artwork_width = row.artwork_height = row.artwork_picture_type = 0
-            row.artwork_path, row.artwork_mtime = "", 0
-            if locator:
-                (row.artwork_source, row.artwork_format, row.artwork_offset,
-                 row.artwork_size, row.artwork_flags, row.artwork_width,
-                 row.artwork_height, row.artwork_picture_type,
-                 row.artwork_path, row.artwork_mtime) = locator
-            row.artwork_scanned = True
-            artwork_scanned += 1
-        # Enumerate real directory entries rather than probing guessed .lrc/.LRC
-        # spellings: a case-insensitive SMB client can otherwise invent a path
-        # which is absent on the NAS case-sensitive SSH filesystem.
-        row.lyrics_path = ""
-        candidate = matching_directory_lrc(path, folder_lyrics_cache)
-        if candidate is not None:
-            lrc_stat = candidate.stat()
-            if 0 < lrc_stat.st_size <= 256 * 1024:
-                row.lyrics_path = "/" + candidate.relative_to(root).as_posix()
-                if fmt in (FORMAT_MAP[".mp3"], FORMAT_MAP[".flac"]):
-                    alias = root / "_FakePod" / "track" / f"{row.track_id:016X}.lrc"
-                    # Each format keeps its own short ID, but both short links
-                    # may point to this one, shared physical LRC file.
-                    if not alias.is_file() or not os.path.samefile(candidate, alias):
-                        prepare_lyrics.append(relative)
-        # Protect against concurrent SMB source edits while scanning.
-        last = path.stat()
-        if (last.st_size, last.st_mtime_ns) != (st.st_size, st.st_mtime_ns):
-            raise RuntimeError(f"扫描过程中歌曲发生变化，请重新扫描：{relative}")
-        rows.append(row)
-        new_entries[relative] = {"size": st.st_size, "mtime_ns": st.st_mtime_ns, "track": asdict(row)}
-        if n % 25 == 0 or n == len(paths):
-            print(f"FAKEPOD_PROGRESS META {n} {len(paths)}", flush=True)
-        if n % 250 == 0 or n == len(paths):
-            print(f"metadata scan: {n}/{len(paths)} reused={len(unchanged)} parsed={len(added)+len(modified)}", flush=True)
-    deleted = sorted(set(old) - set(new_entries), key=ascii_fold_key)
-    mode = "incremental" if previous else "baseline"
-    report = {"version": 1, "mode": mode, "total": len(rows),
-              "added": added if previous else [], "modified": modified if previous else [],
-              "removed": deleted if previous else [], "unchanged": len(unchanged),
-              "initial": len(rows) if not previous else 0,
-              "prepare_paths": ([p for p in (added + modified) if Path(p).suffix.lower() in (".mp3", ".flac")]
-                                if previous else [t.path for t in rows if Path(t.path).suffix.lower() in (".mp3", ".flac")]),
-              "prepare_lyrics": prepare_lyrics,
-              "remove_aliases": ([f"{stable_track_id(p):016X}{Path(p).suffix}" for p in deleted
-                                  if Path(p).suffix.lower() in (".mp3", ".flac")]
-                                 + [f"{stable_track_id(p):016X}.lrc" for p in deleted
-                                    if Path(p).suffix.lower() in (".mp3", ".flac")
-                                    and old[p].get("track", {}).get("lyrics_path")]
-                                 + [f"{t.track_id:016X}.lrc" for t in rows
-                                    if Path(t.path).suffix.lower() in (".mp3", ".flac")
-                                    and not t.lyrics_path and t.path in old
-                                    and old[t.path].get("track", {}).get("lyrics_path")]),
-              "id": uuid.uuid4().hex}
-    # Extra manually repaired aliases remain untouched. Deletion only considers
-    # old canonical names tracked in our own validated cache, never unknown files.
-    new_aliases = {f"{t.track_id:016X}{Path(t.path).suffix}" for t in rows
-                   if Path(t.path).suffix.lower() in (".mp3", ".flac")}
-    new_aliases |= {f"{t.track_id:016X}.lrc" for t in rows if t.lyrics_path
-                    and Path(t.path).suffix.lower() in (".mp3", ".flac")}
-    report["remove_aliases"] = [x for x in report["remove_aliases"] if x not in new_aliases]
-    cache = {"version": CACHE_VERSION, "root": cache_fingerprint(root), "entries": new_entries}
-    print("FAKEPOD_INCREMENTAL " + " ".join(f"{k}={v}" for k, v in
-          (("mode", mode), ("total", len(rows)), ("added", len(report["added"])),
-           ("modified", len(report["modified"])), ("removed", len(report["removed"])),
-           ("reused", len(unchanged)))), flush=True)
-    if technical_parsed or technical_failed:
-        print(f"FAKEPOD_TECH_SCAN parsed={technical_parsed} failed={technical_failed}", flush=True)
-    return rows, cache, report
+    journal = ScanJournal(checkpoint_dir, dict(version=1, root=cache_fingerprint(root), companions=companions), reset_checkpoint) if checkpoint_dir else None
+    try:
+        progress = ScanProgress()
+        resumed = 0
+        rows = []
+        folder_art_cache = {}
+        folder_lyrics_cache = {}
+        artwork_scanned = 0
+        new_entries = {}
+        added, modified, unchanged, prepare_lyrics = [], [], [], []
+        technical_parsed = 0
+        technical_failed = 0
+        previous_key = None
+        seen_ids: Dict[int, str] = {}
+        for n, (relative, physical, fmt, st) in enumerate(paths, 1):
+            key = ascii_fold_key(relative)
+            if key == previous_key:
+                raise ValueError(f"case-insensitive duplicate path is not valid in FakePod V2: {relative}")
+            previous_key = key
+            tid = stable_track_id(relative)
+            if tid in seen_ids and seen_ids[tid] != relative:
+                raise ValueError(f"stable track-id collision: {tid:016X} {seen_ids[tid]!r} {relative!r}")
+            seen_ids[tid] = relative
+            with AudioSession(physical, st, lambda message: progress.emit(message, n - 1, len(paths), relative, force=True)) as path:
+                published_entry = old.get(relative)
+                changed = not (published_entry and published_entry.get('size') == st.st_size and published_entry.get('mtime_ns') == st.st_mtime_ns)
+                if changed: (modified if published_entry else added).append(relative)
+                else: unchanged.append(relative)
+                entry = journal.entries.get(relative) if journal else None
+                if entry and (entry.get('size'), entry.get('mtime_ns')) == (st.st_size, st.st_mtime_ns):
+                    resumed += 1
+                else: entry = published_entry
+                progress.emit('标签', n - 1, len(paths), relative)
+                if (entry and isinstance(entry, dict) and
+                        entry.get("size") == st.st_size and entry.get("mtime_ns") == st.st_mtime_ns):
+                    row = track_from_cache(relative, entry)
+                    if row.fmt != fmt:
+                        raise ValueError(f"扫描缓存格式不一致：{relative}")
+                    # When only folder.jpg changes, the song's size/mtime does not.
+                    # Check the directory once per scan and invalidate external locators.
+                    if row.artwork_scanned and row.artwork_source in (0, 3):
+                        directory = path.parent
+                        if directory not in folder_art_cache:
+                            folder_art_cache[directory] = find_directory_cover(directory, root)
+                        current_folder_art = folder_art_cache[directory]
+                        current = (row.artwork_source, row.artwork_format, row.artwork_offset,
+                                   row.artwork_size, row.artwork_flags, row.artwork_width,
+                                   row.artwork_height, row.artwork_picture_type,
+                                   row.artwork_path, row.artwork_mtime)
+                        if row.artwork_source == 3 and current_folder_art != current:
+                            row.artwork_scanned = False
+                        if row.artwork_source == 0 and current_folder_art is not None:
+                            row.artwork_scanned = False
+                else:
+                    row = build_track_meta(path, root, fmt)
+                progress.emit('音频参数', n - 1, len(paths), relative)
+                # Older scan caches have no technical payload. Refresh only that payload
+                # once; do not classify the audio as modified and do not rebuild aliases.
+                if fmt in (FORMAT_MAP[".mp3"], FORMAT_MAP[".flac"]) and not (row.technical_flags & TECH_PARSED):
+                    technical = probe_technical(path, fmt, st.st_size)
+                    if technical:
+                        for name, value in technical.items():
+                            setattr(row, name, value)
+                        technical_parsed += 1
+                    else:
+                        technical_failed += 1
+                progress.emit('封面/歌词', n - 1, len(paths), relative)
+                if not row.artwork_scanned:
+                    locator = scan_artwork(path, root, fmt, folder_art_cache)
+                    row.artwork_source = row.artwork_format = row.artwork_offset = 0
+                    row.artwork_size = row.artwork_flags = 0
+                    row.artwork_width = row.artwork_height = row.artwork_picture_type = 0
+                    row.artwork_path, row.artwork_mtime = "", 0
+                    if locator:
+                        (row.artwork_source, row.artwork_format, row.artwork_offset,
+                         row.artwork_size, row.artwork_flags, row.artwork_width,
+                         row.artwork_height, row.artwork_picture_type,
+                         row.artwork_path, row.artwork_mtime) = locator
+                    row.artwork_scanned = True
+                    artwork_scanned += 1
+                # Enumerate real directory entries rather than probing guessed .lrc/.LRC
+                # spellings: a case-insensitive SMB client can otherwise invent a path
+                # which is absent on the NAS case-sensitive SSH filesystem.
+                row.lyrics_path = ""
+                candidate = matching_directory_lrc(path, folder_lyrics_cache)
+                if candidate is not None:
+                    lrc_stat = candidate.stat()
+                    if 0 < lrc_stat.st_size <= 256 * 1024:
+                        row.lyrics_path = "/" + candidate.relative_to(root).as_posix()
+                        if fmt in (FORMAT_MAP[".mp3"], FORMAT_MAP[".flac"]):
+                            alias = root / "_FakePod" / "track" / f"{row.track_id:016X}.lrc"
+                            # Each format keeps its own short ID, but both short links
+                            # may point to this one, shared physical LRC file.
+                            if not alias.is_file() or not os.path.samefile(candidate, alias):
+                                prepare_lyrics.append(relative)
+                # Protect against concurrent SMB source edits while scanning.
+                last = retry_io(physical.stat)
+                if (last.st_size, last.st_mtime_ns) != (st.st_size, st.st_mtime_ns):
+                    raise RuntimeError(f"扫描过程中歌曲发生变化，请重新扫描：{relative}")
+                rows.append(row)
+                new_entries[relative] = {"size": st.st_size, "mtime_ns": st.st_mtime_ns, "track": asdict(row)}
+                if journal: journal.save(relative, new_entries[relative])
+                progress.emit('已完成', n, len(paths), relative, force=n == len(paths))
+                if n % 250 == 0 or n == len(paths):
+                    print(f"metadata scan: {n}/{len(paths)} reused={len(unchanged)} parsed={len(added)+len(modified)}", flush=True)
+        deleted = sorted(set(old) - set(new_entries), key=ascii_fold_key)
+        mode = "incremental" if previous else "baseline"
+        report = {"version": 1, "mode": mode, "total": len(rows),
+                  "added": added if previous else [], "modified": modified if previous else [],
+                  "removed": deleted if previous else [], "unchanged": len(unchanged),
+                  "initial": len(rows) if not previous else 0,
+                  "prepare_paths": ([p for p in (added + modified) if Path(p).suffix.lower() in (".mp3", ".flac")]
+                                    if previous else [t.path for t in rows if Path(t.path).suffix.lower() in (".mp3", ".flac")]),
+                  "prepare_lyrics": prepare_lyrics,
+                  "remove_aliases": ([f"{stable_track_id(p):016X}{Path(p).suffix}" for p in deleted
+                                      if Path(p).suffix.lower() in (".mp3", ".flac")]
+                                     + [f"{stable_track_id(p):016X}.lrc" for p in deleted
+                                        if Path(p).suffix.lower() in (".mp3", ".flac")
+                                        and old[p].get("track", {}).get("lyrics_path")]
+                                     + [f"{t.track_id:016X}.lrc" for t in rows
+                                        if Path(t.path).suffix.lower() in (".mp3", ".flac")
+                                        and not t.lyrics_path and t.path in old
+                                        and old[t.path].get("track", {}).get("lyrics_path")]),
+                  "id": uuid.uuid4().hex}
+        report['resumed'] = resumed
+        # Extra manually repaired aliases remain untouched. Deletion only considers
+        # old canonical names tracked in our own validated cache, never unknown files.
+        new_aliases = {f"{t.track_id:016X}{Path(t.path).suffix}" for t in rows
+                       if Path(t.path).suffix.lower() in (".mp3", ".flac")}
+        new_aliases |= {f"{t.track_id:016X}.lrc" for t in rows if t.lyrics_path
+                        and Path(t.path).suffix.lower() in (".mp3", ".flac")}
+        report["remove_aliases"] = [x for x in report["remove_aliases"] if x not in new_aliases]
+        cache = {"version": CACHE_VERSION, "root": cache_fingerprint(root), "entries": new_entries}
+        print("FAKEPOD_INCREMENTAL " + " ".join(f"{k}={v}" for k, v in
+              (("mode", mode), ("total", len(rows)), ("added", len(report["added"])),
+               ("modified", len(report["modified"])), ("removed", len(report["removed"])),
+               ("reused", len(unchanged)))), flush=True)
+        if technical_parsed or technical_failed:
+            print(f"FAKEPOD_TECH_SCAN parsed={technical_parsed} failed={technical_failed}", flush=True)
+        return rows, cache, report
+    finally:
+        if journal: journal.close()
 
 
 def iter_tracks(root: Path) -> List[TrackMeta]:
@@ -1415,6 +1439,7 @@ def main() -> int:
     parser.add_argument("output_dir", type=Path, help="Folder served over HTTP/WebDAV")
     parser.add_argument("--cache-from", type=Path, help="Published scan cache for incremental metadata reuse")
     parser.add_argument("--force-full", action="store_true", help="Ignore previous scan cache; rebuild baseline")
+    parser.add_argument("--checkpoint-dir", type=Path, default=checkpoint_home(), help="Local resume journal directory")
     args = parser.parse_args()
 
     root = args.music_root.resolve()
@@ -1425,7 +1450,7 @@ def main() -> int:
 
     cache_source = None if args.force_full else args.cache_from
     prior = read_scan_cache(cache_source, root)
-    tracks, scan_cache, report = scan_incremental(root, prior)
+    tracks, scan_cache, report = scan_incremental(root, prior, args.checkpoint_dir, args.force_full)
     print("FAKEPOD_PROGRESS CATALOG 0 1", flush=True)
     index_file, manifest_file, index_crc, manifest_crc, artist_count, album_count = build_catalog(tracks)
 

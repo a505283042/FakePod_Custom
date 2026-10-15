@@ -285,13 +285,44 @@ static void build_remote_ui_status(uint8_t packet[6])
     packet[5] = static_cast<uint8_t>(screen_lock_simple_get_lock());
 }
 
+// A stalled phone must not block discovery/accept in this same task.
 static bool send_all(int fd, const uint8_t *data, size_t size)
 {
+    const TickType_t started = xTaskGetTickCount();
+    const TickType_t budget = pdMS_TO_TICKS(750);
     size_t offset = 0U;
     while (offset < size) {
-        const int written = send(fd, data + offset, size - offset, 0);
-        if (written <= 0) return false;
-        offset += static_cast<size_t>(written);
+        const TickType_t elapsed = xTaskGetTickCount() - started;
+        if (elapsed >= budget) {
+            ESP_LOGW(TAG, "遥控发送超时：sent=%u/%u，释放旧会话等待重连",
+                static_cast<unsigned>(offset), static_cast<unsigned>(size));
+            return false;
+        }
+        const int written = send(fd, data + offset, size - offset, MSG_DONTWAIT);
+        if (written > 0) {
+            offset += static_cast<size_t>(written);
+            continue;
+        }
+        if (written < 0 && errno == EINTR) continue;
+        if (written == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+            ESP_LOGW(TAG, "遥控发送失败：errno=%d sent=%u/%u", errno,
+                static_cast<unsigned>(offset), static_cast<unsigned>(size));
+            return false;
+        }
+        const TickType_t remaining = budget - elapsed;
+        const uint32_t remaining_ms = remaining * portTICK_PERIOD_MS;
+        timeval wait = {};
+        wait.tv_sec = remaining_ms / 1000U;
+        wait.tv_usec = (remaining_ms % 1000U) * 1000U;
+        fd_set writable;
+        FD_ZERO(&writable);
+        FD_SET(fd, &writable);
+        const int ready = select(fd + 1, nullptr, &writable, nullptr, &wait);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0) {
+            ESP_LOGW(TAG, "遥控等待可写失败：ready=%d errno=%d，释放旧会话", ready, errno);
+            return false;
+        }
     }
     return true;
 }

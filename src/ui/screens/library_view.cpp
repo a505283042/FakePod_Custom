@@ -378,6 +378,9 @@ static uint32_t g_nas_load_stack_hwm = 0U;
 static uint32_t g_nas_load_elapsed_ms = 0U;
 static std::atomic<bool> g_nas_index_reload_pending{false};
 static bool g_nas_index_reload_active = false;
+// Only a committed server switch may silently bind the newly loaded NAS queue.
+// Ordinary browsing and same-server index reloads keep their existing playback context.
+static bool g_nas_server_bind_pending = false;
 static bool g_nas_index_reload_was_visible = false;
 static uint32_t g_nas_index_reload_old_track_count = 0U;
 static lv_obj_t *g_nas_loading_overlay = nullptr;
@@ -3666,6 +3669,38 @@ static void library_view_activate_nas_ui()
         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
 }
 
+static void library_view_bind_new_nas_playback()
+{
+    if (!g_nas_server_bind_pending) return;
+    if (device_settings_music_library_source() != DeviceMusicLibrarySource::Nas) {
+        g_nas_server_bind_pending = false;
+        return;
+    }
+    if (!nas_library_source_ready() || nas_library_source_track_count() == 0U) return;
+    // A deliberate selection made while loading takes precedence over the switch default.
+    if (player_state_get_source() == PlayerMediaSource::Nas && player_state_is_ready()) {
+        g_nas_server_bind_pending = false;
+        return;
+    }
+    AudioStateSnapshot audio = {};
+    if (!audio_service_get_snapshot(&audio)) return;
+    if (audio.state != AudioPlaybackState::Ready &&
+        audio.state != AudioPlaybackState::Stopped &&
+        audio.state != AudioPlaybackState::Error &&
+        audio.state != AudioPlaybackState::Finished) {
+        g_nas_server_bind_pending = false;
+        ESP_LOGI(TAG, "NAS加载完成时已有新的播放操作，保留用户选择");
+        return;
+    }
+    // Selection only: never call play/seek here. The next explicit Play uses this NAS queue.
+    if (player_control_select_nas_all_tracks(0U)) {
+        g_nas_server_bind_pending = false;
+        ESP_LOGI(TAG, "新NAS播放队列已绑定：首曲已选中，不自动播放");
+    } else {
+        ESP_LOGW(TAG, "新NAS已加载但播放队列绑定失败，重新打开NAS列表可重试");
+    }
+}
+
 static void library_view_finish_nas_load_async(void *)
 {
     esp_err_t result = ESP_FAIL;
@@ -3704,6 +3739,7 @@ static void library_view_finish_nas_load_async(void *)
     }
 
     if (result == ESP_OK && nas_library_source_ready()) {
+        library_view_bind_new_nas_playback();
         library_view_activate_nas_ui();
         return;
     }
@@ -3909,6 +3945,7 @@ bool library_view_open_nas(DeviceMusicListScope scope)
             "NAS曲库命中常驻索引：tracks=%lu psram=%uB，不重复读取TF",
             static_cast<unsigned long>(nas_library_source_track_count()),
             static_cast<unsigned>(nas_library_source_psram_bytes()));
+        library_view_bind_new_nas_playback();
         library_view_activate_nas_ui();
         return true;
     }
@@ -4045,6 +4082,7 @@ bool library_view_prepare_nas_server_switch()
     heap_caps_free(g_nas_remembered_state);
     g_nas_remembered_state = nullptr;
     g_nas_selected_track = UINT32_MAX;
+    g_nas_server_bind_pending = false;
     if (was_visible_nas) player_home_resume_from_fullscreen_view("nas-server-switch");
     ESP_LOGI(TAG, "旧NAS曲库已在LVGL线程退出：PSRAM已回收，NAS播放上下文已清理");
     return true;
@@ -4066,6 +4104,7 @@ void library_view_finish_nas_server_switch()
         ESP_LOGW(TAG, "NAS浏览恢复位置重置失败：list=%s browse=%s",
             esp_err_to_name(list_ret), esp_err_to_name(browse_ret));
     }
+    g_nas_server_bind_pending = true;
     if (!library_view_open_nas(DeviceMusicListScope::All)) {
         ESP_LOGW(TAG, "新NAS索引已写入TF，但未能自动打开；可从主页重新进入NAS曲库");
     }
@@ -4073,6 +4112,7 @@ void library_view_finish_nas_server_switch()
 
 void library_view_on_library_source_changed(DeviceMusicLibrarySource source)
 {
+    if (source == DeviceMusicLibrarySource::Local) g_nas_server_bind_pending = false;
     if (source == DeviceMusicLibrarySource::Local && nas_library_source_ready()) {
         if (library_view_nas_catalog_needed_by_playback()) {
             ESP_LOGI(TAG,
