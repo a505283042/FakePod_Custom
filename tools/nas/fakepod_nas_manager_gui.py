@@ -527,7 +527,9 @@ class App:
                     command.append("--force-full")
                 else:
                     command.extend(["--cache-from", str(cache_path)])
+                child_env = dict(os.environ, PYTHONIOENCODING="utf-8")
                 process = subprocess.Popen(command,
+                                           env=child_env,
                                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                            text=True, encoding="utf-8", errors="replace", bufsize=1)
                 self.scan_process = process

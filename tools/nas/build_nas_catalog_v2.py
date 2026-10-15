@@ -15,6 +15,7 @@ index and never scans the NAS music tree itself.
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 import json
 import os
@@ -1533,4 +1534,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # The GUI pipe is UTF-8 on every Windows locale; GBK cannot encode all songs.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     raise SystemExit(main())
