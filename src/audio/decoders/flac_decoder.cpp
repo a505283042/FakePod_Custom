@@ -1865,6 +1865,70 @@ static bool flac_refine_seekpoint_by_frame_scan(
     return true;
 }
 
+// 无索引本地 FLAC：按 STREAMINFO 总采样数估算偏移，CRC8 校验候选帧头。
+// 不持久化索引、不新增任务；限制扫描量，异常文件不执行超长 PCM 丢弃。
+static bool flac_no_table_seekable(const FlacStreamDescriptor &d)
+{
+    return d.total_frames != 0U && d.max_block_size != 0U &&
+        d.audio_data_offset_bytes < d.file_size_bytes;
+}
+
+static esp_err_t flac_find_no_table_seekpoint(
+    AudioSource *source, AudioDecodeWorkspace *workspace,
+    const FlacStreamDescriptor &descriptor, uint64_t target_frame,
+    FlacSeekPoint *out_point, uint64_t *out_scanned_bytes)
+{
+    if (!flac_no_table_seekable(descriptor) || source == nullptr || workspace == nullptr ||
+        out_point == nullptr || target_frame == 0U) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    const uint64_t audio_bytes = descriptor.file_size_bytes - descriptor.audio_data_offset_bytes;
+    constexpr uint64_t window = 256U * 1024U;
+    constexpr uint32_t max_windows = 48U;
+    const uint64_t estimate = static_cast<uint64_t>(
+        (static_cast<double>(audio_bytes) * static_cast<double>(target_frame)) /
+        static_cast<double>(descriptor.total_frames));
+    uint64_t start = estimate > window / 2U ? estimate - window / 2U : 0U;
+    FlacSeekPoint best = {};
+    uint64_t scanned_total = 0U;
+
+    for (uint32_t attempt = 0U; attempt < max_windows; ++attempt) {
+        const uint64_t end = audio_bytes - start < window ? audio_bytes : start + window;
+        if (start >= end) break;
+        FlacSeekPoint candidate = best;
+        uint64_t scanned = 0U;
+        const bool found = flac_refine_seekpoint_by_frame_scan(
+            source, workspace, descriptor, target_frame, start, end,
+            descriptor.total_frames, &candidate, &scanned);
+        scanned_total += scanned;
+        if (found) best = candidate;
+
+        // 不依赖文件偏移宣称精准：锚点足够近，解码器才会丢弃少量 PCM 到目标。
+        if (target_frame >= best.sample_number &&
+            target_frame - best.sample_number <=
+                static_cast<uint64_t>(descriptor.max_block_size) * 2U) {
+            *out_point = best;
+            if (out_scanned_bytes) *out_scanned_bytes = scanned_total;
+            return ESP_OK;
+        }
+
+        if (found) {
+            // 仍位于目标之前，向后寻找更近的候选帧。
+            if (end == audio_bytes) break;
+            start = end;
+        } else if (best.sample_number == 0U) {
+            // 估算偏移可能已越过目标，逐窗向文件前部回退。
+            if (start == 0U) break;
+            start = start > window ? start - window : 0U;
+        } else {
+            // 前一窗口曾发现有效锚点，当前位置没有更靠近目标的帧。
+            break;
+        }
+    }
+    if (out_scanned_bytes) *out_scanned_bytes = scanned_total;
+    return ESP_ERR_NOT_FOUND;
+}
+
 static esp_err_t flac_select_seekpoint(
     AudioSource *source,
     const FlacStreamDescriptor &descriptor,
@@ -2951,7 +3015,9 @@ static esp_err_t flac_decoder_prepare_seek_runtime(
     if (decoder == nullptr || decoder->source == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (descriptor.seektable_length_bytes < FLAC_SEEKPOINT_BYTES) {
+    const bool has_seektable = descriptor.seektable_length_bytes >= FLAC_SEEKPOINT_BYTES &&
+        descriptor.seektable_length_bytes % FLAC_SEEKPOINT_BYTES == 0U;
+    if (!has_seektable && !flac_no_table_seekable(descriptor)) {
         return ESP_ERR_NOT_SUPPORTED;
     }
     if (descriptor.audio_data_offset_bytes >= descriptor.file_size_bytes) {
@@ -2964,8 +3030,12 @@ static esp_err_t flac_decoder_prepare_seek_runtime(
     FlacSeekPoint point = {};
     FlacSeekPoint next_point = {};
     bool has_next_point = false;
-    esp_err_t ret = flac_select_seekpoint(
-        decoder->source, descriptor, target_frame, &point, &next_point, &has_next_point);
+    uint64_t no_table_scan_bytes = 0U;
+    esp_err_t ret = has_seektable
+        ? flac_select_seekpoint(
+            decoder->source, descriptor, target_frame, &point, &next_point, &has_next_point)
+        : flac_find_no_table_seekpoint(
+            decoder->source, workspace, descriptor, target_frame, &point, &no_table_scan_bytes);
 #if APP_DIAG_AUDIO_SEEK
     const int64_t seekpoint_done_us = esp_timer_get_time();
 #endif
@@ -2980,8 +3050,8 @@ static esp_err_t flac_decoder_prepare_seek_runtime(
 #if APP_DIAG_AUDIO_SEEK
     const FlacSeekPoint table_point = point;
 #endif
-    uint64_t refine_scanned_bytes = 0U;
-    bool refine_used_estimate = false;
+    uint64_t refine_scanned_bytes = no_table_scan_bytes;
+    bool refine_used_estimate = !has_seektable;
 #if APP_DIAG_AUDIO_SEEK
     bool refine_fell_back = false;
 #endif
@@ -2990,7 +3060,7 @@ static esp_err_t flac_decoder_prepare_seek_runtime(
     const uint64_t max_sample = has_next_point ? next_point.sample_number : descriptor.total_frames;
     const bool discard_exceeds_one_block = descriptor.max_block_size == 0U ||
         target_frame - point.sample_number > descriptor.max_block_size;
-    if (discard_exceeds_one_block && max_sample > target_frame &&
+    if (has_seektable && discard_exceeds_one_block && max_sample > target_frame &&
         scan_end > point.stream_offset + 1U) {
         uint64_t scan_start = point.stream_offset + 1U;
         const uint64_t sample_span = max_sample - point.sample_number;
@@ -3210,7 +3280,8 @@ esp_err_t flac_decoder_seek_frame(
         }
         return ret;
     }
-    if (!flac_decoder_has_seektable(decoder)) {
+    if (decoder->streaming_source ||
+        (!flac_decoder_has_seektable(decoder) && !flac_decoder_can_seek_without_table(decoder))) {
         return ESP_ERR_NOT_SUPPORTED;
     }
     if (decoder->total_frames != 0 && target_frame >= decoder->total_frames) {
@@ -3281,6 +3352,13 @@ bool flac_decoder_is_open(const FlacDecoder *decoder)
 bool flac_decoder_is_eof(const FlacDecoder *decoder)
 {
     return decoder != nullptr && decoder->eof && decoder->decoded_offset >= decoder->decoded_size;
+}
+
+bool flac_decoder_can_seek_without_table(const FlacDecoder *decoder)
+{
+    return decoder != nullptr && !decoder->streaming_source &&
+        decoder->total_frames > 0U && decoder->max_block_size > 0U &&
+        decoder->audio_data_offset_bytes < decoder->file_size_bytes;
 }
 
 bool flac_decoder_has_seektable(const FlacDecoder *decoder)

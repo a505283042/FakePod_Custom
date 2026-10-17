@@ -250,3 +250,4 @@ void flac_decoder_close(FlacDecoder *decoder);
 bool flac_decoder_is_open(const FlacDecoder *decoder);
 bool flac_decoder_is_eof(const FlacDecoder *decoder);
 bool flac_decoder_has_seektable(const FlacDecoder *decoder);
+bool flac_decoder_can_seek_without_table(const FlacDecoder *decoder);

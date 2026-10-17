@@ -31,6 +31,7 @@ enum class PcmSeekMethod : uint8_t
     Mp3CbrLinear,
     Mp3VbrLinearFallback,
     FlacSeektable,
+    FlacFrameScan,
     OpusGranule,
     RestartFromBeginning,
 };

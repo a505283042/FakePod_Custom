@@ -196,7 +196,10 @@ esp_err_t pcm_decoder_open_for_seek(
             out_result->requested_frame = target_frame;
             out_result->actual_frame = target_frame;
             out_result->source_offset = source_offset;
-            out_result->method = PcmSeekMethod::FlacSeektable;
+            out_result->method = target_frame == 0U
+                ? PcmSeekMethod::RestartFromBeginning
+                : (flac_decoder_has_seektable(&decoder->flac)
+                    ? PcmSeekMethod::FlacSeektable : PcmSeekMethod::FlacFrameScan);
         }
         return ESP_OK;
     }
@@ -420,7 +423,8 @@ esp_err_t pcm_decoder_seek_frame(
                 decoder->info.total_frames = decoder->flac.total_frames;
                 method = target_frame == 0
                     ? PcmSeekMethod::RestartFromBeginning
-                    : PcmSeekMethod::FlacSeektable;
+                    : (flac_decoder_has_seektable(&decoder->flac)
+                        ? PcmSeekMethod::FlacSeektable : PcmSeekMethod::FlacFrameScan);
             }
             break;
 
@@ -459,7 +463,8 @@ bool pcm_decoder_seek_supported(const PcmDecoder *decoder, uint64_t target_frame
             return !decoder->mp3.streaming_source;
         case PcmDecoderType::Flac:
             return !decoder->flac.streaming_source &&
-                (target_frame == 0 || flac_decoder_has_seektable(&decoder->flac));
+                (target_frame == 0 || flac_decoder_has_seektable(&decoder->flac) ||
+                 flac_decoder_can_seek_without_table(&decoder->flac));
         case PcmDecoderType::Opus:
             return true;
         default:
@@ -544,6 +549,7 @@ const char *pcm_seek_method_name(PcmSeekMethod method)
         case PcmSeekMethod::Mp3CbrLinear: return "MP3_CBR_LINEAR";
         case PcmSeekMethod::Mp3VbrLinearFallback: return "MP3_VBR_LINEAR";
         case PcmSeekMethod::FlacSeektable: return "FLAC_SEEKTABLE";
+        case PcmSeekMethod::FlacFrameScan: return "FLAC_FRAME_SCAN";
         case PcmSeekMethod::OpusGranule: return "OPUS_GRANULE";
         case PcmSeekMethod::RestartFromBeginning: return "RESTART_BEGIN";
         default: return "NONE";
