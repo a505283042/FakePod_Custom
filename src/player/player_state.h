@@ -87,3 +87,6 @@ bool player_state_select_position(size_t position);
 // 在当前目录播放范围内选择上一首/下一首，首尾循环；列表为空或 stale 时返回 false。
 bool player_state_previous();
 bool player_state_next();
+
+// Independent phone playback; leaves device browse folder state untouched.
+bool player_state_select_phone_queue(PlayerMediaSource source, PlayerListType type, uint32_t group, uint32_t track, PlayerFolderScope scope, const char *folder);

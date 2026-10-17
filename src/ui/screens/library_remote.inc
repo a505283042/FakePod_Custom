@@ -127,12 +127,12 @@ static bool lr_binding(uint32_t display, LibraryRowBinding &b, char *name, size_
     else return false;
     return true;
 }
-static bool lr_group(uint32_t type,uint32_t i,LrWriter &w) {
+static bool lr_group(uint32_t type,uint32_t i,LrWriter &w,bool independent=false,bool nas=false) {
     const char *name="",*artist=""; const uint32_t *ids=nullptr;uint32_t count=0,decade=0;
     char decade_name[32]={};
-    if(type==1) { MediaArtistGroupViewV2 v={};if(!library_source_get_artist(i,&v))return false;name=v.name;ids=v.track_indices;count=v.track_count; }
-    else if(type==2) { MediaAlbumGroupViewV2 v={};if(!library_source_get_album(i,&v))return false;name=v.title;artist=v.artist;ids=v.track_indices;count=v.track_count; }
-    else if(type==3) { MediaDecadeGroupViewV2 v={};if(!library_source_get_decade(i,&v))return false;
+    if(type==1) { MediaArtistGroupViewV2 v={};if(!(independent?(nas?nas_library_source_get_artist(i,&v):media_groups_v2_get_artist(i,&v)):library_source_get_artist(i,&v)))return false;name=v.name;ids=v.track_indices;count=v.track_count; }
+    else if(type==2) { MediaAlbumGroupViewV2 v={};if(!(independent?(nas?nas_library_source_get_album(i,&v):media_groups_v2_get_album(i,&v)):library_source_get_album(i,&v)))return false;name=v.title;artist=v.artist;ids=v.track_indices;count=v.track_count; }
+    else if(type==3) { MediaDecadeGroupViewV2 v={};if(!(independent?(nas?nas_library_source_get_decade(i,&v):media_groups_v2_get_decade(i,&v)):library_source_get_decade(i,&v)))return false;
         decade=v.unknown?0:v.decade_start; snprintf(decade_name,sizeof(decade_name),v.unknown?"未知年代":"%u年代",v.decade_start);
         name=decade_name;ids=v.track_indices;count=v.track_count; }
     else return false;
@@ -141,15 +141,15 @@ static bool lr_group(uint32_t type,uint32_t i,LrWriter &w) {
     for(uint32_t j=0;j<count;++j)w.u32(ids[j]);
     return true;
 }
-static bool lr_record(uint32_t section,uint32_t i,LrWriter &w) {
+static bool lr_record(uint32_t section,uint32_t i,LrWriter &w,bool independent=false,bool nas=false) {
     w.u32(i);
     if(section==0) {
-        MediaTrackViewV2 v={};if(!library_source_get_track_view(i,&v)||!v.row)return false;
+        MediaTrackViewV2 v={};if(!(independent?(nas?nas_library_source_get_track_view(i,&v):media_catalog_v2_get_track_view(i,&v)):library_source_get_track_view(i,&v))||!v.row)return false;
         w.str(v.title);w.str(v.artist);w.str(v.album);w.str(v.path);
         w.u32(v.row->metadata_flags);w.u32(v.row->release_year);w.u32(v.row->original_year);w.u32(uint32_t(v.row->format));
         return true;
     }
-    if(section<4)return lr_group(section,i,w);
+    if(section<4)return lr_group(section,i,w,independent,nas);
     LibraryRowBinding b={};char name[PLAYER_FOLDER_PATH_MAX]={};uint32_t count=0;
     if(!lr_binding(i,b,name,sizeof(name),count))return false;
     w.u8(uint8_t(b.action));w.u8(uint8_t(b.group_type));w.u32(b.position);w.u32(b.group_index);w.u32(b.track_index);
@@ -177,7 +177,10 @@ static void lr_clear_search() {
     if(g_search.active)library_search_exit();
     library_view_inertia_stop(false);
 }
+#include "library_remote_independent.inc"
+
 static void library_remote_process(const uint8_t *q) {
+    if(q[2]&0x80U){library_remote_process_independent(q);return;}
     uint8_t op=q[2],src=q[3];uint32_t gen=lr_u32(q+8),rev=lr_u32(q+12),a=lr_u32(q+16);
     lr_result=0;
     if(op==6) {

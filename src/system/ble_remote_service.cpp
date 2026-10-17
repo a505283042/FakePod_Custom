@@ -472,6 +472,13 @@ static void update_phone_library_notify()
         seen_epoch = epoch; frame_size = offset = 0;
         library_view_remote_reset();
     }
+    portENTER_CRITICAL(&g_lock);
+    const bool request_waiting = g_ble_library_request_ready;
+    portEXIT_CRITICAL(&g_lock);
+    if (!request_waiting && frame_size == 0 && !library_view_remote_pending()) {
+        portENTER_CRITICAL(&g_lock);g_ble_library_pumping = false;portEXIT_CRITICAL(&g_lock);
+        return;
+    }
     if (connection_is_encrypted(conn)) {
         uint8_t request[32]; bool queued;
         portENTER_CRITICAL(&g_lock);
@@ -578,6 +585,7 @@ static uint8_t g_last_visual_status[4] = {0xFFU, 0, 0, 0};
 static TickType_t g_visual_resend_due = 0;
 static uint8_t g_last_seek_status[19] = {0xFFU};
 static TickType_t g_seek_resend_due = 0;
+static TickType_t g_aux_check_due = 0;
 
 static void build_remote_ui_status(uint8_t packet[6])
 {
@@ -607,17 +615,25 @@ static void update_phone_state_notify(TickType_t now)
     portEXIT_CRITICAL(&g_lock);
 
     if (!notify_enabled || conn_handle == BLE_HS_CONN_HANDLE_NONE ||
-        g_control_event_val_handle == 0U || !connection_is_encrypted(conn_handle)) {
+        g_control_event_val_handle == 0U) {
         return;
     }
 
+    // Sample stable control snapshots at 100ms, but keep metadata fragmentation fast.
+    if (!force_status && !force_metadata_refresh && g_aux_check_due != 0 && !tick_due(now, g_aux_check_due)) {
+        if (g_metadata_chunk_index < g_metadata_chunk_count && connection_is_encrypted(conn_handle))
+            (void)send_next_metadata_chunk(conn_handle);
+        return;
+    }
+    if (!connection_is_encrypted(conn_handle)) return;
+    g_aux_check_due = now + pdMS_TO_TICKS(100);
     uint8_t seek_status[19] = {};
     remote_music_seek_build_status(seek_status, music_remote_ui_available());
     if (memcmp(seek_status, g_last_seek_status, sizeof(seek_status)) != 0 ||
         g_seek_resend_due == 0 || tick_due(now, g_seek_resend_due)) {
         if (notify_phone_event(conn_handle, seek_status, sizeof(seek_status)) == 0) {
             memcpy(g_last_seek_status, seek_status, sizeof(seek_status));
-            g_seek_resend_due = now + pdMS_TO_TICKS(2000);
+            g_seek_resend_due = now + pdMS_TO_TICKS(15000);
         }
         return;
     }

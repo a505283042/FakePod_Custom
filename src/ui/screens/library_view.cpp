@@ -374,6 +374,9 @@ static portMUX_TYPE g_nas_load_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool g_nas_load_running = false;
 // Captured on the UI thread; background phone sync must not raise a device page.
 static bool g_nas_load_show = true;
+static bool g_nas_load_remote_only = false;
+static TickType_t g_nas_remote_retry_due = 0;
+static void library_view_apply_nas_saved_selection(DeviceMusicListScope);
 static DeviceMusicListScope g_nas_load_scope = DeviceMusicListScope::All;
 static esp_err_t g_nas_load_result = ESP_OK;
 static uint32_t g_nas_load_stack_hwm = 0U;
@@ -3797,8 +3800,19 @@ static void library_view_finish_nas_load_async(void *)
     taskENTER_CRITICAL(&g_nas_load_lock);
     result = g_nas_load_result;
     g_nas_load_running = false;
+    const bool remote_only = g_nas_load_remote_only;
+    g_nas_load_remote_only = false;
     taskEXIT_CRITICAL(&g_nas_load_lock);
 
+    if (remote_only) {
+        if (!g_nas_load_show) {
+            if(result!=ESP_OK){nas_library_source_close();g_nas_remote_retry_due=xTaskGetTickCount()+pdMS_TO_TICKS(30000);}
+            ESP_LOGI(TAG, "APP独立曲库缓存加载完成：%s；设备浏览保持原位", esp_err_to_name(result));
+            return;
+        }
+        // A user explicitly opened NAS on the device while the cache was loading.
+        if (result == ESP_OK) library_view_apply_nas_saved_selection(g_nas_load_scope);
+    }
     if (g_nas_index_reload_active) {
         g_nas_index_reload_active = false;
         if (result == ESP_OK && nas_library_source_ready()) {
@@ -3914,6 +3928,7 @@ static void library_view_nas_load_task(void *)
     DeviceMusicListScope scope = DeviceMusicListScope::All;
     taskENTER_CRITICAL(&g_nas_load_lock);
     scope = g_nas_load_scope;
+    const bool remote_only = g_nas_load_remote_only;
     taskEXIT_CRITICAL(&g_nas_load_lock);
 
     const int64_t started_us = esp_timer_get_time();
@@ -3922,7 +3937,7 @@ static void library_view_nas_load_task(void *)
         initial_scope,
         library_view_nas_open_stage_cb,
         nullptr);
-    if (result == ESP_OK) {
+    if (result == ESP_OK && !remote_only) {
         library_view_apply_nas_saved_selection(scope);
     }
     const uint32_t elapsed_ms =
@@ -4053,6 +4068,7 @@ bool library_view_open_nas(DeviceMusicListScope scope, bool show)
     taskEXIT_CRITICAL(&g_nas_load_lock);
     if (already_running) {
         if (show) {
+            g_nas_load_scope = scope;
             g_nas_load_show = true;
             (void)library_view_show_nas_loading_overlay();
         }

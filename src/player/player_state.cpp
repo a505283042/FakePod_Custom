@@ -6,11 +6,13 @@
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
 #include "nas_library_source.h"
 
 static const char *TAG = "播放器状态";
 static bool g_ready = false;
 static PlayerMediaSource g_source = PlayerMediaSource::Local;
+#include "player_remote_queue.inc"
 
 struct NasListContext
 {
@@ -315,6 +317,7 @@ static bool player_state_find_track_by_path(const char *path, size_t *out_track_
 
 bool player_state_rebind_after_catalog_reload(const char *preferred_path, size_t fallback_track_index)
 {
+    if(g_source==PlayerMediaSource::Local)phone_queue_clear();
     if (!media_library_is_ready()) return false;
     const PlayerMediaSource previous_source = g_source;
     const esp_err_t ret = player_playlist_init();
@@ -361,6 +364,7 @@ static void nas_reload_release_restore()
 
 void player_state_prepare_nas_index_reload()
 {
+    if(g_source==PlayerMediaSource::Nas)phone_queue_clear();
     nas_reload_release_restore();
     if (g_source != PlayerMediaSource::Nas) return;
     g_nas_index_restore.was_nas = true;
@@ -454,6 +458,7 @@ bool player_state_finish_nas_index_reload()
 
 void player_state_forget_nas_context()
 {
+    if(g_source==PlayerMediaSource::Nas)phone_queue_clear();
     g_nas = {};
     if (g_source == PlayerMediaSource::Nas) g_source = PlayerMediaSource::Local;
 }
@@ -559,6 +564,9 @@ bool player_state_set_folder_scope(PlayerFolderScope scope)
 
 PlayerFolderScope player_state_get_folder_scope()
 {
+    portENTER_CRITICAL(&g_phone_queue_lock);const bool phone=phone_queue_valid();
+    const auto phone_scope=phone?g_phone_queue->scope:PlayerFolderScope::All;portEXIT_CRITICAL(&g_phone_queue_lock);
+    if(phone)return phone_scope;
     return g_source == PlayerMediaSource::Nas ? nas_library_source_folder_scope() : player_playlist_get_folder_scope();
 }
 
@@ -573,6 +581,10 @@ bool player_state_set_folder_selection(PlayerFolderScope scope, const char *fold
 bool player_state_copy_folder_selection(PlayerFolderScope scope, char *buffer, size_t buffer_size)
 {
     if (!g_ready) return false;
+    portENTER_CRITICAL(&g_phone_queue_lock);
+    const bool phone=phone_queue_valid() && scope==g_phone_queue->scope && buffer && buffer_size;
+    if(phone)snprintf(buffer,buffer_size,"%s",g_phone_queue->folder);
+    portEXIT_CRITICAL(&g_phone_queue_lock);if(phone)return true;
     return g_source == PlayerMediaSource::Nas
         ? nas_library_source_copy_folder_selection(scope, buffer, buffer_size)
         : player_playlist_copy_folder_selection(scope, buffer, buffer_size);
@@ -580,6 +592,15 @@ bool player_state_copy_folder_selection(PlayerFolderScope scope, char *buffer, s
 
 bool player_state_get_folder_queue_snapshot(PlayerFolderQueueSnapshot *out_snapshot)
 {
+    portENTER_CRITICAL(&g_phone_queue_lock);
+    if(g_phone_queue){
+        if(!phone_queue_valid() || !out_snapshot){portEXIT_CRITICAL(&g_phone_queue_lock);return false;}
+        PlayerFolderQueueSnapshot q={};q.ready=true;q.preferred_scope=q.effective_scope=g_phone_queue->scope;
+        q.catalog_generation=g_phone_queue->generation;q.context_id=0x50484f4eU^g_phone_queue->context_id;
+        q.position=g_phone_queue->position;q.track_count=g_phone_queue->count;
+        q.track_index=g_phone_queue->tracks[q.position];q.current_in_queue=true;*out_snapshot=q;portEXIT_CRITICAL(&g_phone_queue_lock);return true;
+    }
+    portEXIT_CRITICAL(&g_phone_queue_lock);
     return g_source == PlayerMediaSource::Nas ? nas_get_folder_queue(out_snapshot)
         : (g_ready && player_playlist_get_folder_queue_snapshot(out_snapshot));
 }
@@ -593,6 +614,9 @@ static bool player_state_select(bool selected, const char *action)
 
 bool player_state_get_folder_queue_track_index_at_position(size_t position, size_t *out_track_index)
 {
+    portENTER_CRITICAL(&g_phone_queue_lock);
+    if(g_phone_queue){const bool ok=phone_queue_valid() && out_track_index && position<g_phone_queue->count;if(ok)*out_track_index=g_phone_queue->tracks[position];portEXIT_CRITICAL(&g_phone_queue_lock);return ok;}
+    portEXIT_CRITICAL(&g_phone_queue_lock);
     if (out_track_index == nullptr || !player_state_is_ready()) return false;
     if (g_source == PlayerMediaSource::Local) {
         return player_playlist_get_folder_queue_track_index_at_position(position, out_track_index);
@@ -610,6 +634,20 @@ bool player_state_get_folder_queue_track_index_at_position(size_t position, size
 
 bool player_state_select_folder_queue_position(size_t position)
 {
+    portENTER_CRITICAL(&g_phone_queue_lock);
+    if(g_phone_queue){
+        if(!phone_queue_valid() || position>=g_phone_queue->count){portEXIT_CRITICAL(&g_phone_queue_lock);return false;}
+        const uint32_t track=g_phone_queue->tracks[position],identity=g_phone_queue->context_id;
+        portEXIT_CRITICAL(&g_phone_queue_lock);
+        PlayerListSnapshot list={};if(!player_state_get_list_snapshot(&list))return false;
+        const size_t native_position=list.type==PlayerListType::AllTracks?track:position;
+        if(!player_state_select_position(native_position))return false;
+        portENTER_CRITICAL(&g_phone_queue_lock);
+        const bool same=phone_queue_valid() && g_phone_queue->context_id==identity;
+        if(same)g_phone_queue->position=uint32_t(position);
+        portEXIT_CRITICAL(&g_phone_queue_lock);return same;
+    }
+    portEXIT_CRITICAL(&g_phone_queue_lock);
     return player_state_select(g_source == PlayerMediaSource::Nas
         ? nas_select_folder_position(position)
         : player_playlist_select_folder_queue_position(position), "目录播放范围选择");
@@ -617,6 +655,7 @@ bool player_state_select_folder_queue_position(size_t position)
 
 bool player_state_select_local_folder_queue_position(size_t position)
 {
+    phone_queue_clear();
     const bool ok = player_playlist_select_folder_queue_position(position);
     if (ok) g_source = PlayerMediaSource::Local;
     return player_state_select(ok, "本地目录播放范围选择");
@@ -624,6 +663,7 @@ bool player_state_select_local_folder_queue_position(size_t position)
 
 bool player_state_select_all_tracks(size_t position)
 {
+    phone_queue_clear();
     const bool ok = player_playlist_bind_all(position);
     if (ok) g_source = PlayerMediaSource::Local;
     return player_state_select(ok, "切换全部歌曲");
@@ -631,6 +671,7 @@ bool player_state_select_all_tracks(size_t position)
 
 bool player_state_select_artist_group(size_t group_index, size_t position)
 {
+    phone_queue_clear();
     const bool ok = player_playlist_bind_artist(group_index, position);
     if (ok) g_source = PlayerMediaSource::Local;
     return player_state_select(ok, "切换歌手列表");
@@ -638,6 +679,7 @@ bool player_state_select_artist_group(size_t group_index, size_t position)
 
 bool player_state_select_album_group(size_t group_index, size_t position)
 {
+    phone_queue_clear();
     const bool ok = player_playlist_bind_album(group_index, position);
     if (ok) g_source = PlayerMediaSource::Local;
     return player_state_select(ok, "切换专辑列表");
@@ -645,6 +687,7 @@ bool player_state_select_album_group(size_t group_index, size_t position)
 
 bool player_state_select_decade_group(size_t group_index, size_t position)
 {
+    phone_queue_clear();
     const bool ok = player_playlist_bind_decade(group_index, position);
     if (ok) g_source = PlayerMediaSource::Local;
     return player_state_select(ok, "切换年代列表");
@@ -652,11 +695,13 @@ bool player_state_select_decade_group(size_t group_index, size_t position)
 
 bool player_state_select_nas_all_tracks(size_t position)
 {
+    phone_queue_clear();
     return player_state_select(nas_bind(PlayerListType::AllTracks, UINT32_MAX, position), "切换NAS全部歌曲");
 }
 
 bool player_state_select_nas_folder_queue_position(size_t position)
 {
+    phone_queue_clear();
     if (!nas_context_valid()) {
         if (!nas_bind(PlayerListType::AllTracks, UINT32_MAX, 0U)) return false;
     }
@@ -666,16 +711,19 @@ bool player_state_select_nas_folder_queue_position(size_t position)
 
 bool player_state_select_nas_artist_group(size_t group_index, size_t position)
 {
+    phone_queue_clear();
     return player_state_select(nas_bind(PlayerListType::Artist, group_index, position), "切换NAS歌手列表");
 }
 
 bool player_state_select_nas_album_group(size_t group_index, size_t position)
 {
+    phone_queue_clear();
     return player_state_select(nas_bind(PlayerListType::Album, group_index, position), "切换NAS专辑列表");
 }
 
 bool player_state_select_nas_decade_group(size_t group_index, size_t position)
 {
+    phone_queue_clear();
     return player_state_select(nas_bind(PlayerListType::Decade, group_index, position), "切换NAS年代列表");
 }
 
@@ -704,7 +752,7 @@ static bool state_move(int direction)
 bool player_state_previous()
 {
     if (!g_ready) return false;
-    if (g_source == PlayerMediaSource::Nas) return state_move(-1);
+    if (g_source == PlayerMediaSource::Nas || phone_queue_exists()) return state_move(-1);
     if (!player_playlist_folder_previous()) return false;
     player_state_log_current("上一首");
     return true;
@@ -713,8 +761,10 @@ bool player_state_previous()
 bool player_state_next()
 {
     if (!g_ready) return false;
-    if (g_source == PlayerMediaSource::Nas) return state_move(+1);
+    if (g_source == PlayerMediaSource::Nas || phone_queue_exists()) return state_move(+1);
     if (!player_playlist_folder_next()) return false;
     player_state_log_current("下一首");
     return true;
 }
+
+#include "player_phone_select.inc"

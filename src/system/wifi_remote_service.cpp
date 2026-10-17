@@ -471,6 +471,7 @@ static void service_task(void *)
     bool visual_status_sent = false;
     uint8_t rx_buffer[128] = {};
     size_t rx_size = 0U;
+    bool idle_library_reset = false;
 
     for (;;) {
         portENTER_CRITICAL(&g_lock);
@@ -488,7 +489,7 @@ static void service_task(void *)
             if (g_client_fd > max_fd) max_fd = g_client_fd;
         }
         timeval timeout = {};
-        timeout.tv_usec = library_view_remote_pending() ? 20000 : 100000;
+        timeout.tv_usec = library_view_remote_pending() ? 20000 : (g_client_fd >= 0 ? 250000 : 500000);
         const int ready = select(max_fd + 1, &read_set, nullptr, nullptr, &timeout);
         if (ready < 0 && errno != EINTR) {
             ESP_LOGW(TAG, "Wi-Fi遥控select失败：errno=%d", errno);
@@ -576,7 +577,9 @@ static void service_task(void *)
             }
         }
 
-        if (g_client_fd < 0) library_view_remote_reset();
+        if (g_client_fd < 0) {
+            if (!idle_library_reset) { library_view_remote_reset(); idle_library_reset = true; }
+        } else idle_library_reset = false;
         if (g_client_fd >= 0) {
             uint8_t library_frame[255];
             size_t library_size = 0;
@@ -595,7 +598,13 @@ static void service_task(void *)
                 build_status(status);
                 uint8_t seek_status[19] = {};
                 remote_music_seek_build_status(seek_status, music_remote_ui_available());
-                const bool send_status = !status_sent ||
+                uint8_t ui_status[6] = {};
+                build_remote_ui_status(ui_status);
+                const uint8_t visual_status[4] = {
+                    0x04U, kProtocolVersion, 0x03U, player_home_remote_get_spectrum_style()};
+                const bool ui_changed = !ui_status_sent || memcmp(ui_status, last_ui_status, sizeof(ui_status)) != 0;
+                const bool visual_changed = !visual_status_sent || memcmp(visual_status, last_visual_status, sizeof(visual_status)) != 0;
+                const bool send_status = ui_changed || visual_changed || !status_sent ||
                     status_due == 0 || static_cast<int32_t>(now - status_due) >= 0 ||
                     status_semantic_changed(status, last_status) ||
                     !seek_status_sent || memcmp(seek_status, last_seek_status, sizeof(seek_status)) != 0;
@@ -608,8 +617,6 @@ static void service_task(void *)
                     status_due = now + kStatusResyncInterval;
                     memcpy(last_status, status, sizeof(status));
                     status_sent = true;
-                    uint8_t ui_status[6] = {};
-                    build_remote_ui_status(ui_status);
                     if (!ui_status_sent ||
                         memcmp(ui_status, last_ui_status, sizeof(ui_status)) != 0) {
                         if (!send_frame(g_client_fd, ui_status, sizeof(ui_status))) {
@@ -621,9 +628,6 @@ static void service_task(void *)
                         ui_status_sent = true;
                     }
 
-                    const uint8_t visual_status[4] = {
-                        0x04U, kProtocolVersion, 0x03U,
-                        player_home_remote_get_spectrum_style()};
                     if (!visual_status_sent ||
                         memcmp(visual_status, last_visual_status,
                                sizeof(visual_status)) != 0) {
@@ -637,11 +641,13 @@ static void service_task(void *)
                                sizeof(visual_status));
                         visual_status_sent = true;
                     }
-                    if (!send_frame(g_client_fd, seek_status, sizeof(seek_status))) {
-                        close_fd(g_client_fd); rx_size = 0U; continue;
+                    if (!seek_status_sent || memcmp(seek_status, last_seek_status, sizeof(seek_status)) != 0) {
+                        if (!send_frame(g_client_fd, seek_status, sizeof(seek_status))) {
+                            close_fd(g_client_fd); rx_size = 0U; continue;
+                        }
+                        memcpy(last_seek_status, seek_status, sizeof(seek_status));
+                        seek_status_sent = true;
                     }
-                    memcpy(last_seek_status, seek_status, sizeof(seek_status));
-                    seek_status_sent = true;
                     if (sent_metadata_sequence != g_metadata_sequence) {
                         if (send_metadata(g_client_fd)) {
                             sent_metadata_sequence = g_metadata_sequence;

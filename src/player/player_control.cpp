@@ -625,3 +625,14 @@ bool player_control_select_nas_decade_group(size_t group_index, size_t position)
     player_control_unlock();
     return ok;
 }
+
+bool player_control_select_phone_queue(uint8_t source,uint8_t type,uint32_t group,uint32_t track,uint8_t scope,const char *folder)
+{
+    if(source>1 || type>3 || scope>2 || !player_control_lock(pdMS_TO_TICKS(100)))return false;
+    if(source==1 && player_state_get_source()==PlayerMediaSource::Local){
+        const esp_err_t stored=persistent_state_checkpoint_local();
+        if(stored!=ESP_OK)ESP_LOGW(TAG,"APP NAS select: local checkpoint failed: %s",esp_err_to_name(stored));
+    }
+    const bool ok=player_state_select_phone_queue(PlayerMediaSource(source),PlayerListType(type),group,track,PlayerFolderScope(scope),folder);
+    player_control_unlock();return ok;
+}

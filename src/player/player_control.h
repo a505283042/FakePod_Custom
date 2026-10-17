@@ -73,3 +73,6 @@ struct AudioStateSnapshot;
 bool player_control_local_seek_available(const AudioStateSnapshot &audio);
 // Guard source/track/session under the same lock used by track switching.
 bool player_control_remote_seek_ms(uint32_t track, uint32_t revision, uint32_t seek_revision, uint32_t target_ms);
+
+// The source is 0=Local, 1=NAS; browser state is never changed.
+bool player_control_select_phone_queue(uint8_t source,uint8_t type,uint32_t group,uint32_t track,uint8_t scope,const char *folder);
