@@ -479,24 +479,29 @@ static void cassette_view_cover_adjust_cb(lv_event_t *event)
     // 避免两个按钮因为方向数据异常而发生同向移动。
     lv_obj_t *target = static_cast<lv_obj_t *>(lv_event_get_target(event));
     int16_t delta = 0;
-    const char *action = nullptr;
     if (target == g_cover_adjust_buttons[0]) {
         delta = -kCoverYOffsetStepPx;  // 左▲：图像真正向上移动
-        action = "上移";
     } else if (target == g_cover_adjust_buttons[1]) {
         delta = +kCoverYOffsetStepPx;  // 右▼：图像真正向下移动
-        action = "下移";
     } else {
         return;
     }
 
+    (void)cassette_view_adjust_cover(delta < 0 ? 0U : 1U);
+}
+
+bool cassette_view_adjust_cover(uint8_t direction)
+{
+    if (direction > 1U || !g_active || g_cover_image == nullptr) return false;
+    const int16_t delta = direction == 0U ? -kCoverYOffsetStepPx : kCoverYOffsetStepPx;
+    const char *action = direction == 0U ? "上移" : "下移";
     const int16_t safe_limit = cassette_view_cover_safe_offset_limit_px();
     int32_t limited = static_cast<int32_t>(g_cover_y_offset_px) + delta;
     if (limited < -safe_limit) limited = -safe_limit;
     if (limited > safe_limit) limited = safe_limit;
     if (limited == g_cover_y_offset_px) {
         ESP_LOGI(TAG, "磁带封面%s已到安全边界：%dpx", action, static_cast<int>(g_cover_y_offset_px));
-        return;
+        return true;
     }
 
     g_cover_y_offset_px = static_cast<int16_t>(limited);
@@ -506,6 +511,7 @@ static void cassette_view_cover_adjust_cb(lv_event_t *event)
         action,
         static_cast<int>(g_cover_y_offset_px),
         static_cast<int>(safe_limit));
+    return true;
 }
 
 static lv_obj_t *cassette_view_create_cover_adjust_button(
@@ -3380,7 +3386,12 @@ static bool cassette_view_bind_current_cover()
 
     if (g_cover_is_no_artwork_fallback &&
         g_cover_generation == generation && g_cover_track == track) {
-        return true;
+        // NAS read failures use a temporary label. A later ready Surface must
+        // still enter the normal pending-cover/tint transaction below.
+        CoverSurfaceLease recovered = {};
+        if (!artwork_source_is_nas() ||
+            !cover_surface_cache_acquire_normal(track, &recovered)) return true;
+        cover_surface_cache_release(&recovered);
     }
     if (g_cover_lease.slot_index != 0xFFU &&
         g_cover_generation == generation && g_cover_track == track) {
@@ -3401,15 +3412,25 @@ static bool cassette_view_bind_current_cover()
     CoverSurfaceLease next = {};
     if (!cover_surface_cache_acquire_normal(track, &next) || next.normal_rgb565 == nullptr ||
         next.width == 0U || next.height == 0U || next.data_size == 0U) {
+        ArtworkLoaderSnapshot loader = {};
+        const bool nas_read_failed = artwork_source_is_nas() &&
+            artwork_loader_get_snapshot(&loader) &&
+            loader.catalog_generation == generation && loader.track_index == track &&
+            loader.state == ArtworkLoadState::Failed;
         CoverSurfaceSnapshot snapshot = {};
-        if (cover_surface_cache_get_snapshot(&snapshot) &&
+        const bool surface_failed = cover_surface_cache_get_snapshot(&snapshot) &&
             snapshot.catalog_generation == generation && snapshot.track_index == track &&
             snapshot.state == CoverSurfaceState::Failed &&
-            snapshot.result == ESP_ERR_INVALID_SIZE) {
-            artwork_loader_discard_unpinned();
+            (artwork_source_is_nas() || snapshot.result == ESP_ERR_INVALID_SIZE);
+        if (nas_read_failed || surface_failed) {
+            if (surface_failed && snapshot.result == ESP_ERR_INVALID_SIZE) {
+                artwork_loader_discard_unpinned();
+            }
             cassette_view_release_transition_hold();
-            ESP_LOGW(TAG, "磁带大封面降级默认标签：track=%lu",
-                static_cast<unsigned long>(track));
+            ESP_LOGW(TAG, "磁带封面失败，使用缺省标签：source=%s track=%lu err=%s",
+                artwork_source_is_nas() ? "NAS" : "LOCAL",
+                static_cast<unsigned long>(track),
+                esp_err_to_name(nas_read_failed ? loader.result : snapshot.result));
             return cassette_view_bind_no_artwork_label(generation, track);
         }
         return false;

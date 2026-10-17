@@ -12,6 +12,7 @@
 #include "battery_service.h"
 #include "media_catalog_v2.h"
 #include "player_control.h"
+#include "remote_music_seek.h"
 #include "ui/screens/player_home.h"
 #include "screen_lock_simple.h"
 #include "player_state.h"
@@ -168,6 +169,8 @@ static const char *control_command_name(uint8_t command)
         case 0x13U: return "锁屏";
         case 0x14U: return "AOD";
         case 0x15U: return "息屏";
+        case 0x16U: return "磁带封面位置";
+        case 0x17U: return "频谱样式";
         default: return "未知";
     }
 }
@@ -207,6 +210,8 @@ static bool execute_control_command(uint8_t command, uint8_t value = 0U)
         case 0x13U: return music_remote_ui_available() && screen_lock_simple_remote_request(2U);
         case 0x14U: return music_remote_ui_available() && screen_lock_simple_remote_request(3U);
         case 0x15U: return music_remote_ui_available() && screen_lock_simple_remote_request(4U);
+        case 0x16U: return value <= 1U && music_remote_ui_available() && player_home_remote_request_cover_shift(value);
+        case 0x17U: return value <= 2U && music_remote_ui_available() && player_home_remote_request_spectrum_style(value);
         default: return false;
     }
 }
@@ -387,6 +392,10 @@ static void build_status_packet(
     if (video_valid) flags |= 0x08U; // media context = VIDEO
     if (nsf_valid) flags |= 0x10U;   // R46.0.50: media context = NSF
     if (music_remote_ui_available()) flags |= 0x20U; // Music APP foreground
+    if (player_state_get_source() == PlayerMediaSource::Nas ||
+        (audio_valid && audio.source == AudioPlaybackSource::NasHttp)) flags |= 0x40U;
+    if (!nsf_valid && !video_valid && music_remote_ui_available() && audio_valid &&
+        player_control_local_seek_available(audio)) flags |= 0x80U;
     packet[5] = flags;
 
     write_u32_le(&packet[6], track_index);
@@ -481,6 +490,10 @@ static bool send_next_metadata_chunk(uint16_t conn_handle)
 
 static uint8_t g_last_remote_ui_status[6] = {0xFFU, 0, 0, 0, 0, 0};
 static TickType_t g_remote_ui_resend_due = 0;
+static uint8_t g_last_visual_status[4] = {0xFFU, 0, 0, 0};
+static TickType_t g_visual_resend_due = 0;
+static uint8_t g_last_seek_status[19] = {0xFFU};
+static TickType_t g_seek_resend_due = 0;
 
 static void build_remote_ui_status(uint8_t packet[6])
 {
@@ -514,6 +527,17 @@ static void update_phone_state_notify(TickType_t now)
         return;
     }
 
+    uint8_t seek_status[19] = {};
+    remote_music_seek_build_status(seek_status, music_remote_ui_available());
+    if (memcmp(seek_status, g_last_seek_status, sizeof(seek_status)) != 0 ||
+        g_seek_resend_due == 0 || tick_due(now, g_seek_resend_due)) {
+        if (notify_phone_event(conn_handle, seek_status, sizeof(seek_status)) == 0) {
+            memcpy(g_last_seek_status, seek_status, sizeof(seek_status));
+            g_seek_resend_due = now + pdMS_TO_TICKS(2000);
+        }
+        return;
+    }
+
     uint8_t ui_status[6] = {};
     build_remote_ui_status(ui_status);
     if (memcmp(ui_status, g_last_remote_ui_status, sizeof(ui_status)) != 0 ||
@@ -521,6 +545,17 @@ static void update_phone_state_notify(TickType_t now)
         if (notify_phone_event(conn_handle, ui_status, sizeof(ui_status)) == 0) {
             memcpy(g_last_remote_ui_status, ui_status, sizeof(ui_status));
             g_remote_ui_resend_due = now + pdMS_TO_TICKS(15000);
+        }
+        return;
+    }
+
+    const uint8_t visual_status[4] = {
+        0x04U, kPhoneEventProtocolVersion, 0x03U, player_home_remote_get_spectrum_style()};
+    if (memcmp(visual_status, g_last_visual_status, sizeof(visual_status)) != 0 ||
+        g_visual_resend_due == 0 || tick_due(now, g_visual_resend_due)) {
+        if (notify_phone_event(conn_handle, visual_status, sizeof(visual_status)) == 0) {
+            memcpy(g_last_visual_status, visual_status, sizeof(visual_status));
+            g_visual_resend_due = now + pdMS_TO_TICKS(15000);
         }
         return;
     }
@@ -689,6 +724,13 @@ static int control_command_access(
         return handle_wifi_provision_fragment(payload, payload_len);
     }
 
+    if (command == 0x18U) {
+        if (payload_len != 17U) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        const bool seek_ok = music_remote_ui_available() && remote_music_seek_execute(payload, payload_len);
+        ESP_LOGI(TAG, "BLE本地音乐SEEK：result=%s", seek_ok ? "OK" : "REJECTED");
+        return seek_ok ? 0 : BLE_ATT_ERR_UNLIKELY;
+    }
+
     if (payload_len != 1U && payload_len != 2U) {
         return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     }
@@ -702,6 +744,8 @@ static int control_command_access(
         }
     } else if (command == 0x10U || command == 0x11U) {
         if (payload_len != 2U || payload[1] > 3U) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    } else if (command == 0x16U || command == 0x17U) {
+        if (payload_len != 2U || payload[1] > (command == 0x16U ? 1U : 2U)) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     } else if (payload_len != 1U ||
         !((command >= 0x01U && command <= 0x05U) ||
           (command >= 0x12U && command <= 0x15U))) {
@@ -818,6 +862,8 @@ static int gap_event_cb(struct ble_gap_event *event, void *)
                 g_force_metadata_refresh = false;
                 g_status_notify_due_tick = 0;
                 g_status_event_poll_due_tick = 0;
+                g_last_seek_status[0] = 0xFFU;
+                g_last_visual_status[0] = 0xFFU;
                 g_last_remote_ui_status[0] = 0xFFU; // New BLE session must receive its own UI snapshot.
                 set_state_locked(BleRemoteState::Connected);
                 portEXIT_CRITICAL(&g_lock);

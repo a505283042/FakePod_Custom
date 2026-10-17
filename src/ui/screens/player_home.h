@@ -71,3 +71,7 @@ AppId player_home_launcher_shared_app_for_index(uint8_t index);
 // Music/Ebook 共用唯一 Launcher 选择语义：所有扇区都可选；只有“已注册且不是当前前台”才允许启动。
 // 选择动作始终先更新 AppManager launcher_target，未实现 APP 因此仍可正常高亮/显示中心图标。
 AppId player_home_launcher_shared_select_index(uint8_t index, bool *out_should_launch);
+
+bool player_home_remote_request_cover_shift(uint8_t direction);
+bool player_home_remote_request_spectrum_style(uint8_t style);
+uint8_t player_home_remote_get_spectrum_style();

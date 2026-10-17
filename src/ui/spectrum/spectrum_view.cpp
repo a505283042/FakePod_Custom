@@ -1186,10 +1186,7 @@ static void spectrum_root_click_cb(lv_event_t *event)
 
     const uint8_t next =
         (static_cast<uint8_t>(g_style) + 1U) % static_cast<uint8_t>(SpectrumStyle::Count);
-    g_style = static_cast<SpectrumStyle>(next);
-    // R.31：新样式第一次 DRAW_MAIN 前先用当前 bar 状态准备对应几何 cache。
-    spectrum_rebuild_style_geometry_cache();
-    spectrum_apply_style_layout();
+    (void)spectrum_view_set_style(next);
 
     UI_PAGE_INTERACTION_LOGI("Tap切换频谱样式：style=%u %s",
         static_cast<unsigned>(g_style), spectrum_style_name(g_style));
@@ -1491,4 +1488,20 @@ bool spectrum_view_is_visible()
 const char *spectrum_view_current_style_name()
 {
     return spectrum_style_name(g_style);
+}
+
+// Called only by LVGL owner (tap or the remote UI mailbox consumer).
+uint8_t spectrum_view_current_style_id()
+{
+    return static_cast<uint8_t>(g_style);
+}
+
+bool spectrum_view_set_style(uint8_t style)
+{
+    if (style >= static_cast<uint8_t>(SpectrumStyle::Count) || !g_visible || g_root == nullptr) return false;
+    if (static_cast<uint8_t>(g_style) == style) return true;
+    g_style = static_cast<SpectrumStyle>(style);
+    spectrum_rebuild_style_geometry_cache();
+    spectrum_apply_style_layout();
+    return true;
 }

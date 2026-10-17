@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 #include "lvgl.h"
 
 // P1.5.3.2R.6：SegmentedColumns 调整为第一/默认样式，HorizontalMirror 第二，NeonRidge 第三。
@@ -16,3 +18,7 @@ bool spectrum_view_is_visible();
 
 // R.30 性能审计：返回当前自绘样式名。
 const char *spectrum_view_current_style_name();
+
+// LVGL-owner only; 0=segmented, 1=mirror, 2=neon ridge.
+uint8_t spectrum_view_current_style_id();
+bool spectrum_view_set_style(uint8_t style);

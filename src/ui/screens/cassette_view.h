@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 #include <stdbool.h>
 
 #include "esp_err.h"
@@ -31,3 +33,6 @@ void cassette_view_set_launcher_suspended(bool suspended);
 // 进度条拖动/Seek期间冻结磁带机械层，避免UI动画与Seek提交争用。
 void cassette_view_set_seek_frozen(bool frozen);
 bool cassette_view_is_active();
+
+// LVGL-owner only; 0=up, 1=down, same safe 4px step as on-device buttons.
+bool cassette_view_adjust_cover(uint8_t direction);

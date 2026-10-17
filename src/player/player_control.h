@@ -68,3 +68,8 @@ bool player_control_select_nas_folder_queue_position(size_t position);
 bool player_control_select_nas_artist_group(size_t group_index, size_t position);
 bool player_control_select_nas_album_group(size_t group_index, size_t position);
 bool player_control_select_nas_decade_group(size_t group_index, size_t position);
+
+struct AudioStateSnapshot;
+bool player_control_local_seek_available(const AudioStateSnapshot &audio);
+// Guard source/track/session under the same lock used by track switching.
+bool player_control_remote_seek_ms(uint32_t track, uint32_t revision, uint32_t seek_revision, uint32_t target_ms);

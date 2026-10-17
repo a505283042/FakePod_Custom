@@ -466,6 +466,30 @@ bool player_control_seek_ms(uint64_t target_ms)
     return ok;
 }
 
+bool player_control_local_seek_available(const AudioStateSnapshot &audio)
+{
+    return player_state_is_ready() && player_state_get_source() == PlayerMediaSource::Local &&
+        audio.ready && audio.source == AudioPlaybackSource::Local && audio.seek_supported &&
+        audio.track_index != UINT32_MAX && audio.track_index == player_state_get_index() &&
+        audio.playback_revision != 0U && audio.sample_rate_hz > 0U && audio.total_frames > 0ULL &&
+        (audio.state == AudioPlaybackState::Playing || audio.state == AudioPlaybackState::Paused);
+}
+
+bool player_control_remote_seek_ms(uint32_t track, uint32_t revision, uint32_t seek_revision, uint32_t target_ms)
+{
+    if (!player_control_lock(pdMS_TO_TICKS(100))) return false;
+    AudioStateSnapshot audio = {};
+    bool ok = audio_service_get_snapshot(&audio) && player_control_local_seek_available(audio) &&
+        audio.track_index == track && audio.playback_revision == revision && audio.seek_revision == seek_revision;
+    if (ok) {
+        const uint64_t duration_ms = (audio.total_frames * 1000ULL) / audio.sample_rate_hz;
+        // Keep target strictly inside the file; endpoint seeking must not become auto-next.
+        ok = duration_ms > 0ULL && target_ms < duration_ms && player_transport_seek_ms(target_ms);
+    }
+    player_control_unlock();
+    return ok;
+}
+
 static bool player_control_select_context(bool selected)
 {
     if (!selected) {

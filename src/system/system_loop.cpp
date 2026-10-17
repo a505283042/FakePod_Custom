@@ -206,6 +206,15 @@ static bool system_tick_due(TickType_t now, TickType_t due)
     return static_cast<int32_t>(now - due) >= 0;
 }
 
+static bool system_artwork_load_failure_retryable(esp_err_t result)
+{
+    // Keep deterministic missing/invalid artwork terminal. Only transient NAS
+    // transport/readiness failures join the existing bounded backoff pipeline.
+    return result == ESP_ERR_TIMEOUT ||
+        (artwork_source_is_nas() &&
+         (result == ESP_ERR_INVALID_STATE || result == ESP_FAIL));
+}
+
 static TickType_t system_artwork_retry_delay(uint8_t retry_count)
 {
     TickType_t delay = ARTWORK_CURRENT_RETRY_BASE;
@@ -358,6 +367,9 @@ static void system_artwork_begin_context(uint32_t generation, uint32_t current_t
             // 缓存确实已淘汰时重新读取当前曲，不能拿历史 Ready 直接请求 Surface。
             g_artwork_stage = ArtworkCurrentStage::RetryCompressed;
             g_artwork_retry_due_tick = 0;
+        } else if (same_inflight && loader.state == ArtworkLoadState::Failed &&
+                   system_artwork_load_failure_retryable(loader.result)) {
+            system_artwork_schedule_retry(current_track);
         } else if (same_inflight &&
                    (loader.state == ArtworkLoadState::NoArtwork || loader.state == ArtworkLoadState::Failed)) {
             g_artwork_stage = ArtworkCurrentStage::Complete;
@@ -459,7 +471,8 @@ static void system_artwork_current_update()
             }
             if (snapshot.state == ArtworkLoadState::Idle) {
                 system_artwork_schedule_retry(current_track);
-            } else if (snapshot.state == ArtworkLoadState::Failed && snapshot.result == ESP_ERR_TIMEOUT) {
+            } else if (snapshot.state == ArtworkLoadState::Failed &&
+                       system_artwork_load_failure_retryable(snapshot.result)) {
                 system_artwork_schedule_retry(current_track);
             } else if (snapshot.state == ArtworkLoadState::NoArtwork ||
                        snapshot.state == ArtworkLoadState::Failed) {

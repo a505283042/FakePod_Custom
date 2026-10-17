@@ -11,6 +11,7 @@
 #include "media_catalog_v2.h"
 #include "nas_library_source.h"
 #include "player_control.h"
+#include "remote_music_seek.h"
 #include "ui/screens/player_home.h"
 #include "screen_lock_simple.h"
 #include "player_state.h"
@@ -223,6 +224,10 @@ static void build_status(uint8_t packet[kStatusPacketSize])
     if (video_valid) flags |= 0x08U;
     if (nsf_valid) flags |= 0x10U;
     if (music_remote_ui_available()) flags |= 0x20U; // Music APP foreground
+    if (player_state_get_source() == PlayerMediaSource::Nas ||
+        (audio_valid && audio.source == AudioPlaybackSource::NasHttp)) flags |= 0x40U;
+    if (!nsf_valid && !video_valid && music_remote_ui_available() && audio_valid &&
+        player_control_local_seek_available(audio)) flags |= 0x80U;
     packet[5] = flags;
 
     write_u32_le(&packet[6], track);
@@ -271,6 +276,11 @@ static bool execute_command(const uint8_t *payload, size_t size)
         case 0x13U: return size == 1U && music_remote_ui_available() && screen_lock_simple_remote_request(2U); // lock
         case 0x14U: return size == 1U && music_remote_ui_available() && screen_lock_simple_remote_request(3U); // AOD
         case 0x15U: return size == 1U && music_remote_ui_available() && screen_lock_simple_remote_request(4U); // display off
+        case 0x18U: return music_remote_ui_available() && remote_music_seek_execute(payload, size);
+        case 0x16U: return size == 2U && payload[1] <= 1U && music_remote_ui_available() &&
+            player_home_remote_request_cover_shift(payload[1]);
+        case 0x17U: return size == 2U && payload[1] <= 2U && music_remote_ui_available() &&
+            player_home_remote_request_spectrum_style(payload[1]);
         default: return false;
     }
 }
@@ -554,6 +564,16 @@ static void service_task(void *)
                         close_fd(g_client_fd);
                         rx_size = 0U;
                         continue;
+                    }
+                    const uint8_t visual_status[4] = {
+                        0x04U, kProtocolVersion, 0x03U, player_home_remote_get_spectrum_style()};
+                    if (!send_frame(g_client_fd, visual_status, sizeof(visual_status))) {
+                        close_fd(g_client_fd); rx_size = 0U; continue;
+                    }
+                    uint8_t seek_status[19] = {};
+                    remote_music_seek_build_status(seek_status, music_remote_ui_available());
+                    if (!send_frame(g_client_fd, seek_status, sizeof(seek_status))) {
+                        close_fd(g_client_fd); rx_size = 0U; continue;
                     }
                     if (sent_metadata_sequence != g_metadata_sequence) {
                         if (send_metadata(g_client_fd)) {

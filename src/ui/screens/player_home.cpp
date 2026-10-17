@@ -3130,6 +3130,58 @@ static bool player_home_handle_vertical_track_swipe(
 static bool player_home_set_visual_mode(MusicVisualMode mode);
 static std::atomic<uint8_t> g_remote_view_request{0U}; // 0=none, 1..4=requested view
 static std::atomic<uint8_t> g_remote_view_actual{0U};
+static std::atomic<int32_t> g_remote_cover_steps{0};
+static std::atomic<uint8_t> g_remote_spectrum_request{0U};
+static std::atomic<uint8_t> g_remote_spectrum_actual{0U};
+static std::atomic<uint32_t> g_remote_visual_issued_us{0U};
+
+bool player_home_remote_request_cover_shift(uint8_t direction)
+{
+    if (direction > 1U || player_home_remote_get_view() != 1U) return false;
+    g_remote_visual_issued_us.store(static_cast<uint32_t>(esp_timer_get_time()), std::memory_order_relaxed);
+    int32_t before = g_remote_cover_steps.load(std::memory_order_relaxed);
+    const int32_t step = direction == 0U ? -1 : 1;
+    for (;;) {
+        const int32_t next = before + step;
+        if (next < -8 || next > 8) return false;
+        if (g_remote_cover_steps.compare_exchange_weak(before, next,
+                std::memory_order_release, std::memory_order_relaxed)) return true;
+    }
+}
+
+bool player_home_remote_request_spectrum_style(uint8_t style)
+{
+    if (style > 2U || player_home_remote_get_view() != 3U) return false;
+    g_remote_visual_issued_us.store(static_cast<uint32_t>(esp_timer_get_time()), std::memory_order_relaxed);
+    g_remote_spectrum_request.store(static_cast<uint8_t>(style + 1U), std::memory_order_release);
+    return true;
+}
+
+uint8_t player_home_remote_get_spectrum_style()
+{
+    return g_remote_spectrum_actual.load(std::memory_order_acquire);
+}
+
+static void player_home_consume_remote_visual_controls()
+{
+    const int32_t steps = g_remote_cover_steps.exchange(0, std::memory_order_acq_rel);
+    const uint8_t style = g_remote_spectrum_request.exchange(0U, std::memory_order_acq_rel);
+    if (static_cast<uint32_t>(esp_timer_get_time()) - g_remote_visual_issued_us.load(std::memory_order_relaxed) > 500000U) return;
+    if (!g_app_foreground || library_view_is_visible() || g_launcher_visible ||
+        screen_lock_simple_get_power() != ScreenPowerNormal ||
+        screen_lock_simple_get_lock() != ScreenLockUnlocked) return;
+    if (steps != 0 && !lyrics_view_is_visible() && !spectrum_view_is_visible() &&
+        g_music_visual_mode == MusicVisualMode::Cassette) {
+        const int32_t count = steps < 0 ? -steps : steps;
+        for (int32_t i = 0; i < count; ++i) {
+            (void)cassette_view_adjust_cover(steps < 0 ? 0U : 1U);
+        }
+    }
+    if (style != 0U && spectrum_view_is_visible()) {
+        (void)spectrum_view_set_style(static_cast<uint8_t>(style - 1U));
+    }
+}
+
 
 bool player_home_remote_request_view(uint8_t view)
 {
@@ -3149,6 +3201,7 @@ static void player_home_update_remote_view_status()
         (spectrum_view_is_visible() ? 3U :
          (g_music_visual_mode == MusicVisualMode::Cassette ? 1U : 0U));
     g_remote_view_actual.store(view, std::memory_order_release);
+    g_remote_spectrum_actual.store(spectrum_view_current_style_id(), std::memory_order_release);
 }
 
 static void player_home_consume_remote_view()
@@ -3235,6 +3288,7 @@ static void player_home_consume_remote_view()
 static void player_home_gesture_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
+    player_home_consume_remote_visual_controls();
     if (!g_app_foreground) {
         return;
     }
