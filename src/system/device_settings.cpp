@@ -546,6 +546,10 @@ esp_err_t device_settings_set_music_list_selection_for_source(
         return ESP_ERR_INVALID_SIZE;
     }
 
+    // Re-selecting the same directory must not synchronously rewrite Flash.
+    if (selection.scope == scope && strcmp(selection.level1_path, level1_path) == 0 &&
+        strcmp(selection.level2_path, level2_path) == 0) return ESP_OK;
+
     const DeviceMusicListSelection old_selection = selection;
     const DeviceMusicListScope old_active_scope = g_settings.music_list_scope;
     selection.scope = scope;

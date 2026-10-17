@@ -13,6 +13,7 @@
 #include "player_control.h"
 #include "remote_music_seek.h"
 #include "ui/screens/player_home.h"
+#include "ui/screens/library_view.h"
 #include "screen_lock_simple.h"
 #include "player_state.h"
 #include "video_app.h"
@@ -42,7 +43,9 @@ static constexpr size_t kMetadataChunkCountMax =
     (kMetadataMaxBytes + kMetadataChunkBytes - 1U) / kMetadataChunkBytes;
 static constexpr size_t kMetadataWireMaxBytes =
     kMetadataChunkCountMax * (2U + 6U + kMetadataChunkBytes);
-static constexpr TickType_t kStatusInterval = pdMS_TO_TICKS(500);
+// The Android client disconnects after 3 seconds without a complete Wi-Fi frame.
+static constexpr TickType_t kStatusCheckInterval = pdMS_TO_TICKS(250);
+static constexpr TickType_t kStatusResyncInterval = pdMS_TO_TICKS(1500);
 static constexpr TickType_t kTaskStopTimeout = pdMS_TO_TICKS(1200);
 // R46.0.59: runtime HWM ~=3.2KB free on 6144B stack; retain >2KB measured margin.
 static constexpr uint32_t kTaskStackBytes = 5120U;
@@ -243,6 +246,16 @@ static void build_status(uint8_t packet[kStatusPacketSize])
     write_u16_le(&packet[18], g_metadata_sequence);
 }
 
+// Ignore the continuously advancing playback position and battery ADC drift.
+// The phone interpolates position between snapshots; periodic sync still corrects it.
+static bool status_semantic_changed(const uint8_t *current, const uint8_t *last)
+{
+    return current[2] != last[2] || current[3] != last[3] ||
+        ((current[5] ^ last[5]) & static_cast<uint8_t>(~0x02U)) != 0U ||
+        memcmp(&current[6], &last[6], 4U) != 0 ||
+        memcmp(&current[14], &last[14], 6U) != 0;
+}
+
 static bool execute_command(const uint8_t *payload, size_t size)
 {
     if (payload == nullptr || size == 0U) return false;
@@ -259,6 +272,7 @@ static bool execute_command(const uint8_t *payload, size_t size)
             : (command == 0x02U ? VideoRemoteCommand::Next : VideoRemoteCommand::Previous);
         return video_app_remote_submit(video_command);
     }
+    if (command == 0x30U) return library_view_remote_submit(payload, size);
     switch (command) {
         case 0x01U: return size == 1U && player_control_toggle_play_pause();
         case 0x02U: return size == 1U && player_control_next();
@@ -445,7 +459,16 @@ static void service_task(void *)
     ESP_LOGI(TAG, "Wi-Fi遥控已启动：UDP=%u TCP=%u protocol=V1", kDiscoveryPort, kControlPort);
 
     TickType_t status_due = 0;
+    TickType_t status_check_due = 0;
+    uint8_t last_status[kStatusPacketSize] = {};
+    bool status_sent = false;
+    uint8_t last_seek_status[19] = {};
+    bool seek_status_sent = false;
     uint16_t sent_metadata_sequence = 0U;
+    uint8_t last_ui_status[6] = {};
+    bool ui_status_sent = false;
+    uint8_t last_visual_status[4] = {};
+    bool visual_status_sent = false;
     uint8_t rx_buffer[128] = {};
     size_t rx_size = 0U;
 
@@ -465,7 +488,7 @@ static void service_task(void *)
             if (g_client_fd > max_fd) max_fd = g_client_fd;
         }
         timeval timeout = {};
-        timeout.tv_usec = 100000;
+        timeout.tv_usec = library_view_remote_pending() ? 20000 : 100000;
         const int ready = select(max_fd + 1, &read_set, nullptr, nullptr, &timeout);
         if (ready < 0 && errno != EINTR) {
             ESP_LOGW(TAG, "Wi-Fi遥控select失败：errno=%d", errno);
@@ -497,11 +520,17 @@ static void service_task(void *)
             socklen_t peer_len = sizeof(peer);
             const int client = accept(g_listen_fd, reinterpret_cast<sockaddr *>(&peer), &peer_len);
             if (client >= 0) {
+                library_view_remote_reset();
                 close_fd(g_client_fd);
                 g_client_fd = client;
                 rx_size = 0U;
                 sent_metadata_sequence = 0U;
                 status_due = 0;
+                status_check_due = 0;
+                status_sent = false;
+                seek_status_sent = false;
+                ui_status_sent = false;
+                visual_status_sent = false;
                 char peer_text[16] = {};
                 inet_ntoa_r(peer.sin_addr, peer_text, sizeof(peer_text));
                 ESP_LOGI(TAG, "手机Wi-Fi遥控已连接：%s", peer_text);
@@ -535,7 +564,7 @@ static void service_task(void *)
                     if (rx_size - consumed < payload_size + 2U) break;
                     const uint8_t *payload = &rx_buffer[consumed + 2U];
                     const bool ok = execute_command(payload, payload_size);
-                    ESP_LOGI(TAG, "Wi-Fi手机控制：command=0x%02X result=%s",
+                    if (payload[0] != 0x30U) ESP_LOGI(TAG, "Wi-Fi手机控制：command=0x%02X result=%s",
                         static_cast<unsigned>(payload[0]), ok ? "OK" : "FAIL");
                     consumed += payload_size + 2U;
                 }
@@ -547,34 +576,72 @@ static void service_task(void *)
             }
         }
 
+        if (g_client_fd < 0) library_view_remote_reset();
+        if (g_client_fd >= 0) {
+            uint8_t library_frame[255];
+            size_t library_size = 0;
+            // At most one 2KB page per loop, preserving normal status and discovery.
+            while (library_view_remote_take_frame(library_frame, &library_size)) {
+                if (!send_frame(g_client_fd, library_frame, library_size)) {
+                    close_fd(g_client_fd); rx_size = 0U; library_view_remote_reset(); break;
+                }
+            }
+        }
         if (g_client_fd >= 0) {
             const TickType_t now = xTaskGetTickCount();
-            if (status_due == 0 || static_cast<int32_t>(now - status_due) >= 0) {
+            if (status_check_due == 0 || static_cast<int32_t>(now - status_check_due) >= 0) {
+                status_check_due = now + kStatusCheckInterval;
                 uint8_t status[kStatusPacketSize] = {};
                 build_status(status);
+                uint8_t seek_status[19] = {};
+                remote_music_seek_build_status(seek_status, music_remote_ui_available());
+                const bool send_status = !status_sent ||
+                    status_due == 0 || static_cast<int32_t>(now - status_due) >= 0 ||
+                    status_semantic_changed(status, last_status) ||
+                    !seek_status_sent || memcmp(seek_status, last_seek_status, sizeof(seek_status)) != 0;
+                if (!send_status) continue;
                 if (!send_frame(g_client_fd, status, sizeof(status))) {
                     ESP_LOGI(TAG, "手机Wi-Fi遥控发送失败，关闭TCP会话");
                     close_fd(g_client_fd);
                     rx_size = 0U;
                 } else {
-                    status_due = now + kStatusInterval;
+                    status_due = now + kStatusResyncInterval;
+                    memcpy(last_status, status, sizeof(status));
+                    status_sent = true;
                     uint8_t ui_status[6] = {};
                     build_remote_ui_status(ui_status);
-                    if (!send_frame(g_client_fd, ui_status, sizeof(ui_status))) {
-                        close_fd(g_client_fd);
-                        rx_size = 0U;
-                        continue;
+                    if (!ui_status_sent ||
+                        memcmp(ui_status, last_ui_status, sizeof(ui_status)) != 0) {
+                        if (!send_frame(g_client_fd, ui_status, sizeof(ui_status))) {
+                            close_fd(g_client_fd);
+                            rx_size = 0U;
+                            continue;
+                        }
+                        memcpy(last_ui_status, ui_status, sizeof(ui_status));
+                        ui_status_sent = true;
                     }
+
                     const uint8_t visual_status[4] = {
-                        0x04U, kProtocolVersion, 0x03U, player_home_remote_get_spectrum_style()};
-                    if (!send_frame(g_client_fd, visual_status, sizeof(visual_status))) {
-                        close_fd(g_client_fd); rx_size = 0U; continue;
+                        0x04U, kProtocolVersion, 0x03U,
+                        player_home_remote_get_spectrum_style()};
+                    if (!visual_status_sent ||
+                        memcmp(visual_status, last_visual_status,
+                               sizeof(visual_status)) != 0) {
+                        if (!send_frame(g_client_fd, visual_status,
+                                        sizeof(visual_status))) {
+                            close_fd(g_client_fd);
+                            rx_size = 0U;
+                            continue;
+                        }
+                        memcpy(last_visual_status, visual_status,
+                               sizeof(visual_status));
+                        visual_status_sent = true;
                     }
-                    uint8_t seek_status[19] = {};
-                    remote_music_seek_build_status(seek_status, music_remote_ui_available());
                     if (!send_frame(g_client_fd, seek_status, sizeof(seek_status))) {
                         close_fd(g_client_fd); rx_size = 0U; continue;
                     }
+                    memcpy(last_seek_status, seek_status, sizeof(seek_status));
+                    seek_status_sent = true;
                     if (sent_metadata_sequence != g_metadata_sequence) {
                         if (send_metadata(g_client_fd)) {
                             sent_metadata_sequence = g_metadata_sequence;
@@ -588,6 +655,7 @@ static void service_task(void *)
         }
     }
 
+    library_view_remote_reset();
     close_fd(g_client_fd);
     close_fd(g_listen_fd);
     close_fd(g_udp_fd);

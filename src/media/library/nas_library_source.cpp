@@ -64,7 +64,7 @@ static bool copy_component_path(char *out, size_t out_size, const char *prefix, 
     return written > 0 && static_cast<size_t>(written) < out_size;
 }
 
-static bool level1_option_at(size_t wanted, bool require_level2, char *out_path, size_t out_path_size, uint32_t *out_count)
+static bool level1_option_at(size_t wanted, bool require_level2, char *out_path, size_t out_path_size, uint32_t *out_count, size_t *out_total = nullptr)
 {
     size_t visible = 0U;
     uint32_t i = 0U;
@@ -106,6 +106,7 @@ static bool level1_option_at(size_t wanted, bool require_level2, char *out_path,
         }
         i = j > i ? j : i + 1U;
     }
+    if (out_total != nullptr) *out_total = visible;
     return false;
 }
 
@@ -114,8 +115,10 @@ static bool level2_option_at(
     size_t wanted,
     char *out_path,
     size_t out_path_size,
-    uint32_t *out_count)
+    uint32_t *out_count,
+    size_t *out_total = nullptr)
 {
+    if (out_total != nullptr) *out_total = 0U;
     if (parent_path == nullptr || parent_path[0] == '\0') return false;
     const size_t prefix_len = strlen(parent_path);
     size_t visible = 0U;
@@ -158,6 +161,7 @@ static bool level2_option_at(
         }
         i = j > i ? j : i + 1U;
     }
+    if (out_total != nullptr) *out_total = visible;
     return false;
 }
 
@@ -530,11 +534,13 @@ size_t nas_library_source_folder_option_count(PlayerFolderScope scope, const cha
 {
     if (!nas_library_source_ready()) return 0U;
     size_t count = 0U;
-    char path[PLAYER_FOLDER_PATH_MAX] = {};
+    // Count in one pass. Repeated option_at(0..N) rescanned the catalog from
+    // the beginning for every folder, including each UI/phone list-count query.
+    // SIZE_MAX selects no output row, so no temporary path buffer is needed.
     if (scope == PlayerFolderScope::Level1) {
-        while (level1_option_at(count, false, path, sizeof(path), nullptr)) ++count;
+        (void)level1_option_at(SIZE_MAX, false, nullptr, 0U, nullptr, &count);
     } else if (scope == PlayerFolderScope::Level2) {
-        while (level2_option_at(parent_path, count, path, sizeof(path), nullptr)) ++count;
+        (void)level2_option_at(parent_path, SIZE_MAX, nullptr, 0U, nullptr, &count);
     }
     return count;
 }

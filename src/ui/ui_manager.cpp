@@ -57,7 +57,7 @@ static bool g_boot_reveal_pending = false;
 static int64_t g_boot_reveal_retry_started_us = 0;
 static uint8_t g_boot_reveal_retry_count = 0U;
 static lv_timer_t *g_display_visibility_guard_timer = nullptr;
-static constexpr uint32_t kLvglTaskStackBytes = 6144U;
+static constexpr uint32_t kLvglTaskStackBytes = 8192U;
 static bool g_ready = false;
 
 // 首次建库进度由扫描任务只写入轻量计数，真正的 LVGL 文本更新由

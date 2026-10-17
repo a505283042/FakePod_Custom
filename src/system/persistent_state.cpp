@@ -47,6 +47,8 @@ struct PersistentStateData
     uint8_t volume = 50U;
     PlayerLoopMode loop_mode = PlayerLoopMode::Sequential;
     PersistentResumeData resume = {};
+    char *local_path = nullptr; // independent TF last-selected track
+    bool local_dirty = false;
     uint32_t dirty_bits = PERSISTENT_DIRTY_NONE;
 };
 
@@ -266,6 +268,10 @@ static esp_err_t persistent_load_resume()
     loaded.valid = true;
     persistent_resume_clear(&g_state.resume);
     g_state.resume = loaded;
+    // V1/V2 migration: when last-used source is local, seed its independent slot.
+    if (loaded.source == PlayerMediaSource::Local) {
+        (void)persistent_replace_string(&g_state.local_path, loaded.track_path);
+    }
     nvs_close(handle);
     return ESP_OK;
 }
@@ -273,6 +279,7 @@ static esp_err_t persistent_load_resume()
 esp_err_t persistent_state_init()
 {
     persistent_resume_clear(&g_state.resume);
+    persistent_free_string(&g_state.local_path);
     g_state = {};
     g_state.volume = 50U;
     g_state.loop_mode = PlayerLoopMode::Sequential;
@@ -321,6 +328,18 @@ esp_err_t persistent_state_init()
         ESP_LOGW(TAG, "NVS audio namespace 读取失败：%s", esp_err_to_name(audio_ret));
     }
     const esp_err_t resume_ret = persistent_load_resume();
+    // Keep the separately saved local selection even when primary resume is NAS.
+    nvs_handle_t local_handle = 0;
+    if (nvs_open(kResumeNamespace, NVS_READONLY, &local_handle) == ESP_OK) {
+        char *saved = nullptr;
+        if (persistent_nvs_read_string(local_handle, "local_path", &saved) == ESP_OK && saved[0] != '\0') {
+            persistent_free_string(&g_state.local_path);
+            g_state.local_path = saved;
+        } else {
+            persistent_free_string(&saved);
+        }
+        nvs_close(local_handle);
+    }
     if (resume_ret != ESP_OK) {
         ESP_LOGW(TAG, "NVS resume namespace 读取失败：%s", esp_err_to_name(resume_ret));
     }
@@ -503,6 +522,17 @@ static bool persistent_restore_nas_context(size_t track_index)
     return false;
 }
 
+bool persistent_state_restore_local_player()
+{
+    if (!g_state.ready || !player_state_is_ready() || media_library_get_count() == 0U) return false;
+    size_t index = 0;
+    if (g_state.local_path != nullptr && persistent_find_track_by_path(g_state.local_path, &index)) {
+        return player_state_select_all_tracks(index);
+    }
+    // An invalid or absent local record falls back to TF first song.
+    return player_state_select_all_tracks(0U);
+}
+
 bool persistent_state_restore_player()
 {
     if (!g_state.ready) {
@@ -517,6 +547,11 @@ bool persistent_state_restore_player()
         }
     }
 
+    DeviceSettingsSnapshot settings = {};
+    const bool wifi_off = device_settings_get_snapshot(&settings) && !settings.wifi_enabled;
+    if (wifi_off) {
+        return persistent_state_restore_local_player() && ok;
+    }
     if (!g_state.schema_valid || !g_state.resume.valid) {
         return ok;
     }
@@ -559,7 +594,9 @@ bool persistent_state_restore_player()
 
 bool persistent_state_resume_requires_nas()
 {
+    DeviceSettingsSnapshot settings = {};
     return g_state.ready && g_state.schema_valid && g_state.resume.valid &&
+        device_settings_get_snapshot(&settings) && settings.wifi_enabled &&
         g_state.resume.source == PlayerMediaSource::Nas;
 }
 
@@ -639,6 +676,11 @@ static bool persistent_capture_resume()
         !persistent_string_equal(g_state.resume.album_artist, album_artist) ||
         g_state.resume.decade != decade ||
         g_state.resume.decade_unknown != decade_unknown;
+    if (source == PlayerMediaSource::Local &&
+        !persistent_string_equal(g_state.local_path, path)) {
+        if (!persistent_replace_string(&g_state.local_path, path)) return false;
+        g_state.local_dirty = true;
+    }
     if (!changed) {
         return true;
     }
@@ -656,6 +698,22 @@ static bool persistent_capture_resume()
     g_state.resume.decade_unknown = decade_unknown;
     g_state.dirty_bits |= PERSISTENT_DIRTY_RESUME;
     return true;
+}
+
+esp_err_t persistent_state_checkpoint_local()
+{
+    if (!g_state.ready || !player_state_is_ready() ||
+        player_state_get_source() != PlayerMediaSource::Local) return ESP_OK;
+    if (!persistent_capture_resume()) return ESP_FAIL;
+    if (g_state.local_path == nullptr || g_state.local_path[0] == '\0') return ESP_OK;
+    nvs_handle_t handle = 0;
+    esp_err_t ret = nvs_open(kResumeNamespace, NVS_READWRITE, &handle);
+    if (ret != ESP_OK) return ret;
+    ret = nvs_set_str(handle, "local_path", g_state.local_path);
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    nvs_close(handle);
+    if (ret == ESP_OK) g_state.local_dirty = false;
+    return ret;
 }
 
 void persistent_state_observe_runtime()
@@ -762,10 +820,14 @@ static esp_err_t persistent_flush_resume()
             break;
     }
 
+    if (ret == ESP_OK && g_state.local_path != nullptr && g_state.local_path[0] != '\0') {
+        ret = nvs_set_str(handle, "local_path", g_state.local_path);
+    }
     if (ret == ESP_OK) {
         ret = nvs_commit(handle);
     }
     nvs_close(handle);
+    if (ret == ESP_OK) g_state.local_dirty = false;
     return ret;
 }
 
@@ -799,7 +861,15 @@ esp_err_t persistent_state_discard_nas_resume()
     uint8_t stored_source = 0;
     const esp_err_t source_ret = nvs_get_u8(handle, "source", &stored_source);
     if (source_ret == ESP_OK && stored_source == static_cast<uint8_t>(PlayerMediaSource::Nas)) {
-        ret = nvs_erase_all(handle); // 只擦除 resume 命名空间，不触碰设备NVS设置。
+        // Preserve local_path while clearing old NAS resume fields.
+        ret = nvs_erase_key(handle, "track_path");
+        if (ret == ESP_OK) ret = nvs_erase_key(handle, "source");
+        if (ret == ESP_OK) ret = nvs_erase_key(handle, "list_type");
+        if (ret == ESP_OK) ret = persistent_erase_key_if_present(handle, "artist");
+        if (ret == ESP_OK) ret = persistent_erase_key_if_present(handle, "album_title");
+        if (ret == ESP_OK) ret = persistent_erase_key_if_present(handle, "album_artist");
+        if (ret == ESP_OK) ret = persistent_erase_key_if_present(handle, "decade");
+        if (ret == ESP_OK) ret = persistent_erase_key_if_present(handle, "dec_unknown");
         if (ret == ESP_OK) ret = nvs_commit(handle);
     } else if (source_ret == ESP_OK || source_ret == ESP_ERR_NVS_NOT_FOUND) {
         ret = ESP_OK;
@@ -819,7 +889,7 @@ esp_err_t persistent_state_flush()
     // flush 是唯一 Flash 写入口；先捕获调用瞬间的最新 RAM 状态。
     persistent_state_observe_runtime();
     const uint32_t dirty = g_state.dirty_bits;
-    if (dirty == PERSISTENT_DIRTY_NONE) {
+    if (dirty == PERSISTENT_DIRTY_NONE && !g_state.local_dirty) {
         return ESP_OK;
     }
 
@@ -827,7 +897,7 @@ esp_err_t persistent_state_flush()
     if ((dirty & PERSISTENT_DIRTY_AUDIO) != 0U) {
         ret = persistent_flush_audio();
     }
-    if (ret == ESP_OK && (dirty & PERSISTENT_DIRTY_RESUME) != 0U) {
+    if (ret == ESP_OK && ((dirty & PERSISTENT_DIRTY_RESUME) != 0U || g_state.local_dirty)) {
         ret = persistent_flush_resume();
     }
     // schema 最后提交：第一次写入中途掉电时，没有 schema 的半成品不会在下次启动被恢复。

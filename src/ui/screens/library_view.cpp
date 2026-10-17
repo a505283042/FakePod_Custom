@@ -372,11 +372,14 @@ static LibraryRememberedSourceState *g_nas_remembered_state = nullptr;
 
 static portMUX_TYPE g_nas_load_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool g_nas_load_running = false;
+// Captured on the UI thread; background phone sync must not raise a device page.
+static bool g_nas_load_show = true;
 static DeviceMusicListScope g_nas_load_scope = DeviceMusicListScope::All;
 static esp_err_t g_nas_load_result = ESP_OK;
 static uint32_t g_nas_load_stack_hwm = 0U;
 static uint32_t g_nas_load_elapsed_ms = 0U;
 static std::atomic<bool> g_nas_index_reload_pending{false};
+static std::atomic<bool> g_playback_focus_pending{false};
 static bool g_nas_index_reload_active = false;
 // Only a committed server switch may silently bind the newly loaded NAS queue.
 // Ordinary browsing and same-server index reloads keep their existing playback context.
@@ -401,6 +404,7 @@ static LibraryBrowseMode library_view_category_mode_for_detail();
 static void library_view_return_to_parent_category();
 static void library_view_finish_nas_load_async(void *);
 static void library_view_nas_index_reload_timer_cb(lv_timer_t *);
+static void library_remote_timer(lv_timer_t *);
 static void library_view_nas_index_reload_async(void *);
 static void library_view_update_nas_load_stage_async(void *stage_value);
 static bool library_view_nas_catalog_needed_by_playback();
@@ -1965,9 +1969,75 @@ static int32_t library_view_scroll_for_position(uint32_t position)
     return static_cast<int32_t>(top_position * static_cast<uint32_t>(LIBRARY_ROW_STEP));
 }
 
+// Cache the first matching scroll target, not Catalog pointers.
+// A collaboration may belong to several artist groups; row highlighting keeps all of them.
+static uint32_t library_view_current_group(LibraryBrowseMode mode)
+{
+    if (!player_state_is_ready() ||
+        player_state_get_source() != (library_source_is_nas() ? PlayerMediaSource::Nas : PlayerMediaSource::Local) ||
+        (mode != LibraryBrowseMode::Artists && mode != LibraryBrowseMode::Albums && mode != LibraryBrowseMode::Decades)) {
+        return UINT32_MAX;
+    }
+    struct CurrentGroupCache {
+        bool valid = false;
+        LibraryDataSource source = LibraryDataSource::Local;
+        LibraryBrowseMode mode = LibraryBrowseMode::AllTracks;
+        uint32_t generation = 0U, track = UINT32_MAX, group = UINT32_MAX;
+    };
+    static CurrentGroupCache cache;
+    const uint32_t generation = library_source_generation();
+    const uint32_t track = static_cast<uint32_t>(player_state_get_index());
+    if (cache.valid && cache.source == g_source && cache.generation == generation &&
+        cache.track == track && cache.mode == mode) return cache.group;
+    uint32_t found = UINT32_MAX;
+    const uint32_t count = library_view_top_level_count(mode);
+    for (uint32_t position = 0U; position < count && found == UINT32_MAX; ++position) {
+        const uint32_t *indices = nullptr;
+        uint32_t size = 0U;
+        if (mode == LibraryBrowseMode::Artists) {
+            MediaArtistGroupViewV2 view = {};
+            if (!library_source_get_artist(position, &view)) continue;
+            indices = view.track_indices; size = view.track_count;
+        } else if (mode == LibraryBrowseMode::Albums) {
+            MediaAlbumGroupViewV2 view = {};
+            if (!library_source_get_album(position, &view)) continue;
+            indices = view.track_indices; size = view.track_count;
+        } else {
+            MediaDecadeGroupViewV2 view = {};
+            if (!library_source_get_decade(position, &view)) continue;
+            indices = view.track_indices; size = view.track_count;
+        }
+        if (indices == nullptr) continue;
+        for (uint32_t i = 0U; i < size; ++i) {
+            if (indices[i] == track) { found = position; break; }
+        }
+    }
+    cache.valid = true; cache.source = g_source; cache.mode = mode;
+    cache.generation = generation; cache.track = track; cache.group = found;
+    return found;
+}
+
+static bool library_view_group_contains_current_track(LibraryBrowseMode mode, uint32_t group_index)
+{
+    if (group_index == UINT32_MAX) return false;
+    const uint32_t first = library_view_current_group(mode);
+    if (first == UINT32_MAX) return false;
+    if (first == group_index) return true;
+    // Album/decade membership is unique; artist membership includes collaborators
+    // and album artists, so other matching artist rows must remain highlighted.
+    if (mode != LibraryBrowseMode::Artists) return false;
+    MediaArtistGroupViewV2 view = {};
+    if (!library_source_get_artist(group_index, &view) || view.track_indices == nullptr) return false;
+    const uint32_t track = static_cast<uint32_t>(player_state_get_index());
+    for (uint32_t i = 0U; i < view.track_count; ++i) {
+        if (view.track_indices[i] == track) return true;
+    }
+    return false;
+}
+
 static bool library_view_focus_current_playback()
 {
-    // 只在“当前播放源 == 当前浏览源”且当前页本身就是歌曲列表时定位。
+    // 当前播放源必须匹配浏览源；歌曲页与歌手/专辑/年代分组页都可定位。
     // 不切换 BrowseContext，不恢复搜索，也不抢文件夹选择页的滚动位置。
     if (!player_state_is_ready() || g_search.active || library_view_folder_browser_active()) {
         return false;
@@ -2009,6 +2079,14 @@ static bool library_view_focus_current_playback()
         }
         if (current_position != UINT32_MAX) {
             g_state.detail_scroll_y = library_view_scroll_for_position(current_position);
+        }
+    } else if (g_state.mode == LibraryBrowseMode::Artists ||
+               g_state.mode == LibraryBrowseMode::Albums ||
+               g_state.mode == LibraryBrowseMode::Decades) {
+        current_position = library_view_current_group(g_state.mode);
+        if (current_position != UINT32_MAX) {
+            g_state.top_scroll_y[static_cast<uint8_t>(g_state.mode)] =
+                library_view_scroll_for_position(current_position);
         }
     } else {
         return false;
@@ -2578,7 +2656,8 @@ static bool library_view_bind_top_row(LibraryVirtualRow &row, uint32_t item_inde
         primary = view.title;
         if (view.artist != nullptr && view.artist[0] != '\0') {
             library_view_set_row_text(row, primary, view.artist);
-            library_view_reset_row_style(row, false, true);
+            library_view_reset_row_style(
+                row, library_view_group_contains_current_track(g_state.mode, item_index), true);
             return true;
         }
         snprintf(secondary, sizeof(secondary), "%lu首", static_cast<unsigned long>(view.track_count));
@@ -2605,7 +2684,8 @@ static bool library_view_bind_top_row(LibraryVirtualRow &row, uint32_t item_inde
     }
 
     library_view_set_row_text(row, primary, secondary);
-    library_view_reset_row_style(row, false, true);
+    library_view_reset_row_style(
+        row, library_view_group_contains_current_track(g_state.mode, item_index), true);
     return true;
 }
 
@@ -2795,6 +2875,7 @@ static void library_view_switch_category(int direction)
     g_state.mode = static_cast<LibraryBrowseMode>(index);
     g_state.detail_type = PlayerListType::AllTracks;
     g_state.detail_group_index = UINT32_MAX;
+    (void)library_view_focus_current_playback();
     library_view_render(true);
     UI_PAGE_INTERACTION_LOGI("曲库横滑切换：mode=%ld", static_cast<long>(index));
 }
@@ -2905,17 +2986,12 @@ static bool library_view_nas_wifi_enabled_for_playback()
     return false;
 }
 
-static void library_view_row_clicked_cb(lv_event_t *event)
+static bool library_view_activate_binding(LibraryRowBinding *row)
 {
-    if (lv_event_get_code(event) != LV_EVENT_CLICKED || library_click_suppressed()) {
-        return;
-    }
-
-    LibraryRowBinding *row = static_cast<LibraryRowBinding *>(lv_event_get_user_data(event));
     if (row == nullptr || row->generation == 0U || row->generation != library_source_generation()) {
         ESP_LOGW(TAG, "点击行已过期，刷新曲库视图");
         library_view_schedule_render();
-        return;
+        return false;
     }
 
     const bool selecting_track =
@@ -2923,12 +2999,12 @@ static void library_view_row_clicked_cb(lv_event_t *event)
         row->action == LibraryRowAction::PlayFolderTrack ||
         row->action == LibraryRowAction::PlayGroupTrack;
     if (selecting_track && !library_view_validate_nas_search_track_origin(*row)) {
-        return;
+        return false;
     }
     // NAS 浏览不依赖 Wi-Fi，但真正点歌时如果用户明确关闭了 Wi-Fi，
     // 必须在提交 PlayerState 前提示并拦截，避免“旧音频继续播、当前歌曲却已切 NAS”的假状态。
     if (selecting_track && library_source_is_nas() && !library_view_nas_wifi_enabled_for_playback()) {
-        return;
+        return false;
     }
     // NAS 网络播放当前接入 MP3/FLAC。先在提交 PlayerState 之前做能力检查，
     // 避免点击暂不支持的 OPUS 等格式后把统一“当前播放上下文”改成 NAS，
@@ -2938,13 +3014,13 @@ static void library_view_row_clicked_cb(lv_event_t *event)
         if (!library_source_get_track_view(row->track_index, &candidate) || candidate.row == nullptr) {
             ESP_LOGW(TAG, "NAS选歌预检失败：track=%lu",
                 static_cast<unsigned long>(row->track_index));
-            return;
+            return false;
         }
         if (candidate.row->format != MediaFormat::MP3 && candidate.row->format != MediaFormat::FLAC) {
             ESP_LOGW(TAG, "NAS当前阶段仅开放MP3/FLAC：track=%lu format=%s；保持当前播放上下文不变",
                 static_cast<unsigned long>(row->track_index),
                 media_format_name(candidate.row->format));
-            return;
+            return false;
         }
     }
     const bool transition_hold = selecting_track && !library_source_is_nas() &&
@@ -2975,8 +3051,9 @@ static void library_view_row_clicked_cb(lv_event_t *event)
                 : (row->action == LibraryRowAction::OpenAlbum ? PlayerListType::Album : PlayerListType::Decade);
             g_state.detail_group_index = row->group_index;
             g_state.detail_scroll_y = 0;
+            (void)library_view_focus_current_playback();
             library_view_schedule_render();
-            return;
+            return true;
         }
 
         case LibraryRowAction::PlayAllTrack:
@@ -2985,7 +3062,7 @@ static void library_view_row_clicked_cb(lv_event_t *event)
                     : player_control_select_all_tracks(row->position))) {
                 if (transition_hold) player_home_cancel_track_transition_hold();
                 ESP_LOGW(TAG, "选择全部歌曲位置失败：%lu", static_cast<unsigned long>(row->position));
-                return;
+                return false;
             }
             break;
 
@@ -2995,7 +3072,7 @@ static void library_view_row_clicked_cb(lv_event_t *event)
                     : player_control_select_local_folder_queue_position(row->position))) {
                 if (transition_hold) player_home_cancel_track_transition_hold();
                 ESP_LOGW(TAG, "选择目录列表位置失败：%lu", static_cast<unsigned long>(row->position));
-                return;
+                return false;
             }
             break;
 
@@ -3022,7 +3099,7 @@ static void library_view_row_clicked_cb(lv_event_t *event)
                     player_playlist_type_name(row->group_type),
                     static_cast<unsigned long>(row->group_index),
                     static_cast<unsigned long>(row->position));
-                return;
+                return false;
             }
             break;
         }
@@ -3037,7 +3114,7 @@ static void library_view_row_clicked_cb(lv_event_t *event)
                 !library_view_persist_folder_selection(PlayerFolderScope::Level1, path)) {
                 ESP_LOGW(TAG, "一级文件夹切换失败：pos=%lu",
                     static_cast<unsigned long>(row->position));
-                return;
+                return false;
             }
             g_state.folder_view = LibraryFolderView::Tracks;
             PlayerFolderQueueSnapshot queue = {};
@@ -3045,12 +3122,12 @@ static void library_view_row_clicked_cb(lv_event_t *event)
                 ? library_view_scroll_for_position(queue.position) : 0;
             library_view_schedule_render();
             UI_PAGE_INTERACTION_LOGI("一级列表文件夹已切换：%s", path);
-            return;
+            return true;
         }
 
         case LibraryRowAction::SelectLevel2Folder:
         {
-            if (!library_view_resolve_level2_parent()) return;
+            if (!library_view_resolve_level2_parent()) return false;
             char path[PLAYER_FOLDER_PATH_MAX] = {};
             if (!library_source_copy_folder_option_at(
                     PlayerFolderScope::Level2, g_state.level2_parent_path, row->position,
@@ -3059,7 +3136,7 @@ static void library_view_row_clicked_cb(lv_event_t *event)
                 ESP_LOGW(TAG, "二级文件夹切换失败：parent=%s pos=%lu",
                     g_state.level2_parent_path,
                     static_cast<unsigned long>(row->position));
-                return;
+                return false;
             }
             g_state.folder_view = LibraryFolderView::Tracks;
             PlayerFolderQueueSnapshot queue = {};
@@ -3067,7 +3144,7 @@ static void library_view_row_clicked_cb(lv_event_t *event)
                 ? library_view_scroll_for_position(queue.position) : 0;
             library_view_schedule_render();
             UI_PAGE_INTERACTION_LOGI("二级列表文件夹已切换：%s", path);
-            return;
+            return true;
         }
 
         case LibraryRowAction::SelectLevel2Parent:
@@ -3076,14 +3153,14 @@ static void library_view_row_clicked_cb(lv_event_t *event)
             if (!library_source_copy_folder_option_at(
                     PlayerFolderScope::Level1, nullptr, row->position,
                     path, sizeof(path), nullptr)) {
-                return;
+                return false;
             }
             snprintf(g_state.level2_parent_path, sizeof(g_state.level2_parent_path), "%s", path);
             g_state.folder_view = LibraryFolderView::Level2Folders;
             g_state.folder_scroll_y[1] = 0;
             library_view_schedule_render();
             UI_PAGE_INTERACTION_LOGI("二级目录父级切换：%s", path);
-            return;
+            return true;
         }
 
         case LibraryRowAction::FolderUp:
@@ -3091,10 +3168,10 @@ static void library_view_row_clicked_cb(lv_event_t *event)
             g_state.folder_scroll_y[2] = 0;
             library_view_schedule_render();
             UI_PAGE_INTERACTION_LOGI("二级文件夹：进入上一级目录列表");
-            return;
+            return true;
 
         case LibraryRowAction::None:
-            return;
+            return false;
     }
 
     if (selecting_track) {
@@ -3102,6 +3179,7 @@ static void library_view_row_clicked_cb(lv_event_t *event)
     }
     if (!player_control_play_current()) {
         ESP_LOGW(TAG, "曲库选歌后播放请求未能入队");
+        return false;
     }
     // R.36.2：必须先隐藏曲库再恢复主页；旧顺序先 refresh 时 QoS 仍看到曲库 visible，
     // 会让 Artwork 保持 inactive，切歌返回后存在黑屏/延迟恢复窗口。
@@ -3109,6 +3187,13 @@ static void library_view_row_clicked_cb(lv_event_t *event)
         lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
     }
     player_home_resume_from_fullscreen_view("library-select");
+    return true;
+}
+
+static void library_view_row_clicked_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED || library_click_suppressed()) return;
+    (void)library_view_activate_binding(static_cast<LibraryRowBinding *>(lv_event_get_user_data(event)));
 }
 
 static void library_view_return_to_parent_category()
@@ -3350,6 +3435,7 @@ void library_view_create(lv_obj_t *screen)
     }
     // 常驻轻量计时器仅在普通 NAS 同步真正提交新索引后尝试刷新 PSRAM。
     (void)lv_timer_create(library_view_nas_index_reload_timer_cb, 1000, nullptr);
+    (void)lv_timer_create(library_remote_timer, 20, nullptr);
 
     if (!quick_index_keyboard_create(
             &g_search_keyboard,
@@ -3439,7 +3525,7 @@ bool library_view_resume_after_app_switch()
     return true;
 }
 
-void library_view_open()
+void library_view_open(bool show)
 {
     if (g_root == nullptr) return;
     if (!media_catalog_v2_ready()) {
@@ -3511,9 +3597,11 @@ void library_view_open()
 
     (void)library_view_focus_current_playback();
     library_view_render(true);
-    lv_obj_remove_flag(g_root, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(g_root);
-    screen_lock_simple_raise();
+    if (show) {
+        lv_obj_remove_flag(g_root, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(g_root);
+        screen_lock_simple_raise();
+    }
     UI_PAGE_INTERACTION_LOGI("打开本地曲库：generation=%lu scope=%s resume=%s scroll=%ld",
         static_cast<unsigned long>(media_catalog_v2_generation()),
         player_playlist_folder_scope_name(player_playlist_get_folder_scope()),
@@ -3626,7 +3714,7 @@ static void library_view_nas_open_stage_cb(NasLibraryOpenStage stage, void *)
         reinterpret_cast<void *>(static_cast<uintptr_t>(stage) + 1U));
 }
 
-static void library_view_activate_nas_ui()
+static void library_view_activate_nas_ui(bool show = true)
 {
     library_view_inertia_stop(false);
     library_view_scrollbar_set_visible(false);
@@ -3653,9 +3741,11 @@ static void library_view_activate_nas_ui()
     (void)library_view_focus_current_playback();
     library_view_render(true);
     library_view_destroy_nas_loading_overlay();
-    lv_obj_remove_flag(g_root, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(g_root);
-    screen_lock_simple_raise();
+    if (show) {
+        lv_obj_remove_flag(g_root, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(g_root);
+        screen_lock_simple_raise();
+    }
 
     ESP_LOGI(TAG,
         "NAS使用现有曲库UI打开：tracks=%lu scope=%s resume=%s source_psram=%uB load=%lums stack_hwm=%lu internal=%u psram=%u",
@@ -3740,7 +3830,7 @@ static void library_view_finish_nas_load_async(void *)
 
     if (result == ESP_OK && nas_library_source_ready()) {
         library_view_bind_new_nas_playback();
-        library_view_activate_nas_ui();
+        library_view_activate_nas_ui(g_nas_load_show);
         return;
     }
 
@@ -3929,7 +4019,7 @@ static void library_view_nas_index_reload_async(void *)
     library_view_nas_index_reload_timer_cb(nullptr);
 }
 
-bool library_view_open_nas(DeviceMusicListScope scope)
+bool library_view_open_nas(DeviceMusicListScope scope, bool show)
 {
     if (nas_catalog_service_is_server_switching() || g_nas_index_reload_active) {
         ESP_LOGW(TAG, "NAS配置或索引重载中，暂不允许打开旧NAS曲库");
@@ -3946,13 +4036,14 @@ bool library_view_open_nas(DeviceMusicListScope scope)
             static_cast<unsigned long>(nas_library_source_track_count()),
             static_cast<unsigned>(nas_library_source_psram_bytes()));
         library_view_bind_new_nas_playback();
-        library_view_activate_nas_ui();
+        library_view_activate_nas_ui(show);
         return true;
     }
 
     taskENTER_CRITICAL(&g_nas_load_lock);
     const bool already_running = g_nas_load_running;
     if (!already_running) {
+        g_nas_load_show = show;
         g_nas_load_running = true;
         g_nas_load_scope = scope;
         g_nas_load_result = ESP_OK;
@@ -3960,7 +4051,13 @@ bool library_view_open_nas(DeviceMusicListScope scope)
         g_nas_load_elapsed_ms = 0U;
     }
     taskEXIT_CRITICAL(&g_nas_load_lock);
-    if (already_running) return true;
+    if (already_running) {
+        if (show) {
+            g_nas_load_show = true;
+            (void)library_view_show_nas_loading_overlay();
+        }
+        return true;
+    }
 
     if (library_source_is_nas()) {
         library_remember_current_source_state();
@@ -3968,7 +4065,7 @@ bool library_view_open_nas(DeviceMusicListScope scope)
         g_source = LibraryDataSource::Local;
     }
 
-    if (!library_view_show_nas_loading_overlay()) {
+    if (show && !library_view_show_nas_loading_overlay()) {
         taskENTER_CRITICAL(&g_nas_load_lock);
         g_nas_load_running = false;
         taskEXIT_CRITICAL(&g_nas_load_lock);
@@ -4134,6 +4231,20 @@ void library_view_on_library_source_changed(DeviceMusicLibrarySource source)
             "曲库来源保持NAS：NAS Catalog继续常驻 psram=%uB",
             static_cast<unsigned>(nas_library_source_psram_bytes()));
     }
+}
+
+static void library_view_apply_playback_focus()
+{
+    if (!library_view_is_visible()) return;
+    if (library_view_focus_current_playback()) library_view_render(true);
+    else library_view_refresh_virtual_rows(true);
+}
+
+void library_view_request_playback_focus()
+{
+    // BLE/Wi-Fi/audio tasks must not allocate LVGL async nodes or touch UI objects.
+    // One flag coalesces rapid skips; the existing UI timer reads the latest track.
+    g_playback_focus_pending.store(true);
 }
 
 bool library_view_is_visible()
@@ -4341,3 +4452,5 @@ bool library_view_search_is_active()
 {
     return g_search.active;
 }
+
+#include "library_remote.inc"

@@ -1589,6 +1589,16 @@ static void bluetooth_switch_click_cb(lv_event_t *event)
         ble_remote_service_update();
     }
 
+    if (requested && old_wifi) {
+        if (player_state_is_ready() && player_state_get_source() == PlayerMediaSource::Nas) {
+            (void)audio_service_stop(true);
+            (void)persistent_state_restore_local_player();
+            ui_common_show_notice("已切换至本地音乐", "NAS播放已停止，恢复本地上次歌曲");
+        }
+        (void)device_settings_set_music_library_source(DeviceMusicLibrarySource::Local);
+        library_view_on_library_source_changed(DeviceMusicLibrarySource::Local);
+    }
+
     ESP_LOGI(TAG, "蓝牙开关：BLE=%s Wi-Fi=%s",
         requested ? "开" : "关", requested ? "关" : (old_wifi ? "开" : "关"));
 }
@@ -1637,6 +1647,16 @@ static void wifi_switch_click_cb(lv_event_t *event)
         }
         ESP_LOGW(TAG, "Wi-Fi开关运行期切换失败：%s", esp_err_to_name(runtime_ret));
         return;
+    }
+
+    if (!requested) {
+        if (player_state_is_ready() && player_state_get_source() == PlayerMediaSource::Nas) {
+            (void)audio_service_stop(true);
+            (void)persistent_state_restore_local_player();
+            ui_common_show_notice("Wi-Fi已关闭", "NAS播放已停止，恢复本地音乐");
+        }
+        (void)device_settings_set_music_library_source(DeviceMusicLibrarySource::Local);
+        library_view_on_library_source_changed(DeviceMusicLibrarySource::Local);
     }
 
     ESP_LOGI(TAG, "Wi-Fi开关：Wi-Fi=%s BLE=%s",

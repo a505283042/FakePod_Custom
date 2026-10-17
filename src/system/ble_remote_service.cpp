@@ -13,6 +13,7 @@
 #include "media_catalog_v2.h"
 #include "player_control.h"
 #include "remote_music_seek.h"
+#include "ui/screens/library_view.h"
 #include "ui/screens/player_home.h"
 #include "screen_lock_simple.h"
 #include "player_state.h"
@@ -95,6 +96,12 @@ static const ble_uuid128_t kControlEventUuid = BLE_UUID128_INIT(
 static uint16_t g_control_event_val_handle = 0U;
 static bool g_control_event_notify_enabled = false;
 static bool g_force_status_notify = false;
+// The host only assembles bounded command bytes. The runtime pump owns replies.
+static uint8_t g_ble_library_request[32] = {};
+static uint8_t g_ble_library_received = 0;
+static bool g_ble_library_request_ready = false;
+static uint32_t g_ble_library_epoch = 0;
+static bool g_ble_library_pumping = false;
 static bool g_force_metadata_refresh = false;
 static TickType_t g_status_notify_due_tick = 0;
 static TickType_t g_status_event_poll_due_tick = 0;
@@ -446,6 +453,83 @@ static int notify_phone_event(uint16_t conn_handle, const void *data, size_t siz
     return ble_gatts_notify_custom(conn_handle, g_control_event_val_handle, om);
 }
 
+// A 255-byte existing library frame is wrapped in <=20-byte BLE values.
+// Keep the current fragment on notify backpressure; never advance on ENOMEM.
+static void update_phone_library_notify()
+{
+    uint16_t conn;
+    uint32_t epoch;
+    portENTER_CRITICAL(&g_lock);
+    const bool usable = g_connected && g_control_event_notify_enabled && !g_ble_library_pumping;
+    conn = g_conn_handle; epoch = g_ble_library_epoch;
+    if (usable) g_ble_library_pumping = true;
+    portEXIT_CRITICAL(&g_lock);
+    if (!usable) return;
+    static uint32_t seen_epoch = UINT32_MAX;
+    static uint8_t frame[255];
+    static size_t frame_size = 0, offset = 0;
+    if (seen_epoch != epoch) {
+        seen_epoch = epoch; frame_size = offset = 0;
+        library_view_remote_reset();
+    }
+    if (connection_is_encrypted(conn)) {
+        uint8_t request[32]; bool queued;
+        portENTER_CRITICAL(&g_lock);
+        queued = g_ble_library_request_ready;
+        if (queued) memcpy(request, g_ble_library_request, sizeof(request));
+        portEXIT_CRITICAL(&g_lock);
+        if (queued && frame_size == 0 && library_view_remote_submit(request, sizeof(request))) {
+            portENTER_CRITICAL(&g_lock);
+            if (epoch == g_ble_library_epoch) g_ble_library_request_ready = false;
+            portEXIT_CRITICAL(&g_lock);
+        }
+        for (unsigned burst = 0; burst < 8; ++burst) {
+            portENTER_CRITICAL(&g_lock);
+            const bool current = epoch == g_ble_library_epoch && conn == g_conn_handle && g_control_event_notify_enabled;
+            portEXIT_CRITICAL(&g_lock);
+            if (!current) break;
+            if (!frame_size) {
+                if (!library_view_remote_take_frame(frame, &frame_size)) break;
+                offset = 0;
+            }
+            size_t n = frame_size - offset;
+            if (n > 17) n = 17;
+            uint8_t packet[20] = {7, uint8_t(offset), uint8_t(frame_size)};
+            memcpy(packet + 3, frame + offset, n);
+            if (notify_phone_event(conn, packet, n + 3) != 0) break;
+            offset += n;
+            if (offset == frame_size) frame_size = offset = 0;
+        }
+    }
+    portENTER_CRITICAL(&g_lock);g_ble_library_pumping = false;portEXIT_CRITICAL(&g_lock);
+}
+
+static int handle_library_fragment(const uint8_t *payload, size_t size)
+{
+    if (size != 18 || (payload[1] != 0 && payload[1] != 16)) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    int result = 0;
+    portENTER_CRITICAL(&g_lock);
+    if (g_ble_library_request_ready) result = BLE_ATT_ERR_UNLIKELY;
+    else {
+        const uint8_t offset = payload[1];
+        if (offset == 0) g_ble_library_received = 0;
+        if (offset != g_ble_library_received) {g_ble_library_received = 0;result = BLE_ATT_ERR_UNLIKELY;}
+        else {
+            memcpy(g_ble_library_request + offset, payload + 2, 16);
+            g_ble_library_received += 16;
+            if (g_ble_library_received == 32) {
+                // BLE may never export NAS data, even after a device-side source change.
+                if (g_ble_library_request[0] != 0x30 || g_ble_library_request[1] != 1 ||
+                    (g_ble_library_request[3] != 0 && g_ble_library_request[3] != 255)) result = BLE_ATT_ERR_UNLIKELY;
+                else {g_ble_library_request[3] = 0;g_ble_library_request_ready = true;}
+                g_ble_library_received = 0;
+            }
+        }
+    }
+    portEXIT_CRITICAL(&g_lock);
+    return result;
+}
+
 static bool status_semantic_changed(const uint8_t *packet)
 {
     // position_ms(10..13) 由手机本地单调时钟推进，不参与事件变化判断。
@@ -720,6 +804,7 @@ static int control_command_access(
     }
 
     const uint8_t command = payload[0];
+    if (command == 0x31U) return handle_library_fragment(payload, payload_len);
     if (command == kWifiProvisionCommand) {
         return handle_wifi_provision_fragment(payload, payload_len);
     }
@@ -857,6 +942,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *)
                 portENTER_CRITICAL(&g_lock);
                 g_connected = true;
                 g_conn_handle = event->connect.conn_handle;
+                ++g_ble_library_epoch;g_ble_library_received = 0;g_ble_library_request_ready = false;
                 g_control_event_notify_enabled = false;
                 g_force_status_notify = false;
                 g_force_metadata_refresh = false;
@@ -877,6 +963,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *)
         case BLE_GAP_EVENT_DISCONNECT: {
             portENTER_CRITICAL(&g_lock);
             g_connected = false;
+            ++g_ble_library_epoch;g_ble_library_received = 0;g_ble_library_request_ready = false;
             g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
             g_control_event_notify_enabled = false;
             g_force_status_notify = false;
@@ -1355,6 +1442,7 @@ void ble_remote_service_update()
         if (state == BleRemoteState::Connected) {
 #if FAKEPOD_BLE_FOUNDATION_ENABLED
             update_phone_state_notify(now);
+            update_phone_library_notify();
 #endif
             return;
         }

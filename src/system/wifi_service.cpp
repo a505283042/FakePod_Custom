@@ -473,6 +473,16 @@ static void wifi_worker(void *)
             g_wifi_events != nullptr || wifi_remote_service_is_running()) {
             cleanup_wifi();
         }
+        // Wi-Fi/NAS browsing is no longer a valid source after the radio is stopped.
+        // Persist Local as the next browsing source; active NAS playback context is
+        // retained separately until the player transport releases its catalog.
+        const esp_err_t source_ret = device_settings_set_music_library_source(
+            DeviceMusicLibrarySource::Local);
+        if (source_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Wi-Fi关闭后切回本地曲库来源失败：%s", esp_err_to_name(source_ret));
+        } else {
+            ESP_LOGI(TAG, "Wi-Fi已关闭：曲库浏览来源切回本地");
+        }
         restore_ble_fallback();
         worker_finish_idle();
         vTaskDeleteWithCaps(xTaskGetCurrentTaskHandle());
@@ -723,7 +733,13 @@ esp_err_t wifi_service_stop()
         g_last_error = ESP_OK;
         g_state = g_configured ? WifiServiceState::ConfiguredIdle : WifiServiceState::Unconfigured;
         portEXIT_CRITICAL(&g_lock);
-        return ESP_OK;
+        // Also normalize the browse source when Wi-Fi was already down.
+        const esp_err_t source_ret = device_settings_set_music_library_source(
+            DeviceMusicLibrarySource::Local);
+        if (source_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Wi-Fi已关闭但切回本地曲库来源失败：%s", esp_err_to_name(source_ret));
+        }
+        return source_ret;
     }
     portEXIT_CRITICAL(&g_lock);
     return start_worker(WorkerMode::Stop);

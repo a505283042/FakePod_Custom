@@ -1,4 +1,5 @@
 #include "player_control.h"
+#include "persistent_state.h"
 
 #include <atomic>
 #include <stdio.h>
@@ -13,6 +14,7 @@
 #include "audio_service.h"
 #include "device_settings.h"
 #include "player_state.h"
+#include "ui/screens/library_view.h"
 
 static const char *TAG = "播放器控制";
 static SemaphoreHandle_t g_transport_lock = nullptr;
@@ -212,6 +214,7 @@ static void player_control_auto_next_async(void *)
     player_transport_handle_finished_event(snapshot);
     player_control_unlock();
     g_auto_next_dispatch_state.store(AUTO_NEXT_IDLE, std::memory_order_release);
+    library_view_request_playback_focus();
 }
 
 static void player_control_try_dispatch_auto_next()
@@ -273,6 +276,7 @@ bool player_control_play_current()
     }
     const bool ok = player_transport_play_current("用户选择播放");
     player_control_unlock();
+    if (ok) library_view_request_playback_focus();
     return ok;
 }
 
@@ -324,6 +328,7 @@ bool player_control_previous()
     }
     const bool ok = player_transport_previous();
     player_control_unlock();
+    if (ok) library_view_request_playback_focus();
     return ok;
 }
 
@@ -334,6 +339,7 @@ bool player_control_next()
     }
     const bool ok = player_transport_next();
     player_control_unlock();
+    if (ok) library_view_request_playback_focus();
     return ok;
 }
 
@@ -563,6 +569,10 @@ bool player_control_select_decade_group(size_t group_index, size_t position)
 bool player_control_select_nas_all_tracks(size_t position)
 {
     if (!player_control_lock(pdMS_TO_TICKS(100))) return false;
+    if (player_state_get_source() == PlayerMediaSource::Local) {
+        const esp_err_t stored = persistent_state_checkpoint_local();
+        if (stored != ESP_OK) ESP_LOGW(TAG, "保存本地上次曲目失败：%s", esp_err_to_name(stored));
+    }
     const bool ok = player_control_select_context(player_state_select_nas_all_tracks(position));
     player_control_unlock();
     return ok;
@@ -571,6 +581,10 @@ bool player_control_select_nas_all_tracks(size_t position)
 bool player_control_select_nas_folder_queue_position(size_t position)
 {
     if (!player_control_lock(pdMS_TO_TICKS(100))) return false;
+    if (player_state_get_source() == PlayerMediaSource::Local) {
+        const esp_err_t stored = persistent_state_checkpoint_local();
+        if (stored != ESP_OK) ESP_LOGW(TAG, "保存本地上次曲目失败：%s", esp_err_to_name(stored));
+    }
     const bool ok = player_control_select_context(player_state_select_nas_folder_queue_position(position));
     player_control_unlock();
     return ok;
@@ -579,6 +593,10 @@ bool player_control_select_nas_folder_queue_position(size_t position)
 bool player_control_select_nas_artist_group(size_t group_index, size_t position)
 {
     if (!player_control_lock(pdMS_TO_TICKS(100))) return false;
+    if (player_state_get_source() == PlayerMediaSource::Local) {
+        const esp_err_t stored = persistent_state_checkpoint_local();
+        if (stored != ESP_OK) ESP_LOGW(TAG, "保存本地上次曲目失败：%s", esp_err_to_name(stored));
+    }
     const bool ok = player_control_select_context(player_state_select_nas_artist_group(group_index, position));
     player_control_unlock();
     return ok;
@@ -587,6 +605,10 @@ bool player_control_select_nas_artist_group(size_t group_index, size_t position)
 bool player_control_select_nas_album_group(size_t group_index, size_t position)
 {
     if (!player_control_lock(pdMS_TO_TICKS(100))) return false;
+    if (player_state_get_source() == PlayerMediaSource::Local) {
+        const esp_err_t stored = persistent_state_checkpoint_local();
+        if (stored != ESP_OK) ESP_LOGW(TAG, "保存本地上次曲目失败：%s", esp_err_to_name(stored));
+    }
     const bool ok = player_control_select_context(player_state_select_nas_album_group(group_index, position));
     player_control_unlock();
     return ok;
@@ -595,6 +617,10 @@ bool player_control_select_nas_album_group(size_t group_index, size_t position)
 bool player_control_select_nas_decade_group(size_t group_index, size_t position)
 {
     if (!player_control_lock(pdMS_TO_TICKS(100))) return false;
+    if (player_state_get_source() == PlayerMediaSource::Local) {
+        const esp_err_t stored = persistent_state_checkpoint_local();
+        if (stored != ESP_OK) ESP_LOGW(TAG, "保存本地上次曲目失败：%s", esp_err_to_name(stored));
+    }
     const bool ok = player_control_select_context(player_state_select_nas_decade_group(group_index, position));
     player_control_unlock();
     return ok;

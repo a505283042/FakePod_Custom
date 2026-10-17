@@ -33,6 +33,10 @@ bool persistent_state_restore_audio();
 // Catalog/Player 建立后恢复播放模式、歌曲与稳定 Playlist Context。
 // 只恢复选择状态，不自动播放；歌曲始终从 00:00 开始。
 bool persistent_state_restore_player();
+// Restore TF last-selected track (or first TF track), never start audio.
+bool persistent_state_restore_local_player();
+// Save TF last selection once before handing playback context to NAS.
+esp_err_t persistent_state_checkpoint_local();
 
 // Boot 在建立 Player 后查询：上次加载歌曲若来自 NAS，则需要先从 TF 缓存打开 NAS Catalog，
 // 再调用 persistent_state_restore_player()；该判断不依赖 Wi-Fi。
