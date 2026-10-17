@@ -101,6 +101,72 @@ struct FlacSeekPoint
     uint16_t frame_samples = 0;
 };
 
+// Cache only the current NAS FLAC track's sparse SEEKTABLE in PSRAM. The first
+// seek parses metadata once; later seeks can open the target Range directly.
+// CRC8-validated frame positions observed during no-SEEKTABLE Range probes.
+// Kept as diagnostics only; the fast approximate path uses the linear estimate
+// and validates the destination frame on each seek. Keep the small array in PSRAM.
+static constexpr uint32_t FLAC_NAS_NO_TABLE_ANCHOR_CAPACITY = 24U;
+struct FlacNasObservedAnchor
+{
+    uint64_t sample = 0;
+    uint64_t file_offset = 0;
+};
+
+struct FlacNasSeekCache
+{
+    FlacStreamDescriptor descriptor = {};
+    FlacSeekPoint *points = nullptr;
+    uint32_t count = 0;
+    uint32_t capacity = 0;
+    FlacNasObservedAnchor *observed = nullptr;
+    uint32_t observed_count = 0;
+    uint32_t observed_next = 0;
+    bool valid = false;
+};
+
+static FlacNasSeekCache g_nas_flac_seek_cache = {};
+
+void flac_decoder_clear_nas_seek_cache()
+{
+    if (g_nas_flac_seek_cache.points != nullptr) {
+        heap_caps_free(g_nas_flac_seek_cache.points);
+    }
+    if (g_nas_flac_seek_cache.observed != nullptr) {
+        heap_caps_free(g_nas_flac_seek_cache.observed);
+    }
+    g_nas_flac_seek_cache = {};
+}
+
+static void flac_nas_remember_observed_anchor(uint64_t sample, uint64_t file_offset)
+{
+    FlacNasSeekCache &cache = g_nas_flac_seek_cache;
+    const FlacStreamDescriptor &d = cache.descriptor;
+    if (!cache.valid || cache.count != 0U || d.total_frames == 0U ||
+        sample >= d.total_frames || file_offset < d.audio_data_offset_bytes ||
+        file_offset >= d.file_size_bytes) return;
+    if (cache.observed == nullptr) {
+        cache.observed = static_cast<FlacNasObservedAnchor *>(heap_caps_calloc(
+            FLAC_NAS_NO_TABLE_ANCHOR_CAPACITY, sizeof(FlacNasObservedAnchor),
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (cache.observed == nullptr) return;  // The uncached path remains valid.
+    }
+    for (uint32_t i = 0; i < cache.observed_count; ++i) {
+        if (cache.observed[i].sample == sample) {
+            cache.observed[i].file_offset = file_offset;
+            return;
+        }
+    }
+    const uint32_t slot = cache.observed_next;
+    cache.observed[slot] = {sample, file_offset};
+    cache.observed_next = (slot + 1U) % FLAC_NAS_NO_TABLE_ANCHOR_CAPACITY;
+    if (cache.observed_count < FLAC_NAS_NO_TABLE_ANCHOR_CAPACITY) ++cache.observed_count;
+    ESP_LOGD(TAG, "NAS_FLAC_NO_TABLE_CACHE: store sample=%llu offset=%llu count=%lu",
+        static_cast<unsigned long long>(sample),
+        static_cast<unsigned long long>(file_offset),
+        static_cast<unsigned long>(cache.observed_count));
+}
+
 static FlacPrefetchProfile flac_prefetch_profile_for_rate(uint32_t sample_rate_hz)
 {
     if (sample_rate_hz > 96000U) {
@@ -1313,7 +1379,8 @@ static esp_err_t flac_streaming_discard(AudioSource *source, uint64_t bytes)
 
 static esp_err_t flac_parse_stream_descriptor_streaming(
     AudioSource *source,
-    FlacStreamDescriptor *out_descriptor)
+    FlacStreamDescriptor *out_descriptor,
+    FlacNasSeekPlan *seek_plan = nullptr, uint64_t seek_target_ms = 0ULL)
 {
     if (!audio_source_is_open(source) || out_descriptor == nullptr ||
         !audio_source_has_capability(source, AUDIO_SOURCE_CAP_READ) ||
@@ -1322,6 +1389,10 @@ static esp_err_t flac_parse_stream_descriptor_streaming(
         return ESP_ERR_INVALID_ARG;
     }
     *out_descriptor = {};
+    if (seek_plan != nullptr) {
+        *seek_plan = {};
+        flac_decoder_clear_nas_seek_cache();
+    }
 
     uint8_t first4[4] = {};
     esp_err_t ret = flac_streaming_read_exact(source, first4, sizeof(first4));
@@ -1355,6 +1426,10 @@ static esp_err_t flac_parse_stream_descriptor_streaming(
         return ESP_ERR_INVALID_RESPONSE;
     }
     out_descriptor->flac_offset_bytes = cursor;
+    if (seek_plan != nullptr &&
+        audio_source_size(source, &out_descriptor->file_size_bytes) != ESP_OK) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     cursor += 4ULL;
 
     uint8_t block_header[4] = {};
@@ -1379,6 +1454,22 @@ static esp_err_t flac_parse_stream_descriptor_streaming(
     ret = flac_decode_streaminfo_payload(out_descriptor);
     if (ret != ESP_OK) return ret;
 
+    uint64_t chosen_sample = 0ULL;
+    uint64_t chosen_offset = 0ULL;
+    bool valid_seekpoint = false;
+    bool seektable_processed = false;
+    uint64_t wanted_sample = 0ULL;
+    if (seek_plan != nullptr) {
+        if (out_descriptor->sample_rate_hz == 0U ||
+            seek_target_ms > UINT64_MAX / out_descriptor->sample_rate_hz) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        wanted_sample = (seek_target_ms * out_descriptor->sample_rate_hz) / 1000ULL;
+        if (wanted_sample == 0U ||
+            (out_descriptor->total_frames != 0U && wanted_sample >= out_descriptor->total_frames)) {
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
     while (!is_last) {
         ret = flac_streaming_read_exact(source, block_header, sizeof(block_header));
         if (ret != ESP_OK) return ret;
@@ -1388,11 +1479,113 @@ static esp_err_t flac_parse_stream_descriptor_streaming(
             (static_cast<uint32_t>(block_header[1]) << 16) |
             (static_cast<uint32_t>(block_header[2]) << 8) |
             static_cast<uint32_t>(block_header[3]);
-        ret = flac_streaming_discard(source, metadata_length);
-        if (ret != ESP_OK) return ret;
+        const uint8_t type = block_header[0] & 0x7FU;
+        if (type == 3U && out_descriptor->seektable_length_bytes == 0U &&
+            metadata_length >= FLAC_SEEKPOINT_BYTES &&
+            metadata_length % FLAC_SEEKPOINT_BYTES == 0U) {
+            out_descriptor->seektable_offset_bytes = cursor;
+            out_descriptor->seektable_length_bytes = metadata_length;
+        }
+        if (seek_plan != nullptr && type == 3U && !seektable_processed &&
+            metadata_length >= FLAC_SEEKPOINT_BYTES &&
+            metadata_length % FLAC_SEEKPOINT_BYTES == 0U &&
+            metadata_length <= 4096U * FLAC_SEEKPOINT_BYTES) {
+            seektable_processed = true;
+            const uint32_t entry_count = metadata_length / FLAC_SEEKPOINT_BYTES;
+            g_nas_flac_seek_cache.points = static_cast<FlacSeekPoint *>(
+                heap_caps_malloc(static_cast<size_t>(entry_count) * sizeof(FlacSeekPoint),
+                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            g_nas_flac_seek_cache.capacity = g_nas_flac_seek_cache.points != nullptr ? entry_count : 0U;
+            uint8_t entry[FLAC_SEEKPOINT_BYTES] = {};
+            for (uint32_t n = 0; n < entry_count; ++n) {
+                ret = flac_streaming_read_exact(source, entry, sizeof(entry));
+                if (ret != ESP_OK) {
+                    flac_decoder_clear_nas_seek_cache();
+                    return ret;
+                }
+                const uint64_t sample = flac_read_be64(entry);
+                const uint64_t offset = flac_read_be64(entry + 8);
+                const uint16_t frame_samples = flac_read_be16(entry + 16);
+                if (sample == FLAC_SEEKPOINT_PLACEHOLDER || frame_samples == 0U ||
+                    (out_descriptor->total_frames && sample >= out_descriptor->total_frames)) continue;
+                valid_seekpoint = true;
+                if (g_nas_flac_seek_cache.points != nullptr &&
+                    g_nas_flac_seek_cache.count < g_nas_flac_seek_cache.capacity) {
+                    FlacSeekPoint &cached = g_nas_flac_seek_cache.points[g_nas_flac_seek_cache.count++];
+                    cached.sample_number = sample;
+                    cached.stream_offset = offset;
+                    cached.frame_samples = frame_samples;
+                }
+                if (sample <= wanted_sample && sample >= chosen_sample) {
+                    chosen_sample = sample;
+                    chosen_offset = offset;
+                }
+            }
+        } else {
+            ret = flac_streaming_discard(source, metadata_length);
+            if (ret != ESP_OK) return ret;
+        }
         cursor += metadata_length;
     }
     out_descriptor->audio_data_offset_bytes = cursor;
+    if (seek_plan != nullptr && cursor < out_descriptor->file_size_bytes &&
+        out_descriptor->total_frames > 0U &&
+        ((!seektable_processed || !valid_seekpoint) ||
+         (g_nas_flac_seek_cache.points != nullptr && g_nas_flac_seek_cache.count > 0U))) {
+        g_nas_flac_seek_cache.descriptor = *out_descriptor;
+        g_nas_flac_seek_cache.valid = true;
+        ESP_LOGD(TAG, "NAS_FLAC_SEEK_CACHE: stored=1 points=%lu bytes=%u audio_offset=%llu",
+            static_cast<unsigned long>(g_nas_flac_seek_cache.count),
+            static_cast<unsigned>(g_nas_flac_seek_cache.count * sizeof(FlacSeekPoint)),
+            static_cast<unsigned long long>(out_descriptor->audio_data_offset_bytes));
+    }
+    if (seek_plan != nullptr) {
+        if (cursor >= out_descriptor->file_size_bytes ||
+            (valid_seekpoint && seektable_processed &&
+             (g_nas_flac_seek_cache.points == nullptr || g_nas_flac_seek_cache.count == 0U)) ||
+            (valid_seekpoint && seektable_processed &&
+             (chosen_offset >= out_descriptor->file_size_bytes - cursor ||
+              chosen_sample > wanted_sample ||
+              wanted_sample - chosen_sample > static_cast<uint64_t>(out_descriptor->sample_rate_hz) * 30ULL))) {
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+        memcpy(seek_plan->streaminfo, out_descriptor->streaminfo_payload, FLAC_STREAMINFO_BYTES);
+        seek_plan->file_bytes = out_descriptor->file_size_bytes;
+        seek_plan->audio_offset = cursor;
+        seek_plan->seek_offset = cursor + chosen_offset;
+        seek_plan->anchor_sample = chosen_sample;
+        seek_plan->target_sample = wanted_sample;
+        seek_plan->requested_target_sample = wanted_sample;
+        // Preserve metadata capability across the Range reopen. The new streaming decoder
+        // starts at an audio frame and receives a synthetic header, so its descriptor would
+        // otherwise lose the original SEEKTABLE length and reject every subsequent SEEK.
+        seek_plan->seektable_offset = out_descriptor->seektable_offset_bytes;
+        seek_plan->seektable_length_bytes = out_descriptor->seektable_length_bytes;
+        seek_plan->sample_rate_hz = out_descriptor->sample_rate_hz;
+        if (!valid_seekpoint || !seektable_processed) {
+            // Fraction-of-file offset is only a first guess; NEVER decode it directly.
+            // The following bounded Range scan must verify a real frame's sample number.
+            const uint64_t audio_bytes = out_descriptor->file_size_bytes - cursor;
+            seek_plan->no_seektable = true;
+            seek_plan->scan_min_offset = cursor;
+            seek_plan->scan_max_offset = out_descriptor->file_size_bytes;
+            seek_plan->scan_min_sample = 0U;
+            seek_plan->scan_max_sample = out_descriptor->total_frames;
+            const uint64_t remainder = audio_bytes % out_descriptor->total_frames;
+            if (remainder != 0U && wanted_sample > UINT64_MAX / remainder) return ESP_ERR_NOT_SUPPORTED;
+            seek_plan->scan_estimate_offset = cursor +
+                (audio_bytes / out_descriptor->total_frames) * wanted_sample +
+                (remainder * wanted_sample) / out_descriptor->total_frames;
+            // Avoid multiply overflow from huge files: computed term is bounded by audio_bytes.
+            seek_plan->scan_required = true;
+            (void)flac_decoder_set_nas_seek_scan_window(seek_plan, 64U * 1024U);
+            ESP_LOGD(TAG, "NAS_FLAC_NO_TABLE: target=%llu estimate=%llu audio=%llu bytes=%llu",
+                static_cast<unsigned long long>(wanted_sample),
+                static_cast<unsigned long long>(seek_plan->scan_estimate_offset),
+                static_cast<unsigned long long>(cursor),
+                static_cast<unsigned long long>(audio_bytes));
+        }
+    }
 
 #if APP_DIAG_AUDIO_CODEC
     ESP_LOGI(TAG,
@@ -2855,6 +3048,7 @@ esp_err_t flac_decoder_open_streaming(
 {
     if (decoder == nullptr || !audio_source_is_open(source)) return ESP_ERR_INVALID_ARG;
     flac_decoder_close(decoder);
+    flac_decoder_clear_nas_seek_cache();
     esp_err_t ret = flac_decoder_register_backend();
     if (ret != ESP_OK) return ret;
 
@@ -3003,6 +3197,435 @@ static esp_err_t flac_decoder_discard_to_frame(FlacDecoder *decoder, uint64_t ta
         decoder->frames_read += skip_frames;
     }
     return ESP_OK;
+}
+
+esp_err_t flac_decoder_set_nas_seek_scan_window(FlacNasSeekPlan *plan, uint32_t guard_bytes)
+{
+    if (plan == nullptr || guard_bytes < 1024U || plan->scan_min_offset < plan->audio_offset ||
+        plan->scan_max_offset <= plan->scan_min_offset || plan->scan_estimate_offset < plan->scan_min_offset ||
+        plan->scan_estimate_offset > plan->scan_max_offset) {
+        if (plan != nullptr) plan->scan_required = false;
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const uint64_t guard = guard_bytes;
+    const uint64_t start = plan->scan_estimate_offset > guard
+        ? plan->scan_estimate_offset - guard : plan->scan_min_offset;
+    const uint64_t end = plan->scan_estimate_offset > UINT64_MAX - guard
+        ? plan->scan_max_offset : plan->scan_estimate_offset + guard;
+    plan->scan_start_offset = start > plan->scan_min_offset ? start : plan->scan_min_offset;
+    plan->scan_end_offset = end < plan->scan_max_offset ? end : plan->scan_max_offset;
+    const uint64_t length = plan->scan_end_offset > plan->scan_start_offset
+        ? plan->scan_end_offset - plan->scan_start_offset : 0U;
+    plan->scan_required = length >= 64U && length <= 512ULL * 1024ULL;
+    return plan->scan_required ? ESP_OK : ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t flac_decoder_plan_nas_seek_cached(uint64_t target_ms, FlacNasSeekPlan *out_plan)
+{
+    if (out_plan == nullptr || target_ms == 0U || !g_nas_flac_seek_cache.valid) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    const FlacStreamDescriptor &d = g_nas_flac_seek_cache.descriptor;
+    if (d.sample_rate_hz == 0U || target_ms > UINT64_MAX / d.sample_rate_hz) return ESP_ERR_INVALID_ARG;
+    const uint64_t target_sample = (target_ms * d.sample_rate_hz) / 1000ULL;
+    if (target_sample == 0U || (d.total_frames != 0U && target_sample >= d.total_frames)) return ESP_ERR_INVALID_ARG;
+
+    if (g_nas_flac_seek_cache.points == nullptr || g_nas_flac_seek_cache.count == 0U) {
+        if (d.audio_data_offset_bytes >= d.file_size_bytes || d.total_frames == 0U) return ESP_ERR_NOT_SUPPORTED;
+        *out_plan = {};
+        memcpy(out_plan->streaminfo, d.streaminfo_payload, FLAC_STREAMINFO_BYTES);
+        out_plan->file_bytes = d.file_size_bytes;
+        out_plan->audio_offset = d.audio_data_offset_bytes;
+        out_plan->target_sample = target_sample;
+        out_plan->requested_target_sample = target_sample;
+        out_plan->sample_rate_hz = d.sample_rate_hz;
+        out_plan->no_seektable = true;
+        out_plan->scan_min_offset = d.audio_data_offset_bytes;
+        out_plan->scan_max_offset = d.file_size_bytes;
+        out_plan->scan_min_sample = 0U;
+        out_plan->scan_max_sample = d.total_frames;
+        const uint64_t audio_bytes = d.file_size_bytes - d.audio_data_offset_bytes;
+        const uint64_t remainder = audio_bytes % d.total_frames;
+        if (remainder != 0U && target_sample > UINT64_MAX / remainder) return ESP_ERR_NOT_SUPPORTED;
+        out_plan->scan_estimate_offset = d.audio_data_offset_bytes +
+            (audio_bytes / d.total_frames) * target_sample +
+            (remainder * target_sample) / d.total_frames;
+        out_plan->requested_target_sample = target_sample;
+        ESP_LOGD(TAG, "NAS_FLAC_FAST_SEEK: estimate=linear target=%llu offset=%llu audio=%llu bytes=%llu",
+            static_cast<unsigned long long>(target_sample),
+            static_cast<unsigned long long>(out_plan->scan_estimate_offset),
+            static_cast<unsigned long long>(d.audio_data_offset_bytes),
+            static_cast<unsigned long long>(audio_bytes));
+        // Begin with a wider local window. Fast approximate seek does not rely on
+        // dynamic-anchor cache hits; a verified frame close to the requested time wins.
+        return flac_decoder_set_nas_seek_scan_window(out_plan, 128U * 1024U);
+    }
+
+    const FlacSeekPoint *previous = nullptr;
+    const FlacSeekPoint *next = nullptr;
+    for (uint32_t i = 0; i < g_nas_flac_seek_cache.count; ++i) {
+        const FlacSeekPoint &p = g_nas_flac_seek_cache.points[i];
+        if (p.sample_number <= target_sample &&
+            (previous == nullptr || p.sample_number > previous->sample_number)) previous = &p;
+        if (p.sample_number > target_sample &&
+            (next == nullptr || p.sample_number < next->sample_number)) next = &p;
+    }
+    if (previous == nullptr || d.audio_data_offset_bytes >= d.file_size_bytes ||
+        previous->stream_offset >= d.file_size_bytes - d.audio_data_offset_bytes ||
+        target_sample - previous->sample_number > static_cast<uint64_t>(d.sample_rate_hz) * 30ULL) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    *out_plan = {};
+    memcpy(out_plan->streaminfo, d.streaminfo_payload, FLAC_STREAMINFO_BYTES);
+    out_plan->file_bytes = d.file_size_bytes;
+    out_plan->audio_offset = d.audio_data_offset_bytes;
+    out_plan->seek_offset = d.audio_data_offset_bytes + previous->stream_offset;
+    out_plan->anchor_sample = previous->sample_number;
+    out_plan->target_sample = target_sample;
+    out_plan->requested_target_sample = target_sample;
+    out_plan->seektable_offset = d.seektable_offset_bytes;
+    out_plan->seektable_length_bytes = d.seektable_length_bytes;
+    out_plan->sample_rate_hz = d.sample_rate_hz;
+
+    // Interpolation chooses only a bounded scan window. The final anchor must be a real
+    // frame header with a valid FLAC header CRC8, never the interpolated byte position.
+    const uint64_t block_limit = static_cast<uint64_t>(d.max_block_size != 0U ? d.max_block_size : 4096U) * 2ULL;
+    const uint64_t audio_bytes = d.file_size_bytes - d.audio_data_offset_bytes;
+    const uint64_t next_sample = next != nullptr ? next->sample_number : d.total_frames;
+    const uint64_t next_stream_offset = next != nullptr ? next->stream_offset : audio_bytes;
+    if (target_sample - previous->sample_number > block_limit &&
+        next_sample > previous->sample_number && next_stream_offset > previous->stream_offset &&
+        next_stream_offset <= audio_bytes && next_sample >= target_sample) {
+        const uint64_t sample_span = next_sample - previous->sample_number;
+        const uint64_t byte_span = next_stream_offset - previous->stream_offset;
+        const uint64_t sample_delta = target_sample - previous->sample_number;
+        if (sample_span != 0U && byte_span != 0U && sample_delta <= UINT64_MAX / byte_span) {
+            const uint64_t previous_abs = d.audio_data_offset_bytes + previous->stream_offset;
+            const uint64_t next_abs = d.audio_data_offset_bytes + next_stream_offset;
+            const uint64_t estimate = previous_abs + (byte_span * sample_delta) / sample_span;
+            out_plan->scan_estimate_offset = estimate;
+            out_plan->scan_min_offset = previous_abs;
+            out_plan->scan_max_offset = next_abs;
+            out_plan->scan_min_sample = previous->sample_number;
+            out_plan->scan_max_sample = next_sample;
+            // Start with a small +/-64KB window. The caller expands it only if
+            // the local frame scan cannot find a close enough valid frame.
+            (void)flac_decoder_set_nas_seek_scan_window(out_plan, 64U * 1024U);
+        }
+    }
+    ESP_LOGD(TAG,
+        "NAS_FLAC_SEEK_CACHE: hit=1 points=%lu target=%llu anchor=%llu gap_ms=%llu offset=%llu refine=%u scan=%llu..%llu estimate=%llu",
+        static_cast<unsigned long>(g_nas_flac_seek_cache.count),
+        static_cast<unsigned long long>(target_sample),
+        static_cast<unsigned long long>(previous->sample_number),
+        static_cast<unsigned long long>(((target_sample - previous->sample_number) * 1000ULL) / d.sample_rate_hz),
+        static_cast<unsigned long long>(out_plan->seek_offset), out_plan->scan_required ? 1U : 0U,
+        static_cast<unsigned long long>(out_plan->scan_start_offset),
+        static_cast<unsigned long long>(out_plan->scan_end_offset),
+        static_cast<unsigned long long>(out_plan->scan_estimate_offset));
+    return ESP_OK;
+}
+
+esp_err_t flac_decoder_calibrate_nas_seek_no_table(FlacNasSeekPlan *plan)
+{
+    if (plan == nullptr || !plan->no_seektable || !plan->observed_valid ||
+        plan->sample_rate_hz == 0U || plan->scan_max_sample == 0U ||
+        plan->scan_max_offset <= plan->scan_min_offset) return ESP_ERR_NOT_SUPPORTED;
+    // Correct the byte guess using an actual CRC8-validated FLAC frame header.
+    // Proportional extrapolation is bounded; subsequent probes re-calibrate it.
+    const uint64_t audio_bytes = plan->scan_max_offset - plan->scan_min_offset;
+    const uint64_t bytes_per_sample = audio_bytes / plan->scan_max_sample;
+    const uint64_t delta = plan->target_sample > plan->observed_sample
+        ? plan->target_sample - plan->observed_sample
+        : plan->observed_sample - plan->target_sample;
+    if (delta > UINT64_MAX / (bytes_per_sample + 1U)) return ESP_ERR_NOT_SUPPORTED;
+    const uint64_t remainder = audio_bytes % plan->scan_max_sample;
+    if (remainder != 0U && delta > UINT64_MAX / remainder) return ESP_ERR_NOT_SUPPORTED;
+    const uint64_t shift = delta * bytes_per_sample +
+        (delta * remainder) / plan->scan_max_sample;
+    const uint64_t candidate = plan->target_sample > plan->observed_sample
+        ? (shift > UINT64_MAX - plan->observed_offset ? UINT64_MAX : plan->observed_offset + shift)
+        : (shift > plan->observed_offset ? 0U : plan->observed_offset - shift);
+    uint64_t clamped = candidate < plan->scan_min_offset ? plan->scan_min_offset
+        : (candidate >= plan->scan_max_offset ? plan->scan_max_offset - 1U : candidate);
+    bool shifted_out_of_window = false;
+    // A proportional correction can land inside the exact window that just missed.
+    // Do not terminate the seek in that case: move one bounded window beyond the
+    // scanned region in the direction indicated by the observed frame sample.
+    if (clamped >= plan->scan_start_offset && clamped < plan->scan_end_offset) {
+        constexpr uint64_t kNoTableProbeStep = 64U * 1024U;
+        if (plan->observed_sample <= plan->target_sample) {
+            clamped = plan->scan_end_offset > UINT64_MAX - kNoTableProbeStep
+                ? plan->scan_max_offset - 1U : plan->scan_end_offset + kNoTableProbeStep;
+        } else {
+            clamped = plan->scan_start_offset > plan->scan_min_offset + kNoTableProbeStep
+                ? plan->scan_start_offset - kNoTableProbeStep : plan->scan_min_offset;
+        }
+        if (clamped >= plan->scan_max_offset) clamped = plan->scan_max_offset - 1U;
+        shifted_out_of_window = clamped < plan->scan_start_offset || clamped >= plan->scan_end_offset;
+    }
+    ESP_LOGD(TAG, "NAS_FLAC_NO_TABLE: calibrate observed=%llu at=%llu next=%llu target=%llu shift=%u",
+        static_cast<unsigned long long>(plan->observed_sample),
+        static_cast<unsigned long long>(plan->observed_offset),
+        static_cast<unsigned long long>(clamped),
+        static_cast<unsigned long long>(plan->target_sample), shifted_out_of_window ? 1U : 0U);
+    if (clamped >= plan->scan_start_offset && clamped < plan->scan_end_offset)
+        return ESP_ERR_NOT_FOUND;
+    plan->scan_estimate_offset = clamped;
+    plan->observed_valid = false;
+    return ESP_OK;
+}
+
+esp_err_t flac_decoder_refine_nas_seek_range(
+    AudioSource *source, FlacNasSeekPlan *in_out_plan,
+    uint8_t **out_replay_buffer, size_t *out_replay_bytes, uint64_t *out_scanned_bytes)
+{
+    if (out_replay_buffer != nullptr) *out_replay_buffer = nullptr;
+    if (out_replay_bytes != nullptr) *out_replay_bytes = 0U;
+    if (out_scanned_bytes != nullptr) *out_scanned_bytes = 0U;
+    if (!audio_source_is_open(source) || in_out_plan == nullptr || out_replay_buffer == nullptr ||
+        out_replay_bytes == nullptr || !in_out_plan->scan_required ||
+        in_out_plan->scan_start_offset < in_out_plan->audio_offset ||
+        in_out_plan->scan_end_offset <= in_out_plan->scan_start_offset ||
+        in_out_plan->scan_end_offset > in_out_plan->file_bytes || !g_nas_flac_seek_cache.valid) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const uint64_t length64 = in_out_plan->scan_end_offset - in_out_plan->scan_start_offset;
+    constexpr size_t kMaxScanBytes = 512U * 1024U;
+    if (length64 < 64U || length64 > kMaxScanBytes) return ESP_ERR_INVALID_SIZE;
+    const size_t scan_length = static_cast<size_t>(length64);
+    uint8_t *scan = static_cast<uint8_t *>(heap_caps_malloc(scan_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (scan == nullptr) return ESP_ERR_NO_MEM;
+
+    size_t filled = 0U;
+    size_t scan_cursor = 0U;
+    uint32_t empty_retries = 0U;
+    bool reached_after_target = false;
+    FlacSeekPoint best = {};
+    size_t best_index = 0U;
+    bool found = false;
+    uint64_t nearest_distance = UINT64_MAX;
+    esp_err_t ret = ESP_OK;
+    const FlacStreamDescriptor &d = g_nas_flac_seek_cache.descriptor;
+
+    // Read and inspect incrementally. Stop shortly after the first valid frame beyond
+    // target rather than always downloading the full 512KB window. Keep 32 bytes of tail
+    // so a FLAC header split across two reads is still validated as one candidate.
+    while (filled < scan_length && empty_retries < 50U) {
+        const size_t chunk = scan_length - filled < FLAC_INPUT_BUFFER_BYTES
+            ? scan_length - filled : FLAC_INPUT_BUFFER_BYTES;
+        size_t got = 0U;
+        ret = audio_source_read(source, scan + filled, chunk, &got);
+        if (ret != ESP_OK && ret != ESP_ERR_TIMEOUT) break;
+        if (got == 0U) {
+            if (audio_source_eof(source)) break;
+            ++empty_retries;
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        filled += got;
+        empty_retries = 0U;
+        const size_t safe_end = filled == scan_length || audio_source_eof(source)
+            ? filled : (filled > FLAC_FRAME_HEADER_MAX_BYTES ? filled - FLAC_FRAME_HEADER_MAX_BYTES : 0U);
+        while (scan_cursor < safe_end) {
+            const size_t i = scan_cursor++;
+            if (i + 6U > filled || scan[i] != 0xFFU || (scan[i + 1U] & 0xFEU) != 0xF8U) continue;
+            uint64_t sample = 0U;
+            if (!flac_parse_frame_sample_number(scan + i, filled - i, d, &sample)) continue;
+            if (in_out_plan->no_seektable) {
+                const uint64_t distance = sample > in_out_plan->target_sample
+                    ? sample - in_out_plan->target_sample : in_out_plan->target_sample - sample;
+                if (distance < nearest_distance) {
+                    nearest_distance = distance;
+                    in_out_plan->observed_valid = true;
+                    in_out_plan->observed_sample = sample;
+                    in_out_plan->observed_offset = in_out_plan->scan_start_offset + i;
+                }
+            }
+            if (sample > in_out_plan->target_sample) {
+                reached_after_target = true;
+                break;
+            }
+            if (sample <= in_out_plan->scan_min_sample || sample >= in_out_plan->scan_max_sample) continue;
+            if (!found || sample > best.sample_number) {
+                best.sample_number = sample;
+                best.stream_offset = (in_out_plan->scan_start_offset - in_out_plan->audio_offset) + i;
+                best.frame_samples = 0U;
+                best_index = i;
+                found = true;
+            }
+        }
+        if (reached_after_target) break;
+    }
+
+    if (out_scanned_bytes != nullptr) *out_scanned_bytes = filled;
+    // Persist the nearest CRC8-validated frame even when this scan misses.
+    // Subsequent SEEK requests can interpolate between such real observations.
+    if (in_out_plan->no_seektable && in_out_plan->observed_valid) {
+        flac_nas_remember_observed_anchor(in_out_plan->observed_sample,
+            in_out_plan->observed_offset);
+    }
+    if ((ret != ESP_OK && ret != ESP_ERR_TIMEOUT) || filled < 64U) {
+        heap_caps_free(scan);
+        return ret != ESP_OK && ret != ESP_ERR_TIMEOUT ? ret : ESP_ERR_NOT_FOUND;
+    }
+    // If the window ended before seeing a frame after target, inspect the final tail.
+    // The previous loop deliberately deferred this tail until more bytes arrived.
+    while (!reached_after_target && scan_cursor + 6U <= filled) {
+        const size_t i = scan_cursor++;
+        if (scan[i] != 0xFFU || (scan[i + 1U] & 0xFEU) != 0xF8U) continue;
+        uint64_t sample = 0U;
+        if (!flac_parse_frame_sample_number(scan + i, filled - i, d, &sample)) continue;
+        if (in_out_plan->no_seektable) {
+            const uint64_t distance = sample > in_out_plan->target_sample
+                ? sample - in_out_plan->target_sample : in_out_plan->target_sample - sample;
+            if (distance < nearest_distance) {
+                nearest_distance = distance;
+                in_out_plan->observed_valid = true;
+                in_out_plan->observed_sample = sample;
+                in_out_plan->observed_offset = in_out_plan->scan_start_offset + i;
+            }
+        }
+        if (sample > in_out_plan->target_sample) {
+            reached_after_target = true;
+            break;
+        }
+        if (sample <= in_out_plan->scan_min_sample || sample >= in_out_plan->scan_max_sample) continue;
+        if (!found || sample > best.sample_number) {
+            best.sample_number = sample;
+            best.stream_offset = (in_out_plan->scan_start_offset - in_out_plan->audio_offset) + i;
+            best.frame_samples = 0U;
+            best_index = i;
+            found = true;
+        }
+    }
+
+    const uint64_t max_gap = in_out_plan->no_seektable
+        ? static_cast<uint64_t>(in_out_plan->sample_rate_hz) * 2ULL
+        : static_cast<uint64_t>(d.max_block_size != 0U ? d.max_block_size : 4096U) * 2ULL;
+    if (in_out_plan->no_seektable && in_out_plan->observed_valid && nearest_distance <= max_gap &&
+        in_out_plan->observed_offset >= in_out_plan->scan_start_offset &&
+        in_out_plan->observed_offset < in_out_plan->scan_start_offset + filled) {
+        // Approximate mode: the frame header was validated (including CRC8), and
+        // the nearest frame is within the accepted 2-second error budget. Start there
+        // instead of decoding/discarding PCM to an exact sample boundary.
+        best.sample_number = in_out_plan->observed_sample;
+        best.stream_offset = in_out_plan->observed_offset - in_out_plan->audio_offset;
+        best.frame_samples = 0U;
+        best_index = static_cast<size_t>(in_out_plan->observed_offset - in_out_plan->scan_start_offset);
+        found = true;
+    }
+    if (!found || best_index >= filled ||
+        (!in_out_plan->no_seektable && (in_out_plan->target_sample < best.sample_number ||
+        in_out_plan->target_sample - best.sample_number > max_gap))) {
+        ESP_LOGD(TAG, "NAS_FLAC_SEEK_REFINE: found=0 scanned=%uB estimate=%llu fallback_anchor=%llu nearest_delta_ms=%llu",
+            static_cast<unsigned>(filled), static_cast<unsigned long long>(in_out_plan->scan_estimate_offset),
+            static_cast<unsigned long long>(in_out_plan->anchor_sample),
+            static_cast<unsigned long long>(nearest_distance == UINT64_MAX ? UINT64_MAX :
+                (nearest_distance * 1000ULL) / (in_out_plan->sample_rate_hz != 0U ? in_out_plan->sample_rate_hz : 1U)));
+        heap_caps_free(scan);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    const uint64_t frame_absolute = in_out_plan->audio_offset + best.stream_offset;
+    if (in_out_plan->no_seektable) {
+        flac_nas_remember_observed_anchor(best.sample_number, frame_absolute);
+        in_out_plan->target_sample = best.sample_number;
+        in_out_plan->anchor_sample = best.sample_number;
+    }
+    const size_t replay_bytes = filled - best_index;
+    memmove(scan, scan + best_index, replay_bytes);
+    in_out_plan->seek_offset = frame_absolute;
+    in_out_plan->anchor_sample = best.sample_number;
+    *out_replay_buffer = scan;
+    *out_replay_bytes = replay_bytes;
+    const uint64_t requested_sample = in_out_plan->requested_target_sample != 0U
+        ? in_out_plan->requested_target_sample : in_out_plan->target_sample;
+    const uint64_t snap_delta = requested_sample > best.sample_number
+        ? requested_sample - best.sample_number : best.sample_number - requested_sample;
+    ESP_LOGD(TAG,
+        "NAS_FLAC_SEEK_REFINE: found=1 mode=%s requested=%llu actual=%llu error_ms=%llu frame_offset=%llu anchor=%llu discarded=%llu scanned=%uB replay=%uB",
+        in_out_plan->no_seektable ? "approx" : "precise",
+        static_cast<unsigned long long>(requested_sample),
+        static_cast<unsigned long long>(best.sample_number),
+        static_cast<unsigned long long>((snap_delta * 1000ULL) / in_out_plan->sample_rate_hz),
+        static_cast<unsigned long long>(frame_absolute), static_cast<unsigned long long>(best.sample_number),
+        static_cast<unsigned long long>(in_out_plan->no_seektable ? 0U : in_out_plan->target_sample - best.sample_number),
+        static_cast<unsigned>(filled), static_cast<unsigned>(replay_bytes));
+    return ESP_OK;
+}
+
+esp_err_t flac_decoder_plan_nas_seek(AudioSource *source, uint64_t target_ms,
+                                      FlacNasSeekPlan *out_plan)
+{
+    if (source == nullptr || out_plan == nullptr || target_ms == 0U) return ESP_ERR_INVALID_ARG;
+    FlacStreamDescriptor descriptor = {};
+    const esp_err_t ret = flac_parse_stream_descriptor_streaming(
+        source, &descriptor, out_plan, target_ms);
+    if (ret == ESP_OK) {
+        ESP_LOGD(TAG,
+            "NAS_FLAC_SEEK_PLAN: target=%llu anchor=%llu gap_ms=%llu offset=%llu audio=%llu points=%lu",
+            static_cast<unsigned long long>(out_plan->target_sample),
+            static_cast<unsigned long long>(out_plan->anchor_sample),
+            static_cast<unsigned long long>(((out_plan->target_sample - out_plan->anchor_sample) * 1000ULL) / out_plan->sample_rate_hz),
+            static_cast<unsigned long long>(out_plan->seek_offset),
+            static_cast<unsigned long long>(out_plan->audio_offset),
+            static_cast<unsigned long>(descriptor.seektable_length_bytes / FLAC_SEEKPOINT_BYTES));
+    }
+    return ret;
+}
+
+esp_err_t flac_decoder_open_streaming_at_nas_seek(FlacDecoder *decoder, AudioSource *source,
+    AudioDecodeWorkspace *workspace, const FlacNasSeekPlan &plan)
+{
+    if (decoder == nullptr || source == nullptr || !audio_source_is_open(source) ||
+        plan.sample_rate_hz == 0U || plan.target_sample < plan.anchor_sample ||
+        (!plan.no_seektable && (plan.seektable_length_bytes < FLAC_SEEKPOINT_BYTES ||
+        plan.seektable_length_bytes % FLAC_SEEKPOINT_BYTES != 0U ||
+        plan.seektable_offset >= plan.audio_offset ||
+        plan.seektable_length_bytes > plan.audio_offset - plan.seektable_offset)) ||
+        plan.seek_offset < plan.audio_offset || plan.seek_offset >= plan.file_bytes) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    flac_decoder_close(decoder);
+    esp_err_t ret = flac_decoder_register_backend();
+    if (ret != ESP_OK) return ret;
+    FlacStreamDescriptor descriptor = {};
+    descriptor.file_size_bytes = plan.file_bytes;
+    descriptor.audio_data_offset_bytes = plan.audio_offset;
+    descriptor.seektable_offset_bytes = plan.seektable_offset;
+    descriptor.seektable_length_bytes = plan.seektable_length_bytes;
+    memcpy(descriptor.streaminfo_payload, plan.streaminfo, FLAC_STREAMINFO_BYTES);
+    ret = flac_decode_streaminfo_payload(&descriptor);
+    if (ret != ESP_OK || descriptor.sample_rate_hz != plan.sample_rate_hz ||
+        (descriptor.total_frames != 0U && plan.target_sample >= descriptor.total_frames)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    decoder->source = source;
+    flac_apply_stream_descriptor(decoder, descriptor);
+    uint8_t synthetic_header[FLAC_SYNTHETIC_HEADER_BYTES] = {};
+    flac_build_synthetic_header(descriptor, synthetic_header);
+    ret = flac_decoder_prepare_runtime(decoder, workspace, plan.seek_offset,
+        synthetic_header, sizeof(synthetic_header), plan.anchor_sample, true);
+    if (ret == ESP_OK) {
+        decoder->preplay_decode_active = true;
+        ret = flac_decoder_discard_to_frame(decoder, plan.target_sample);
+        decoder->preplay_decode_active = false;
+    }
+    if (ret != ESP_OK) {
+        flac_decoder_close(decoder);
+    } else {
+        ESP_LOGI(TAG, "NAS_FLAC_SEEK: target=%llu anchor=%llu discarded=%llu offset=%llu retained_seekpoints=%lu",
+            static_cast<unsigned long long>(plan.target_sample),
+            static_cast<unsigned long long>(plan.anchor_sample),
+            static_cast<unsigned long long>(plan.target_sample - plan.anchor_sample),
+            static_cast<unsigned long long>(plan.seek_offset),
+            static_cast<unsigned long>(plan.seektable_length_bytes / FLAC_SEEKPOINT_BYTES));
+    }
+    return ret;
 }
 
 static esp_err_t flac_decoder_prepare_seek_runtime(

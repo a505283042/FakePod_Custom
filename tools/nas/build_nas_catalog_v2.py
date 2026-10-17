@@ -63,6 +63,7 @@ META_HAS_ALBUM_ARTIST_TAG = 1 << 10
 TECH_PARSED = 1 << 0
 TECH_HAS_VBR_HEADER = 1 << 2
 TECH_DURATION_ESTIMATED = 1 << 3
+TECH_CBR_INFO = 1 << 4
 
 MP3_SCAN_BUFFER_BYTES = 8192
 MP3_MAX_LEADING_SCAN_BYTES = 256 * 1024
@@ -551,14 +552,15 @@ def mp3_side_info_size(header: dict) -> int:
     return 9 if header["channels"] == 1 else 17
 
 
-def mp3_xing_frame_count(f, frame_offset: int, header: dict) -> int:
+def mp3_xing_frame_count(f, frame_offset: int, header: dict) -> tuple[int, bool]:
     offset = frame_offset + 4 + (2 if header["has_crc"] else 0) + mp3_side_info_size(header)
     f.seek(offset)
     prefix = f.read(12)
     if len(prefix) != 12 or prefix[:4] not in (b"Xing", b"Info"):
-        return 0
+        return 0, False
     flags = int.from_bytes(prefix[4:8], "big", signed=False)
-    return int.from_bytes(prefix[8:12], "big", signed=False) if flags & 1 else 0
+    count = int.from_bytes(prefix[8:12], "big", signed=False) if flags & 1 else 0
+    return count, prefix[:4] == b"Info" and count > 0
 
 
 def mp3_vbri_frame_count(f, frame_offset: int) -> int:
@@ -586,11 +588,11 @@ def probe_mp3_technical(path: Path, file_size: int) -> dict:
         flags = TECH_PARSED
         total_frames = 0
         duration_ms = 0
-        frame_count = mp3_xing_frame_count(f, frame_offset, frame)
+        frame_count, cbr_info = mp3_xing_frame_count(f, frame_offset, frame)
         if frame_count == 0:
             frame_count = mp3_vbri_frame_count(f, frame_offset)
         if frame_count:
-            flags |= TECH_HAS_VBR_HEADER
+            flags |= TECH_CBR_INFO if cbr_info else TECH_HAS_VBR_HEADER
             total_frames = frame_count * frame["samples_per_frame"]
             duration_ms = (total_frames * 1000) // frame["sample_rate_hz"]
         elif frame["bitrate_kbps"] and file_size > frame_offset:

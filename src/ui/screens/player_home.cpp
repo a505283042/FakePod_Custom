@@ -3557,7 +3557,9 @@ static void player_home_update_time_labels(uint64_t position_ms, uint64_t total_
 
 static bool player_home_snapshot_can_scrub(const AudioStateSnapshot &snapshot)
 {
-    if (snapshot.source != AudioPlaybackSource::Local ||
+    const AudioPlaybackSource expected_source = player_state_get_source() == PlayerMediaSource::Nas
+        ? AudioPlaybackSource::NasHttp : AudioPlaybackSource::Local;
+    if (snapshot.source != expected_source ||
         !snapshot.ready || !snapshot.seek_supported || snapshot.track_index == UINT32_MAX) {
         return false;
     }

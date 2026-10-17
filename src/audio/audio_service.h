@@ -219,6 +219,17 @@ bool audio_service_seek_track(
     bool wait = false
 );
 
+// R145.6：NAS SEEK 必须携带真实 HTTP URL 与认证；与本地 SEEK 共用 AudioTask 单槽。
+bool audio_service_seek_nas_track(
+    uint32_t track_index,
+    const char *url,
+    MediaFormat format,
+    const char *username,
+    const char *password,
+    const MediaTechnicalInfo *technical_info,
+    uint64_t target_ms,
+    bool wait = false);
+
 // 用户音量/静音同样只能通过 AudioTask 命令队列改变。
 // percent 范围 0~100；R.13 默认 50%≈-18dB，保持接近旧版 80%=-20dB 的启动实际响度。
 bool audio_service_set_volume(uint8_t percent, bool wait = false);

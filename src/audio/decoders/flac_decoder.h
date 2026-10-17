@@ -217,6 +217,60 @@ esp_err_t flac_decoder_open_streaming(
     AudioDecodeWorkspace *workspace = nullptr
 );
 
+// R145.13: NAS FLAC SEEKTABLE seek plan. File offsets are absolute HTTP byte offsets.
+// The streaminfo is retained only for building a synthetic FLAC header after Range reopen.
+struct FlacNasSeekPlan
+{
+    uint8_t streaminfo[34] = {};
+    uint64_t file_bytes = 0;
+    uint64_t audio_offset = 0;
+    uint64_t seek_offset = 0;
+    uint64_t anchor_sample = 0;
+    uint64_t target_sample = 0;
+    // Original requested sample; no-SEEKTABLE fast seek may intentionally snap to a nearby frame.
+    uint64_t requested_target_sample = 0;
+    uint64_t seektable_offset = 0;
+    uint32_t seektable_length_bytes = 0;
+    uint32_t sample_rate_hz = 0;
+    // Bounded HTTP Range window used to refine the sparse SEEKTABLE anchor by scanning
+    // actual FLAC frame headers. All offsets are absolute file byte offsets.
+    uint64_t scan_start_offset = 0;
+    uint64_t scan_end_offset = 0;
+    uint64_t scan_estimate_offset = 0;
+    uint64_t scan_min_offset = 0;
+    uint64_t scan_max_offset = 0;
+    uint64_t scan_min_sample = 0;
+    uint64_t scan_max_sample = 0;
+    bool scan_required = false;
+    // No-SEEKTABLE iterative calibration: last observed real FLAC frame.
+    bool no_seektable = false;
+    bool observed_valid = false;
+    uint64_t observed_sample = 0;
+    uint64_t observed_offset = 0;
+};
+
+// Resize the local frame-scan window around the interpolated byte estimate.
+// The window is always clamped between adjacent SEEKTABLE anchors.
+esp_err_t flac_decoder_set_nas_seek_scan_window(FlacNasSeekPlan *plan, uint32_t guard_bytes);
+
+// Call on a streaming HTTP source opened at offset zero. Reads only FLAC metadata.
+// Reuse the current track's cached SEEKTABLE after the first seek; no metadata HTTP pass.
+esp_err_t flac_decoder_plan_nas_seek_cached(uint64_t target_ms, FlacNasSeekPlan *out_plan);
+// Use a verified FLAC frame sample number to correct the byte estimate after a local miss.
+esp_err_t flac_decoder_calibrate_nas_seek_no_table(FlacNasSeekPlan *plan);
+// Scan a bounded Range window for the latest CRC8-valid FLAC frame header at/before target.
+// On success, returns a PSRAM replay buffer suffix beginning at that frame; caller transfers
+// ownership to buffered_http_audio_source_attach_replay(). No second HTTP connection is needed.
+esp_err_t flac_decoder_refine_nas_seek_range(
+    AudioSource *source, FlacNasSeekPlan *in_out_plan,
+    uint8_t **out_replay_buffer, size_t *out_replay_bytes, uint64_t *out_scanned_bytes);
+void flac_decoder_clear_nas_seek_cache();
+esp_err_t flac_decoder_plan_nas_seek(AudioSource *source, uint64_t target_ms,
+                                      FlacNasSeekPlan *out_plan);
+// Call on a new HTTP Range source already positioned at plan.seek_offset.
+esp_err_t flac_decoder_open_streaming_at_nas_seek(FlacDecoder *decoder, AudioSource *source,
+    AudioDecodeWorkspace *workspace, const FlacNasSeekPlan &plan);
+
 // 直接从指定毫秒位置建立 FLAC 运行时。Seek 请求使用该入口可避免先按曲首建立一次
 // Prefetch/首块 PCM，随后又立即关闭并重建到 seekpoint 的重复工作。
 esp_err_t flac_decoder_open_at_ms(

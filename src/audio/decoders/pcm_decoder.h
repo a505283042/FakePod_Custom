@@ -84,6 +84,10 @@ esp_err_t pcm_decoder_open_streaming(
     AudioSource *source,
     AudioDecodeWorkspace *workspace = nullptr
 );
+// NAS FLAC SEEKTABLE: transfers ownership of streaming Source even on failure.
+esp_err_t pcm_decoder_open_streaming_flac_seek(
+    PcmDecoder *decoder, AudioSource *source, AudioDecodeWorkspace *workspace,
+    const FlacNasSeekPlan &plan);
 // 在硬件启动前直接建立到目标位置的解码器。FLAC 会从目标 seekpoint 一次性建立运行时，
 // 避免普通 open 后再 seek 造成重复 Prefetch；MP3/WAV/Opus 保持 open + seek 行为。
 esp_err_t pcm_decoder_open_for_seek(

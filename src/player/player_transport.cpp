@@ -592,11 +592,7 @@ bool player_transport_seek_ms(uint64_t target_ms)
     if (path == nullptr || path[0] == '\0') {
         return false;
     }
-    if (player_state_get_source() == PlayerMediaSource::Nas) {
-        ESP_LOGW(TAG, "NAS HTTP顺序流当前不支持Seek：target=%llums",
-            static_cast<unsigned long long>(target_ms));
-        return false;
-    }
+    const bool nas = player_state_get_source() == PlayerMediaSource::Nas;
     const size_t track_index = player_state_get_index();
     MediaTechnicalInfo technical = {};
     const bool has_technical = player_state_get_technical_info(&technical);
@@ -605,6 +601,22 @@ bool player_transport_seek_ms(uint64_t target_ms)
         static_cast<unsigned>(track_index),
         static_cast<unsigned long long>(target_ms));
 #endif
+    if (nas) {
+        NasPlaybackEndpoint endpoint = {};
+        if (nas_catalog_service_get_playback_endpoint(&endpoint) != ESP_OK) return false;
+        static constexpr size_t kUrlMax = 4096U;
+        char *url = static_cast<char *>(heap_caps_malloc(
+            kUrlMax, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (url == nullptr) return false;
+        const bool built = nas_catalog_service_build_track_url(
+            &endpoint, path, url, kUrlMax) == ESP_OK;
+        const bool ok = built && audio_service_seek_nas_track(
+            static_cast<uint32_t>(track_index), url, player_state_get_format(),
+            endpoint.username, endpoint.password,
+            has_technical ? &technical : nullptr, target_ms, false);
+        heap_caps_free(url);
+        return ok;
+    }
     return audio_service_seek_track(
         static_cast<uint32_t>(track_index),
         path,

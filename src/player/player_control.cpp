@@ -455,21 +455,19 @@ bool player_control_seek_ms(uint64_t target_ms)
         return false;
     }
     AudioStateSnapshot audio = {};
-    if (audio_service_get_snapshot(&audio) && audio.source == AudioPlaybackSource::NasHttp) {
-        ESP_LOGW(TAG, "NAS顺序流当前不支持Seek：target=%llums",
-            static_cast<unsigned long long>(target_ms));
-        player_control_unlock();
-        return false;
-    }
-    const bool ok = player_transport_seek_ms(target_ms);
+    const bool ok = audio_service_get_snapshot(&audio) &&
+        player_control_local_seek_available(audio) &&
+        player_transport_seek_ms(target_ms);
     player_control_unlock();
     return ok;
 }
 
 bool player_control_local_seek_available(const AudioStateSnapshot &audio)
 {
-    return player_state_is_ready() && player_state_get_source() == PlayerMediaSource::Local &&
-        audio.ready && audio.source == AudioPlaybackSource::Local && audio.seek_supported &&
+    const AudioPlaybackSource expected_source = player_state_get_source() == PlayerMediaSource::Nas
+        ? AudioPlaybackSource::NasHttp : AudioPlaybackSource::Local;
+    return player_state_is_ready() &&
+        audio.ready && audio.source == expected_source && audio.seek_supported &&
         audio.track_index != UINT32_MAX && audio.track_index == player_state_get_index() &&
         audio.playback_revision != 0U && audio.sample_rate_hz > 0U && audio.total_frames > 0ULL &&
         (audio.state == AudioPlaybackState::Playing || audio.state == AudioPlaybackState::Paused);

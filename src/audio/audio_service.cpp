@@ -209,9 +209,14 @@ static uint16_t g_task_channels = 0;
 static uint16_t g_task_bits_per_sample = 0;
 static AudioPlaybackClock g_playback_clock = {};
 static uint64_t g_task_total_frames = 0;
+static bool g_nas_mp3_cbr_seek_available = false;
 static uint32_t g_task_seek_revision = 0;
 static uint32_t g_task_last_seek_request_id = 0;
 static uint64_t g_task_last_seek_target_ms = 0;
+// R145.8: one-shot seek timing diagnostic; never changes decoder, buffer or clock.
+static bool g_nas_seek_diag_first_pcm_pending = false;
+static int64_t g_nas_seek_diag_begin_us = 0;
+static uint32_t g_nas_seek_diag_request_id = 0;
 static uint64_t g_last_progress_publish_frame = 0;
 #if APP_DIAG_AUDIO_CLOCK || APP_DIAG_AUDIO_RAM
 static bool g_ram_trace_first_pcm_done = false;
@@ -692,7 +697,15 @@ static void audio_task_publish_snapshot()
     snapshot.decoder_position_frames = g_playback_clock.decoder_frames;
     snapshot.position_ms = audio_playback_clock_position_ms(&g_playback_clock);
     snapshot.total_frames = g_task_total_frames;
-    snapshot.seek_supported = pcm_decoder_seek_supported(&g_decoder, 1);
+    // R145.5：NAS MP3 有已解析 CBR 索引时开放 SEEK；VBR 暂不作线性伪精确定位。
+    snapshot.seek_supported = pcm_decoder_seek_supported(&g_decoder, 1) ||
+        (snapshot.source == AudioPlaybackSource::NasHttp &&
+         snapshot.format == MediaFormat::FLAC &&
+         (flac_decoder_has_seektable(&g_decoder.flac) ||
+          (g_decoder.flac.sample_rate_hz > 0U && g_decoder.flac.total_frames > 0U &&
+           g_decoder.flac.audio_data_offset_bytes > 0U))) ||
+        (snapshot.source == AudioPlaybackSource::NasHttp &&
+         snapshot.format == MediaFormat::MP3 && g_nas_mp3_cbr_seek_available);
     snapshot.seek_revision = g_task_seek_revision;
     snapshot.last_seek_request_id = g_task_last_seek_request_id;
     snapshot.last_seek_target_ms = g_task_last_seek_target_ms;
@@ -934,6 +947,7 @@ static bool audio_task_try_recover_http_mp3_starvation(esp_err_t decoder_error)
 
 static void audio_task_reset_media_fields()
 {
+    g_nas_mp3_cbr_seek_available = false;
     g_task_sample_rate_hz = 0;
     g_task_channels = 0;
     g_task_bits_per_sample = 0;
@@ -1750,6 +1764,314 @@ static esp_err_t audio_task_start_output_hardware(
     return ESP_OK;
 }
 
+static bool nas_mp3_index_allows_cbr_seek(const MediaTechnicalInfo &tech)
+{
+    const bool estimated_no_vbr =
+        (tech.flags & MEDIA_TECH_DURATION_ESTIMATED) != 0U &&
+        (tech.flags & MEDIA_TECH_HAS_VBR_HEADER) == 0U;
+    const bool explicit_cbr_info = (tech.flags & MEDIA_TECH_CBR_INFO) != 0U &&
+        (tech.flags & MEDIA_TECH_HAS_VBR_HEADER) == 0U;
+    return (tech.flags & MEDIA_TECH_PARSED) != 0U &&
+        (estimated_no_vbr || explicit_cbr_info) &&
+        tech.bitrate_kbps > 0U && tech.sample_rate_hz > 0U && tech.channels > 0U;
+}
+
+// R145.10: NAS Xing VBR use the *real* 100-entry TOC. Never apply CBR byte/time mapping.
+// Xing TOC quantizes file position: the returned sample position is an estimate, not sample-accurate.
+struct NasMp3XingMap {
+    uint8_t toc[100] = {};
+    uint64_t audio_bytes = 0;
+    uint64_t audio_offset = 0;
+    // PCM sample frames, not MPEG compressed frames and not interleaved scalar samples.
+    uint64_t total_samples = 0;
+};
+
+// R145.12: Fraunhofer VBRI: the table covers spans of compressed MPEG frames.
+// Values are stored in PSRAM only during SEEK, never on the AudioTask stack.
+struct NasMp3VbriMap {
+    uint32_t *spans = nullptr;
+    uint16_t entries = 0;
+    uint16_t frames_per_entry = 0;
+    uint64_t audio_offset = 0;
+    uint64_t audio_bytes = 0;
+    uint64_t total_samples = 0;
+    uint32_t samples_per_frame = 0;
+};
+
+static void nas_mp3_vbri_release(NasMp3VbriMap *map)
+{
+    if (map != nullptr) {
+        if (map->spans != nullptr) heap_caps_free(map->spans);
+        *map = {};
+    }
+}
+
+static uint16_t nas_mp3_be16(const uint8_t *p)
+{
+    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
+}
+
+static uint32_t nas_mp3_be32(const uint8_t *p)
+{
+    return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
+        (static_cast<uint32_t>(p[2]) << 8) | p[3];
+}
+
+static bool nas_mp3_vbr_index(const MediaTechnicalInfo &tech)
+{
+    return (tech.flags & (MEDIA_TECH_PARSED | MEDIA_TECH_HAS_VBR_HEADER)) ==
+        (MEDIA_TECH_PARSED | MEDIA_TECH_HAS_VBR_HEADER) &&
+        tech.total_frames > 0 && tech.sample_rate_hz > 0 && tech.channels > 0;
+}
+
+static bool nas_mp3_seek_index_eligible(const MediaTechnicalInfo &tech)
+{
+    return nas_mp3_index_allows_cbr_seek(tech) || nas_mp3_vbr_index(tech);
+}
+
+static esp_err_t nas_mp3_load_xing_map(
+    const AudioRequest *request, const MediaTechnicalInfo &tech, NasMp3XingMap *map)
+{
+    if (request == nullptr || map == nullptr || !nas_mp3_vbr_index(tech)) return ESP_ERR_NOT_SUPPORTED;
+    AudioSource probe = {};
+    esp_err_t err = buffered_http_audio_source_open_range(
+        &probe, BufferedHttpAudioProfile::Mp3, audio_request_path(request),
+        request->nas_username, request->nas_password, tech.audio_data_offset,
+        audio_task_nas_open_should_abort, request);
+    if (err != ESP_OK) return err;
+    uint8_t header[256] = {};
+    size_t used = 0;
+    while (used < sizeof(header) && !audio_task_nas_open_should_abort(request)) {
+        size_t got = 0;
+        err = audio_source_read(&probe, header + used, sizeof(header) - used, &got);
+        if (err != ESP_OK || got == 0) break;
+        used += got;
+    }
+    uint64_t file_bytes = 0ULL;
+    const bool have_size = audio_source_size(&probe, &file_bytes) == ESP_OK;
+    (void)audio_source_close(&probe);
+    if (err != ESP_OK || used != sizeof(header)) return ESP_ERR_INVALID_RESPONSE;
+    if (!have_size || file_bytes <= tech.audio_data_offset + 256ULL) return ESP_ERR_INVALID_SIZE;
+    if (header[0] != 0xFF || (header[1] & 0xE0U) != 0xE0U ||
+        ((header[2] >> 2) & 3U) == 3U || (header[2] >> 4) == 0U ||
+        (header[2] >> 4) == 15U || ((header[1] >> 1) & 3U) != 1U) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    const uint8_t version = (header[1] >> 3) & 3U;
+    if (version == 1U) return ESP_ERR_NOT_SUPPORTED;
+    const uint32_t base_rates[3] = {44100U, 48000U, 32000U};
+    const uint32_t rate = base_rates[(header[2] >> 2) & 3U] /
+        (version == 3U ? 1U : version == 2U ? 2U : 4U);
+    if (rate != tech.sample_rate_hz) return ESP_ERR_INVALID_RESPONSE;
+    const bool mono = ((header[3] >> 6) & 3U) == 3U;
+    const uint32_t side = version == 3U ? (mono ? 17U : 32U) : (mono ? 9U : 17U);
+    const size_t pos = 4U + ((header[1] & 1U) == 0U ? 2U : 0U) + side;
+    if (pos + 8U > sizeof(header) || memcmp(header + pos, "Xing", 4) != 0) {
+        // VBRI and Xing without TOC remain disabled; never silently use linear bitrate.
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    const uint32_t flags = nas_mp3_be32(header + pos + 4U);
+    if ((flags & 0x4U) == 0U || (flags & 0x1U) == 0U) return ESP_ERR_NOT_SUPPORTED;
+    size_t cursor = pos + 8U;
+    if (cursor + 4U > sizeof(header)) return ESP_ERR_INVALID_SIZE;
+    const uint32_t frames = nas_mp3_be32(header + cursor);
+    cursor += 4U;
+    if (frames == 0 || (static_cast<uint64_t>(frames) *
+        (version == 3U ? 1152ULL : 576ULL)) != tech.total_frames)
+        return ESP_ERR_NOT_SUPPORTED;
+    uint64_t bytes = 0;
+    if ((flags & 0x2U) != 0U) {
+        if (cursor + 4U > sizeof(header)) return ESP_ERR_INVALID_SIZE;
+        bytes = nas_mp3_be32(header + cursor);
+        cursor += 4U;
+    }
+    if (bytes == 0 || bytes > file_bytes - tech.audio_data_offset ||
+        cursor + 100U > sizeof(header)) return ESP_ERR_NOT_SUPPORTED;
+    memcpy(map->toc, header + cursor, 100U);
+    for (size_t i = 1; i < 100U; ++i) {
+        if (map->toc[i] < map->toc[i - 1U]) return ESP_ERR_INVALID_RESPONSE;
+    }
+    map->audio_bytes = bytes;
+    map->audio_offset = tech.audio_data_offset;
+    map->total_samples = tech.total_frames;
+    ESP_LOGI(TAG,
+        "NAS_VBR_MAP: audio_offset=%llu audio_bytes=%llu total_samples=%llu rate=%lu toc0=%u toc50=%u toc99=%u precision=TOC_APPROX",
+        static_cast<unsigned long long>(map->audio_offset),
+        static_cast<unsigned long long>(map->audio_bytes),
+        static_cast<unsigned long long>(map->total_samples),
+        static_cast<unsigned long>(tech.sample_rate_hz),
+        static_cast<unsigned>(map->toc[0]),
+        static_cast<unsigned>(map->toc[50]),
+        static_cast<unsigned>(map->toc[99]));
+    return ESP_OK;
+}
+
+static esp_err_t nas_mp3_load_vbri_map(
+    const AudioRequest *request, const MediaTechnicalInfo &tech, NasMp3VbriMap *map)
+{
+    if (request == nullptr || map == nullptr || !nas_mp3_vbr_index(tech)) return ESP_ERR_NOT_SUPPORTED;
+    AudioSource probe = {};
+    esp_err_t ret = buffered_http_audio_source_open_range(
+        &probe, BufferedHttpAudioProfile::Mp3, audio_request_path(request),
+        request->nas_username, request->nas_password, tech.audio_data_offset,
+        audio_task_nas_open_should_abort, request);
+    if (ret != ESP_OK) return ret;
+    uint8_t head[62] = {};
+    size_t used = 0;
+    while (used < sizeof(head) && !audio_task_nas_open_should_abort(request)) {
+        size_t got = 0;
+        ret = audio_source_read(&probe, head + used, sizeof(head) - used, &got);
+        if (ret != ESP_OK || got == 0) break;
+        used += got;
+    }
+    uint64_t file_bytes = 0;
+    const bool size_ok = audio_source_size(&probe, &file_bytes) == ESP_OK;
+    if (ret != ESP_OK || used != sizeof(head) || !size_ok ||
+        file_bytes <= tech.audio_data_offset + sizeof(head)) {
+        (void)audio_source_close(&probe);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    // VBRI marker is at MPEG-frame offset +36, including the 4-byte MPEG header.
+    const uint8_t version = (head[1] >> 3) & 3U;
+    if (head[0] != 0xFF || (head[1] & 0xE6U) != 0xE2U ||
+        version == 1U || ((head[2] >> 2) & 3U) == 3U ||
+        memcmp(head + 36, "VBRI", 4) != 0) {
+        (void)audio_source_close(&probe);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    const uint32_t rate_table[3] = {44100U, 48000U, 32000U};
+    const uint32_t sample_rate = rate_table[(head[2] >> 2) & 3U] /
+        (version == 3U ? 1U : version == 2U ? 2U : 4U);
+    const uint32_t spf = version == 3U ? 1152U : 576U;
+    const uint8_t *v = head + 36;
+    const uint32_t audio_bytes = nas_mp3_be32(v + 10);
+    const uint32_t frame_count = nas_mp3_be32(v + 14);
+    const uint16_t entries = nas_mp3_be16(v + 18);
+    const uint16_t scale = nas_mp3_be16(v + 20);
+    const uint16_t entry_bytes = nas_mp3_be16(v + 22);
+    const uint16_t frames_per_entry = nas_mp3_be16(v + 24);
+    if (sample_rate != tech.sample_rate_hz || frame_count == 0U ||
+        static_cast<uint64_t>(frame_count) * spf != tech.total_frames ||
+        entries == 0U || entries > 4096U || scale == 0U ||
+        entry_bytes == 0U || entry_bytes > 4U || frames_per_entry == 0U ||
+        static_cast<uint64_t>(entries) * frames_per_entry < frame_count ||
+        audio_bytes == 0U || audio_bytes > file_bytes - tech.audio_data_offset ||
+        62ULL + static_cast<uint64_t>(entries) * entry_bytes >
+            file_bytes - tech.audio_data_offset) {
+        (void)audio_source_close(&probe);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    map->spans = static_cast<uint32_t *>(heap_caps_malloc(
+        static_cast<size_t>(entries) * sizeof(uint32_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (map->spans == nullptr) {
+        (void)audio_source_close(&probe);
+        return ESP_ERR_NO_MEM;
+    }
+    uint64_t sum = 0;
+    for (uint16_t i = 0; i < entries; ++i) {
+        uint8_t raw[4] = {};
+        size_t done = 0;
+        while (done < entry_bytes && !audio_task_nas_open_should_abort(request)) {
+            size_t got = 0;
+            ret = audio_source_read(&probe, raw + done, entry_bytes - done, &got);
+            if (ret != ESP_OK || got == 0U) break;
+            done += got;
+        }
+        if (ret != ESP_OK || done != entry_bytes) { ret = ESP_ERR_INVALID_RESPONSE; break; }
+        uint32_t value = 0;
+        for (uint16_t j = 0; j < entry_bytes; ++j) value = (value << 8) | raw[j];
+        const uint64_t span = static_cast<uint64_t>(value) * scale;
+        if (span == 0ULL || span > UINT32_MAX || sum + span > audio_bytes) {
+            ret = ESP_ERR_INVALID_RESPONSE;
+            break;
+        }
+        sum += span;
+        map->spans[i] = static_cast<uint32_t>(span);
+    }
+    (void)audio_source_close(&probe);
+    if (ret != ESP_OK || sum == 0ULL) {
+        nas_mp3_vbri_release(map);
+        return ret == ESP_OK ? ESP_ERR_INVALID_RESPONSE : ret;
+    }
+    map->entries = entries;
+    map->frames_per_entry = frames_per_entry;
+    map->audio_offset = tech.audio_data_offset;
+    map->audio_bytes = audio_bytes;
+    map->total_samples = tech.total_frames;
+    map->samples_per_frame = spf;
+    ESP_LOGI(TAG, "NAS_VBRI_MAP: entries=%u scale=%u entry_bytes=%u frames_per_entry=%u audio_bytes=%lu samples=%llu precision=VBRI_APPROX",
+        static_cast<unsigned>(entries), static_cast<unsigned>(scale),
+        static_cast<unsigned>(entry_bytes), static_cast<unsigned>(frames_per_entry),
+        static_cast<unsigned long>(audio_bytes),
+        static_cast<unsigned long long>(map->total_samples));
+    return ESP_OK;
+}
+
+static uint64_t nas_mp3_vbri_offset(const NasMp3VbriMap &map, uint64_t sample)
+{
+    const uint64_t mpeg_frame = sample / map.samples_per_frame;
+    const uint64_t index = mpeg_frame / map.frames_per_entry;
+    const uint64_t inside = mpeg_frame % map.frames_per_entry;
+    uint64_t bytes = 0;
+    for (uint16_t i = 0; i < map.entries; ++i) {
+        if (i == index) {
+            bytes += (static_cast<uint64_t>(map.spans[i]) * inside) / map.frames_per_entry;
+            break;
+        }
+        bytes += map.spans[i];
+    }
+    return map.audio_offset + bytes;
+}
+
+static uint64_t nas_mp3_vbri_estimate_sample_at_byte(const NasMp3VbriMap &map, uint64_t byte)
+{
+    uint64_t remaining = byte > map.audio_offset ? byte - map.audio_offset : 0ULL;
+    uint64_t frames = 0ULL;
+    for (uint16_t i = 0; i < map.entries; ++i) {
+        const uint32_t span = map.spans[i];
+        if (remaining < span) {
+            frames += remaining * map.frames_per_entry / span;
+            break;
+        }
+        remaining -= span;
+        frames += map.frames_per_entry;
+    }
+    const uint64_t samples = frames * map.samples_per_frame;
+    return samples < map.total_samples ? samples : map.total_samples;
+}
+
+static uint64_t nas_mp3_xing_offset(const NasMp3XingMap &map, uint64_t sample)
+{
+    if (map.audio_bytes == 0ULL || map.total_samples == 0ULL) return map.audio_offset;
+    const uint64_t fraction10000 = sample >= map.total_samples ? 9999ULL :
+        (sample * 10000ULL) / map.total_samples;
+    const uint32_t idx = static_cast<uint32_t>(fraction10000 / 100U);
+    const uint32_t frac = static_cast<uint32_t>(fraction10000 % 100U);
+    const uint32_t a = map.toc[idx];
+    const uint32_t b = idx < 99U ? map.toc[idx + 1U] : 256U;
+    return map.audio_offset +
+        (map.audio_bytes * (a * 100ULL + (b - a) * frac)) / 25600ULL;
+}
+
+static uint64_t nas_mp3_xing_estimate_sample_at_byte(const NasMp3XingMap &map, uint64_t byte)
+{
+    // Inverse mapping from the 100-entry/8-bit Xing TOC; never an exact sample index.
+    if (map.audio_bytes == 0ULL || map.total_samples == 0ULL || byte <= map.audio_offset) return 0;
+    const uint64_t end = map.audio_offset + map.audio_bytes;
+    if (byte >= end) return map.total_samples;
+    const uint64_t scaled = ((byte - map.audio_offset) * 25600ULL) / map.audio_bytes;
+    for (uint32_t i = 0; i < 100U; ++i) {
+        const uint32_t a = map.toc[i] * 100U;
+        const uint32_t b = (i == 99U ? 256U : map.toc[i + 1U]) * 100U;
+        if (scaled < b || i == 99U) {
+            const uint64_t part = b > a && scaled > a
+                ? ((scaled - a) * 100ULL) / (b - a) : 0ULL;
+            return (map.total_samples * (i * 100ULL + (part < 100ULL ? part : 99ULL))) / 10000ULL;
+        }
+    }
+    return map.total_samples;
+}
+
 static esp_err_t audio_task_start_pcm_pipeline(
     PcmDecoderType decoder_type,
     const char *path,
@@ -1765,36 +2087,350 @@ static esp_err_t audio_task_start_pcm_pipeline(
         *out_failure_scope = AudioFailureScope::System;
     }
     audio_task_log_ram("before_decoder_open");
+    // A normal play request starts a new track/session; release any prior NAS FLAC
+    // SEEKTABLE cache even when the next track is MP3 or a local file.
+    if (!apply_seek) {
+        flac_decoder_clear_nas_seek_cache();
+    }
     PcmSeekResult seek_result = {};
     const bool nas_http = request != nullptr && request->source == AudioPlaybackSource::NasHttp;
     esp_err_t ret = ESP_OK;
     if (nas_http) {
-        if (apply_seek || (decoder_type != PcmDecoderType::Mp3 && decoder_type != PcmDecoderType::Flac)) {
+        if (decoder_type != PcmDecoderType::Mp3 && decoder_type != PcmDecoderType::Flac) {
             return ESP_ERR_NOT_SUPPORTED;
         }
         const BufferedHttpAudioProfile profile = decoder_type == PcmDecoderType::Flac
             ? BufferedHttpAudioProfile::Flac
             : BufferedHttpAudioProfile::Mp3;
         AudioSource http_source = {};
-        ret = buffered_http_audio_source_open(
-            &http_source,
-            profile,
-            path,
-            request->nas_username,
-            request->nas_password,
-            audio_task_nas_open_should_abort,
-            request);
+        uint64_t aligned_offset = 0ULL;
+        uint64_t estimated_offset = 0ULL;
+        uint64_t seek_preroll_ms = 0ULL;
+        NasMp3XingMap xing = {};
+        NasMp3VbriMap vbri = {};
+        bool use_vbri = false;
+        FlacNasSeekPlan flac_seek_plan = {};
+        const MediaTechnicalInfo *tech = request->has_technical_info
+            ? &request->technical_info : nullptr;
+        if (apply_seek && decoder_type == PcmDecoderType::Flac && seek_target_ms != 0ULL) {
+            // The first SEEK parses metadata and caches SEEKTABLE in PSRAM. Cached seeks
+            // estimate only a bounded scan window; the final anchor must be a real FLAC
+            // frame header. Scanned bytes are replayed through the same HTTP ring, so a
+            // successful refinement does not require a second Range handshake.
+            ret = flac_decoder_plan_nas_seek_cached(seek_target_ms, &flac_seek_plan);
+            if (ret == ESP_ERR_NOT_FOUND) {
+                ret = buffered_http_audio_source_open(
+                    &http_source, profile, path, request->nas_username,
+                    request->nas_password, audio_task_nas_open_should_abort, request);
+                if (ret == ESP_OK) {
+                    ret = flac_decoder_plan_nas_seek(&http_source, seek_target_ms, &flac_seek_plan);
+                    (void)audio_source_close(&http_source);
+                }
+                if (ret == ESP_OK) {
+                    FlacNasSeekPlan cached_plan = {};
+                    if (flac_decoder_plan_nas_seek_cached(seek_target_ms, &cached_plan) == ESP_OK) {
+                        flac_seek_plan = cached_plan;
+                    }
+                }
+            }
+            if (ret == ESP_OK) {
+                const FlacNasSeekPlan fallback_plan = flac_seek_plan;
+                bool refined = false;
+                bool fallback_to_seektable = false;
+                if (flac_seek_plan.scan_required) {
+                    // Adaptive windows: keep the common path small, and expand only
+                    // after a miss. Each attempt uses one Range connection and reuses
+                    // its scanned suffix if a valid near-target frame is found.
+                    constexpr uint32_t kScanGuards[] = {64U * 1024U, 128U * 1024U, 256U * 1024U};
+                    // No-SEEKTABLE mode is intentionally approximate: start wider and
+                    // allow only one calibrated retry, rather than chasing sample-exactness.
+                    constexpr uint32_t kNoTableFirstGuard = 128U * 1024U;
+                    constexpr size_t kNoTableMaxProbes = 2U;
+                    ret = ESP_ERR_NOT_FOUND;
+                    for (size_t attempt = 0U;
+                         attempt < (flac_seek_plan.no_seektable ? kNoTableMaxProbes :
+                            sizeof(kScanGuards) / sizeof(kScanGuards[0])); ++attempt) {
+                        if (audio_task_nas_open_should_abort(request)) {
+                            ret = ESP_ERR_INVALID_STATE;
+                            break;
+                        }
+                        const esp_err_t window_ret = flac_decoder_set_nas_seek_scan_window(
+                            &flac_seek_plan, flac_seek_plan.no_seektable
+                                ? (attempt == 0U ? kNoTableFirstGuard : 256U * 1024U)
+                                : kScanGuards[attempt]);
+                        if (window_ret != ESP_OK) {
+                            ret = window_ret;
+                            break;
+                        }
+                        if (attempt != 0U) {
+                            ESP_LOGD(TAG, "NAS_FLAC_SEEK_REFINE: expand attempt=%u guard=%uB window=%lluB",
+                                static_cast<unsigned>(attempt + 1U),
+                                flac_seek_plan.no_seektable
+                                    ? (attempt == 0U ? kNoTableFirstGuard : 256U * 1024U)
+                                    : kScanGuards[attempt],
+                                static_cast<unsigned long long>(flac_seek_plan.scan_end_offset - flac_seek_plan.scan_start_offset));
+                        }
+                        fallback_to_seektable = false;
+                        ret = buffered_http_audio_source_open_range(
+                            &http_source, flac_seek_plan.no_seektable
+                                ? BufferedHttpAudioProfile::FlacSeekProbe : profile,
+                            path, request->nas_username,
+                            request->nas_password, flac_seek_plan.scan_start_offset,
+                            audio_task_nas_open_should_abort, request);
+                        if (ret != ESP_OK) break;
+
+                        uint8_t *replay_buffer = nullptr;
+                        size_t replay_bytes = 0U;
+                        uint64_t scanned_bytes = 0ULL;
+                        const esp_err_t refine_ret = flac_decoder_refine_nas_seek_range(
+                            &http_source, &flac_seek_plan, &replay_buffer, &replay_bytes, &scanned_bytes);
+                        if (refine_ret == ESP_OK) {
+                            const esp_err_t attach_ret = buffered_http_audio_source_attach_replay(
+                                &http_source, replay_buffer, replay_bytes, flac_seek_plan.seek_offset);
+                            if (attach_ret == ESP_OK) {
+                                replay_buffer = nullptr;  // Source owns the PSRAM replay buffer now.
+                                ESP_LOGD(TAG,
+                                    "NAS_FLAC_SEEK_REFINE: attached=1 attempt=%u scanned=%lluB replay=%uB connection_reused=1",
+                                    static_cast<unsigned>(attempt + 1U),
+                                    static_cast<unsigned long long>(scanned_bytes),
+                                    static_cast<unsigned>(replay_bytes));
+                                refined = true;
+                                ret = ESP_OK;
+                            } else {
+                                ESP_LOGW(TAG, "NAS_FLAC_SEEK_REFINE: replay attach failed ret=%s",
+                                    esp_err_to_name(attach_ret));
+                                ret = attach_ret;
+                                fallback_to_seektable = true;
+                            }
+                        } else {
+                            ESP_LOGD(TAG, "NAS_FLAC_SEEK_REFINE: attempt=%u miss ret=%s scanned=%lluB",
+                                static_cast<unsigned>(attempt + 1U), esp_err_to_name(refine_ret),
+                                static_cast<unsigned long long>(scanned_bytes));
+                            ret = refine_ret;
+                            fallback_to_seektable = !flac_seek_plan.no_seektable &&
+                                (refine_ret == ESP_ERR_NOT_FOUND || refine_ret == ESP_ERR_INVALID_SIZE);
+                        }
+                        if (replay_buffer != nullptr) heap_caps_free(replay_buffer);
+                        if (refined) break;
+                        (void)audio_source_close(&http_source);
+                        // Only a local miss should expand the search. Transport, memory,
+                        // or cancellation errors should not trigger repeated handshakes.
+                        if (refine_ret != ESP_ERR_NOT_FOUND && refine_ret != ESP_ERR_INVALID_SIZE) break;
+                        if (flac_seek_plan.no_seektable) {
+                            if (flac_decoder_calibrate_nas_seek_no_table(&flac_seek_plan) != ESP_OK) break;
+                        }
+                    }
+                } else {
+                    ret = buffered_http_audio_source_open_range(
+                        &http_source, profile, path, request->nas_username,
+                        request->nas_password, flac_seek_plan.seek_offset,
+                        audio_task_nas_open_should_abort, request);
+                }
+
+                if (!refined && flac_seek_plan.scan_required && fallback_to_seektable && ret != ESP_OK) {
+                    if (audio_source_is_open(&http_source)) (void)audio_source_close(&http_source);
+                    flac_seek_plan = fallback_plan;
+                    if (audio_task_nas_open_should_abort(request)) {
+                        ret = ESP_ERR_INVALID_STATE;
+                    } else {
+                        ESP_LOGW(TAG, "NAS_FLAC_SEEK_REFINE: fallback=SEEKTABLE after adaptive scan ret=%s",
+                            esp_err_to_name(ret));
+                        ret = buffered_http_audio_source_open_range(
+                            &http_source, profile, path, request->nas_username,
+                            request->nas_password, flac_seek_plan.seek_offset,
+                            audio_task_nas_open_should_abort, request);
+                    }
+                }
+            }
+        } else if (apply_seek && decoder_type == PcmDecoderType::Mp3) {
+            if (tech == nullptr || !nas_mp3_seek_index_eligible(*tech)) {
+                return ESP_ERR_NOT_SUPPORTED;
+            }
+            const bool vbr = nas_mp3_vbr_index(*tech);
+            if (vbr) {
+                ret = nas_mp3_load_xing_map(request, *tech, &xing);
+                if (ret == ESP_ERR_NOT_SUPPORTED) {
+                    ret = nas_mp3_load_vbri_map(request, *tech, &vbri);
+                    use_vbri = ret == ESP_OK;
+                }
+                if (ret != ESP_OK) {
+                    ESP_LOGW(TAG, "NAS_VBR_SEEK: no valid Xing TOC or VBRI table ret=%s", esp_err_to_name(ret));
+                    return ret;
+                }
+            }
+            // VBR: choose 1500ms preroll using Xing's nonlinear time/byte map.
+            // CBR: preserve the already validated 400ms linear path exactly.
+            seek_preroll_ms = vbr ? 1500ULL : 400ULL;
+            const uint64_t anchor_ms = seek_target_ms > seek_preroll_ms
+                ? seek_target_ms - seek_preroll_ms : 0ULL;
+            estimated_offset = vbr
+                ? (use_vbri ? nas_mp3_vbri_offset(vbri, (anchor_ms * tech->sample_rate_hz) / 1000ULL)
+                            : nas_mp3_xing_offset(xing, (anchor_ms * tech->sample_rate_hz) / 1000ULL))
+                : tech->audio_data_offset +
+                    (anchor_ms * static_cast<uint64_t>(tech->bitrate_kbps)) / 8ULL;
+            ret = buffered_http_audio_source_open_mp3_aligned_range(
+                &http_source, path, request->nas_username, request->nas_password,
+                estimated_offset, tech->sample_rate_hz, &aligned_offset,
+                audio_task_nas_open_should_abort, request);
+        } else {
+            ret = buffered_http_audio_source_open(
+                &http_source, profile, path, request->nas_username,
+                request->nas_password, audio_task_nas_open_should_abort, request);
+        }
+        if (ret == ESP_OK && apply_seek && decoder_type == PcmDecoderType::Mp3 &&
+            tech != nullptr && nas_mp3_vbr_index(*tech)) {
+            const uint64_t audio_start = use_vbri ? vbri.audio_offset : xing.audio_offset;
+            const uint64_t audio_end = audio_start + (use_vbri ? vbri.audio_bytes : xing.audio_bytes);
+            if (audio_end < audio_start || estimated_offset < audio_start ||
+                estimated_offset >= audio_end || aligned_offset < audio_start ||
+                aligned_offset >= audio_end) {
+                ESP_LOGW(TAG,
+                    "NAS_VBR_SEEK_COORD: reject out-of-audio-range estimate_byte=%llu aligned_byte=%llu audio_start=%llu audio_end=%llu",
+                    static_cast<unsigned long long>(estimated_offset),
+                    static_cast<unsigned long long>(aligned_offset),
+                    static_cast<unsigned long long>(audio_start),
+                    static_cast<unsigned long long>(audio_end));
+                ret = ESP_ERR_INVALID_RESPONSE;
+            }
+        }
         if (ret != ESP_OK) {
             // HTTP connect/header/prime 属于 NAS transport 故障，不是“坏曲”。
             // 保持 System scope，Player 不会因此连续随机跳过后续正常曲目。
             if (out_failure_scope != nullptr) *out_failure_scope = AudioFailureScope::System;
+            nas_mp3_vbri_release(&vbri);
+            if (audio_source_is_open(&http_source)) (void)audio_source_close(&http_source);
             return ret;
         }
-        ret = pcm_decoder_open_streaming(
-            &g_decoder, decoder_type, &http_source, &g_decode_workspace);
+        ret = apply_seek && decoder_type == PcmDecoderType::Flac && seek_target_ms != 0ULL
+            ? pcm_decoder_open_streaming_flac_seek(
+                &g_decoder, &http_source, &g_decode_workspace, flac_seek_plan)
+            : pcm_decoder_open_streaming(
+                &g_decoder, decoder_type, &http_source, &g_decode_workspace);
+        if (ret == ESP_OK && apply_seek && decoder_type == PcmDecoderType::Flac) {
+            seek_result.requested_frame = flac_seek_plan.target_sample;
+            seek_result.actual_frame = flac_seek_plan.target_sample;
+            seek_result.source_offset = flac_seek_plan.seek_offset;
+            seek_result.method = seek_target_ms == 0ULL
+                ? PcmSeekMethod::RestartFromBeginning
+                : (flac_seek_plan.no_seektable ? PcmSeekMethod::FlacFrameScan : PcmSeekMethod::FlacSeektable);
+        }
+        if (ret == ESP_OK && apply_seek && decoder_type == PcmDecoderType::Mp3) {
+            if (g_decoder.info.sample_rate_hz != tech->sample_rate_hz ||
+                g_decoder.info.channels != tech->channels ||
+                aligned_offset < tech->audio_data_offset) {
+                ret = ESP_ERR_INVALID_RESPONSE;
+            } else {
+                // Xing maps time to file position only approximately; this is not sample-accurate VBR seek.
+                const bool vbr = nas_mp3_vbr_index(*tech);
+                const uint64_t anchor_ms = vbr ? 0ULL :
+                    ((aligned_offset - tech->audio_data_offset) * 8ULL) /
+                    static_cast<uint64_t>(tech->bitrate_kbps);
+                uint64_t base_frame = vbr
+                    ? (use_vbri ? nas_mp3_vbri_estimate_sample_at_byte(vbri, aligned_offset)
+                                : nas_mp3_xing_estimate_sample_at_byte(xing, aligned_offset))
+                    : (anchor_ms * tech->sample_rate_hz) / 1000ULL;
+                const uint64_t estimated_base_sample = base_frame;
+                uint64_t dropped_frames = 0ULL;
+                const uint64_t target_frame =
+                    (seek_target_ms * static_cast<uint64_t>(tech->sample_rate_hz)) / 1000ULL;
+                if (vbr) {
+                    const uint64_t expected_preroll_samples =
+                        (seek_preroll_ms * static_cast<uint64_t>(tech->sample_rate_hz)) / 1000ULL;
+                    const int64_t expected_anchor_sample = target_frame >= expected_preroll_samples
+                        ? static_cast<int64_t>(target_frame - expected_preroll_samples) : 0LL;
+                    const int64_t anchor_delta_samples =
+                        static_cast<int64_t>(estimated_base_sample) - expected_anchor_sample;
+                    const int64_t byte_delta = static_cast<int64_t>(aligned_offset) -
+                        static_cast<int64_t>(estimated_offset);
+                    ESP_LOGI(TAG,
+                        "NAS_VBR_SEEK_COORD: target_ms=%llu target_sample=%llu requested_preroll_ms=%llu estimate_byte=%llu aligned_byte=%llu align_delta_bytes=%lld anchor_sample_est=%llu anchor_ms_est=%llu estimated_preroll_ms=%llu anchor_delta_samples=%lld unit=PCM_FRAMES precision=%s",
+                        static_cast<unsigned long long>(seek_target_ms),
+                        static_cast<unsigned long long>(target_frame),
+                        static_cast<unsigned long long>(seek_preroll_ms),
+                        static_cast<unsigned long long>(estimated_offset),
+                        static_cast<unsigned long long>(aligned_offset),
+                        static_cast<long long>(byte_delta),
+                        static_cast<unsigned long long>(estimated_base_sample),
+                        static_cast<unsigned long long>((estimated_base_sample * 1000ULL) / tech->sample_rate_hz),
+                        static_cast<unsigned long long>(target_frame >= estimated_base_sample
+                            ? ((target_frame - estimated_base_sample) * 1000ULL) / tech->sample_rate_hz : 0ULL),
+                        static_cast<long long>(anchor_delta_samples),
+                        use_vbri ? "VBRI_APPROX" : "TOC_APPROX");
+                }
+                if (base_frame > target_frame ||
+                    (vbr && target_frame - base_frame >
+                     static_cast<uint64_t>(tech->sample_rate_hz) * 4ULL)) {
+                    ret = ESP_ERR_INVALID_RESPONSE;
+                } else {
+                    // 临时 PCM 丢弃缓冲置于 PSRAM，避免增加 AudioTask 栈与内部 RAM 峰值。
+                    constexpr size_t kDropFrames = 512U;
+                    int32_t *drop = static_cast<int32_t *>(heap_caps_malloc(
+                        kDropFrames * 2U * sizeof(int32_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+                    if (drop == nullptr) {
+                        ret = ESP_ERR_NO_MEM;
+                    } else {
+                        uint32_t timeouts = 0U;
+                        while (ret == ESP_OK && base_frame < target_frame &&
+                            !audio_task_nas_open_should_abort(request)) {
+                            const size_t wanted = static_cast<size_t>(
+                                target_frame - base_frame < kDropFrames
+                                    ? target_frame - base_frame : kDropFrames);
+                            size_t got = 0U;
+                            const esp_err_t read_ret = pcm_decoder_read_pcm32(
+                                &g_decoder, drop, wanted, &got);
+                            if (read_ret == ESP_ERR_TIMEOUT && timeouts++ < 50U) continue;
+                            if (read_ret != ESP_OK || got == 0U) {
+                                ret = read_ret != ESP_OK ? read_ret : ESP_ERR_INVALID_SIZE;
+                                break;
+                            }
+                            timeouts = 0U;
+                            base_frame += got;
+                            dropped_frames += got;
+                        }
+                        heap_caps_free(drop);
+                        if (audio_task_nas_open_should_abort(request)) ret = ESP_ERR_INVALID_STATE;
+                    }
+                    if (ret == ESP_OK) {
+                        seek_result.method = vbr
+                            ? (use_vbri ? PcmSeekMethod::Mp3Vbri : PcmSeekMethod::Mp3XingToc)
+                            : PcmSeekMethod::Mp3CbrLinear;
+                        if (vbr) ESP_LOGW(TAG,
+                            "NAS_VBR_SEEK: method=%s target_sample=%llu anchor_sample_est=%llu aligned_byte=%llu decoded_discard_frames=%llu clock_sample=%llu model_residual_samples=%lld unit=PCM_FRAMES accuracy=APPROXIMATE",
+                            use_vbri ? "VBRI" : "XING_TOC",
+                            static_cast<unsigned long long>(target_frame),
+                            static_cast<unsigned long long>(estimated_base_sample),
+                            static_cast<unsigned long long>(aligned_offset),
+                            static_cast<unsigned long long>(dropped_frames),
+                            static_cast<unsigned long long>(base_frame),
+                            static_cast<long long>(base_frame) - static_cast<long long>(target_frame));
+                        seek_result.requested_frame = target_frame;
+                        seek_result.actual_frame = base_frame;
+                        seek_result.source_offset = aligned_offset;
+                        if (!vbr) ESP_LOGI(TAG,
+                            "NAS_SEEK_DIAG: target_ms=%llu target_sample=%llu anchor_byte=%llu base_sample=%llu discarded=%llu first_sample=%llu residual_samples=%lld rate=%lu",
+                            static_cast<unsigned long long>(seek_target_ms),
+                            static_cast<unsigned long long>(target_frame),
+                            static_cast<unsigned long long>(aligned_offset),
+                            static_cast<unsigned long long>(estimated_base_sample),
+                            static_cast<unsigned long long>(dropped_frames),
+                            static_cast<unsigned long long>(base_frame),
+                            static_cast<long long>(base_frame) - static_cast<long long>(target_frame),
+                            static_cast<unsigned long>(tech->sample_rate_hz));
+                        ESP_LOGI(TAG,
+                            "NAS MP3 SEEK：target=%llums aligned=%llu actual_frame=%llu%s",
+                            static_cast<unsigned long long>(seek_target_ms),
+                            static_cast<unsigned long long>(aligned_offset),
+                            static_cast<unsigned long long>(base_frame),
+                            vbr ? (use_vbri ? " (VBRI approx)" : " (Xing approx)") : "");
+                    }
+                }
+            }
+            if (ret != ESP_OK) pcm_decoder_close(&g_decoder);
+        }
         if (audio_source_is_open(&http_source)) {
             (void)audio_source_close(&http_source);
         }
+        nas_mp3_vbri_release(&vbri);
     } else {
         ret = apply_seek
             ? pcm_decoder_open_for_seek(
@@ -1935,6 +2571,26 @@ static esp_err_t audio_task_start_pcm_pipeline(
         ESP_LOGI(TAG, "CLOCK_TRACE: TOTAL_SOURCE=decoder total=%llu",
             static_cast<unsigned long long>(g_task_total_frames));
 #endif
+    }
+    g_nas_mp3_cbr_seek_available = nas_http && decoder_type == PcmDecoderType::Mp3 &&
+        request != nullptr && request->has_technical_info &&
+        nas_mp3_seek_index_eligible(request->technical_info) &&
+        request->technical_info.channels == g_decoder.info.channels &&
+        request->technical_info.sample_rate_hz == g_decoder.info.sample_rate_hz;
+    if (nas_http && decoder_type == PcmDecoderType::Mp3 && request != nullptr) {
+        const MediaTechnicalInfo &tech = request->technical_info;
+        ESP_LOGI(TAG,
+            "NAS_SEEK_CAP: parsed=%u estimated=%u vbr_header=%u cbr_info=%u "
+            "bitrate=%lu rate=%lu channels=%u index=%u supported=%u (VBR requires Xing TOC on seek)",
+            static_cast<unsigned>((tech.flags & MEDIA_TECH_PARSED) != 0U),
+            static_cast<unsigned>((tech.flags & MEDIA_TECH_DURATION_ESTIMATED) != 0U),
+            static_cast<unsigned>((tech.flags & MEDIA_TECH_HAS_VBR_HEADER) != 0U),
+            static_cast<unsigned>((tech.flags & MEDIA_TECH_CBR_INFO) != 0U),
+            static_cast<unsigned long>(tech.bitrate_kbps),
+            static_cast<unsigned long>(tech.sample_rate_hz),
+            static_cast<unsigned>(tech.channels),
+            static_cast<unsigned>(request->has_technical_info),
+            static_cast<unsigned>(g_nas_mp3_cbr_seek_available));
     }
     g_last_progress_publish_frame = g_playback_clock.submitted_frames;
 #if APP_DIAG_AUDIO_CLOCK || APP_DIAG_AUDIO_RAM
@@ -2224,6 +2880,15 @@ static void audio_task_service_pcm_playback()
     // i2s_output_stream_write_pcm32() 成功表示整块真实 PCM 已复制进 DMA。
     // 启动 prime、暂停保持时钟和 EOF drain 都走 silence API，因此不会污染该计数。
     audio_playback_clock_commit_pcm(&g_playback_clock, frames);
+    if (g_nas_seek_diag_first_pcm_pending && g_task_source == AudioPlaybackSource::NasHttp &&
+        g_task_format == MediaFormat::MP3) {
+        g_nas_seek_diag_first_pcm_pending = false;
+        ESP_LOGI(TAG, "NAS_SEEK_DIAG: FIRST_PCM request=%lu frames=%u clock_after_ms=%llu elapsed_ms=%lld note=DMA_submitted_not_audible",
+            static_cast<unsigned long>(g_nas_seek_diag_request_id),
+            static_cast<unsigned>(frames),
+            static_cast<unsigned long long>(audio_playback_clock_position_ms(&g_playback_clock)),
+            static_cast<long long>((esp_timer_get_time() - g_nas_seek_diag_begin_us) / 1000));
+    }
 
     // P1.5.2R.3 / R46.0.99：只在“真实 PCM 已成功进入 I2S DMA”之后旁路采样。
     // 本地>=96kHz仍按12Hz降载；NAS_HTTP>=96kHz由Hi-Res Guard跳过FFT。
@@ -4779,7 +5444,15 @@ static void audio_task_handle_seek(AudioRequest *request)
     }
     const uint64_t target_frame = known_rate > 0
         ? (target_ms * static_cast<uint64_t>(known_rate)) / 1000ULL : 0ULL;
-    if (!pcm_decoder_seek_supported(&g_decoder, target_frame)) {
+    const bool nas_mp3_seek = g_task_source == AudioPlaybackSource::NasHttp &&
+        decoder_type == PcmDecoderType::Mp3;
+    const bool nas_flac_seek = g_task_source == AudioPlaybackSource::NasHttp &&
+        decoder_type == PcmDecoderType::Flac &&
+        (flac_decoder_has_seektable(&g_decoder.flac) ||
+         (g_decoder.flac.sample_rate_hz > 0U && g_decoder.flac.total_frames > 0U &&
+          g_decoder.flac.audio_data_offset_bytes > 0U));
+    if (!nas_mp3_seek && !nas_flac_seek &&
+        !pcm_decoder_seek_supported(&g_decoder, target_frame)) {
         ESP_LOGW(TAG,
             "SEEK_TRACE: 当前文件/后端不支持该 Seek format=%s target=%llums；保持原播放位置",
             pcm_decoder_type_name(decoder_type),
@@ -4789,13 +5462,25 @@ static void audio_task_handle_seek(AudioRequest *request)
     }
     if (decoder_type == PcmDecoderType::Mp3 &&
         (!request->has_technical_info ||
-         (request->technical_info.flags & MEDIA_TECH_PARSED) == 0U)) {
+         (request->technical_info.flags & MEDIA_TECH_PARSED) == 0U ||
+         (nas_mp3_seek &&
+          !nas_mp3_seek_index_eligible(request->technical_info)))) {
         ESP_LOGW(TAG, "SEEK_TRACE: MP3 缺少技术索引，拒绝无依据的字节定位");
         audio_request_complete(request, false, ESP_ERR_NOT_SUPPORTED);
         return;
     }
 
     const bool was_paused = g_task_state == AudioPlaybackState::Paused;
+    g_nas_seek_diag_first_pcm_pending = false;
+    if (nas_mp3_seek) {
+        g_nas_seek_diag_begin_us = esp_timer_get_time();
+        g_nas_seek_diag_request_id = request->request_id;
+        ESP_LOGI(TAG, "NAS_SEEK_DIAG: BEGIN request=%lu target_ms=%llu target_sample=%llu clock_before_ms=%llu",
+            static_cast<unsigned long>(request->request_id),
+            static_cast<unsigned long long>(target_ms),
+            static_cast<unsigned long long>(target_frame),
+            static_cast<unsigned long long>(audio_playback_clock_position_ms(&g_playback_clock)));
+    }
     audio_task_set_state(AudioPlaybackState::Seeking, ESP_OK);
 #if APP_DIAG_AUDIO_SEEK
     ESP_LOGI(TAG,
@@ -4812,7 +5497,7 @@ static void audio_task_handle_seek(AudioRequest *request)
     PcmSeekResult seek_result = {};
     bool fast_seek_done = false;
     esp_err_t ret = ESP_ERR_NOT_SUPPORTED;
-    if (decoder_type == PcmDecoderType::Flac) {
+    if (decoder_type == PcmDecoderType::Flac && !nas_flac_seek) {
         ret = audio_task_fast_seek_flac(
             target_frame, was_paused, &seek_result);
         fast_seek_done = ret == ESP_OK;
@@ -4878,6 +5563,13 @@ static void audio_task_handle_seek(AudioRequest *request)
     }
     g_task_last_seek_request_id = request->request_id;
     g_task_last_seek_target_ms = target_ms;
+    if (nas_mp3_seek && !was_paused) {
+        g_nas_seek_diag_first_pcm_pending = true;
+        ESP_LOGI(TAG, "NAS_SEEK_DIAG: COMMIT request=%lu clock_ms=%llu seek_elapsed_ms=%lld",
+            static_cast<unsigned long>(request->request_id),
+            static_cast<unsigned long long>(audio_playback_clock_position_ms(&g_playback_clock)),
+            static_cast<long long>((esp_timer_get_time() - g_nas_seek_diag_begin_us) / 1000));
+    }
 
     if (was_paused) {
         // Seek 定位期间 DAC 始终保持手动静音；Paused 下继续送零维持时钟。
@@ -5873,6 +6565,50 @@ bool audio_service_music_deep_restore(AudioMusicSuspendOwner owner, bool wait)
 }
 
 
+static bool audio_service_seek_track_internal(
+    uint32_t track_index,
+    const char *path,
+    MediaFormat format,
+    const MediaTechnicalInfo *technical_info,
+    uint64_t target_ms,
+    bool wait,
+    AudioPlaybackSource source,
+    const char *username,
+    const char *password)
+{
+    AudioStateSnapshot snapshot = {};
+    if (!audio_service_get_snapshot(&snapshot) || !snapshot.ready ||
+        !snapshot.seek_supported || snapshot.source != source ||
+        snapshot.track_index != track_index ||
+        (snapshot.state != AudioPlaybackState::Playing &&
+         snapshot.state != AudioPlaybackState::Paused &&
+         snapshot.state != AudioPlaybackState::Seeking)) {
+        return false;
+    }
+    AudioRequest *request = audio_request_create(AudioCommandType::Seek, wait);
+    if (request == nullptr) return false;
+    request->track_index = track_index;
+    request->source = source;
+    request->format = format;
+    request->expected_playback_revision = snapshot.playback_revision;
+    request->seek_target_ms = target_ms;
+    if (technical_info != nullptr) {
+        request->technical_info = *technical_info;
+        request->has_technical_info = true;
+    }
+    if (source == AudioPlaybackSource::NasHttp) {
+        snprintf(request->nas_username, sizeof(request->nas_username), "%s",
+            username != nullptr ? username : "");
+        snprintf(request->nas_password, sizeof(request->nas_password), "%s",
+            password != nullptr ? password : "");
+    }
+    if (!audio_request_set_path(request, path)) {
+        audio_request_release(request);
+        return false;
+    }
+    return audio_service_submit_transport_intent(request, wait);
+}
+
 bool audio_service_seek_track(
     uint32_t track_index,
     const char *path,
@@ -5881,34 +6617,25 @@ bool audio_service_seek_track(
     uint64_t target_ms,
     bool wait)
 {
-    AudioStateSnapshot snapshot = {};
-    if (!audio_service_get_snapshot(&snapshot) || !snapshot.ready ||
-        snapshot.track_index != track_index ||
-        (snapshot.state != AudioPlaybackState::Playing &&
-         snapshot.state != AudioPlaybackState::Paused &&
-         snapshot.state != AudioPlaybackState::Seeking)) {
-        return false;
-    }
+    return audio_service_seek_track_internal(track_index, path, format,
+        technical_info, target_ms, wait, AudioPlaybackSource::Local, nullptr, nullptr);
+}
 
-    AudioRequest *request = audio_request_create(AudioCommandType::Seek, wait);
-    if (request == nullptr) {
+bool audio_service_seek_nas_track(
+    uint32_t track_index,
+    const char *url,
+    MediaFormat format,
+    const char *username,
+    const char *password,
+    const MediaTechnicalInfo *technical_info,
+    uint64_t target_ms,
+    bool wait)
+{
+    if (url == nullptr || strncmp(url, "http://", 7U) != 0 ||
+        (format != MediaFormat::MP3 && format != MediaFormat::FLAC))
         return false;
-    }
-    request->track_index = track_index;
-    request->format = format;
-    request->expected_playback_revision = snapshot.playback_revision;
-    request->seek_target_ms = target_ms;
-    if (technical_info != nullptr) {
-        request->technical_info = *technical_info;
-        request->has_technical_info = true;
-    }
-    if (!audio_request_set_path(request, path)) {
-        audio_request_release(request);
-        return false;
-    }
-
-    // Play/Seek 共用 latest-intent 单槽；快速拖动或快速切歌都只保留最后目标。
-    return audio_service_submit_transport_intent(request, wait);
+    return audio_service_seek_track_internal(track_index, url, format,
+        technical_info, target_ms, wait, AudioPlaybackSource::NasHttp, username, password);
 }
 
 bool audio_service_set_volume(uint8_t percent, bool wait)

@@ -67,6 +67,8 @@ enum MediaTechnicalFlags : uint32_t
     MEDIA_TECH_HAS_ARTWORK = 1U << 1,
     MEDIA_TECH_HAS_VBR_HEADER = 1U << 2,
     MEDIA_TECH_DURATION_ESTIMATED = 1U << 3,
+    // CBR 编码器的 Info 帧数头；与真正的 Xing/VBRI 区分，需重建 NAS 索引。
+    MEDIA_TECH_CBR_INFO = 1U << 4,
 };
 
 // 扫描阶段解析并持久化的播放技术参数。

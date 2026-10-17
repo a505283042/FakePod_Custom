@@ -163,6 +163,28 @@ static bool mp3_seek_headers_compatible(const Mp3SeekFrameHeader &a, const Mp3Se
         a.version_id == b.version_id;
 }
 
+// R145.4: 从一块连续 HTTP Range 数据中寻找连续两帧，避免对每个候选帧发起网络请求。
+// 这里只确认帧边界，不把估算的文件偏移当成精确的采样时间。
+bool mp3_decoder_find_frame_pair_in_buffer(
+    const uint8_t *data, size_t bytes, uint32_t expected_rate_hz, size_t *out_offset)
+{
+    if (data == nullptr || out_offset == nullptr || bytes < 8U) return false;
+    for (size_t i = 0; i + 8U <= bytes; ++i) {
+        Mp3SeekFrameHeader first = {};
+        if (!mp3_seek_parse_frame_header(data + i, &first) ||
+            (expected_rate_hz != 0U && first.sample_rate_hz != expected_rate_hz)) continue;
+        const size_t next = i + first.frame_size_bytes;
+        if (next + 4U > bytes) continue;
+        Mp3SeekFrameHeader second = {};
+        if (mp3_seek_parse_frame_header(data + next, &second) &&
+            mp3_seek_headers_compatible(first, second) && first.channels == second.channels) {
+            *out_offset = i;
+            return true;
+        }
+    }
+    return false;
+}
+
 static uint32_t mp3_seek_side_info_size(const Mp3SeekFrameHeader &header)
 {
     if (header.version_id == 3U) {

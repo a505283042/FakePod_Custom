@@ -148,6 +148,29 @@ esp_err_t pcm_decoder_open_streaming(
     return ESP_OK;
 }
 
+esp_err_t pcm_decoder_open_streaming_flac_seek(
+    PcmDecoder *decoder, AudioSource *source, AudioDecodeWorkspace *workspace,
+    const FlacNasSeekPlan &plan)
+{
+    if (decoder == nullptr || source == nullptr || !audio_source_is_open(source))
+        return ESP_ERR_INVALID_ARG;
+    pcm_decoder_close(decoder);
+    decoder->source = *source;
+    *source = {};
+    const esp_err_t ret = flac_decoder_open_streaming_at_nas_seek(
+        &decoder->flac, &decoder->source, workspace, plan);
+    if (ret != ESP_OK) {
+        pcm_decoder_close(decoder);
+        return ret;
+    }
+    decoder->type = PcmDecoderType::Flac;
+    decoder->info.sample_rate_hz = decoder->flac.sample_rate_hz;
+    decoder->info.channels = decoder->flac.channels;
+    decoder->info.bits_per_sample = decoder->flac.bits_per_sample;
+    decoder->info.total_frames = decoder->flac.total_frames;
+    return ESP_OK;
+}
+
 esp_err_t pcm_decoder_open_for_seek(
     PcmDecoder *decoder,
     PcmDecoderType type,

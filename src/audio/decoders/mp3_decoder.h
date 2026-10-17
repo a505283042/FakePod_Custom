@@ -173,3 +173,7 @@ esp_err_t mp3_decoder_seek_frame(
 void mp3_decoder_close(Mp3Decoder *decoder);
 bool mp3_decoder_is_open(const Mp3Decoder *decoder);
 bool mp3_decoder_is_eof(const Mp3Decoder *decoder);
+
+// 两个连续、格式兼容的 MPEG Layer III 帧头必须位于同一内存窗口。
+bool mp3_decoder_find_frame_pair_in_buffer(
+    const uint8_t *data, size_t bytes, uint32_t expected_rate_hz, size_t *out_offset);

@@ -1,6 +1,9 @@
 #include "buffered_http_audio_source.h"
+#include "../decoders/mp3_decoder.h"
 
 #include <string.h>
+#include <strings.h>
+#include <stdio.h>
 
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
@@ -49,6 +52,11 @@ static bool resolve_profile(BufferedHttpAudioProfile profile, HttpStreamProfile 
             // MP3 parser 首块可能先消费较大的 ID3/内嵌封面；保留 R46.0.82 的 128KB/96KB 实测配置。
             *out = {"MP3", 128U * 1024U, 96U * 1024U};
             return true;
+        case BufferedHttpAudioProfile::FlacSeekProbe:
+            // Only no-SEEKTABLE Range probes use a smaller startup threshold.
+            // Keep the full FLAC ring for continuous playback after replay attach.
+            *out = {"FLAC_SEEK", 384U * 1024U, 128U * 1024U};
+            return true;
         case BufferedHttpAudioProfile::Flac:
             // R46.0.98：NAS 在 HTTP 建链前拿不到可靠采样率；所有 FLAC 固定使用高余量档，
             // 避免 96k/24bit 被误分到 192KB ring。只增加 PSRAM，不增加 Internal task stack。
@@ -80,6 +88,13 @@ struct BufferedHttpContext
     BufferedHttpAudioAbortFn abort_fn = nullptr;
     const void *abort_context = nullptr;
 
+    uint8_t *seek_replay = nullptr;
+    size_t seek_replay_bytes = 0U;
+    size_t seek_replay_cursor = 0U;
+    uint64_t requested_offset = 0ULL;
+    uint64_t consumed_bytes = 0ULL;
+    uint64_t response_total_bytes = 0ULL;
+    bool content_range_verified = false;
     volatile bool stop_requested = false;
     volatile bool ready_signaled = false;
     volatile bool eof = false;
@@ -149,6 +164,25 @@ static size_t nas_stream_http_tx_bytes(const BufferedHttpContext *context)
     return (needed + 255U) & ~static_cast<size_t>(255U);
 }
 
+// 对 Range 响应明确核验 Content-Range 起点；拒绝无视 Range 的 200 响应。
+static esp_err_t http_range_event(esp_http_client_event_t *event)
+{
+    if (event == nullptr || event->user_data == nullptr ||
+        event->event_id != HTTP_EVENT_ON_HEADER || event->header_key == nullptr ||
+        event->header_value == nullptr) return ESP_OK;
+    auto *context = static_cast<BufferedHttpContext *>(event->user_data);
+    if (context->requested_offset == 0ULL ||
+        strcasecmp(event->header_key, "Content-Range") != 0) return ESP_OK;
+    unsigned long long first = 0ULL, last = 0ULL, total = 0ULL;
+    if (sscanf(event->header_value, "bytes %llu-%llu/%llu", &first, &last, &total) == 3 &&
+        first == static_cast<unsigned long long>(context->requested_offset) &&
+        last >= first && total > last) {
+        context->content_range_verified = true;
+        context->response_total_bytes = static_cast<uint64_t>(total);
+    }
+    return ESP_OK;
+}
+
 static void nas_stream_task(void *arg)
 {
     BufferedHttpContext *context = static_cast<BufferedHttpContext *>(arg);
@@ -174,6 +208,8 @@ static void nas_stream_task(void *arg)
     config.buffer_size = kHttpRxBufferBytes;
     config.buffer_size_tx = tx_bytes;
     config.keep_alive_enable = false;
+    config.event_handler = http_range_event;
+    config.user_data = context;
     if (context->username != nullptr && context->username[0] != '\0') {
         config.username = context->username;
         config.password = context->password != nullptr ? context->password : "";
@@ -193,6 +229,16 @@ static void nas_stream_task(void *arg)
                 goto finish;
             }
 
+            if (context->requested_offset != 0ULL) {
+                char range_header[64] = {};
+                snprintf(range_header, sizeof(range_header), "bytes=%llu-",
+                    static_cast<unsigned long long>(context->requested_offset));
+                ret = esp_http_client_set_header(client, "Range", range_header);
+                if (ret != ESP_OK) {
+                    set_error(context, ret);
+                    goto finish;
+                }
+            }
             ret = esp_http_client_open(client, 0);
             if (ret == ESP_OK) break;
 
@@ -242,8 +288,13 @@ static void nas_stream_task(void *arg)
             goto finish;
         }
         const int status = esp_http_client_get_status_code(client);
-        if (status != 200) {
-            ESP_LOGE(TAG, "HTTP状态异常：status=%d", status);
+        const bool valid_status = context->requested_offset == 0ULL
+            ? status == 200
+            : status == 206 && context->content_range_verified;
+        if (!valid_status) {
+            ESP_LOGE(TAG, "HTTP Range响应不匹配：status=%d offset=%llu content_range=%u",
+                status, static_cast<unsigned long long>(context->requested_offset),
+                static_cast<unsigned>(context->content_range_verified));
             set_error(context, ESP_ERR_HTTP_CONNECT);
             goto finish;
         }
@@ -363,6 +414,24 @@ static esp_err_t source_read(void *raw, void *buffer, size_t bytes, size_t *out_
     }
     if (bytes == 0U) return ESP_OK;
 
+    // R145.9: MP3 Range 的帧对齐探测数据先回放，再接续同一个 HTTP Ring。
+    // seek_replay 仅由串行 AudioTask 读取，网络 Worker 不会触碰它。
+    if (context->seek_replay_cursor < context->seek_replay_bytes) {
+        const size_t pending = context->seek_replay_bytes - context->seek_replay_cursor;
+        const size_t take = bytes < pending ? bytes : pending;
+        memcpy(buffer, context->seek_replay + context->seek_replay_cursor, take);
+        context->seek_replay_cursor += take;
+        context->consumed_bytes += static_cast<uint64_t>(take);
+        *out_bytes = take;
+        if (context->seek_replay_cursor == context->seek_replay_bytes) {
+            heap_caps_free(context->seek_replay);
+            context->seek_replay = nullptr;
+            context->seek_replay_bytes = 0U;
+            context->seek_replay_cursor = 0U;
+        }
+        return ESP_OK;
+    }
+
     // Streaming source 只返回当前已经可用的一批数据，不为了凑满 decoder 的整个请求窗口。
     // Worker 不理解 MP3/FLAC 格式；真正 ring=0 后由对应 Codec/AudioTask 决定欠载策略。
     const size_t received = xStreamBufferReceive(
@@ -372,6 +441,7 @@ static esp_err_t source_read(void *raw, void *buffer, size_t bytes, size_t *out_
         kReadWait);
     if (received > 0U) {
         *out_bytes = received;
+        context->consumed_bytes += static_cast<uint64_t>(received);
         const size_t buffered = xStreamBufferBytesAvailable(context->stream);
         if (buffered < context->min_buffered_bytes) {
             context->min_buffered_bytes = static_cast<uint32_t>(buffered);
@@ -387,10 +457,33 @@ static esp_err_t source_read(void *raw, void *buffer, size_t bytes, size_t *out_
     return ESP_ERR_TIMEOUT;
 }
 
+// MP3 Range SEEK 需要绝对文件坐标；不提供随机 SEEK 能力，避免频繁小读触发 HTTP 重连。
+static esp_err_t source_tell(void *raw, uint64_t *out_position)
+{
+    auto *context = context_from_raw(raw);
+    if (context == nullptr || out_position == nullptr) return ESP_ERR_INVALID_ARG;
+    if (UINT64_MAX - context->requested_offset < context->consumed_bytes) return ESP_ERR_INVALID_SIZE;
+    *out_position = context->requested_offset + context->consumed_bytes;
+    return ESP_OK;
+}
+
+static esp_err_t source_size(void *raw, uint64_t *out_size)
+{
+    auto *context = context_from_raw(raw);
+    if (context == nullptr || out_size == nullptr) return ESP_ERR_INVALID_ARG;
+    const uint64_t size = context->response_total_bytes != 0ULL
+        ? context->response_total_bytes
+        : (context->requested_offset == 0ULL ? context->content_length : 0ULL);
+    if (size == 0ULL) return ESP_ERR_NOT_SUPPORTED;
+    *out_size = size;
+    return ESP_OK;
+}
+
 static bool source_eof(void *raw)
 {
     BufferedHttpContext *context = context_from_raw(raw);
     return context != nullptr && context->stream != nullptr && context->eof &&
+        context->seek_replay_cursor >= context->seek_replay_bytes &&
         xStreamBufferBytesAvailable(context->stream) == 0U;
 }
 
@@ -420,6 +513,7 @@ static void destroy_context(BufferedHttpContext *context)
         context->eof ? 1U : 0U,
         context->io_error ? 1U : 0U);
 
+    if (context->seek_replay != nullptr) heap_caps_free(context->seek_replay);
     if (context->stream != nullptr) vStreamBufferDelete(context->stream);
     if (context->ring_storage != nullptr) heap_caps_free(context->ring_storage);
     if (context->read_buffer != nullptr) heap_caps_free(context->read_buffer);
@@ -445,8 +539,8 @@ static const char *source_name(void *)
 const AudioSourceOps kOps = {
     source_read,
     nullptr,
-    nullptr,
-    nullptr,
+    source_tell,
+    source_size,
     source_eof,
     source_close,
     source_name,
@@ -454,12 +548,13 @@ const AudioSourceOps kOps = {
 
 } // namespace
 
-esp_err_t buffered_http_audio_source_open(
+esp_err_t buffered_http_audio_source_open_range(
     AudioSource *out_source,
     BufferedHttpAudioProfile profile,
     const char *url,
     const char *username,
     const char *password,
+    uint64_t start_offset,
     BufferedHttpAudioAbortFn abort_fn,
     const void *abort_context)
 {
@@ -474,6 +569,7 @@ esp_err_t buffered_http_audio_source_open(
         1, sizeof(BufferedHttpContext), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     if (context == nullptr) return ESP_ERR_NO_MEM;
     context->min_buffered_bytes = UINT32_MAX;
+    context->requested_offset = start_offset;
     context->profile_label = stream_profile.label;
     context->ring_bytes = stream_profile.ring_bytes;
     context->start_target_bytes = stream_profile.start_target_bytes;
@@ -539,7 +635,12 @@ esp_err_t buffered_http_audio_source_open(
     context->min_buffered_bytes = static_cast<uint32_t>(primed);
     out_source->ops = &kOps;
     out_source->context = context;
-    out_source->capabilities = AUDIO_SOURCE_CAP_READ | AUDIO_SOURCE_CAP_EOF | AUDIO_SOURCE_CAP_STREAMING;
+    out_source->capabilities = AUDIO_SOURCE_CAP_READ | AUDIO_SOURCE_CAP_EOF |
+        AUDIO_SOURCE_CAP_STREAMING | AUDIO_SOURCE_CAP_TELL;
+    if (context->response_total_bytes > 0ULL ||
+        (context->requested_offset == 0ULL && context->content_length > 0ULL)) {
+        out_source->capabilities |= AUDIO_SOURCE_CAP_SIZE;
+    }
     out_source->stats = {};
     ESP_LOGI(TAG, "NAS流预取就绪：profile=%s primed=%uB ring=%uKB task_stack=%uB priority=%u core=%d",
         context->profile_label != nullptr ? context->profile_label : "?",
@@ -548,6 +649,80 @@ esp_err_t buffered_http_audio_source_open(
         static_cast<unsigned>(kTaskStackBytes),
         static_cast<unsigned>(kTaskPriority),
         static_cast<int>(kTaskCore));
+    return ESP_OK;
+}
+
+esp_err_t buffered_http_audio_source_open(
+    AudioSource *out_source,
+    BufferedHttpAudioProfile profile,
+    const char *url,
+    const char *username,
+    const char *password,
+    BufferedHttpAudioAbortFn abort_fn,
+    const void *abort_context)
+{
+    return buffered_http_audio_source_open_range(out_source, profile, url, username,
+        password, 0ULL, abort_fn, abort_context);
+}
+
+esp_err_t buffered_http_audio_source_reopen_range(
+    AudioSource *source,
+    uint64_t start_offset,
+    BufferedHttpAudioAbortFn abort_fn,
+    const void *abort_context)
+{
+    if (source == nullptr || source->ops != &kOps || source->context == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    auto *old = static_cast<BufferedHttpContext *>(source->context);
+    // 目前只接入 MP3；FLAC 后续需要独立验证其帧锚点与 PCM 丢弃。
+    if (old->profile_label == nullptr || strcmp(old->profile_label, "MP3") != 0) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (start_offset == old->requested_offset && old->network_bytes == 0ULL) {
+        return ESP_OK;
+    }
+
+    AudioSource next = {};
+    const esp_err_t ret = buffered_http_audio_source_open_range(
+        &next, BufferedHttpAudioProfile::Mp3, old->url, old->username, old->password,
+        start_offset, abort_fn, abort_context);
+    if (ret != ESP_OK) {
+        // 原 Source 没有被修改；206/Content-Range 验证由 open_range 负责。
+        ESP_LOGW(TAG, "NAS MP3 Range切换失败，保留旧流：offset=%llu ret=%s",
+            static_cast<unsigned long long>(start_offset), esp_err_to_name(ret));
+        return ret;
+    }
+
+    AudioSource previous = *source;
+    *source = next;
+    // 此时对外只可读新源；旧 Worker 停止后回收 Ring，保证不会交叉读取。
+    (void)audio_source_close(&previous);
+    ESP_LOGI(TAG, "NAS MP3 Range切换成功：offset=%llu",
+        static_cast<unsigned long long>(start_offset));
+    return ESP_OK;
+}
+
+esp_err_t buffered_http_audio_source_attach_replay(
+    AudioSource *source, uint8_t *owned_buffer, size_t replay_bytes, uint64_t absolute_offset)
+{
+    if (source == nullptr || source->ops != &kOps || source->context == nullptr ||
+        owned_buffer == nullptr || replay_bytes == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    auto *context = static_cast<BufferedHttpContext *>(source->context);
+    if (context->seek_replay != nullptr || context->seek_replay_cursor < context->seek_replay_bytes) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    // The scan consumed bytes from this Range. Replay starts at the selected frame and
+    // extends to the end of the scanned window; then the same ring continues seamlessly.
+    context->seek_replay = owned_buffer;
+    context->seek_replay_bytes = replay_bytes;
+    context->seek_replay_cursor = 0U;
+    context->requested_offset = absolute_offset;
+    context->consumed_bytes = 0ULL;
+    ESP_LOGI(TAG, "NAS HTTP replay已挂接：offset=%llu replay=%uB reused_connection=1",
+        static_cast<unsigned long long>(absolute_offset), static_cast<unsigned>(replay_bytes));
     return ESP_OK;
 }
 
@@ -566,6 +741,11 @@ bool buffered_http_audio_source_get_stats(
     stats.ring_min_buffered_bytes = context->min_buffered_bytes == UINT32_MAX
         ? 0U : context->min_buffered_bytes;
     stats.network_bytes = context->network_bytes;
+    stats.range_offset_bytes = context->requested_offset;
+    stats.file_total_bytes = context->response_total_bytes != 0ULL
+        ? context->response_total_bytes
+        : (context->requested_offset == 0ULL ? context->content_length : 0ULL);
+    stats.range_response_verified = context->requested_offset != 0ULL && context->content_range_verified;
     stats.task_stack_hwm = context->task_stack_hwm;
     stats.eof = context->eof;
     stats.io_error = context->io_error;
@@ -592,4 +772,74 @@ bool buffered_http_audio_source_get_endpoint_view(
     *out_username = context->username;
     *out_password = context->password;
     return true;
+}
+
+// Range 解码锚点：扫描一次连续内存块并核验下一帧，避免网络逐候选 SEEK。
+esp_err_t buffered_http_audio_source_open_mp3_aligned_range(
+    AudioSource *out_source, const char *url, const char *username, const char *password,
+    uint64_t estimate_offset, uint32_t expected_sample_rate_hz, uint64_t *out_frame_offset,
+    BufferedHttpAudioAbortFn abort_fn, const void *abort_context)
+{
+    if (out_source == nullptr || out_frame_offset == nullptr ||
+        url == nullptr || expected_sample_rate_hz == 0U ||
+        audio_source_is_open(out_source)) return ESP_ERR_INVALID_ARG;
+    *out_frame_offset = 0ULL;
+    // 16KiB 上限；只允许在 AudioTask 串行上下文、decoder 尚未绑定新源时调用。
+    constexpr size_t kProbeBytes = 16U * 1024U;
+    uint8_t *probe = static_cast<uint8_t *>(heap_caps_malloc(kProbeBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (probe == nullptr) return ESP_ERR_NO_MEM;
+    AudioSource candidate = {};
+    esp_err_t ret = buffered_http_audio_source_open_range(
+        &candidate, BufferedHttpAudioProfile::Mp3, url, username, password,
+        estimate_offset, abort_fn, abort_context);
+    size_t filled = 0U;
+    if (ret == ESP_OK) {
+        uint32_t empty_retries = 0U;
+        while (filled < kProbeBytes && empty_retries < 20U &&
+            !(abort_fn != nullptr && abort_fn(abort_context))) {
+            size_t read_bytes = 0U;
+            ret = audio_source_read(&candidate, probe + filled, kProbeBytes - filled, &read_bytes);
+            if (ret != ESP_OK && ret != ESP_ERR_TIMEOUT) break;
+            if (read_bytes == 0U) {
+                ++empty_retries;
+                if (audio_source_eof(&candidate)) break;
+            } else {
+                filled += read_bytes;
+                empty_retries = 0U;
+            }
+        }
+        size_t relative_offset = 0U;
+        if (mp3_decoder_find_frame_pair_in_buffer(
+                probe, filled, expected_sample_rate_hz, &relative_offset)) {
+            const uint64_t absolute = estimate_offset + relative_offset;
+            // 保留探测窗口剩余字节：decoder 先消费 replay，之后读取同一连接的 Ring。
+            // 不再二次连接/二次预取；tell() 使用对齐后的绝对偏移。
+            auto *context = static_cast<BufferedHttpContext *>(candidate.context);
+            if (context == nullptr || (abort_fn != nullptr && abort_fn(abort_context))) {
+                ret = ESP_ERR_INVALID_STATE;
+            } else {
+                const size_t replay_bytes = filled - relative_offset;
+                memmove(probe, probe + relative_offset, replay_bytes);
+                context->seek_replay = probe;
+                context->seek_replay_bytes = replay_bytes;
+                context->seek_replay_cursor = 0U;
+                context->requested_offset = absolute;
+                context->consumed_bytes = 0ULL;
+                probe = nullptr;  // ownership transferred to the Source; close() reclaims it.
+                *out_source = candidate;
+                candidate = {};
+                *out_frame_offset = absolute;
+                ESP_LOGI(TAG, "NAS MP3 Range帧对齐：estimate=%llu aligned=%llu probe=%uB replay=%uB reused=1",
+                    static_cast<unsigned long long>(estimate_offset),
+                    static_cast<unsigned long long>(absolute), static_cast<unsigned>(filled),
+                    static_cast<unsigned>(replay_bytes));
+                ret = ESP_OK;
+            }
+        } else {
+            ret = ESP_ERR_NOT_FOUND;
+        }
+    }
+    if (audio_source_is_open(&candidate)) (void)audio_source_close(&candidate);
+    if (probe != nullptr) heap_caps_free(probe);
+    return ret;
 }
