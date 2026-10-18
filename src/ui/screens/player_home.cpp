@@ -824,7 +824,7 @@ static lv_obj_t *player_home_create_battery_status(lv_obj_t *parent)
 {
     lv_obj_t *status = lv_obj_create(parent);
     ui_common_lock_object(status);
-    lv_obj_set_size(status, 94, 28);
+    lv_obj_set_size(status, 140, 28);
     lv_obj_set_style_radius(status, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(status, lv_color_hex(0xFFFFFF), 0);
     lv_obj_set_style_bg_opa(status, 28, 0);
@@ -838,7 +838,7 @@ static lv_obj_t *player_home_create_battery_status(lv_obj_t *parent)
     g_battery_label = player_home_create_label(
         status, "--%", lv_color_hex(0xF5F7FA), font_manager_get_ui_font());
     // R33: 电量百分比文字区与已验证的音量标签保持一致，避免较宽数字组合挤掉末尾 % 字形。
-    lv_obj_set_size(g_battery_label, 54, 28);
+    lv_obj_set_size(g_battery_label, 100, 28);
     lv_obj_set_style_text_align(g_battery_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(g_battery_label, LV_ALIGN_RIGHT_MID, -3, 0);
     return status;
@@ -4821,12 +4821,12 @@ void player_home_create(lv_obj_t *screen)
 
     // 同一状态行显示音量 / 无线状态 / 电量。无线图标只反映保存的开关意图：
     // BLE 或 Wi-Fi 开启时显示对应图标，运行期尚未 Ready 时用半透明提示；两者都关闭则隐藏。
-    // 音量胶囊加宽为 140x28，保证 100% 完整显示，并把实际点击范围再向四周额外扩大 8px。
-    lv_obj_t *volume_status = player_home_create_pill_button(g_overlay, 140, 28, "80%", &g_volume_label);
-    lv_obj_set_pos(volume_status, 66, 319);
+    // 音量胶囊为 120x28，保证 100% 完整显示，并把实际点击范围再向四周额外扩大 8px。
+    lv_obj_t *volume_status = player_home_create_pill_button(g_overlay, 120, 28, "80%", &g_volume_label);
+    lv_obj_set_pos(volume_status, 86, 319);
     lv_obj_set_ext_click_area(volume_status, 8);
     lv_obj_add_event_cb(volume_status, player_home_volume_status_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
-    lv_obj_set_size(g_volume_label, 100, 28);
+    lv_obj_set_size(g_volume_label, 80, 28);
     lv_obj_set_style_text_align(g_volume_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(g_volume_label, LV_ALIGN_RIGHT_MID, -3, 0);
     lv_obj_add_event_cb(volume_status, player_home_mute_cb, LV_EVENT_CLICKED, nullptr);
