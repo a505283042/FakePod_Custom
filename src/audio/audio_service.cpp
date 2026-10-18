@@ -144,6 +144,8 @@ struct AudioRequest
     AudioOutputMode output_mode = AudioOutputMode::NormalHeadphones;
     bool mute = false;
     AudioMusicSuspendOwner music_suspend_owner = AudioMusicSuspendOwner::Video;
+    bool music_restore_async = false;
+    bool music_restore_resume = false;
     uint32_t video_sample_rate_hz = 0U;
     uint8_t video_channels = 0U;
     uint8_t video_bits_per_sample = 0U;
@@ -2094,6 +2096,7 @@ static esp_err_t audio_task_start_pcm_pipeline(
     }
     PcmSeekResult seek_result = {};
     const bool nas_http = request != nullptr && request->source == AudioPlaybackSource::NasHttp;
+    const AudioRequest *nas_abort_request = check_transport_intent ? request : nullptr;
     esp_err_t ret = ESP_OK;
     if (nas_http) {
         if (decoder_type != PcmDecoderType::Mp3 && decoder_type != PcmDecoderType::Flac) {
@@ -2121,7 +2124,7 @@ static esp_err_t audio_task_start_pcm_pipeline(
             if (ret == ESP_ERR_NOT_FOUND) {
                 ret = buffered_http_audio_source_open(
                     &http_source, profile, path, request->nas_username,
-                    request->nas_password, audio_task_nas_open_should_abort, request);
+                    request->nas_password, audio_task_nas_open_should_abort, nas_abort_request);
                 if (ret == ESP_OK) {
                     ret = flac_decoder_plan_nas_seek(&http_source, seek_target_ms, &flac_seek_plan);
                     (void)audio_source_close(&http_source);
@@ -2150,7 +2153,7 @@ static esp_err_t audio_task_start_pcm_pipeline(
                     for (size_t attempt = 0U;
                          attempt < (flac_seek_plan.no_seektable ? kNoTableMaxProbes :
                             sizeof(kScanGuards) / sizeof(kScanGuards[0])); ++attempt) {
-                        if (audio_task_nas_open_should_abort(request)) {
+                        if (audio_task_nas_open_should_abort(nas_abort_request)) {
                             ret = ESP_ERR_INVALID_STATE;
                             break;
                         }
@@ -2176,7 +2179,7 @@ static esp_err_t audio_task_start_pcm_pipeline(
                                 ? BufferedHttpAudioProfile::FlacSeekProbe : profile,
                             path, request->nas_username,
                             request->nas_password, flac_seek_plan.scan_start_offset,
-                            audio_task_nas_open_should_abort, request);
+                            audio_task_nas_open_should_abort, nas_abort_request);
                         if (ret != ESP_OK) break;
 
                         uint8_t *replay_buffer = nullptr;
@@ -2224,13 +2227,13 @@ static esp_err_t audio_task_start_pcm_pipeline(
                     ret = buffered_http_audio_source_open_range(
                         &http_source, profile, path, request->nas_username,
                         request->nas_password, flac_seek_plan.seek_offset,
-                        audio_task_nas_open_should_abort, request);
+                        audio_task_nas_open_should_abort, nas_abort_request);
                 }
 
                 if (!refined && flac_seek_plan.scan_required && fallback_to_seektable && ret != ESP_OK) {
                     if (audio_source_is_open(&http_source)) (void)audio_source_close(&http_source);
                     flac_seek_plan = fallback_plan;
-                    if (audio_task_nas_open_should_abort(request)) {
+                    if (audio_task_nas_open_should_abort(nas_abort_request)) {
                         ret = ESP_ERR_INVALID_STATE;
                     } else {
                         ESP_LOGW(TAG, "NAS_FLAC_SEEK_REFINE: fallback=SEEKTABLE after adaptive scan ret=%s",
@@ -2238,7 +2241,7 @@ static esp_err_t audio_task_start_pcm_pipeline(
                         ret = buffered_http_audio_source_open_range(
                             &http_source, profile, path, request->nas_username,
                             request->nas_password, flac_seek_plan.seek_offset,
-                            audio_task_nas_open_should_abort, request);
+                            audio_task_nas_open_should_abort, nas_abort_request);
                     }
                 }
             }
@@ -2271,11 +2274,11 @@ static esp_err_t audio_task_start_pcm_pipeline(
             ret = buffered_http_audio_source_open_mp3_aligned_range(
                 &http_source, path, request->nas_username, request->nas_password,
                 estimated_offset, tech->sample_rate_hz, &aligned_offset,
-                audio_task_nas_open_should_abort, request);
+                audio_task_nas_open_should_abort, nas_abort_request);
         } else {
             ret = buffered_http_audio_source_open(
                 &http_source, profile, path, request->nas_username,
-                request->nas_password, audio_task_nas_open_should_abort, request);
+                request->nas_password, audio_task_nas_open_should_abort, nas_abort_request);
         }
         if (ret == ESP_OK && apply_seek && decoder_type == PcmDecoderType::Mp3 &&
             tech != nullptr && nas_mp3_vbr_index(*tech)) {
@@ -2371,7 +2374,7 @@ static esp_err_t audio_task_start_pcm_pipeline(
                     } else {
                         uint32_t timeouts = 0U;
                         while (ret == ESP_OK && base_frame < target_frame &&
-                            !audio_task_nas_open_should_abort(request)) {
+                            !audio_task_nas_open_should_abort(nas_abort_request)) {
                             const size_t wanted = static_cast<size_t>(
                                 target_frame - base_frame < kDropFrames
                                     ? target_frame - base_frame : kDropFrames);
@@ -2388,7 +2391,7 @@ static esp_err_t audio_task_start_pcm_pipeline(
                             dropped_frames += got;
                         }
                         heap_caps_free(drop);
-                        if (audio_task_nas_open_should_abort(request)) ret = ESP_ERR_INVALID_STATE;
+                        if (audio_task_nas_open_should_abort(nas_abort_request)) ret = ESP_ERR_INVALID_STATE;
                     }
                     if (ret == ESP_OK) {
                         seek_result.method = vbr
@@ -3128,6 +3131,8 @@ static void audio_task_handle_music_deep_suspend(AudioRequest *request)
     audio_request_complete(request, true, ESP_OK);
 }
 
+static void audio_task_handle_resume(AudioRequest *request);
+
 static void audio_task_handle_music_deep_restore(AudioRequest *request)
 {
     if (request == nullptr) return;
@@ -3161,6 +3166,14 @@ static void audio_task_handle_music_deep_restore(AudioRequest *request)
         return;
     }
 
+    // Async restore is an old music target: a newer Play/Seek must win.
+    if (request->music_restore_async &&
+        request->transport_intent_revision != audio_transport_latest_revision()) {
+        audio_task_release_music_deep_suspend_context();
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+
     const PcmDecoderType decoder_type = audio_decoder_type_for_format(g_music_deep_suspend.format);
     if (decoder_type == PcmDecoderType::None) {
         audio_request_complete(request, false, ESP_ERR_NOT_SUPPORTED);
@@ -3170,6 +3183,7 @@ static void audio_task_handle_music_deep_restore(AudioRequest *request)
     const bool nas_http = g_music_deep_suspend.source == AudioPlaybackSource::NasHttp;
     AudioRequest restore = {};
     restore.type = AudioCommandType::Play;
+    restore.transport_intent_revision = request->transport_intent_revision;
     restore.track_index = g_music_deep_suspend.track_index;
     restore.source = g_music_deep_suspend.source;
     restore.format = g_music_deep_suspend.format;
@@ -3192,14 +3206,26 @@ static void audio_task_handle_music_deep_restore(AudioRequest *request)
         g_music_deep_suspend.position_ms,
         &seek,
         nullptr,
-        false);
+        request->music_restore_async);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "%s Music恢复失败：source=%s position=%llums ret=%s；保留上下文供后续重试",
+        ESP_LOGE(TAG, "%s Music恢复失败：source=%s position=%llums ret=%s；异步失败可回音乐页重试，同步保留上下文",
             owner_name, nas_http ? "NAS_HTTP" : "LOCAL",
             static_cast<unsigned long long>(g_music_deep_suspend.position_ms),
             esp_err_to_name(ret));
-        audio_task_set_state(AudioPlaybackState::Paused, ret);
+        // Async UI handoff has no lifecycle retry owner. Release the saved strings;
+        // the normal Music Play button can reopen the selected song after recovery.
+        if (request->music_restore_async) {
+            (void)audio_task_shutdown_pipeline();
+            audio_task_release_music_deep_suspend_context();
+            audio_task_set_state(AudioPlaybackState::Error, ret, AudioFailureScope::System);
+        } else audio_task_set_state(AudioPlaybackState::Paused, ret);
         audio_request_complete(request, false, ret);
+        return;
+    }
+    if (request->music_restore_async && !audio_transport_request_is_latest(&restore)) {
+        (void)audio_task_shutdown_pipeline();
+        audio_task_release_music_deep_suspend_context();
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
         return;
     }
     if (nas_http) seek.method = PcmSeekMethod::RestartFromBeginning;
@@ -3216,6 +3242,11 @@ static void audio_task_handle_music_deep_restore(AudioRequest *request)
         static_cast<unsigned long long>(requested_ms),
         static_cast<unsigned long long>(audio_playback_clock_position_ms(&g_playback_clock)),
         pcm_seek_method_name(seek.method));
+    if (request->music_restore_async && request->music_restore_resume) {
+        // Resume only after the decoder and output hardware really exist.
+        audio_task_handle_resume(request);
+        return;
+    }
     audio_request_complete(request, true, ESP_OK);
 }
 
@@ -6562,6 +6593,21 @@ bool audio_service_music_deep_restore(AudioMusicSuspendOwner owner, bool wait)
     if (request == nullptr) return false;
     request->music_suspend_owner = owner;
     return audio_service_submit(request, wait);
+}
+
+
+bool audio_service_music_deep_restore_async(AudioMusicSuspendOwner owner, bool resume)
+{
+    AudioRequest *request = audio_request_create(AudioCommandType::MusicDeepRestore, false);
+    if (!audio_service_bind_current_playback_context(request)) {
+        audio_request_release(request);
+        return false;
+    }
+    request->music_suspend_owner = owner;
+    request->music_restore_async = true;
+    request->music_restore_resume = resume;
+    request->transport_intent_revision = audio_transport_latest_revision();
+    return audio_service_submit(request, false);
 }
 
 

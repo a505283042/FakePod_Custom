@@ -485,7 +485,7 @@ static bool pause_music_for_nsf_exclusive()
     const size_t player_track = player_state_get_index();
     const char *path = player_state_get_path();
     MediaTechnicalInfo technical = {};
-    const bool has_technical = media_library_get_technical_info(player_track, &technical);
+    const bool has_technical = player_state_get_technical_info(&technical);
     const bool mp3_index_safe = snapshot.format != MediaFormat::MP3 ||
         (has_technical && (technical.flags & MEDIA_TECH_PARSED) != 0U);
     const AudioPlaybackSource player_source = player_state_get_source() == PlayerMediaSource::Nas
@@ -553,6 +553,18 @@ static bool stop_nsf_audio(bool restore_music, const char *reason, bool force_ha
     }
 
     if (restore_music && g_music_deep_suspended_for_nsf) {
+        AudioStateSnapshot music = {};
+        if (audio_service_get_snapshot(&music) && music.source == AudioPlaybackSource::NasHttp) {
+            if (!audio_service_music_deep_restore_async(AudioMusicSuspendOwner::Nsf, g_music_paused_for_nsf)) {
+                ESP_LOGW(TAG, "NAS Music restore queue busy; retry exit");
+                return false;
+            }
+            g_music_deep_suspended_for_nsf = false;
+            g_music_paused_for_nsf = false;
+            ESP_LOGI(TAG, "NAS Music restore queued; screen exit does not wait for network");
+            return true;
+        }
+
         if (!audio_service_music_deep_restore(AudioMusicSuspendOwner::Nsf, true)) {
             ESP_LOGW(TAG, "NSF Exclusive深度恢复Music失败：reason=%s；保留上下文等待生命周期重试",
                 reason != nullptr ? reason : "unknown");

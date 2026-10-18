@@ -83,6 +83,10 @@ bool audio_service_music_deep_restore(
     bool wait = true
 );
 
+// NAS recovery runs on AudioTask; UI never waits for HTTP reconnect.
+// A new Play/Seek supersedes it; resume is committed only after restore succeeds.
+bool audio_service_music_deep_restore_async(AudioMusicSuspendOwner owner, bool resume);
+
 // R.40.4.1：AVI 内 MP3 临时接管 AudioTask 的 PCM/I2S/CS43131 输出。
 // 浅暂停路径在 Video MP3 stop 后恢复 Paused Music 硬件；Deep Suspend 路径则由
 // Video 生命周期先通过共用恢复核心重建 Music decoder/硬件再 resume。Video/Extractor 不直接操作 I2S/DAC。

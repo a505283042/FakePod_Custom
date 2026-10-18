@@ -379,7 +379,7 @@ static bool benchmark_pause_music_for_exclusive()
     const size_t player_track = player_state_get_index();
     const char *path = player_state_get_path();
     MediaTechnicalInfo technical = {};
-    const bool has_technical = media_library_get_technical_info(player_track, &technical);
+    const bool has_technical = player_state_get_technical_info(&technical);
     const bool mp3_index_safe = snapshot.format != MediaFormat::MP3 ||
         (has_technical && (technical.flags & MEDIA_TECH_PARSED) != 0U);
     const AudioPlaybackSource player_source = player_state_get_source() == PlayerMediaSource::Nas
@@ -427,6 +427,18 @@ static void benchmark_restore_music_after_exclusive(const char *reason)
 {
     if (!benchmark_music_exclusive_active()) return;
     if (g_music_deep_suspended_for_benchmark) {
+        AudioStateSnapshot music = {};
+        if (audio_service_get_snapshot(&music) && music.source == AudioPlaybackSource::NasHttp) {
+            if (!audio_service_music_deep_restore_async(AudioMusicSuspendOwner::Video, g_music_paused_for_benchmark)) {
+                ESP_LOGW(TAG, "NAS Music restore queue busy; retry exit");
+                return;
+            }
+            g_music_deep_suspended_for_benchmark = false;
+            g_music_paused_for_benchmark = false;
+            ESP_LOGI(TAG, "NAS Music restore queued; screen exit does not wait for network");
+            return;
+        }
+
         if (!audio_service_music_deep_restore(AudioMusicSuspendOwner::Video, true)) {
             ESP_LOGW(TAG, "Video Exclusive：深度恢复Music失败 reason=%s；保留上下文等待生命周期重试",
                 reason != nullptr ? reason : "unknown");
@@ -2107,6 +2119,14 @@ static esp_err_t video_leave(AppRunState next_state)
             return cleanup_ret;
         }
     }
+    if (!benchmark_presenter_is_running()) {
+        benchmark_restore_music_after_exclusive("leave");
+        if (benchmark_music_exclusive_active()) {
+            // Queue pressure can reject admission; keep a usable page for retry.
+            show_browser();
+            return ESP_ERR_TIMEOUT;
+        }
+    }
     g_page = VideoPage::Browser;
     g_risk_prompt_active = false;
     g_eof_transition = EofTransition::None;
@@ -2115,7 +2135,6 @@ static esp_err_t video_leave(AppRunState next_state)
     gesture_router_reset();
     app_launcher_overlay_hide();
     set_visible(g_root, false);
-    if (!benchmark_presenter_is_running()) benchmark_restore_music_after_exclusive("leave");
     ESP_LOGI(TAG, "Video离开Foreground：MJPEG Benchmark/目录协作任务已停止，Video Exclusive Music状态已恢复");
     return ESP_OK;
 }
