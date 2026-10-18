@@ -1256,7 +1256,7 @@ void lyrics_view_create(lv_obj_t *screen)
     // R.12：时间行中间只保留音量百分比；底部统一成五按钮一行：
     // 模式 / 上一曲 / 播放 / 下一曲 / 音量。两侧 58px 大按钮同时扩大视觉和触摸区域。
     g_overlay_volume = lyrics_view_create_label(
-        g_control_overlay, "80%", lv_color_hex(LYRICS_ACCENT_RGB), 54, 24);
+        g_control_overlay, "80%", lv_color_hex(LYRICS_ACCENT_RGB), 100, 24);
     lv_obj_set_style_text_align(g_overlay_volume, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(g_overlay_volume, LV_ALIGN_TOP_MID, 0, 28);
 

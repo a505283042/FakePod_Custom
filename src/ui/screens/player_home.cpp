@@ -4821,12 +4821,12 @@ void player_home_create(lv_obj_t *screen)
 
     // 同一状态行显示音量 / 无线状态 / 电量。无线图标只反映保存的开关意图：
     // BLE 或 Wi-Fi 开启时显示对应图标，运行期尚未 Ready 时用半透明提示；两者都关闭则隐藏。
-    // 音量胶囊保持 94x28，并把实际点击范围再向四周额外扩大 8px。
-    lv_obj_t *volume_status = player_home_create_pill_button(g_overlay, 94, 28, "80%", &g_volume_label);
-    lv_obj_set_pos(volume_status, 112, 319);
+    // 音量胶囊加宽为 140x28，保证 100% 完整显示，并把实际点击范围再向四周额外扩大 8px。
+    lv_obj_t *volume_status = player_home_create_pill_button(g_overlay, 140, 28, "80%", &g_volume_label);
+    lv_obj_set_pos(volume_status, 66, 319);
     lv_obj_set_ext_click_area(volume_status, 8);
     lv_obj_add_event_cb(volume_status, player_home_volume_status_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
-    lv_obj_set_size(g_volume_label, 54, 28);
+    lv_obj_set_size(g_volume_label, 100, 28);
     lv_obj_set_style_text_align(g_volume_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(g_volume_label, LV_ALIGN_RIGHT_MID, -3, 0);
     lv_obj_add_event_cb(volume_status, player_home_mute_cb, LV_EVENT_CLICKED, nullptr);
