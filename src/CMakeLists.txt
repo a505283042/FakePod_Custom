@@ -153,6 +153,7 @@ idf_component_register(
         "ui/spectrum"
 
     REQUIRES
+        esp-dsp
         esp_adc
         esp_driver_i2c
         esp_driver_gpio

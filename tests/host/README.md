@@ -22,3 +22,8 @@ python tests/host/test_nas_exclusive_restore.py
 需要 Python 3；执行 C++ 主机回归的脚本还需要 g++。这些测试使用主机替身，不能代替完整固件构建及真机验收。
 
 旧的 R.37 源码清点脚本采用早期显示接口约束，已随历史资料单独存档，不作为当前版本验收标准。
+
+## R147.6 音频数学回归
+
+`python tests/host/test_audio_perf_math.py`：需要 g++，检查 FFT 对直接 DFT 的误差、频谱等级误差，以及 PCM 转换逐样本一致性。使用 AddressSanitizer/UBSan；不测试 ESP32-S3 汇编速度。
+可用 `--dsp-reference <ESP-DSP v1.6.0 的 modules/fft/float/dsps_fft2r_fc32_ansi.c>` 加入官方 ANSI 内核对照。

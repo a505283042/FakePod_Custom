@@ -104,6 +104,7 @@ struct FlacPerfSnapshot
 {
     uint32_t sequence = 0;
     bool active = false;
+    bool network_source = false;
     int32_t prefetch_core_id = -1;
     uint32_t sample_rate_hz = 0;
 

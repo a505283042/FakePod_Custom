@@ -8,6 +8,9 @@
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "app_diag_config.h"
+#include "nas_stream_schedule.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/stream_buffer.h"
@@ -186,6 +189,14 @@ static esp_err_t http_range_event(esp_http_client_event_t *event)
 static void nas_stream_task(void *arg)
 {
     BufferedHttpContext *context = static_cast<BufferedHttpContext *>(arg);
+    // Only the producer owns this scheduler state; startup prime stays unrestricted.
+    int64_t last_cooperate_us = esp_timer_get_time();
+#if APP_DIAG_FLAC_PERFORMANCE
+    int64_t perf_start_us = last_cooperate_us;
+    uint32_t read_max_us = 0, reads = 0, yields = 0;
+    size_t window_min = context != nullptr ? context->ring_bytes : 0U;
+#endif
+
     esp_http_client_handle_t client = nullptr;
     if (context == nullptr || context->stream == nullptr || context->read_buffer == nullptr ||
         context->url == nullptr) {
@@ -332,8 +343,16 @@ static void nas_stream_task(void *arg)
             continue;
         }
 
+#if APP_DIAG_FLAC_PERFORMANCE
+        const int64_t read_start_us = esp_timer_get_time();
+#endif
         const int got = esp_http_client_read(
             client, reinterpret_cast<char *>(context->read_buffer), kReadChunkBytes);
+#if APP_DIAG_FLAC_PERFORMANCE
+        const uint32_t read_us = static_cast<uint32_t>(esp_timer_get_time() - read_start_us);
+        if (read_us > read_max_us) read_max_us = read_us;
+        ++reads;
+#endif
         if (got == -ESP_ERR_HTTP_EAGAIN) {
             const uint32_t read_timeout_total = context->read_timeout_total + 1U;
             const uint32_t read_timeout_streak = context->read_timeout_streak + 1U;
@@ -391,7 +410,29 @@ static void nas_stream_task(void *arg)
             context->min_buffered_bytes = static_cast<uint32_t>(buffered);
         }
         if (buffered >= context->start_target_bytes) signal_ready(context);
-        taskYIELD();
+        const int64_t now_us = esp_timer_get_time();
+        if (fakepod_nas::should_cooperate(context->ready_signaled, buffered,
+                context->ring_bytes, now_us - last_cooperate_us)) {
+            // taskYIELD alone cannot give lower-priority UI tasks CPU time.
+            // One RTOS tick, only with >=75% ring and >=2ms since the last break.
+            vTaskDelay(1);
+            last_cooperate_us = esp_timer_get_time();
+#if APP_DIAG_FLAC_PERFORMANCE
+            ++yields;
+#endif
+        }
+#if APP_DIAG_FLAC_PERFORMANCE
+        if (buffered < window_min) window_min = buffered;
+        if (now_us - perf_start_us >= 5000000LL) {
+            ESP_LOGI(TAG, "NAS_RX_PERF: reads=%lu read_max=%luus producer_min=%u/%uB cooperative=%lu stack=%uB",
+                (unsigned long)reads, (unsigned long)read_max_us,
+                (unsigned)window_min, (unsigned)context->ring_bytes,
+                (unsigned long)yields, (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+            reads = read_max_us = yields = 0;
+            window_min = context->ring_bytes;
+            perf_start_us = esp_timer_get_time();
+        }
+#endif
     }
 
 finish:

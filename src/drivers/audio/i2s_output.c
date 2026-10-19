@@ -4,8 +4,14 @@
 #include <stdint.h>
 #include "driver/i2s_std.h"
 #include "esp_log.h"
+
 #include "board_pins.h"
 #include "app_diag_config.h"
+#if APP_DIAG_FLAC_PERFORMANCE
+#include "esp_timer.h"
+static int64_t g_perf_last_end, g_perf_window;
+static uint32_t g_perf_gap_max, g_perf_write_max, g_perf_calls, g_perf_timeouts, g_perf_partial;
+#endif
 #include "../../audio/audio_rate_profile.h"
 
 static const char *TAG = "I2S";
@@ -92,6 +98,10 @@ static esp_err_t i2s_output_create_channel(uint32_t sample_rate_hz, uint8_t dma_
         return ret;
     }
 
+#if APP_DIAG_FLAC_PERFORMANCE
+    g_perf_last_end = g_perf_window = 0;
+    g_perf_gap_max = g_perf_write_max = g_perf_calls = g_perf_timeouts = g_perf_partial = 0;
+#endif
     g_sample_rate_hz = sample_rate_hz;
     g_started = true;
 
@@ -121,6 +131,12 @@ static esp_err_t i2s_output_write_all(const void *data, size_t bytes, uint32_t t
         return ESP_ERR_INVALID_STATE;
     }
 
+#if APP_DIAG_FLAC_PERFORMANCE
+    const int64_t perf_begin = esp_timer_get_time();
+    if (g_perf_window == 0) g_perf_window = perf_begin;
+    if (g_perf_last_end != 0 && perf_begin - g_perf_last_end > g_perf_gap_max)
+        g_perf_gap_max = (uint32_t)(perf_begin - g_perf_last_end);
+#endif
     const uint8_t *cursor = (const uint8_t *)data;
     size_t remaining = bytes;
     int zero_progress_timeouts = 0;
@@ -135,6 +151,10 @@ static esp_err_t i2s_output_write_all(const void *data, size_t bytes, uint32_t t
             timeout_ms
         );
 
+#if APP_DIAG_FLAC_PERFORMANCE
+        if (ret == ESP_ERR_TIMEOUT) ++g_perf_timeouts;
+        if (bytes_written > 0 && bytes_written < remaining) ++g_perf_partial;
+#endif
         if (bytes_written > 0) {
             cursor += bytes_written;
             remaining -= bytes_written;
@@ -166,6 +186,22 @@ static esp_err_t i2s_output_write_all(const void *data, size_t bytes, uint32_t t
         return ret != ESP_OK ? ret : ESP_FAIL;
     }
 
+#if APP_DIAG_FLAC_PERFORMANCE
+    const int64_t perf_end = esp_timer_get_time();
+    const uint32_t duration = (uint32_t)(perf_end - perf_begin);
+    if (duration > g_perf_write_max) g_perf_write_max = duration;
+    ++g_perf_calls;
+    if (perf_end - g_perf_window >= 5000000LL) {
+        ESP_LOGI(TAG, "PCM_FEED_PERF: rate=%lu calls=%lu gap_max=%luus write_max=%luus timeouts=%lu partial=%lu (gap includes pause/seek; not underrun count)",
+            (unsigned long)g_sample_rate_hz, (unsigned long)g_perf_calls,
+            (unsigned long)g_perf_gap_max, (unsigned long)g_perf_write_max,
+            (unsigned long)g_perf_timeouts, (unsigned long)g_perf_partial);
+        g_perf_window = perf_end;
+        g_perf_gap_max = g_perf_write_max = g_perf_calls = g_perf_timeouts = g_perf_partial = 0;
+    }
+    // Exclude this diagnostic's own serial logging from the next measured gap.
+    g_perf_last_end = esp_timer_get_time();
+#endif
     return ESP_OK;
 }
 

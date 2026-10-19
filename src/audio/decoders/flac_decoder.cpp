@@ -1,4 +1,5 @@
 #include "flac_decoder.h"
+#include "pcm_i2s_convert.h"
 
 #include <limits.h>
 #include <string.h>
@@ -12,6 +13,9 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "../audio_rate_profile.h"
+#if APP_DIAG_FLAC_PERFORMANCE
+#include "../sources/buffered_http_audio_source.h"
+#endif
 
 static const char *TAG = "FLAC";
 
@@ -699,6 +703,18 @@ static void flac_perf_maybe_publish(FlacDecoder *decoder, uint64_t now_us)
     snapshot.prefetch_stack_hwm = context != nullptr
         ? static_cast<uint32_t>(context->stack_hwm)
         : 0;
+
+    // NAS bypasses the local FLAC prefetch context; report its actual HTTP ring.
+    if(context == nullptr && decoder->source != nullptr){
+        BufferedHttpAudioSourceStats http = {};
+        if(buffered_http_audio_source_get_stats(decoder->source, &http)){
+            snapshot.network_source = true;
+            snapshot.ring_buffered_bytes = http.ring_buffered_bytes;
+            snapshot.ring_capacity_bytes = http.ring_capacity_bytes;
+            snapshot.ring_min_buffered_bytes = http.ring_min_buffered_bytes;
+            snapshot.prefetch_stack_hwm = http.task_stack_hwm;
+        }
+    }
 
     snapshot.decode_avg_us = decoder->perf_decode_calls > 0
         ? static_cast<uint32_t>(decoder->perf_decode_total_us / decoder->perf_decode_calls)
@@ -2770,29 +2786,6 @@ static esp_err_t flac_decode_next_output(FlacDecoder *decoder)
     return ESP_OK;
 }
 
-static int32_t flac_read_sample_as_i2s32(const uint8_t *p, uint16_t bits_per_sample)
-{
-    if (bits_per_sample == 16) {
-        const uint32_t raw = static_cast<uint32_t>(p[0]) |
-            (static_cast<uint32_t>(p[1]) << 8);
-        const uint32_t sign_extended = (raw & 0x8000U) != 0 ? (raw | 0xFFFF0000U) : raw;
-        return static_cast<int32_t>(sign_extended << 16);
-    }
-    if (bits_per_sample == 24) {
-        const uint32_t raw = static_cast<uint32_t>(p[0]) |
-            (static_cast<uint32_t>(p[1]) << 8) |
-            (static_cast<uint32_t>(p[2]) << 16);
-        const uint32_t sign_extended = (raw & 0x800000U) != 0 ? (raw | 0xFF000000U) : raw;
-        return static_cast<int32_t>(sign_extended << 8);
-    }
-
-    const uint32_t raw = static_cast<uint32_t>(p[0]) |
-        (static_cast<uint32_t>(p[1]) << 8) |
-        (static_cast<uint32_t>(p[2]) << 16) |
-        (static_cast<uint32_t>(p[3]) << 24);
-    return static_cast<int32_t>(raw);
-}
-
 static esp_err_t flac_decoder_prepare_runtime(
     FlacDecoder *decoder,
     AudioDecodeWorkspace *workspace,
@@ -3137,16 +3130,8 @@ esp_err_t flac_decoder_read_pcm32(
             : available_frames;
 
         const uint8_t *src = decoder->decoded_buffer + decoder->decoded_offset;
-        for (size_t i = 0; i < copy_frames; ++i) {
-            const int32_t left = flac_read_sample_as_i2s32(src, decoder->bits_per_sample);
-            int32_t right = left;
-            if (decoder->channels == 2) {
-                right = flac_read_sample_as_i2s32(src + sample_bytes, decoder->bits_per_sample);
-            }
-            out_interleaved_stereo[(produced + i) * 2] = left;
-            out_interleaved_stereo[(produced + i) * 2 + 1] = right;
-            src += source_frame_bytes;
-        }
+        fakepod_pcm::to_i2s32(src, out_interleaved_stereo + produced * 2U,
+            copy_frames, decoder->bits_per_sample, decoder->channels);
 
         const size_t consumed_bytes = copy_frames * source_frame_bytes;
         decoder->decoded_offset += consumed_bytes;

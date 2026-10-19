@@ -1,3 +1,4 @@
+#include "audio/audio_rate_profile.h"
 #include "system_loop.h"
 
 #include "freertos/FreeRTOS.h"
@@ -735,6 +736,14 @@ void system_loop_update()
 
             g_last_flac_perf_sequence =
                 flac_perf.sequence;
+            AudioRateProfile rate_profile = {};
+            const bool rate_known = audio_rate_profile_get(flac_perf.sample_rate_hz, &rate_profile);
+            const uint32_t dma_capacity_us = rate_known && flac_perf.sample_rate_hz > 0
+                ? static_cast<uint32_t>((static_cast<uint64_t>(rate_profile.i2s_dma_desc_num) * 256ULL * 1000000ULL) / flac_perf.sample_rate_hz) : 0U;
+            ESP_LOGI("FLAC", "FLAC_PERF_CONTEXT: source=%s rate=%luHz DMA_full_capacity=%luus (not remaining); NAS fread/copy counters are N/A",
+                flac_perf.network_source ? "NAS_HTTP" : "TF_SD",
+                static_cast<unsigned long>(flac_perf.sample_rate_hz),
+                static_cast<unsigned long>(dma_capacity_us));
 
 
             ESP_LOGI(

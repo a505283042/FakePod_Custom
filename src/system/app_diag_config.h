@@ -114,3 +114,8 @@
 #ifndef APP_DIAG_MP3_PERFORMANCE
 #define APP_DIAG_MP3_PERFORMANCE (APP_DIAG_PROFILE >= APP_DIAG_PROFILE_STRESS)
 #endif
+
+// Optional 5-second spectrum timing summaries, independent of noisy STRESS traces.
+#ifndef APP_DIAG_SPECTRUM_PERFORMANCE
+#define APP_DIAG_SPECTRUM_PERFORMANCE 0
+#endif

@@ -1,4 +1,12 @@
 #include "audio_spectrum_snapshot.h"
+#include "sdkconfig.h"
+#include "spectrum_fft_math.h"
+#ifndef FAKEPOD_SPECTRUM_DSP
+#define FAKEPOD_SPECTRUM_DSP 1
+#endif
+#if FAKEPOD_SPECTRUM_DSP && CONFIG_IDF_TARGET_ESP32S3
+#include "dsps_fft2r.h"
+#endif
 
 #include <atomic>
 #include <math.h>
@@ -33,9 +41,6 @@ constexpr uint32_t FFT_TASK_STACK_BYTES = 4096U;
 constexpr UBaseType_t FFT_TASK_PRIORITY = 2U;
 constexpr uint32_t FFT_GRACE_REUSE_MS = 2000U;
 constexpr BaseType_t FFT_TASK_CORE = 1;
-constexpr float FFT_PI = 3.14159265358979323846f;
-constexpr float FFT_REFERENCE_MAGNITUDE = 64.0f; // Bartlett窗下满幅正弦约落在该量级。
-constexpr float FFT_FLOOR_DB = -45.0f;
 
 // P1.5.2R.3.1：低频端增加细分。约 16kHz / 256 点时，前几段从约 62Hz 起步，
 // 重点覆盖底鼓/贝斯；后半段再逐渐扩宽到约 8kHz。14.7kHz 分析率下比例保持接近。
@@ -221,119 +226,38 @@ static void spectrum_release_slot(int slot_index)
     portEXIT_CRITICAL(&g_frame_mux);
 }
 
-static void spectrum_fft_in_place(float *real, float *imag)
+static void spectrum_fft_in_place(float *data)
 {
-    // 256点 radix-2 Cooley-Tukey。只在 Core1/P1 的 SpectrumFFT 任务执行。
-    for (size_t i = 1U, j = 0U; i < FFT_SIZE; ++i) {
-        size_t bit = FFT_SIZE >> 1U;
-        for (; (j & bit) != 0U; bit >>= 1U) {
-            j ^= bit;
-        }
-        j ^= bit;
-        if (i < j) {
-            const float real_tmp = real[i];
-            real[i] = real[j];
-            real[j] = real_tmp;
-            const float imag_tmp = imag[i];
-            imag[i] = imag[j];
-            imag[j] = imag_tmp;
-        }
-    }
-
-    for (size_t len = 2U; len <= FFT_SIZE; len <<= 1U) {
-        const float angle = -2.0f * FFT_PI / static_cast<float>(len);
-        const float step_real = cosf(angle);
-        const float step_imag = sinf(angle);
-        const size_t half = len >> 1U;
-
-        for (size_t base = 0U; base < FFT_SIZE; base += len) {
-            float w_real = 1.0f;
-            float w_imag = 0.0f;
-            for (size_t j = 0U; j < half; ++j) {
-                const size_t even = base + j;
-                const size_t odd = even + half;
-                const float odd_real =
-                    real[odd] * w_real - imag[odd] * w_imag;
-                const float odd_imag =
-                    real[odd] * w_imag + imag[odd] * w_real;
-
-                const float even_real = real[even];
-                const float even_imag = imag[even];
-                real[even] = even_real + odd_real;
-                imag[even] = even_imag + odd_imag;
-                real[odd] = even_real - odd_real;
-                imag[odd] = even_imag - odd_imag;
-
-                const float next_w_real =
-                    w_real * step_real - w_imag * step_imag;
-                w_imag = w_real * step_imag + w_imag * step_real;
-                w_real = next_w_real;
-            }
-        }
-    }
-}
-
-static uint8_t spectrum_magnitude_to_level(float magnitude)
-{
-    float normalized = magnitude / FFT_REFERENCE_MAGNITUDE;
-    if (normalized < 0.000001f) {
-        normalized = 0.000001f;
-    }
-    float db = 20.0f * log10f(normalized);
-    if (db <= FFT_FLOOR_DB) {
-        return 0U;
-    }
-    if (db >= 0.0f) {
-        return 255U;
-    }
-    const float scaled = (db - FFT_FLOOR_DB) * (255.0f / -FFT_FLOOR_DB);
-    if (scaled <= 0.0f) {
-        return 0U;
-    }
-    if (scaled >= 255.0f) {
-        return 255U;
-    }
-
-    // P1.5.2R.3.1：增加轻量对比曲线，压低持续存在的中等能量，
-    // 让强瞬态仍能接近满幅，避免整屏长期悬在半高处。
-    const uint32_t linear = static_cast<uint32_t>(scaled + 0.5f);
-    return static_cast<uint8_t>((linear * linear + 127U) / 255U);
+#if FAKEPOD_SPECTRUM_DSP && CONFIG_IDF_TARGET_ESP32S3
+    // Use the fixed-size raw kernel with our own immutable coefficient table.
+    // No global ESP-DSP init/deinit, heap allocation, or task-lifetime table race.
+    (void)dsps_fft2r_fc32_aes3_(data, static_cast<int>(FFT_SIZE),
+        const_cast<float *>(fakepod_spectrum::kTwiddle));
+#else
+    fakepod_spectrum::portable_fft(data);
+#endif
+    fakepod_spectrum::bit_reverse(data);
 }
 
 static void spectrum_analyze_frame(const FftFrameSlot &frame, uint8_t *levels)
 {
     // FFT 工作数组只存在于低优先级任务栈，不占 AudioTask 栈，也不会交给 UI。
-    float real[FFT_SIZE] = {};
-    float imag[FFT_SIZE] = {};
-
-    float mean = 0.0f;
-    for (size_t i = 0U; i < FFT_SIZE; ++i) {
-        mean += static_cast<float>(frame.samples[i]);
-    }
-    mean /= static_cast<float>(FFT_SIZE);
-
-    for (size_t i = 0U; i < FFT_SIZE; ++i) {
-        // 轻量 Bartlett（三角）窗，避免在 AudioTask 热路径做窗函数，也避免每帧256次三角函数。
-        const float window = (i <= FFT_SIZE / 2U)
-            ? static_cast<float>(i) / static_cast<float>(FFT_SIZE / 2U)
-            : static_cast<float>(FFT_SIZE - 1U - i) /
-                static_cast<float>(FFT_SIZE / 2U - 1U);
-        real[i] = ((static_cast<float>(frame.samples[i]) - mean) / 32768.0f) * window;
-    }
-
-    spectrum_fft_in_place(real, imag);
+    alignas(16) float data[FFT_SIZE * 2U];
+    static_assert(FFT_SIZE == fakepod_spectrum::kSize);
+    fakepod_spectrum::prepare(frame.samples, data);
+    spectrum_fft_in_place(data);
 
     for (uint8_t band = 0U; band < AUDIO_SPECTRUM_BAND_COUNT; ++band) {
         const uint16_t start = FFT_BAND_EDGES[band];
         const uint16_t end = FFT_BAND_EDGES[band + 1U];
         float max_power = 0.0f;
         for (uint16_t bin = start; bin < end && bin < FFT_SIZE / 2U; ++bin) {
-            const float power = real[bin] * real[bin] + imag[bin] * imag[bin];
+            const float power = data[2U * bin] * data[2U * bin] + data[2U * bin + 1U] * data[2U * bin + 1U];
             if (power > max_power) {
                 max_power = power;
             }
         }
-        levels[band] = spectrum_magnitude_to_level(sqrtf(max_power));
+        levels[band] = fakepod_spectrum::power_level(max_power);
     }
 }
 
@@ -367,7 +291,16 @@ static void spectrum_fft_task_main(void *)
 {
     TaskHandle_t self = xTaskGetCurrentTaskHandle();
     uint32_t logged_generation = 0U;
+#if FAKEPOD_SPECTRUM_DSP && CONFIG_IDF_TARGET_ESP32S3
+    ESP_LOGI(TAG, "FFT backend=ESP-DSP S3 aes3 N=256 readonly-table stack-work=2048B");
+#else
+    ESP_LOGI(TAG, "FFT backend=portable-table N=256 stack-work=2048B");
+#endif
 
+#if APP_DIAG_SPECTRUM_PERFORMANCE
+    int64_t perf_since_us=esp_timer_get_time();
+    uint64_t perf_total_us=0;uint32_t perf_frames=0,perf_max_us=0;
+#endif
     while (true) {
         FftTaskLifecycle lifecycle = g_fft_lifecycle.load(std::memory_order_acquire);
         TickType_t wait_ticks = portMAX_DELAY;
@@ -432,6 +365,21 @@ static void spectrum_fft_task_main(void *)
                 spectrum_analyze_frame(frame, levels);
                 const uint32_t fft_elapsed_us = static_cast<uint32_t>(
                     esp_timer_get_time() - fft_begin_us);
+#if APP_DIAG_SPECTRUM_PERFORMANCE
+                perf_total_us+=fft_elapsed_us;++perf_frames;
+                if(fft_elapsed_us>perf_max_us)perf_max_us=fft_elapsed_us;
+                const int64_t perf_now_us=esp_timer_get_time();
+                if(perf_now_us-perf_since_us>=5000000LL){
+                    ESP_LOGI(TAG, "SPECTRUM_PERF: frames=%lu avg=%luus max=%luus dropped_total=%lu source=%luHz stack_hwm=%u",
+                        static_cast<unsigned long>(perf_frames),
+                        static_cast<unsigned long>(perf_total_us/perf_frames),
+                        static_cast<unsigned long>(perf_max_us),
+                        static_cast<unsigned long>(g_dropped_frames.load(std::memory_order_relaxed)),
+                        static_cast<unsigned long>(frame.source_sample_rate_hz),
+                        static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+                    perf_since_us=perf_now_us;perf_total_us=0;perf_frames=0;perf_max_us=0;
+                }
+#endif
                 spectrum_publish_fft_snapshot(frame, levels);
                 g_analyzed_frames.fetch_add(1U, std::memory_order_relaxed);
 

@@ -1,0 +1,6 @@
+ESP-DSP v1.6.0
+https://github.com/espressif/esp-dsp/tree/v1.6.0
+Source: https://codeload.github.com/espressif/esp-dsp/zip/refs/tags/v1.6.0
+Archive SHA256: 96aff4cd9a926074ba9bef85fc1218f770f34a7b57207e0bd0e8f5433d47e4b8
+Upstream CMakeLists.txt, Kconfig, LICENSE and modules retained unmodified.
+No registry manifest: this is a local ESP-IDF component.
