@@ -1,3 +1,4 @@
+#include "font_unpack_2bpp.h"
 #include "font_manager.h"
 #include "storage_io.h"
 #include "device_settings.h"
@@ -355,20 +356,8 @@ static const void *font_manager_get_glyph_bitmap_cb(
         return nullptr;
     }
 
-    static constexpr uint8_t OPACITY_2BPP[4] = {0, 85, 170, 255};
     const uint8_t *packed = g_context.data + bitmap_offset;
-    memset(draw_buf->data, 0, output_size);
-
-    for (uint32_t y = 0; y < glyph_dsc->box_h; ++y) {
-        const uint8_t *source_row = packed + static_cast<size_t>(y) * row_bytes;
-        uint8_t *target_row = draw_buf->data + static_cast<size_t>(y) * stride;
-        for (uint32_t x = 0; x < glyph_dsc->box_w; ++x) {
-            const uint8_t packed_byte = source_row[x >> 2];
-            const uint8_t shift = static_cast<uint8_t>(6 - ((x & 0x03U) * 2));
-            const uint8_t level = static_cast<uint8_t>((packed_byte >> shift) & 0x03U);
-            target_row[x] = OPACITY_2BPP[level];
-        }
-    }
+    fakepod_font::unpack(packed, draw_buf->data, glyph_dsc->box_w, glyph_dsc->box_h, stride);
 
     return draw_buf;
 }

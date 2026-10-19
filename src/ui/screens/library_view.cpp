@@ -1,3 +1,4 @@
+#include "library_row_step.h"
 #include "library_view.h"
 
 #include <atomic>
@@ -55,7 +56,7 @@ static const char *TAG = "曲库界面";
 static constexpr int32_t LIBRARY_LIST_X = 8;
 static constexpr int32_t LIBRARY_LIST_Y = 92;
 static constexpr int32_t LIBRARY_LIST_W = FAKEPOD_LCD_WIDTH - 16;
-static constexpr int32_t LIBRARY_LIST_H = FAKEPOD_LCD_HEIGHT - LIBRARY_LIST_Y - 8;
+static constexpr int32_t LIBRARY_LIST_H = ((FAKEPOD_LCD_HEIGHT - LIBRARY_LIST_Y - 8) / 70) * 70;
 static constexpr int32_t LIBRARY_ROW_X = 4;
 static constexpr int32_t LIBRARY_ROW_W = LIBRARY_LIST_W - 8;
 static constexpr int32_t LIBRARY_ROW_H = 62;
@@ -218,6 +219,7 @@ struct LibraryVirtualRow
     lv_obj_t *arrow = nullptr;
     LibraryRowBinding binding = {};
     uint32_t item_index = UINT32_MAX;
+    bool center_selected = false;
 };
 
 struct LibraryBrowseState
@@ -250,6 +252,7 @@ struct LibraryGestureState
     uint32_t last_sample_tick_ms = 0U;
     uint32_t last_motion_tick_ms = 0U;
     int32_t scroll_velocity_px_s = 0;
+    int32_t row_drag_remainder = 0;
     uint32_t suppress_click_until = 0;
 };
 
@@ -1694,13 +1697,10 @@ static uint32_t library_view_item_count()
 
 static int32_t library_view_max_scroll_y()
 {
-    const uint32_t item_count = library_view_item_count();
-    const int32_t list_h = library_view_list_h();
-    const int32_t content_h = item_count == 0U
-        ? list_h
-        : static_cast<int32_t>(item_count) * library_view_row_step() + 4;
-    const int32_t max_scroll = content_h - list_h;
-    return max_scroll > 0 ? max_scroll : 0;
+    const uint32_t count = library_view_item_count();
+    const int32_t step = library_view_row_step();
+    const uint32_t visible = static_cast<uint32_t>(library_view_list_h() / step);
+    return count > visible ? static_cast<int32_t>(count - visible) * step : 0;
 }
 
 static int32_t library_view_clamp_scroll_y(int32_t y)
@@ -1709,7 +1709,7 @@ static int32_t library_view_clamp_scroll_y(int32_t y)
         return 0;
     }
     const int32_t max_scroll = library_view_max_scroll_y();
-    return y > max_scroll ? max_scroll : y;
+    return fakepod_library::align_scroll(y, max_scroll, library_view_row_step());
 }
 
 static int32_t library_view_current_scroll_y()
@@ -1755,7 +1755,7 @@ static void library_view_scrollbar_update_position()
         return;
     }
 
-    // 列表本体必须逐触摸采样跟手；右侧位置条只是辅助视觉。
+    // 列表按整行步进；右侧位置条只是辅助视觉。
     // 手指按住期间把 thumb 更新限到约20Hz，释放后立即补一次最终位置。
     if (g_gesture.pressed) {
         const uint32_t now = static_cast<uint32_t>(lv_tick_get());
@@ -2483,7 +2483,12 @@ static void library_view_set_folder_row_text(
 static void library_view_reset_row_style(LibraryVirtualRow &row, bool current, bool arrow)
 {
     const LibraryThemeColors theme = library_view_theme_colors();
-    lv_obj_set_style_bg_color(row.button, lv_color_hex(current ? theme.row_current_bg : theme.row_bg), 0);
+    const uint32_t first = static_cast<uint32_t>(library_view_current_scroll_y() / library_view_row_step());
+    const uint32_t count = library_view_item_count();
+    const uint32_t selected = first + ((count - first > 2U) ? 2U : (count - first - 1U));
+    row.center_selected = row.item_index == selected;
+    lv_obj_set_style_bg_color(row.button,
+        lv_color_hex(row.center_selected ? theme.row_current_bg : 0x0D1016), 0);
     lv_obj_set_style_text_color(row.label, lv_color_hex(current ? 0xFFFFFF : 0xE9ECF1), 0);
     if (row.accent != nullptr) {
         lv_obj_set_style_bg_color(row.accent, lv_color_hex(theme.accent), 0);
@@ -2726,9 +2731,11 @@ static void library_view_refresh_virtual_rows(bool force)
     int32_t scroll_y = library_view_current_scroll_y();
     uint32_t first_visible = scroll_y > 0 ? static_cast<uint32_t>(scroll_y / row_step) : 0U;
     uint32_t first_item = first_visible > 0U ? first_visible - 1U : 0U;
-    for (uint32_t slot = 0U; slot < LIBRARY_VIRTUAL_ROWS; ++slot) {
-        LibraryVirtualRow &row = g_rows[slot];
-        const uint32_t item_index = first_item + slot;
+    for (uint32_t offset = 0U; offset < LIBRARY_VIRTUAL_ROWS; ++offset) {
+        const uint32_t item_index = first_item + offset;
+        // Stable ring ownership: overlapping items keep their existing text,
+        // style and click binding when the visible window crosses one row.
+        LibraryVirtualRow &row = g_rows[item_index % LIBRARY_VIRTUAL_ROWS];
         if (item_index >= item_count || row.button == nullptr) {
             library_view_hide_row(row);
             continue;
@@ -2738,6 +2745,15 @@ static void library_view_refresh_virtual_rows(bool force)
         // 搜索模式下 display index 再映射回真实歌曲/分组索引，不复制任何字符串。
         lv_obj_set_y(row.button, static_cast<int32_t>(item_index) * row_step + 4 - scroll_y);
         if (!force && row.item_index == item_index) {
+            const uint32_t selected = first_visible +
+                ((item_count - first_visible > 2U) ? 2U : (item_count - first_visible - 1U));
+            const bool center = item_index == selected;
+            if (center != row.center_selected) {
+                row.center_selected = center;
+                const LibraryThemeColors theme = library_view_theme_colors();
+                lv_obj_set_style_bg_color(row.button,
+                    lv_color_hex(center ? theme.row_current_bg : 0x0D1016), 0);
+            }
             continue;
         }
 
@@ -3262,8 +3278,8 @@ static void library_view_create_virtual_rows()
         ui_common_lock_object(row.button);
         lv_obj_set_pos(row.button, LIBRARY_ROW_X, 4 + static_cast<int32_t>(slot) * LIBRARY_ROW_STEP);
         lv_obj_set_size(row.button, LIBRARY_ROW_W, LIBRARY_ROW_H);
-        lv_obj_set_style_radius(row.button, 11, 0);
-        lv_obj_set_style_bg_color(row.button, lv_color_hex(0x151A21), 0);
+        lv_obj_set_style_radius(row.button, 0, 0);
+        lv_obj_set_style_bg_color(row.button, lv_color_hex(0x0D1016), 0);
         lv_obj_set_style_bg_opa(row.button, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(row.button, 0, 0);
         lv_obj_set_style_shadow_width(row.button, 0, 0);
@@ -4297,6 +4313,7 @@ void library_view_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick
             g_gesture.last_sample_tick_ms = tick_ms;
             g_gesture.last_motion_tick_ms = tick_ms;
             g_gesture.scroll_velocity_px_s = 0;
+            g_gesture.row_drag_remainder = 0;
             g_gesture.axis = LibraryGestureAxis::None;
             const int32_t list_y = library_view_list_y();
             const int32_t list_h = library_view_list_h();
@@ -4347,29 +4364,18 @@ void library_view_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick
                 g_gesture.axis == LibraryGestureAxis::Vertical) {
                 const int32_t step_y = static_cast<int32_t>(y) - previous_y;
                 if (step_y != 0) {
-                    // 手指向上 => scroll_y 增大；手指向下 => scroll_y 减小。
+                    // 累计触摸距离，达到一行才提交；小幅移动不修改任何行对象。
                     const int32_t before = library_view_current_scroll_y();
-                    library_view_set_scroll_y(before - step_y);
+                    const int32_t delta = fakepod_library::consume_drag(
+                        g_gesture.row_drag_remainder, -step_y, library_view_row_step());
+                    if (delta != 0) {
+                        library_view_set_scroll_y(before + delta);
+                    }
                     const int32_t after = library_view_current_scroll_y();
-                    const int32_t actual_scroll_delta = after - before;
-                    const uint32_t sample_dt_ms = tick_ms - g_gesture.last_sample_tick_ms;
-                    if (actual_scroll_delta != 0 && sample_dt_ms > 0U) {
-                        g_gesture.last_motion_tick_ms = tick_ms;
-                        int32_t instantaneous = static_cast<int32_t>(
-                            (static_cast<int64_t>(actual_scroll_delta) * 1000LL) /
-                            static_cast<int64_t>(sample_dt_ms));
-                        instantaneous = library_clamp_i32(
-                            instantaneous, -LIBRARY_INERTIA_MAX_PX_S, LIBRARY_INERTIA_MAX_PX_S);
-                        if (g_gesture.scroll_velocity_px_s == 0) {
-                            g_gesture.scroll_velocity_px_s = instantaneous;
-                        } else {
-                            // 最近采样权重大，既能跟上快速甩动，又能过滤 CST820 单点抖动。
-                            g_gesture.scroll_velocity_px_s =
-                                (g_gesture.scroll_velocity_px_s * 2 + instantaneous * 3) / 5;
-                        }
-                    } else if (actual_scroll_delta == 0) {
-                        // 已经触顶/触底时不保留向外的速度，防止抬手后继续“顶边”。
-                        g_gesture.scroll_velocity_px_s = 0;
+                    // 边缘向外的残量丢弃，反向拖动无需先偿还越界距离。
+                    if ((after == 0 && g_gesture.row_drag_remainder < 0) ||
+                        (after == library_view_max_scroll_y() && g_gesture.row_drag_remainder > 0)) {
+                        g_gesture.row_drag_remainder = 0;
                     }
                     g_gesture.suppress_click_until = tick_ms + LIBRARY_SUPPRESS_CLICK_MS;
                 }
@@ -4425,17 +4431,7 @@ void library_view_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick
         }
     }
 
-    const bool start_inertia =
-        !g_gesture.ignore &&
-        action == LibraryPendingGesture::None &&
-        g_gesture.started_in_list &&
-        g_gesture.list_dragged &&
-        g_gesture.axis == LibraryGestureAxis::Vertical &&
-        (tick_ms - g_gesture.last_motion_tick_ms) <= 120U &&
-        library_abs(g_gesture.scroll_velocity_px_s) >= LIBRARY_INERTIA_START_MIN_PX_S;
-    const int32_t release_velocity = g_gesture.scroll_velocity_px_s;
-
-    // 抬手时先保存当前位置；若启动惯性，最终停止时会再保存一次最终位置。
+    // 整行步进：抬手保存当前整行位置，不启动惯性或补做半行动画。
     if (g_gesture.started_in_list && g_gesture.list_dragged) {
         library_view_store_scroll_position();
     }
@@ -4452,9 +4448,6 @@ void library_view_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick
     // Direct Touch 已结束：辅助位置条立即追到最终位置，不把节流残留到抬手后。
     library_view_scrollbar_update_position();
 
-    if (start_inertia) {
-        library_view_inertia_start(release_velocity, tick_ms);
-    }
     library_view_queue_gesture(action, tick_ms);
 }
 

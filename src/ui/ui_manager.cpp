@@ -47,6 +47,7 @@ static const char *TAG = "界面";
 #define UI_PERF_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
 #endif
 static lv_display_t *g_display = nullptr;
+#include "perf_overlay.inc"
 static lv_indev_t *g_touch = nullptr;
 static esp_err_t g_touch_error = ESP_ERR_INVALID_STATE;
 static lv_obj_t *g_boot_root = nullptr;
@@ -1621,6 +1622,7 @@ esp_err_t ui_manager_init()
     lyrics_view_create(lv_screen_active());
     spectrum_view_create(lv_screen_active());
     library_view_create(lv_screen_active());
+    ui_perf_overlay_create();
 
     // AOD / 锁屏悬浮层：挂在 lv_screen_active() 顶层，放在所有业务视图之后。
     // 每次页面 move_foreground 后会再调用 screen_lock_simple_raise（可选），
