@@ -2344,7 +2344,7 @@ static void library_view_apply_list_layout()
             lv_obj_set_height(row.accent, accent_h);
         }
         if (row.label != nullptr) {
-            lv_obj_set_pos(row.label, 18, g_search.active ? 6 : 15);
+            lv_obj_set_pos(row.label, 18, (row_h - (g_search.active ? 30 : 32)) / 2);
             lv_obj_set_height(row.label, g_search.active ? 30 : 32);
         }
         if (row.arrow != nullptr) {
@@ -2443,8 +2443,9 @@ static void library_search_keyboard_cb(uint8_t key_index, void *user_data)
 static void library_view_set_row_text(LibraryVirtualRow &row, const char *primary, const char *secondary)
 {
     const char *safe_primary = primary != nullptr && primary[0] != '\0' ? primary : "未知";
-    lv_obj_set_y(row.label, 15);
-    lv_obj_set_height(row.label, 32);
+    const int32_t text_h = g_search.active ? 30 : 32;
+    lv_obj_set_y(row.label, (library_view_row_h() - text_h) / 2);
+    lv_obj_set_height(row.label, text_h);
     if (row.meta != nullptr) {
         lv_obj_add_flag(row.meta, LV_OBJ_FLAG_HIDDEN);
     }
@@ -2460,8 +2461,9 @@ static void library_view_set_folder_row_text(
 {
     const char *safe_name = name != nullptr && name[0] != '\0' ? name : "未知";
     lv_label_set_text(row.label, safe_name);
-    lv_obj_set_y(row.label, 15);
-    lv_obj_set_height(row.label, 32);
+    const int32_t text_h = g_search.active ? 30 : 32;
+    lv_obj_set_y(row.label, (library_view_row_h() - text_h) / 2);
+    lv_obj_set_height(row.label, text_h);
     lv_obj_set_width(row.label, LIBRARY_ROW_W - 146);
     if (row.meta != nullptr) {
         // 文件夹行保持纯粹的左右结构：左侧名称，右侧仅数量数字。
@@ -2487,13 +2489,14 @@ static void library_view_reset_row_style(LibraryVirtualRow &row, bool current, b
         lv_obj_set_style_bg_color(row.accent, lv_color_hex(theme.accent), 0);
         if (current && library_view_folder_browser_active()) {
             // 文件夹选择页的当前项用一个小圆点表达，不占用“当前”文字空间。
-            lv_obj_set_pos(row.accent, 7, 27);
+            lv_obj_set_pos(row.accent, 7, (library_view_row_h() - 8) / 2);
             lv_obj_set_size(row.accent, 8, 8);
             lv_obj_set_style_radius(row.accent, 4, 0);
         } else {
             // 歌曲当前项继续沿用原来的细竖条。
-            lv_obj_set_pos(row.accent, 0, 12);
-            lv_obj_set_size(row.accent, 3, 38);
+            const int32_t bar_h = g_search.active ? 28 : 38;
+            lv_obj_set_pos(row.accent, 0, (library_view_row_h() - bar_h) / 2);
+            lv_obj_set_size(row.accent, 3, bar_h);
             lv_obj_set_style_radius(row.accent, 2, 0);
         }
         if (current) lv_obj_remove_flag(row.accent, LV_OBJ_FLAG_HIDDEN);
@@ -2742,7 +2745,7 @@ static void library_view_refresh_virtual_rows(bool force)
 
         // 直驱滚动时每个 CST820 采样都更新屏幕位置；只有跨到新的显示 item 时才重绑文本。
         // 搜索模式下 display index 再映射回真实歌曲/分组索引，不复制任何字符串。
-        lv_obj_set_y(row.button, static_cast<int32_t>(item_index) * row_step + 4 - scroll_y + g_row_push_offset);
+        lv_obj_set_y(row.button, static_cast<int32_t>(item_index) * row_step + (row_step - library_view_row_h()) / 2 - scroll_y + g_row_push_offset);
         if (!force && row.item_index == item_index) {
             const uint32_t selected = first_visible +
                 ((item_count - first_visible > 2U) ? 2U : (item_count - first_visible - 1U));

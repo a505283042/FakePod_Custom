@@ -24,7 +24,7 @@ int g_row_push_offset=0;bool g_row_push_pending=false;void*g_row_push_timer=null
 Obj objects[7],host;Obj*g_list_host=&host;LibraryVirtualRow g_rows[7];
 enum class LibraryBrowseMode{AllTracks,GroupTracks};struct State{LibraryBrowseMode mode=LibraryBrowseMode::AllTracks;}g_state;
 uint32_t count=376;int scroll=0,step=70,binds=0;bool folder=false,search=false;
-uint32_t library_view_item_count(){return count;}int library_view_row_step(){return step;}int library_view_current_scroll_y(){return scroll;}
+uint32_t library_view_item_count(){return count;}int library_view_row_step(){return step;}int library_view_row_h(){return step==50?44:62;}int library_view_current_scroll_y(){return scroll;}
 uint32_t library_view_source_item_index(uint32_t i){return search?10000+i*3:i;}
 void library_view_hide_row(LibraryVirtualRow&r){r.item_index=UINT32_MAX;r.binding={};r.button->hidden=true;}
 void lv_obj_set_y(Obj*p,int y){p->y=y;}constexpr int LV_OBJ_FLAG_HIDDEN=1;
@@ -41,7 +41,7 @@ void verify(){
  for(auto&r:g_rows){if(r.button->hidden){assert(r.item_index==UINT32_MAX);continue;}
   assert(r.item_index>=first&&r.item_index<first+7&&r.item_index<count);
   assert(r.binding.position==library_view_source_item_index(r.item_index));
-  assert(r.button->y==int(r.item_index)*step+4-scroll);
+  assert(r.button->y==int(r.item_index)*step+(step-library_view_row_h())/2-scroll);
   assert(seen.insert(r.item_index).second);
   assert(r.center_selected==(r.item_index==first_visible+((count-first_visible>2)?2:(count-first_visible-1))));
  }
@@ -56,7 +56,7 @@ int main(){
  std::mt19937 rng(1483);
  for(unsigned mode=0;mode<3;++mode){folder=mode==2;g_state.mode=mode==1?LibraryBrowseMode::GroupTracks:LibraryBrowseMode::AllTracks;
   for(unsigned total:{0U,1U,2U,6U,7U,8U,376U,4227U}){
-   count=total;search=!search;scroll=0;library_view_refresh_virtual_rows(true);verify();
+   count=total;search=!search;step=search?50:70;scroll=0;library_view_refresh_virtual_rows(true);verify();
    for(unsigned j=0;j<1000;++j){scroll=total?int(rng()%(total*step)):0;library_view_refresh_virtual_rows(false);verify();}
    // Context/search changes must force rebind, even at same scroll offset.
    search=!search;library_view_refresh_virtual_rows(true);verify();
