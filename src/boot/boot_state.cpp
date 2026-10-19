@@ -355,6 +355,10 @@ void boot_state_init()
         APP_DIAG_PROFILE_NAME
     );
 
+    ESP_LOGI(TAG, "AUDIO_DIAG: NAS_STREAM=%d FLAC_PERF=%d SPECTRUM_PERF=%d PCM_FEED=%d",
+        (int)APP_DIAG_NAS_STREAM, (int)APP_DIAG_FLAC_PERFORMANCE,
+        (int)APP_DIAG_SPECTRUM_PERFORMANCE, (int)APP_DIAG_PCM_FEED);
+
     // 正式启动从第一个真实阶段直接开始，不再保留历史串口等待状态。
 }
 

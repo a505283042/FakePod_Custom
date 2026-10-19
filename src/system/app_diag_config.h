@@ -119,3 +119,12 @@
 #ifndef APP_DIAG_SPECTRUM_PERFORMANCE
 #define APP_DIAG_SPECTRUM_PERFORMANCE 0
 #endif
+
+// Low-volume NAS transport/output diagnostics without full codec tracing.
+#ifndef APP_DIAG_NAS_STREAM
+#define APP_DIAG_NAS_STREAM 0
+#endif
+
+#ifndef APP_DIAG_PCM_FEED
+#define APP_DIAG_PCM_FEED (APP_DIAG_FLAC_PERFORMANCE || APP_DIAG_NAS_STREAM)
+#endif

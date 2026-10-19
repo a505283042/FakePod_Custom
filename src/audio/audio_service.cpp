@@ -20,6 +20,7 @@
 #include "nsf_synth.h"
 #include "sources/avi_mp3_audio_source.h"
 #include "sources/buffered_http_audio_source.h"
+#include "sources/nas_rebuffer_policy.h"
 #include "app_diag_config.h"
 
 static const char *TAG = "音频服务";
@@ -89,7 +90,7 @@ static constexpr uint32_t AUDIO_HTTP_MP3_STARVE_GRACE_MAX_ATTEMPTS = 192;
 // R46.0.92：NAS FLAC 直接消费 NasStream ring；网络欠载按 HTTP 时间尺度恢复，
 // 不套用本地 SD FlacPrefetch 的 1s/32次窗口。
 static constexpr uint32_t AUDIO_HTTP_FLAC_STARVE_GRACE_MAX_MS = 6000;
-static constexpr uint32_t AUDIO_HTTP_FLAC_STARVE_GRACE_MAX_ATTEMPTS = 192;
+static constexpr uint32_t AUDIO_HTTP_FLAC_STARVE_GRACE_MAX_ATTEMPTS = 2048;
 // 常规 codec workspace 跨曲保留复用；若异常文件把 PCM 工作区推到超大尺寸，
 // 关闭该曲后释放，避免一次特殊文件永久占住大量 PSRAM。
 static constexpr size_t AUDIO_DECODE_WORKSPACE_RETAIN_INPUT_BYTES = 32 * 1024;
@@ -755,6 +756,28 @@ static void audio_task_set_state(
     audio_task_publish_snapshot();
 }
 
+// AudioTask-owned low-frequency counters, no per-underrun serial flood.
+static uint32_t g_nas_starve_entries = 0, g_nas_starve_recovered = 0;
+static uint32_t g_nas_starve_max_ms = 0;
+static uint64_t g_nas_starve_silence_us = 0;
+static int64_t g_nas_starve_report_us = 0;
+static void audio_task_report_nas_starve()
+{
+    const int64_t now = esp_timer_get_time();
+    if (g_nas_starve_report_us == 0) g_nas_starve_report_us = now;
+    if (now - g_nas_starve_report_us < 5000000LL) return;
+    if (g_nas_starve_entries || g_nas_starve_recovered || g_flac_starve_grace_attempts) {
+        ESP_LOGW(TAG, "NAS_REBUFFER: entered=%lu recovered=%lu active=%u silence_queued=%llums recovered_wait_max=%lums (wait includes pause; silence is queued duration)",
+            (unsigned long)g_nas_starve_entries, (unsigned long)g_nas_starve_recovered,
+            g_flac_starve_grace_attempts != 0 ? 1U : 0U,
+            (unsigned long long)(g_nas_starve_silence_us / 1000ULL),
+            (unsigned long)g_nas_starve_max_ms);
+    }
+    g_nas_starve_entries = g_nas_starve_recovered = g_nas_starve_max_ms = 0;
+    g_nas_starve_silence_us = 0;
+    g_nas_starve_report_us = now;
+}
+
 static void audio_task_reset_flac_starve_grace()
 {
     g_flac_starve_grace_attempts = 0;
@@ -770,14 +793,9 @@ static void audio_task_log_flac_starve_recovered()
         ? static_cast<uint32_t>((now_us - g_flac_starve_grace_started_us) / 1000LL)
         : 0U;
     if (g_task_source == AudioPlaybackSource::NasHttp) {
-        BufferedHttpAudioSourceStats http = {};
-        (void)buffered_http_audio_source_get_stats(&g_decoder.source, &http);
-        ESP_LOGI(TAG,
-            "NAS FLAC欠载已恢复：attempts=%u elapsed=%ums ring=%u/%uB",
-            static_cast<unsigned>(g_flac_starve_grace_attempts),
-            static_cast<unsigned>(elapsed_ms),
-            static_cast<unsigned>(http.ring_buffered_bytes),
-            static_cast<unsigned>(http.ring_capacity_bytes));
+        ++g_nas_starve_recovered;
+        if (elapsed_ms > g_nas_starve_max_ms) g_nas_starve_max_ms = elapsed_ms;
+        audio_task_report_nas_starve();
     } else {
         FlacPrefetchRuntimeSnapshot flac = {};
         (void)flac_decoder_get_prefetch_runtime(&g_decoder.flac, &flac);
@@ -826,7 +844,9 @@ static bool audio_task_try_recover_flac_starvation(esp_err_t decoder_error)
     const int64_t now_us = esp_timer_get_time();
     if (g_flac_starve_grace_attempts == 0) {
         g_flac_starve_grace_started_us = now_us;
-        ESP_LOGW(TAG,
+        if (nas_http) {
+            ++g_nas_starve_entries;
+        } else ESP_LOGW(TAG,
             "%sFLAC欠载进入有界恢复：ring=%u/%uB ioerr=0 eof=0，最多%ums/%u次；期间以静音维持I2S",
             nas_http ? "NAS " : "",
             static_cast<unsigned>(buffered),
@@ -859,6 +879,11 @@ static bool audio_task_try_recover_flac_starvation(esp_err_t decoder_error)
             nas_http ? "NAS " : "", esp_err_to_name(silence_ret));
         audio_task_reset_flac_starve_grace();
         return false;
+    }
+    if (nas_http) {
+        if (g_task_sample_rate_hz != 0U)
+            g_nas_starve_silence_us += (uint64_t)silence_frames * 1000000ULL / g_task_sample_rate_hz;
+        audio_task_report_nas_starve();
     }
     audio_task_reset_music_last_pcm();
     return true;
@@ -2795,6 +2820,15 @@ static void audio_task_finish_stream()
         static_cast<unsigned long long>(audio_playback_clock_position_ms(&g_playback_clock)));
 #endif
 
+    if (g_task_format == MediaFormat::FLAC) {
+        const int64_t frame_delta = (int64_t)g_playback_clock.submitted_frames - (int64_t)g_task_total_frames;
+        ESP_LOGI(TAG, "FLAC_EOF_AUDIT: submitted=%llu decoder=%llu declared=%llu delta=%lld rate=%lu (positions after seek; not DAC sample capture)",
+            (unsigned long long)g_playback_clock.submitted_frames,
+            (unsigned long long)g_playback_clock.decoder_frames,
+            (unsigned long long)g_task_total_frames,
+            (long long)frame_delta, (unsigned long)g_task_sample_rate_hz);
+    }
+
     // i2s_channel_write() 返回代表 PCM 已复制进 DMA，不等于最后一个样本已经从引脚送出。
     // 文件尾先追加 4 个静音块，让已排队的最后 PCM 块自然播放完，再执行 DAC 软静音/掉电。
     // 这样不会因为 EOF 清理过快而截掉歌曲最后几毫秒。
@@ -2828,6 +2862,23 @@ static void audio_task_service_pcm_playback()
         return;
     }
 
+    // One bounded silence step per service call: the outer task handles commands
+    // between steps. Do not consume fresh compressed bytes until the high water
+    // mark is reached. EOF/error bypass the gate so decoder tails/errors drain.
+    if (g_task_source == AudioPlaybackSource::NasHttp && g_task_format == MediaFormat::FLAC) {
+        audio_task_report_nas_starve();
+        if (g_flac_starve_grace_attempts != 0U) {
+            BufferedHttpAudioSourceStats http = {};
+            if (buffered_http_audio_source_get_stats(&g_decoder.source, &http) &&
+                fakepod_nas::wait_for_rebuffer(http.ring_buffered_bytes,
+                    http.ring_capacity_bytes, http.eof, http.io_error)) {
+                if (!audio_task_try_recover_flac_starvation(ESP_ERR_TIMEOUT)) {
+                    audio_task_fail_stream(ESP_ERR_TIMEOUT, "NAS重缓冲超限", AudioFailureScope::System);
+                }
+                return;
+            }
+        }
+    }
     size_t frames = 0;
     esp_err_t ret = pcm_decoder_read_pcm32(
         &g_decoder,

@@ -1,4 +1,5 @@
 #include "cassette_view.h"
+#include "cassette_pixel_math.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -1183,7 +1184,7 @@ static void cassette_view_apply_mechanics_frames(
     for (size_t i = 0U; i < 2U; ++i) {
         if (big_frames[i] == g_last_big_reel_frame[i]) continue;
         if (g_big_reel_strip_images[i] != nullptr) {
-            lv_obj_set_x(g_big_reel_strip_images[i],
+            lv_image_set_offset_x(g_big_reel_strip_images[i],
                 -static_cast<int32_t>(big_frames[i]) * kBigReelSize);
         }
         g_last_big_reel_frame[i] = big_frames[i];
@@ -1195,7 +1196,7 @@ static void cassette_view_apply_mechanics_frames(
     if (small_frame != g_last_small_roller_frame) {
         for (size_t i = 0U; i < 2U; ++i) {
             if (g_small_roller_strip_images[i] != nullptr) {
-                lv_obj_set_x(g_small_roller_strip_images[i],
+                lv_image_set_offset_x(g_small_roller_strip_images[i],
                     -static_cast<int32_t>(small_frame) * kSmallRollerSize);
             }
         }
@@ -1430,10 +1431,14 @@ static bool cassette_view_prepare_mechanics()
         if (g_big_reel_strip_images[i] != nullptr) {
             lv_image_set_src(g_big_reel_strip_images[i], &g_big_reel_dsc);
             lv_image_set_antialias(g_big_reel_strip_images[i], false);
+            lv_obj_set_size(g_big_reel_strip_images[i], kBigReelSize, kBigReelSize);
+            lv_image_set_offset_x(g_big_reel_strip_images[i], 0);
         }
         if (g_small_roller_strip_images[i] != nullptr) {
             lv_image_set_src(g_small_roller_strip_images[i], &g_small_roller_dsc);
             lv_image_set_antialias(g_small_roller_strip_images[i], false);
+            lv_obj_set_size(g_small_roller_strip_images[i], kSmallRollerSize, kSmallRollerSize);
+            lv_image_set_offset_x(g_small_roller_strip_images[i], 0);
         }
     }
     if (g_tape_amount_image != nullptr) {
@@ -1548,6 +1553,11 @@ static void cassette_view_update_mechanics()
     if (!audio_service_get_snapshot(&audio)) return;
     const bool high_rate_flac =
         audio.format == MediaFormat::FLAC && audio.sample_rate_hz >= 96000U;
+
+    const int64_t now_us = esp_timer_get_time();
+    const int64_t mechanics_frame_period_us = high_rate_flac
+        ? kHighRateFlacMechanicsFramePeriodUs : kMechanicsFramePeriodUs;
+    if (g_last_mechanics_frame_us > 0 && now_us - g_last_mechanics_frame_us < mechanics_frame_period_us) return;
     cassette_view_update_tape_amount(audio);
     const uint32_t progress_q16 = cassette_view_progress_q16(audio);
     cassette_view_update_tape_path_geometry(progress_q16);
@@ -1555,7 +1565,6 @@ static void cassette_view_update_mechanics()
     const bool moving = cassette_view_audio_matches_current(audio) &&
         (audio.state == AudioPlaybackState::Playing ||
          audio.state == AudioPlaybackState::Seeking);
-    const int64_t now_us = esp_timer_get_time();
     if (!moving) {
         // Pause/Stopped 时机械运动与亮点跳动都冻结；恢复后不补跑暂停期间的相位。
         g_last_mechanics_frame_us = now_us;
@@ -1568,8 +1577,6 @@ static void cassette_view_update_mechanics()
         return;
     }
     int64_t elapsed_us = now_us - g_last_mechanics_frame_us;
-    const int64_t mechanics_frame_period_us = high_rate_flac
-        ? kHighRateFlacMechanicsFramePeriodUs : kMechanicsFramePeriodUs;
     if (elapsed_us < mechanics_frame_period_us) return;
 
     // C2.2：实机确认左右卷轴快慢映射与当前磁带量视觉相反。
@@ -1667,6 +1674,10 @@ static lv_obj_t *cassette_view_create_sprite_viewport(
     if (strip == nullptr) return nullptr;
     ui_common_lock_object(strip);
     lv_obj_set_pos(strip, 0, 0);
+    // Keep the invalidated object one frame wide; source pixels remain the
+    // original strip. TILE clips drawing to this fixed image rectangle.
+    lv_image_set_inner_align(strip, LV_IMAGE_ALIGN_TILE);
+    lv_obj_set_size(strip, size, size);
     lv_obj_remove_flag(strip, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_remove_flag(strip, LV_OBJ_FLAG_SCROLLABLE);
     *out_strip_image = strip;
@@ -2034,22 +2045,23 @@ static void cassette_view_blit_cover(
     const int32_t clip_right = clip_left + kLabelWidth;
     const int32_t clip_bottom = clip_top + kLabelHeight;
 
-    for (int32_t y = clip_top; y < clip_bottom; ++y) {
-        const int32_t scaled_y = y - top;
-        if (scaled_y < 0 || scaled_y >= scaled_height) continue;
-        uint32_t source_y = static_cast<uint32_t>(
-            (static_cast<uint64_t>(scaled_y) * kLvImageScaleNone) / scale);
-        if (source_y >= source_height) source_y = source_height - 1U;
-        for (int32_t x = clip_left; x < clip_right; ++x) {
-            const int32_t scaled_x = x - left;
-            if (scaled_x < 0 || scaled_x >= scaled_width) continue;
-            uint32_t source_x = static_cast<uint32_t>(
-                (static_cast<uint64_t>(scaled_x) * kLvImageScaleNone) / scale);
-            if (source_x >= source_width) source_x = source_width - 1U;
-            const size_t source_index =
-                static_cast<size_t>(source_y) * source_width + source_x;
-            dst[static_cast<size_t>(y) * kControlsCacheWidth + x] =
-                cassette_view_load_rgb565(source + source_index * 2U);
+    const int32_t first_x = clip_left > left ? clip_left : left;
+    const int32_t last_x = clip_right < left + scaled_width ? clip_right : left + scaled_width;
+    const int32_t first_y = clip_top > top ? clip_top : top;
+    const int32_t last_y = clip_bottom < top + scaled_height ? clip_bottom : top + scaled_height;
+    if (first_x >= last_x || first_y >= last_y) return;
+    const fakepod_cassette::ScaleCursor initial_x(static_cast<uint32_t>(first_x-left), scale);
+    fakepod_cassette::ScaleCursor source_y_cursor(static_cast<uint32_t>(first_y-top), scale);
+    for (int32_t y = first_y; y < last_y; ++y, source_y_cursor.advance()) {
+        const uint32_t source_y = source_y_cursor.value < source_height
+            ? source_y_cursor.value : source_height - 1U;
+        const uint8_t *source_row = source + static_cast<size_t>(source_y) * source_width * 2U;
+        uint16_t *out_row = dst + static_cast<size_t>(y) * kControlsCacheWidth;
+        auto source_x_cursor = initial_x;
+        for (int32_t x = first_x; x < last_x; ++x, source_x_cursor.advance()) {
+            const uint32_t source_x = source_x_cursor.value < source_width
+                ? source_x_cursor.value : source_width - 1U;
+            out_row[x] = cassette_view_load_rgb565(source_row + source_x * 2U);
         }
         if ((y & 0x1FU) == 0x1FU) vTaskDelay(1);
     }
@@ -2100,6 +2112,8 @@ static void cassette_view_blit_shell(
     for (int16_t y = 0; y < kCassetteHeight; ++y) {
         for (int16_t x = 0; x < kCassetteWidth; ++x) {
             const size_t index = static_cast<size_t>(y) * kCassetteWidth + x;
+            const uint8_t alpha = alpha_plane[index];
+            if (shell_output == nullptr && alpha == 0U) continue;
             uint16_t color = cassette_view_load_rgb565(g_shell_base_rgb565 + index * 2U);
             if (dynamic_tint && tint_lut != nullptr && g_shell_tint_luma != nullptr) {
                 const uint8_t mapped = g_shell_tint_luma[index];
@@ -2108,7 +2122,6 @@ static void cassette_view_blit_shell(
             if (shell_output != nullptr) {
                 cassette_view_store_rgb565(shell_output + index * 2U, color);
             }
-            const uint8_t alpha = alpha_plane[index];
             if (dst != nullptr && alpha != 0U) {
                 cassette_view_put_pixel(
                     dst, static_cast<int16_t>(kCassetteX + x),
@@ -2211,18 +2224,9 @@ static void cassette_view_draw_fixed_tape_path(uint16_t *dst)
 static void cassette_view_dim_buffer(uint16_t *pixels)
 {
     if (pixels == nullptr) return;
-    const uint32_t keep = 255U - kControlsCacheDimOpacity;
-    const size_t pixel_count =
-        static_cast<size_t>(kControlsCacheWidth) * kControlsCacheHeight;
+    const size_t pixel_count = static_cast<size_t>(kControlsCacheWidth) * kControlsCacheHeight;
     for (size_t index = 0U; index < pixel_count; ++index) {
-        const uint16_t color = pixels[index];
-        const uint32_t r = (color >> 11U) & 0x1FU;
-        const uint32_t g = (color >> 5U) & 0x3FU;
-        const uint32_t b = color & 0x1FU;
-        const uint16_t dr = static_cast<uint16_t>((r * keep + 127U) / 255U);
-        const uint16_t dg = static_cast<uint16_t>((g * keep + 127U) / 255U);
-        const uint16_t db = static_cast<uint16_t>((b * keep + 127U) / 255U);
-        pixels[index] = static_cast<uint16_t>((dr << 11U) | (dg << 5U) | db);
+        pixels[index] = fakepod_cassette::Dim565<kControlsCacheDimOpacity>::apply(pixels[index]);
         if ((index & 0x3FFFU) == 0x3FFFU) vTaskDelay(1);
     }
 }

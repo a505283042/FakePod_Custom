@@ -1,4 +1,5 @@
 #include "flac_decoder.h"
+#include "flac_eos_policy.h"
 #include "pcm_i2s_convert.h"
 
 #include <limits.h>
@@ -2405,7 +2406,8 @@ static esp_err_t flac_prepare_input_window(FlacDecoder *decoder, bool *out_recei
         : 0;
 
     if (decoder->input_chunk_eos) {
-        if (remaining == 0) {
+        if (remaining == 0 &&
+            !fakepod_flac::pending_tail(decoder->total_frames, decoder->frames_read, decoder->max_block_size)) {
             decoder->eof = true;
         }
         return ESP_OK;
@@ -2478,7 +2480,9 @@ static esp_err_t flac_prepare_input_window(FlacDecoder *decoder, bool *out_recei
             }
         }
         decoder->input_chunk_eos = audio_source_eof(decoder->source);
-        if (decoder->input_size == 0U && decoder->input_chunk_eos) decoder->eof = true;
+        if (decoder->input_size == 0U && decoder->input_chunk_eos &&
+            !fakepod_flac::pending_tail(decoder->total_frames, decoder->frames_read, decoder->max_block_size))
+            decoder->eof = true;
         return ESP_OK;
     }
 
@@ -2617,7 +2621,8 @@ static esp_err_t flac_prepare_input_window(FlacDecoder *decoder, bool *out_recei
 
     decoder->input_chunk_eos =
         context->eof && flac_prefetch_ring_buffered(context) == 0;
-    if (decoder->input_size == 0 && decoder->input_chunk_eos) {
+    if (decoder->input_size == 0 && decoder->input_chunk_eos &&
+        !fakepod_flac::pending_tail(decoder->total_frames, decoder->frames_read, decoder->max_block_size)) {
         decoder->eof = true;
     }
     return ESP_OK;
@@ -2655,6 +2660,8 @@ static esp_err_t flac_decode_next_output(FlacDecoder *decoder)
         raw.buffer = decoder->input_buffer + decoder->input_offset;
         raw.len = static_cast<uint32_t>(decoder->input_size - decoder->input_offset);
         raw.eos = decoder->input_chunk_eos;
+        const bool tail_flush = raw.eos && raw.len == 0U &&
+            fakepod_flac::pending_tail(decoder->total_frames, decoder->frames_read, decoder->max_block_size);
 
         esp_audio_simple_dec_out_t out = {};
         out.buffer = decoder->decoded_buffer;
@@ -2707,10 +2714,31 @@ static esp_err_t flac_decode_next_output(FlacDecoder *decoder)
         }
 
         decoder->input_offset += raw.consumed;
+        if (tail_flush) {
+            // A single successful empty-EOS process drains the cached tail.
+            // EOF may be true while decoded_size is still being delivered.
+            decoder->eof = true;
+            ESP_LOGI(TAG, "FLAC_EOS_FLUSH: pending=%llu decoded_bytes=%lu",
+                (unsigned long long)(decoder->total_frames - decoder->frames_read),
+                (unsigned long)out.decoded_size);
+            if (out.decoded_size == 0U) {
+                ESP_LOGE(TAG, "FLAC尾部缺少声明样本：EOS刷新无PCM，拒绝静默截断");
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+        }
         if (out.decoded_size > 0) {
             ret = flac_verify_runtime_info(decoder);
             if (ret != ESP_OK) {
                 return ret;
+            }
+            if (tail_flush) {
+                const size_t frame_bytes = (decoder->bits_per_sample / 8U) * decoder->channels;
+                const uint64_t pending = decoder->total_frames - decoder->frames_read;
+                if (frame_bytes == 0U || out.decoded_size % frame_bytes != 0U ||
+                    out.decoded_size / frame_bytes != pending) {
+                    ESP_LOGE(TAG, "FLAC尾部刷新样本数不匹配，拒绝补零或重复PCM");
+                    return ESP_ERR_INVALID_RESPONSE;
+                }
             }
             decoder->decoded_size = out.decoded_size;
             decoder->decoded_offset = 0;
@@ -2770,6 +2798,10 @@ static esp_err_t flac_decode_next_output(FlacDecoder *decoder)
 
         if (raw.consumed == 0) {
             if (raw.eos) {
+                if (fakepod_flac::pending_tail(decoder->total_frames, decoder->frames_read, decoder->max_block_size)) {
+                    ESP_LOGE(TAG, "FLAC尾部解析无进度且仍缺样本，拒绝当成正常EOF");
+                    return ESP_ERR_INVALID_RESPONSE;
+                }
                 decoder->eof = true;
                 return ESP_OK;
             }
@@ -2778,6 +2810,11 @@ static esp_err_t flac_decode_next_output(FlacDecoder *decoder)
         }
 
         if (decoder->input_offset >= decoder->input_size && decoder->input_chunk_eos) {
+            if (fakepod_flac::pending_tail(decoder->total_frames, decoder->frames_read, decoder->max_block_size)) {
+                // The parser may have consumed the final bytes without emitting
+                // its cached short frame yet. Next pass supplies empty EOS.
+                continue;
+            }
             decoder->eof = true;
             return ESP_OK;
         }

@@ -7,7 +7,7 @@
 
 #include "board_pins.h"
 #include "app_diag_config.h"
-#if APP_DIAG_FLAC_PERFORMANCE
+#if APP_DIAG_PCM_FEED
 #include "esp_timer.h"
 static int64_t g_perf_last_end, g_perf_window;
 static uint32_t g_perf_gap_max, g_perf_write_max, g_perf_calls, g_perf_timeouts, g_perf_partial;
@@ -98,7 +98,7 @@ static esp_err_t i2s_output_create_channel(uint32_t sample_rate_hz, uint8_t dma_
         return ret;
     }
 
-#if APP_DIAG_FLAC_PERFORMANCE
+#if APP_DIAG_PCM_FEED
     g_perf_last_end = g_perf_window = 0;
     g_perf_gap_max = g_perf_write_max = g_perf_calls = g_perf_timeouts = g_perf_partial = 0;
 #endif
@@ -131,7 +131,7 @@ static esp_err_t i2s_output_write_all(const void *data, size_t bytes, uint32_t t
         return ESP_ERR_INVALID_STATE;
     }
 
-#if APP_DIAG_FLAC_PERFORMANCE
+#if APP_DIAG_PCM_FEED
     const int64_t perf_begin = esp_timer_get_time();
     if (g_perf_window == 0) g_perf_window = perf_begin;
     if (g_perf_last_end != 0 && perf_begin - g_perf_last_end > g_perf_gap_max)
@@ -151,7 +151,7 @@ static esp_err_t i2s_output_write_all(const void *data, size_t bytes, uint32_t t
             timeout_ms
         );
 
-#if APP_DIAG_FLAC_PERFORMANCE
+#if APP_DIAG_PCM_FEED
         if (ret == ESP_ERR_TIMEOUT) ++g_perf_timeouts;
         if (bytes_written > 0 && bytes_written < remaining) ++g_perf_partial;
 #endif
@@ -186,7 +186,7 @@ static esp_err_t i2s_output_write_all(const void *data, size_t bytes, uint32_t t
         return ret != ESP_OK ? ret : ESP_FAIL;
     }
 
-#if APP_DIAG_FLAC_PERFORMANCE
+#if APP_DIAG_PCM_FEED
     const int64_t perf_end = esp_timer_get_time();
     const uint32_t duration = (uint32_t)(perf_end - perf_begin);
     if (duration > g_perf_write_max) g_perf_write_max = duration;

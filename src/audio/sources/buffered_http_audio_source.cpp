@@ -191,9 +191,10 @@ static void nas_stream_task(void *arg)
     BufferedHttpContext *context = static_cast<BufferedHttpContext *>(arg);
     // Only the producer owns this scheduler state; startup prime stays unrestricted.
     int64_t last_cooperate_us = esp_timer_get_time();
-#if APP_DIAG_FLAC_PERFORMANCE
+#if APP_DIAG_FLAC_PERFORMANCE || APP_DIAG_NAS_STREAM
     int64_t perf_start_us = last_cooperate_us;
     uint32_t read_max_us = 0, reads = 0, yields = 0;
+    uint64_t perf_bytes = 0;
     size_t window_min = context != nullptr ? context->ring_bytes : 0U;
 #endif
 
@@ -343,12 +344,12 @@ static void nas_stream_task(void *arg)
             continue;
         }
 
-#if APP_DIAG_FLAC_PERFORMANCE
+#if APP_DIAG_FLAC_PERFORMANCE || APP_DIAG_NAS_STREAM
         const int64_t read_start_us = esp_timer_get_time();
 #endif
         const int got = esp_http_client_read(
             client, reinterpret_cast<char *>(context->read_buffer), kReadChunkBytes);
-#if APP_DIAG_FLAC_PERFORMANCE
+#if APP_DIAG_FLAC_PERFORMANCE || APP_DIAG_NAS_STREAM
         const uint32_t read_us = static_cast<uint32_t>(esp_timer_get_time() - read_start_us);
         if (read_us > read_max_us) read_max_us = read_us;
         ++reads;
@@ -404,6 +405,9 @@ static void nas_stream_task(void *arg)
                 pdMS_TO_TICKS(50));
         }
         context->network_bytes += sent;
+#if APP_DIAG_FLAC_PERFORMANCE || APP_DIAG_NAS_STREAM
+        perf_bytes += sent;
+#endif
 
         const size_t buffered = xStreamBufferBytesAvailable(context->stream);
         if (buffered < context->min_buffered_bytes) {
@@ -417,18 +421,21 @@ static void nas_stream_task(void *arg)
             // One RTOS tick, only with >=75% ring and >=2ms since the last break.
             vTaskDelay(1);
             last_cooperate_us = esp_timer_get_time();
-#if APP_DIAG_FLAC_PERFORMANCE
+#if APP_DIAG_FLAC_PERFORMANCE || APP_DIAG_NAS_STREAM
             ++yields;
 #endif
         }
-#if APP_DIAG_FLAC_PERFORMANCE
+#if APP_DIAG_FLAC_PERFORMANCE || APP_DIAG_NAS_STREAM
         if (buffered < window_min) window_min = buffered;
         if (now_us - perf_start_us >= 5000000LL) {
-            ESP_LOGI(TAG, "NAS_RX_PERF: reads=%lu read_max=%luus producer_min=%u/%uB cooperative=%lu stack=%uB",
+            ESP_LOGI(TAG, "NAS_RX_PERF: rx=%luB/s window=%lums reads=%lu read_max=%luus producer_min=%u/%uB cooperative=%lu stack=%uB",
+                (unsigned long)(perf_bytes * 1000000ULL / (uint64_t)(now_us - perf_start_us)),
+                (unsigned long)((now_us - perf_start_us) / 1000LL),
                 (unsigned long)reads, (unsigned long)read_max_us,
                 (unsigned)window_min, (unsigned)context->ring_bytes,
                 (unsigned long)yields, (unsigned)uxTaskGetStackHighWaterMark(nullptr));
             reads = read_max_us = yields = 0;
+            perf_bytes = 0;
             window_min = context->ring_bytes;
             perf_start_us = esp_timer_get_time();
         }
