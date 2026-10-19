@@ -34,11 +34,10 @@ void library_view_suspend_for_app_switch();
 bool library_view_resume_after_app_switch();
 
 // 由 ui_manager 的 CST820 原始指针路径旁路观察：
-// 普通曲库负责横向分类 + 纵向直驱列表；搜索模式只允许结果区纵向滚动，键盘区域交给 LVGL Button。
+// 普通曲库负责横向分类 + 纵向整行步进；搜索模式只允许结果区纵向滚动，键盘区域交给 LVGL Button。
 void library_view_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick_ms);
 
 // R.30 性能审计只读状态。
-bool library_view_inertia_is_active();
 bool library_view_search_is_active();
 
 // R146: Wi-Fi mailbox. Requests are copied; all catalog/UI work runs on LVGL.

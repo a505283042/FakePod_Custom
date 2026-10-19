@@ -22,7 +22,7 @@ with tempfile.TemporaryDirectory() as t:
  p=Path(t);(p/'t.cpp').write_text(code)
  subprocess.run(['g++','-std=c++17','-O2','-fsanitize=undefined','-I'+str(root/'src/ui/screens'),str(p/'t.cpp'),'-o',str(p/'test')],check=True)
  subprocess.run([str(p/'test')],check=True)
-s=(root/'src/ui/screens/library_view.cpp').read_text();feed=s.split('void library_view_feed_pointer(',1)[1].split('bool library_view_inertia_is_active',1)[0]
+s=(root/'src/ui/screens/library_view.cpp').read_text();feed=s.split('void library_view_feed_pointer(',1)[1].split('bool library_view_search_is_active',1)[0]
 assert 'library_view_inertia_start(' not in feed
 assert 'consume_drag(' in feed and 'row_drag_remainder = 0' in feed
 print('PASS: drag accumulation/reverse/multi-row, whole-row bounds, no release inertia; UBSan')

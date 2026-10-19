@@ -158,9 +158,7 @@ enum class UiPerfContext : uint8_t
     SpectrumHorizontal,
     SpectrumNeon,
     Library,
-    LibraryInertia,
     LibrarySearch,
-    LibrarySearchInertia,
 };
 
 struct UiPerfInvalidationAccum
@@ -372,9 +370,7 @@ static const char *ui_perf_context_name(UiPerfContext context)
         case UiPerfContext::SpectrumHorizontal: return "频谱/HorizontalMirror";
         case UiPerfContext::SpectrumNeon: return "频谱/NeonRidge";
         case UiPerfContext::Library: return "曲库/列表";
-        case UiPerfContext::LibraryInertia: return "曲库/惯性";
         case UiPerfContext::LibrarySearch: return "曲库/搜索";
-        case UiPerfContext::LibrarySearchInertia: return "曲库/搜索惯性";
         case UiPerfContext::Home:
         default:
             return "主页/封面";
@@ -385,8 +381,6 @@ static uint32_t ui_perf_context_target_period_ms(UiPerfContext context)
 {
     switch (context) {
         case UiPerfContext::LauncherAnim:
-        case UiPerfContext::LibraryInertia:
-        case UiPerfContext::LibrarySearchInertia:
             return 16U;
         case UiPerfContext::LyricsMotion:
         case UiPerfContext::LyricsMotionOverlay:
@@ -404,10 +398,7 @@ static UiPerfContext ui_perf_resolve_context()
 {
     if (library_view_is_visible()) {
         const bool search = library_view_search_is_active();
-        const bool inertia = library_view_inertia_is_active();
-        if (search && inertia) return UiPerfContext::LibrarySearchInertia;
         if (search) return UiPerfContext::LibrarySearch;
-        if (inertia) return UiPerfContext::LibraryInertia;
         return UiPerfContext::Library;
     }
 
@@ -451,8 +442,6 @@ static bool ui_te_context_is_continuous_animation(UiPerfContext context)
         case UiPerfContext::SpectrumSegmented:
         case UiPerfContext::SpectrumHorizontal:
         case UiPerfContext::SpectrumNeon:
-        case UiPerfContext::LibraryInertia:
-        case UiPerfContext::LibrarySearchInertia:
             return true;
         default:
             return false;

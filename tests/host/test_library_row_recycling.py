@@ -8,6 +8,7 @@ a=s.index('static void library_view_refresh_virtual_rows(bool force)\n');b=s.ind
 fn=s[a:b]
 code=r'''
 #include <cassert>
+void library_view_marquee_stop(){}
 #include <cstdint>
 #include <set>
 #include <random>
@@ -19,6 +20,7 @@ uint32_t lv_color_hex(uint32_t c){return c;}
 void lv_obj_set_style_bg_color(Obj*,uint32_t,int){}
 struct Binding{uint32_t position=UINT32_MAX;};
 struct LibraryVirtualRow{Obj*button=nullptr;Binding binding{};uint32_t item_index=UINT32_MAX;bool center_selected=false;};
+int g_row_push_offset=0;bool g_row_push_pending=false;void*g_row_push_timer=nullptr;void lv_timer_pause(void*){}
 Obj objects[7],host;Obj*g_list_host=&host;LibraryVirtualRow g_rows[7];
 enum class LibraryBrowseMode{AllTracks,GroupTracks};struct State{LibraryBrowseMode mode=LibraryBrowseMode::AllTracks;}g_state;
 uint32_t count=376;int scroll=0,step=70,binds=0;bool folder=false,search=false;

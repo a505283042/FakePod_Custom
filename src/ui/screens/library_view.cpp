@@ -51,7 +51,7 @@ static const char *TAG = "曲库界面";
 #define UI_PAGE_INTERACTION_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
 #endif
 
-// P1.3.5.4.1：460x460 方屏曲库，Direct Touch + 音频感知惯性 + 轻量常驻位置条。
+// P1.3.5.4.1：460x460 方屏曲库，整行轻推 + 选中行跑马灯 + 轻量位置条。
 // 顶部固定标题/搜索/分类指示器，下面恰好保留约五行单行列表。
 static constexpr int32_t LIBRARY_LIST_X = 8;
 static constexpr int32_t LIBRARY_LIST_Y = 92;
@@ -96,14 +96,6 @@ static constexpr int32_t LIBRARY_SEARCH_KEYBOARD_X = 16;
 static constexpr int32_t LIBRARY_SEARCH_KEYBOARD_Y = 330;
 static constexpr int32_t LIBRARY_SEARCH_KEYBOARD_W = FAKEPOD_LCD_WIDTH - 32;
 static constexpr int32_t LIBRARY_SEARCH_KEYBOARD_H = 116;
-
-// P1.3.5.4.1：直驱滚动保持不变；惯性只在音频余量安全时运行。
-static constexpr uint32_t LIBRARY_INERTIA_PERIOD_MS = 16U;
-static constexpr int32_t LIBRARY_INERTIA_START_MIN_PX_S = 180;
-static constexpr int32_t LIBRARY_INERTIA_STOP_PX_S = 36;
-static constexpr int32_t LIBRARY_INERTIA_MAX_PX_S = 3600;
-static constexpr int32_t LIBRARY_INERTIA_DECAY_PERCENT = 92;
-static constexpr uint32_t LIBRARY_INERTIA_DT_MAX_MS = 40U;
 
 // P1.3.5.4.1：右侧常驻轻量位置条；滚动热路径只更新 thumb Y，不做样式/层级动画。
 static constexpr int32_t LIBRARY_SCROLLBAR_W = 4;
@@ -249,20 +241,11 @@ struct LibraryGestureState
     bool async_scheduled = false;
     bool started_in_list = false;
     bool list_dragged = false;
-    uint32_t last_sample_tick_ms = 0U;
-    uint32_t last_motion_tick_ms = 0U;
-    int32_t scroll_velocity_px_s = 0;
+
+
+
     int32_t row_drag_remainder = 0;
     uint32_t suppress_click_until = 0;
-};
-
-struct LibraryInertiaState
-{
-    lv_timer_t *timer = nullptr;
-    bool active = false;
-    int32_t velocity_px_s = 0;
-    int32_t remainder_milli_px = 0;
-    uint32_t last_tick_ms = 0U;
 };
 
 struct LibraryScrollbarState
@@ -357,13 +340,18 @@ static lv_obj_t *g_search_button = nullptr;
 static lv_obj_t *g_indicator[4] = {};
 static lv_obj_t *g_list_host = nullptr;
 static int32_t g_manual_scroll_y = 0;
+static int32_t g_row_push_offset = 0;
+static bool g_row_push_pending = false;
+static lv_timer_t *g_row_push_timer = nullptr;
+static lv_obj_t *g_marquee_label = nullptr;
+static uint32_t g_marquee_activity_tick = 0;
+static uint32_t g_marquee_move_ms = 1;
 static lv_obj_t *g_hint = nullptr;
 static LibraryVirtualRow g_rows[LIBRARY_VIRTUAL_ROWS] = {};
 static LibraryBrowseState g_state = {};
 static LibraryGestureState g_gesture = {};
 static LibrarySearchState g_search = {};
 static QuickIndexKeyboard g_search_keyboard = {};
-static LibraryInertiaState g_inertia = {};
 static LibraryScrollbarState g_scrollbar = {};
 static LibraryDataSource g_source = LibraryDataSource::Local;
 static uint32_t g_nas_selected_track = UINT32_MAX;
@@ -401,11 +389,9 @@ static void library_view_render(bool preserve_scroll = true);
 static void library_view_refresh_virtual_rows(bool force = false);
 static bool library_view_focus_current_playback();
 static const char *library_search_scope_name();
-static void library_view_inertia_stop(bool store_position);
 static void library_view_store_scroll_position();
 static void library_view_scrollbar_rebuild_geometry();
 static void library_view_scrollbar_update_position();
-static bool library_view_inertia_audio_safe();
 static LibraryBrowseMode library_view_category_mode_for_detail();
 static void library_view_return_to_parent_category();
 static void library_view_finish_nas_load_async(void *);
@@ -1717,13 +1703,113 @@ static int32_t library_view_current_scroll_y()
     return g_manual_scroll_y;
 }
 
+static void library_view_marquee_stop()
+{
+    if (g_marquee_label != nullptr) {
+        lv_label_set_long_mode(g_marquee_label, LV_LABEL_LONG_DOT);
+        g_marquee_label = nullptr;
+    }
+    g_marquee_activity_tick = static_cast<uint32_t>(lv_tick_get());
+}
+
+// The first 1800ms of every forward run holds the beginning in place.
+static int32_t library_view_marquee_path(const lv_anim_t *anim)
+{
+    const int64_t t = static_cast<int64_t>(anim->act_time) - 1800;
+    if (t <= 0) return anim->start_value;
+    const uint32_t elapsed = t >= g_marquee_move_ms ? g_marquee_move_ms : static_cast<uint32_t>(t);
+    return anim->start_value + static_cast<int32_t>(
+        (static_cast<int64_t>(anim->end_value - anim->start_value) * elapsed) / g_marquee_move_ms);
+}
+
+static void library_view_marquee_timer(lv_timer_t *)
+{
+    FlacStorageWindowSnapshot window = {};
+    const bool pressure = flac_decoder_get_storage_window(&window) &&
+        window.active && window.pressure_active;
+    if (!library_view_is_visible() || g_gesture.pressed || g_row_push_pending || pressure ||
+        screen_lock_simple_get_power() != ScreenPowerNormal) {
+        library_view_marquee_stop();
+        return;
+    }
+    if (static_cast<uint32_t>(lv_tick_get() - g_marquee_activity_tick) < 600U) return;
+    lv_obj_t *selected = nullptr;
+    for (auto &row : g_rows) {
+        if (row.item_index != UINT32_MAX && row.center_selected && row.button != nullptr &&
+            !lv_obj_has_flag(row.button, LV_OBJ_FLAG_HIDDEN)) {
+            selected = row.label;
+            break;
+        }
+    }
+    if (selected == g_marquee_label) return;
+    library_view_marquee_stop();
+    if (selected != nullptr) {
+        g_marquee_label = selected;
+        // SCROLL supplies the overflow endpoints and the public animation's exec callback.
+        // Clone it without playback: forward -> hold tail -> reset -> hold head.
+        lv_label_set_long_mode(selected, LV_LABEL_LONG_SCROLL);
+        lv_anim_t *native = lv_anim_get(selected, nullptr);
+        if (native != nullptr) {
+            lv_anim_t anim = *native;
+            const int32_t distance = library_abs(anim.end_value - anim.start_value);
+            uint32_t chars = 0;
+            for (const unsigned char *p = reinterpret_cast<const unsigned char *>(lv_label_get_text(selected)); *p; ++p) {
+                if ((*p & 0xC0U) != 0x80U) ++chars;
+            }
+            const uint32_t width = static_cast<uint32_t>(lv_obj_get_content_width(selected));
+            // 500ms per UTF-8 codepoint at average glyph width; scale to overflow distance.
+            const uint64_t full_width = static_cast<uint64_t>(width) + distance;
+            g_marquee_move_ms = full_width > 0 ? static_cast<uint32_t>(
+                (static_cast<uint64_t>(chars) * 500U * distance) / full_width) : 1U;
+            if (g_marquee_move_ms == 0) g_marquee_move_ms = 1;
+            lv_anim_delete(selected, nullptr);
+            lv_anim_set_duration(&anim, g_marquee_move_ms + 1800U);
+            lv_anim_set_delay(&anim, 0);
+            lv_anim_set_playback_duration(&anim, 0);
+            lv_anim_set_playback_delay(&anim, 0);
+            lv_anim_set_repeat_delay(&anim, 1800);
+            lv_anim_set_repeat_count(&anim, LV_ANIM_REPEAT_INFINITE);
+            lv_anim_set_path_cb(&anim, library_view_marquee_path);
+            lv_anim_start(&anim);
+        }
+    }
+}
+
+static void library_view_row_push_finish(lv_timer_t *)
+{
+    if (g_row_push_timer != nullptr) lv_timer_pause(g_row_push_timer);
+    const bool pending = g_row_push_pending;
+    g_row_push_pending = false;
+    g_row_push_offset = 0;
+    if (pending && library_view_is_visible()) {
+        library_view_refresh_virtual_rows(false);
+        library_view_scrollbar_update_position();
+    }
+}
+
 static void library_view_set_scroll_y(int32_t y)
 {
     const int32_t clamped = library_view_clamp_scroll_y(y);
-    if (clamped == g_manual_scroll_y) {
-        return;
-    }
+    if (clamped == g_manual_scroll_y) return;
+    library_view_marquee_stop();
+    const int32_t delta = clamped - g_manual_scroll_y;
     g_manual_scroll_y = clamped;
+    FlacStorageWindowSnapshot window = {};
+    const bool pressure = flac_decoder_get_storage_window(&window) &&
+        window.active && window.pressure_active;
+    // While the 40ms transition is pending, coalesce touch updates to its final position.
+    if (g_row_push_pending && !pressure) return;
+    if (!pressure && g_row_push_timer != nullptr &&
+        library_abs(delta) == library_view_row_step()) {
+        g_row_push_offset = delta / 2;
+        g_row_push_pending = true;
+        lv_timer_reset(g_row_push_timer);
+        lv_timer_resume(g_row_push_timer);
+    } else {
+        g_row_push_offset = 0;
+        g_row_push_pending = false;
+        if (g_row_push_timer != nullptr) lv_timer_pause(g_row_push_timer);
+    }
     library_view_refresh_virtual_rows(false);
     library_view_scrollbar_update_position();
 }
@@ -1829,18 +1915,6 @@ static void library_view_scrollbar_rebuild_geometry()
     library_view_scrollbar_update_position();
 }
 
-static bool library_view_inertia_audio_safe()
-{
-    FlacStorageWindowSnapshot window = {};
-    if (!flac_decoder_get_storage_window(&window) || !window.active) {
-        return true;
-    }
-
-    // P1.3.5.4.2：任何 FLAC 播放期间都关闭惯性。
-    // Direct Touch 仍然逐采样跟手；只取消抬手后的 16ms 动画，给 FlacPrefetch 留足 Core1 余量。
-    return false;
-}
-
 static void library_view_store_scroll_position()
 {
     if (g_list_host == nullptr) {
@@ -1866,87 +1940,6 @@ static void library_view_store_scroll_position()
     if (mode < 4U) {
         g_state.top_scroll_y[mode] = y;
     }
-}
-
-static void library_view_inertia_timer_cb(lv_timer_t *timer)
-{
-    (void)timer;
-    if (!g_inertia.active || !library_view_is_visible() || g_gesture.pressed) {
-        library_view_inertia_stop(true);
-        return;
-    }
-    if (!library_view_inertia_audio_safe()) {
-        library_view_inertia_stop(true);
-        return;
-    }
-
-    const uint32_t now = static_cast<uint32_t>(lv_tick_get());
-    uint32_t dt_ms = now - g_inertia.last_tick_ms;
-    if (dt_ms == 0U) {
-        return;
-    }
-    if (dt_ms > LIBRARY_INERTIA_DT_MAX_MS) {
-        dt_ms = LIBRARY_INERTIA_DT_MAX_MS;
-    }
-    g_inertia.last_tick_ms = now;
-
-    const int64_t accumulated =
-        static_cast<int64_t>(g_inertia.velocity_px_s) * static_cast<int64_t>(dt_ms) +
-        static_cast<int64_t>(g_inertia.remainder_milli_px);
-    const int32_t delta_px = static_cast<int32_t>(accumulated / 1000LL);
-    g_inertia.remainder_milli_px = static_cast<int32_t>(accumulated % 1000LL);
-
-    if (delta_px != 0) {
-        const int32_t before = library_view_current_scroll_y();
-        library_view_set_scroll_y(before + delta_px);
-        const int32_t after = library_view_current_scroll_y();
-        if (after == before) {
-            library_view_inertia_stop(true);
-            return;
-        }
-        g_gesture.suppress_click_until = now + LIBRARY_SUPPRESS_CLICK_MS;
-    }
-
-    g_inertia.velocity_px_s =
-        (g_inertia.velocity_px_s * LIBRARY_INERTIA_DECAY_PERCENT) / 100;
-    if (library_abs(g_inertia.velocity_px_s) < LIBRARY_INERTIA_STOP_PX_S) {
-        library_view_inertia_stop(true);
-    }
-}
-
-static void library_view_inertia_stop(bool store_position)
-{
-    const bool was_active = g_inertia.active;
-    g_inertia.active = false;
-    g_inertia.velocity_px_s = 0;
-    g_inertia.remainder_milli_px = 0;
-    g_inertia.last_tick_ms = 0U;
-    if (g_inertia.timer != nullptr) {
-        lv_timer_pause(g_inertia.timer);
-    }
-    if (was_active && store_position) {
-        library_view_store_scroll_position();
-    }
-}
-
-static void library_view_inertia_start(int32_t velocity_px_s, uint32_t tick_ms)
-{
-    if (g_inertia.timer == nullptr || !library_view_inertia_audio_safe()) {
-        return;
-    }
-    const int32_t velocity = library_clamp_i32(
-        velocity_px_s, -LIBRARY_INERTIA_MAX_PX_S, LIBRARY_INERTIA_MAX_PX_S);
-    if (library_abs(velocity) < LIBRARY_INERTIA_START_MIN_PX_S) {
-        return;
-    }
-
-    g_inertia.velocity_px_s = velocity;
-    g_inertia.remainder_milli_px = 0;
-    g_inertia.last_tick_ms = tick_ms;
-    g_inertia.active = true;
-    g_gesture.suppress_click_until = tick_ms + LIBRARY_SUPPRESS_CLICK_MS;
-    lv_timer_reset(g_inertia.timer);
-    lv_timer_resume(g_inertia.timer);
 }
 
 static int32_t library_view_saved_scroll_position()
@@ -2726,6 +2719,12 @@ static void library_view_refresh_virtual_rows(bool force)
         return;
     }
 
+    if (force) {
+        library_view_marquee_stop();
+        g_row_push_offset = 0;
+        g_row_push_pending = false;
+        if (g_row_push_timer != nullptr) lv_timer_pause(g_row_push_timer);
+    }
     const uint32_t item_count = library_view_item_count();
     const int32_t row_step = library_view_row_step();
     int32_t scroll_y = library_view_current_scroll_y();
@@ -2743,7 +2742,7 @@ static void library_view_refresh_virtual_rows(bool force)
 
         // 直驱滚动时每个 CST820 采样都更新屏幕位置；只有跨到新的显示 item 时才重绑文本。
         // 搜索模式下 display index 再映射回真实歌曲/分组索引，不复制任何字符串。
-        lv_obj_set_y(row.button, static_cast<int32_t>(item_index) * row_step + 4 - scroll_y);
+        lv_obj_set_y(row.button, static_cast<int32_t>(item_index) * row_step + 4 - scroll_y + g_row_push_offset);
         if (!force && row.item_index == item_index) {
             const uint32_t selected = first_visible +
                 ((item_count - first_visible > 2U) ? 2U : (item_count - first_visible - 1U));
@@ -2797,7 +2796,6 @@ static void library_view_render(bool preserve_scroll)
         return;
     }
 
-    library_view_inertia_stop(false);
     // 一级/二级列表只有“歌曲/文件夹”语义；歌手/专辑/年代是总列表分类。
     // scope 在设置页变化时 UI 可能仍带着旧总列表 mode，这里作为最终不变量守门。
     (void)library_view_normalize_mode_for_folder_scope();
@@ -3445,13 +3443,10 @@ void library_view_create(lv_obj_t *screen)
     lv_obj_add_flag(g_scrollbar.thumb, LV_OBJ_FLAG_HIDDEN);
 
 
-    g_inertia.timer = lv_timer_create(
-        library_view_inertia_timer_cb,
-        LIBRARY_INERTIA_PERIOD_MS,
-        nullptr);
-    if (g_inertia.timer != nullptr) {
-        lv_timer_pause(g_inertia.timer);
-    }
+    (void)lv_timer_create(library_view_marquee_timer, 150, nullptr);
+    g_row_push_timer = lv_timer_create(library_view_row_push_finish, 40, nullptr);
+    if (g_row_push_timer != nullptr) lv_timer_pause(g_row_push_timer);
+
     // 常驻轻量计时器仅在普通 NAS 同步真正提交新索引后尝试刷新 PSRAM。
     (void)lv_timer_create(library_view_nas_index_reload_timer_cb, 1000, nullptr);
     (void)lv_timer_create(library_remote_timer, 20, nullptr);
@@ -3494,7 +3489,7 @@ void library_view_suspend_for_app_switch()
         library_view_close_nas();
         return;
     }
-    library_view_inertia_stop(false);
+
     if (lv_obj_has_flag(g_root, LV_OBJ_FLAG_HIDDEN)) {
         return;
     }
@@ -3567,7 +3562,6 @@ void library_view_open(bool show)
     g_local_suspended_for_app_switch = false;
     g_local_suspended_state.valid = false;
 
-    library_view_inertia_stop(false);
     library_view_scrollbar_set_visible(false);
     g_state = {};
     g_gesture = {};
@@ -3735,7 +3729,7 @@ static void library_view_nas_open_stage_cb(NasLibraryOpenStage stage, void *)
 
 static void library_view_activate_nas_ui(bool show = true)
 {
-    library_view_inertia_stop(false);
+
     library_view_scrollbar_set_visible(false);
     quick_index_keyboard_set_visible(&g_search_keyboard, false);
     library_search_release_cache();
@@ -4009,7 +4003,7 @@ static void library_view_nas_index_reload_timer_cb(lv_timer_t *)
     if (library_source_is_nas()) library_remember_current_source_state();
     player_state_prepare_nas_index_reload();
     // 确保所有旧 Catalogue 引用都先从 LVGL/PlayerState 脱离，再释放 PSRAM。
-    library_view_inertia_stop(false);
+
     library_view_scrollbar_set_visible(false);
     library_search_release_cache();
     g_source = LibraryDataSource::Local;
@@ -4149,7 +4143,7 @@ void library_view_close_nas()
 {
     if (!library_source_is_nas()) return;
     library_remember_current_source_state();
-    library_view_inertia_stop(false);
+
     library_view_scrollbar_set_visible(false);
     quick_index_keyboard_set_visible(&g_search_keyboard, false);
     if (g_root != nullptr) lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
@@ -4287,7 +4281,7 @@ bool library_view_is_visible()
 void library_view_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick_ms)
 {
     if (!library_view_is_visible()) {
-        library_view_inertia_stop(false);
+
         g_gesture.pressed = false;
         g_gesture.axis = LibraryGestureAxis::None;
         return;
@@ -4295,13 +4289,13 @@ void library_view_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick
 
     if (pressed) {
         if (!g_gesture.pressed) {
-            const bool stopped_inertia = g_inertia.active;
-            library_view_inertia_stop(true);
+            // Settle before a fresh press so hit testing matches the final row geometry.
+            library_view_marquee_stop();
+            library_view_row_push_finish(nullptr);
 
-            // P1.5R.2.1：点击抑制只能属于“上一轮拖动自身”，不能跨到下一次独立点击。
-            // 拖动 MOVE/UP 后仍保留 suppress_click_until，用于拦截 LVGL 为该拖动产生的 CLICK；
-            // 一旦收到下一轮新的 DOWN，就清除上一手势残留。若此 DOWN 正好用于刹停列表惯性，
-            // 下面会仅对本轮列表按压重新建立 suppression，因此 Header 仍可一次点击生效。
+
+
+            // 新一次按下清除上一轮拖动的点击抑制。
             g_gesture.suppress_click_until = 0U;
 
             g_gesture.pressed = true;
@@ -4310,20 +4304,15 @@ void library_view_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick
             g_gesture.last_x = x;
             g_gesture.last_y = y;
             g_gesture.start_tick_ms = tick_ms;
-            g_gesture.last_sample_tick_ms = tick_ms;
-            g_gesture.last_motion_tick_ms = tick_ms;
-            g_gesture.scroll_velocity_px_s = 0;
+
+
+
             g_gesture.row_drag_remainder = 0;
             g_gesture.axis = LibraryGestureAxis::None;
             const int32_t list_y = library_view_list_y();
             const int32_t list_h = library_view_list_h();
             g_gesture.started_in_list = y >= list_y && y < list_y + list_h;
-            // 点正在惯性滚动的列表：第一下只负责刹车，不顺便触发该行。
-            // Header 按钮仍可一次点击生效，不因为列表惯性而被全局吞掉。
-            g_gesture.list_dragged = stopped_inertia && g_gesture.started_in_list;
-            if (g_gesture.list_dragged) {
-                g_gesture.suppress_click_until = tick_ms + LIBRARY_SUPPRESS_CLICK_MS;
-            }
+            g_gesture.list_dragged = false;
 
             const bool search_area =
                 y >= LIBRARY_HEADER_BUTTON_Y &&
@@ -4379,7 +4368,7 @@ void library_view_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick
                     }
                     g_gesture.suppress_click_until = tick_ms + LIBRARY_SUPPRESS_CLICK_MS;
                 }
-                g_gesture.last_sample_tick_ms = tick_ms;
+
             }
         }
 
@@ -4441,9 +4430,9 @@ void library_view_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick
     g_gesture.ignore = false;
     g_gesture.started_in_list = false;
     g_gesture.list_dragged = false;
-    g_gesture.scroll_velocity_px_s = 0;
-    g_gesture.last_sample_tick_ms = 0U;
-    g_gesture.last_motion_tick_ms = 0U;
+
+
+
 
     // Direct Touch 已结束：辅助位置条立即追到最终位置，不把节流残留到抬手后。
     library_view_scrollbar_update_position();
@@ -4451,11 +4440,6 @@ void library_view_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick
     library_view_queue_gesture(action, tick_ms);
 }
 
-
-bool library_view_inertia_is_active()
-{
-    return g_inertia.active;
-}
 
 bool library_view_search_is_active()
 {

@@ -175,7 +175,6 @@ static void lr_state(LrWriter &w) {
 }
 static void lr_clear_search() {
     if(g_search.active)library_search_exit();
-    library_view_inertia_stop(false);
 }
 #include "library_remote_independent.inc"
 
