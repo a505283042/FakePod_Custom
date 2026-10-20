@@ -56,7 +56,8 @@ static inline bool audio_rate_profile_get(uint32_t sample_rate_hz, AudioRateProf
         case 96000U:
             profile.sample_rate_hz = 96000U;
             profile.cs43131_asp_sprate = 0x04U;
-            profile.i2s_dma_desc_num = 12U;
+            // 临时诊断：将 96kHz DMA 描述符从 24 降到 16，测试界面切换爆音是否变化。
+            profile.i2s_dma_desc_num = 26U;
             profile.flac_stage_enabled = true;
             break;
         case 176400U:

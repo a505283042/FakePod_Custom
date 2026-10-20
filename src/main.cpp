@@ -41,6 +41,9 @@ extern "C" void app_main(void)
         esp_log_level_set(tag, ESP_LOG_WARN);
     }
 
+    // 临时诊断：关闭全部 ESP-IDF 日志，测试界面切换爆音是否与日志开销有关。
+    // esp_log_level_set("*", ESP_LOG_NONE);
+
     // 初始化启动状态机
     boot_state_init();
 
