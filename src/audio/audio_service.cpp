@@ -123,6 +123,7 @@ enum class AudioCommandType : uint8_t
     VideoMp3ReleaseStart,
     VideoMp3Pause,
     VideoMp3Resume,
+    VideoMp3Seek,
     VideoMp3Stop,
     NsfStart,
     NsfPause,
@@ -151,6 +152,7 @@ struct AudioRequest
     uint8_t video_channels = 0U;
     uint8_t video_bits_per_sample = 0U;
     bool video_start_barrier_armed = false;
+    uint32_t video_seek_base_ms = 0U;
     uint8_t *nsf_prg = nullptr;
     size_t nsf_prg_size = 0U;
     NsfSynthConfig nsf_config = {};
@@ -239,6 +241,10 @@ static bool g_pcm_fade_in_logged_done = true;
 static int32_t g_music_last_pcm_left = 0;
 static int32_t g_music_last_pcm_right = 0;
 static bool g_music_last_pcm_valid = false;
+// 视频 MP3 同样记录最后提交样本：seek/暂停前先做数字淡出，避免在非零波形处硬切。
+static int32_t g_video_last_pcm_left = 0;
+static int32_t g_video_last_pcm_right = 0;
+static bool g_video_last_pcm_valid = false;
 
 static void audio_task_reset_music_last_pcm();
 
@@ -1031,6 +1037,7 @@ static const char *audio_command_name(AudioCommandType type)
         case AudioCommandType::VideoMp3ReleaseStart: return "VIDEO_MP3_RELEASE_START";
         case AudioCommandType::VideoMp3Pause: return "VIDEO_MP3_PAUSE";
         case AudioCommandType::VideoMp3Resume: return "VIDEO_MP3_RESUME";
+        case AudioCommandType::VideoMp3Seek: return "VIDEO_MP3_SEEK";
         case AudioCommandType::VideoMp3Stop: return "VIDEO_MP3_STOP";
         case AudioCommandType::NsfStart: return "NSF_START";
         case AudioCommandType::NsfPause: return "NSF_PAUSE";
@@ -1164,6 +1171,62 @@ static void audio_task_reset_music_last_pcm()
     g_music_last_pcm_valid = false;
 }
 
+static void audio_task_reset_video_last_pcm()
+{
+    g_video_last_pcm_left = 0;
+    g_video_last_pcm_right = 0;
+    g_video_last_pcm_valid = false;
+}
+
+// 视频 MP3 seek/暂停前的数字淡出：从最后提交样本平滑收敛到 0。
+// 视频路径没有 FLAC 那样的硬件 mute 过渡，只能靠数字斜坡，否则会在波形中间硬切产生“咔”。
+static esp_err_t audio_task_fade_video_output_to_zero(uint32_t sample_rate_hz)
+{
+    if (!g_video_last_pcm_valid || g_task_user_muted ||
+        !g_pipeline_headphone_enabled || !g_pipeline_i2s_started ||
+        !i2s_output_is_started()) {
+        audio_task_reset_video_last_pcm();
+        return ESP_OK;
+    }
+
+    const uint32_t rate = sample_rate_hz > 0U ? sample_rate_hz : 48000U;
+    size_t total_frames = static_cast<size_t>(
+        (static_cast<uint64_t>(rate) * AUDIO_PCM_FADE_OUT_MS + 999ULL) / 1000ULL);
+    if (total_frames == 0U) total_frames = 1U;
+
+    const int32_t start_left = g_video_last_pcm_left;
+    const int32_t start_right = g_video_last_pcm_right;
+    size_t produced = 0U;
+    while (produced < total_frames) {
+        const size_t remaining_frames = total_frames - produced;
+        const size_t frames = remaining_frames < AUDIO_STREAM_FRAMES
+            ? remaining_frames : AUDIO_STREAM_FRAMES;
+        const uint64_t denominator = total_frames > 1U
+            ? static_cast<uint64_t>(total_frames - 1U) : 1ULL;
+        for (size_t i = 0; i < frames; ++i) {
+            const uint64_t absolute = static_cast<uint64_t>(produced + i);
+            const uint64_t remaining = absolute < denominator
+                ? denominator - absolute : 0ULL;
+            g_pcm_block[i * 2U] = static_cast<int32_t>(
+                (static_cast<int64_t>(start_left) * static_cast<int64_t>(remaining)) /
+                static_cast<int64_t>(denominator));
+            g_pcm_block[i * 2U + 1U] = static_cast<int32_t>(
+                (static_cast<int64_t>(start_right) * static_cast<int64_t>(remaining)) /
+                static_cast<int64_t>(denominator));
+        }
+        const esp_err_t ret = i2s_output_stream_write_pcm32(
+            g_pcm_block, frames, AUDIO_I2S_WRITE_TIMEOUT_MS);
+        if (ret != ESP_OK) {
+            audio_task_reset_video_last_pcm();
+            return ret;
+        }
+        produced += frames;
+    }
+
+    audio_task_reset_video_last_pcm();
+    return ESP_OK;
+}
+
 static void audio_task_note_music_pcm(const int32_t *pcm, size_t frames)
 {
     if (pcm == nullptr || frames == 0U) {
@@ -1173,6 +1236,15 @@ static void audio_task_note_music_pcm(const int32_t *pcm, size_t frames)
     g_music_last_pcm_left = pcm[base];
     g_music_last_pcm_right = pcm[base + 1U];
     g_music_last_pcm_valid = true;
+}
+
+static void audio_task_note_video_pcm(const int32_t *pcm, size_t frames)
+{
+    if (pcm == nullptr || frames == 0U) return;
+    const size_t base = (frames - 1U) * 2U;
+    g_video_last_pcm_left = pcm[base];
+    g_video_last_pcm_right = pcm[base + 1U];
+    g_video_last_pcm_valid = true;
 }
 
 static esp_err_t audio_task_fade_music_output_to_zero(uint32_t sample_rate_hz)
@@ -3379,6 +3451,7 @@ static esp_err_t audio_task_stop_video_mp3_internal(bool restore_music_hardware,
 
     audio_task_video_mp3_close_decoder();
     const bool should_restore = restore_music_hardware && g_video_restore_paused_music_hardware;
+    audio_task_reset_video_last_pcm();
     g_video_mp3_active = false;
     g_video_mp3_eof = false;
     g_video_mp3_start_released = true;
@@ -3523,6 +3596,8 @@ static void audio_task_handle_video_mp3_start(AudioRequest *request)
     if (g_video_clock_revision == 0U) ++g_video_clock_revision;
     g_video_mp3_active = true;
     g_video_mp3_start_released = !request->video_start_barrier_armed;
+    // 新一段视频音频从零开始，清掉上一段残留的最后样本。
+    audio_task_reset_video_last_pcm();
     audio_task_publish_video_clock_snapshot();
     ESP_LOGI(TAG, "视频音频已%s：%luHz/%uch",
         g_video_mp3_start_released ? "启动" : "预备",
@@ -3586,6 +3661,67 @@ static void audio_task_handle_video_mp3_resume(AudioRequest *request)
     audio_request_complete(request, true, ESP_OK);
 }
 
+static void audio_task_handle_video_mp3_seek(AudioRequest *request)
+{
+    if (request == nullptr) return;
+    g_task_last_request_id = request->request_id;
+    if (!g_video_mp3_active || !mp3_decoder_is_open(&g_video_mp3_decoder) ||
+        g_video_mp3_sample_rate_hz == 0U) {
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+
+    // 1. 先做数字淡出，把最后提交样本平滑收敛到 0，再硬件静音；
+    //    直接在非零波形处 mute，听感同样是一声“咔”。
+    (void)audio_task_fade_video_output_to_zero(g_video_mp3_sample_rate_hz);
+
+    // 2. 静音 DAC，把整条 DMA runway 用零数据顶出去。
+    //    否则旧位置的 PCM 会和新位置 PCM 硬拼接。
+    esp_err_t ret = cs43131_set_pcm_mute(true);
+    if (ret != ESP_OK) {
+        audio_request_complete(request, false, ret);
+        return;
+    }
+    g_pcm_unmute_pending = false;
+    audio_task_reset_pcm_fade_in();
+
+    if (g_pipeline_i2s_started && i2s_output_is_started()) {
+        AudioRateProfile rate_profile = {};
+        if (audio_rate_profile_get(g_video_mp3_sample_rate_hz, &rate_profile) &&
+            rate_profile.i2s_dma_desc_num > 0U) {
+            const size_t drain_frames =
+                static_cast<size_t>(rate_profile.i2s_dma_desc_num) * AUDIO_STREAM_FRAMES;
+            ret = i2s_output_stream_write_silence(drain_frames, AUDIO_I2S_WRITE_TIMEOUT_MS);
+            if (ret != ESP_OK) {
+                audio_request_complete(request, false, ret);
+                return;
+            }
+        }
+    }
+
+    // 3. 清掉解码器里旧位置残留的压缩/PCM 数据，避免用旧帧数据解新帧产生持续噪声。
+    mp3_decoder_flush_stream(&g_video_mp3_decoder);
+    g_video_mp3_eof = false;
+
+    // 4. 时钟对齐到 seek 位置（绝对时间轴）
+    const uint64_t base_frames = static_cast<uint64_t>(request->video_seek_base_ms) *
+        g_video_mp3_sample_rate_hz / 1000ULL;
+    audio_playback_clock_seek(&g_video_playback_clock, base_frames);
+    ++g_video_clock_revision;
+    if (g_video_clock_revision == 0U) ++g_video_clock_revision;
+    audio_task_publish_video_clock_snapshot();
+
+    // 5. 新位置首块 PCM 到达时淡入并解除静音，把拼接点变成平滑斜坡。
+    audio_task_begin_pcm_fade_in("video_seek", g_video_mp3_sample_rate_hz);
+    g_pcm_unmute_pending = true;
+
+    ESP_LOGI(TAG, "视频音频seek：base=%lums frames=%llu 淡入=%lums",
+        static_cast<unsigned long>(request->video_seek_base_ms),
+        static_cast<unsigned long long>(base_frames),
+        static_cast<unsigned long>(AUDIO_PCM_FADE_IN_MS));
+    audio_request_complete(request, true, ESP_OK);
+}
+
 static void audio_task_handle_video_mp3_stop(AudioRequest *request)
 {
     if (request == nullptr) return;
@@ -3606,6 +3742,8 @@ static void audio_task_service_video_mp3()
     if (!g_video_mp3_start_released || g_video_mp3_paused) {
         // Start Barrier或Video暂停期间只维持稳定的静音I2S时钟，不读取Bridge、不推进decoder/submitted clock。
         // 这样Video可以先准备首张RGB和BoundedSPI窗口，同时避免AudioTask零等待自旋。
+        // 已经输出静音后，最后样本不再代表扬声器里的波形，清掉以免 seek 淡出把旧样本拉回来。
+        audio_task_reset_video_last_pcm();
         const esp_err_t silence_ret =
             i2s_output_stream_write_silence(AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
         if (silence_ret != ESP_OK) {
@@ -3615,6 +3753,7 @@ static void audio_task_service_video_mp3()
     }
 
     if (g_video_mp3_eof) {
+        audio_task_reset_video_last_pcm();
         const esp_err_t silence_ret =
             i2s_output_stream_write_silence(AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
         if (silence_ret != ESP_OK) {
@@ -3631,6 +3770,7 @@ static void audio_task_service_video_mp3()
         &frames);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "AVI MP3读取PCM失败：%s；本段Video后续保持静音", esp_err_to_name(ret));
+        audio_task_reset_video_last_pcm();
         (void)cs43131_set_pcm_mute(true);
         g_video_mp3_eof = true;
         audio_task_publish_video_clock_snapshot();
@@ -3664,6 +3804,8 @@ static void audio_task_service_video_mp3()
         audio_task_publish_video_clock_snapshot();
         return;
     }
+    // 记录最后提交的样本，seek/暂停时用它做数字淡出。
+    audio_task_note_video_pcm(g_pcm_block, frames);
     audio_playback_clock_commit_pcm(&g_video_playback_clock, frames);
     audio_task_publish_video_clock_snapshot();
 }
@@ -6001,6 +6143,9 @@ static void audio_task_process_request(AudioRequest *request)
         case AudioCommandType::VideoMp3Resume:
             audio_task_handle_video_mp3_resume(request);
             break;
+        case AudioCommandType::VideoMp3Seek:
+            audio_task_handle_video_mp3_seek(request);
+            break;
         case AudioCommandType::VideoMp3Stop:
             audio_task_handle_video_mp3_stop(request);
             break;
@@ -6842,20 +6987,12 @@ bool audio_service_video_mp3_get_clock(AudioVideoClockSnapshot *out_snapshot)
     return true;
 }
 
-void audio_service_video_mp3_reset_clock(uint32_t base_ms)
+bool audio_service_video_mp3_seek(uint32_t base_ms, bool wait)
 {
-    // seek 时 bridge 已清空，AudioTask 阻塞在数据等待上，此时复位时钟无竞态。
-    // 用 audio_playback_clock_seek 而不是 reset：保留 sample_rate，并把 start/submitted
-    // 直接对齐到 seek 目标时间，使音频位置与自定义解复用器恢复的绝对视频 PTS 同轴。
-    const uint64_t base_frames = g_video_mp3_sample_rate_hz > 0U
-        ? static_cast<uint64_t>(base_ms) * g_video_mp3_sample_rate_hz / 1000ULL
-        : 0ULL;
-    portENTER_CRITICAL(&g_video_clock_snapshot_mux);
-    audio_playback_clock_seek(&g_video_playback_clock, base_frames);
-    g_video_clock_snapshot.submitted_frames = base_frames;
-    g_video_clock_snapshot.decoder_frames = base_frames;
-    g_video_clock_snapshot.position_us = static_cast<uint64_t>(base_ms) * 1000ULL;
-    portEXIT_CRITICAL(&g_video_clock_snapshot_mux);
+    AudioRequest *request = audio_request_create(AudioCommandType::VideoMp3Seek, wait);
+    if (request == nullptr) return false;
+    request->video_seek_base_ms = base_ms;
+    return audio_service_submit(request, wait);
 }
 
 bool audio_service_nsf_start(

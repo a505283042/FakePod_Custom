@@ -1355,6 +1355,19 @@ void mp3_decoder_close(Mp3Decoder *decoder)
     *decoder = {};
 }
 
+void mp3_decoder_flush_stream(Mp3Decoder *decoder)
+{
+    if (decoder == nullptr) return;
+    // 丢弃输入侧残留的旧压缩数据（可能是不完整的旧 MP3 帧），
+    // 以及已解码但尚未送出的旧 PCM；两者混入新位置数据都会产生爆音。
+    decoder->input_offset = 0;
+    decoder->input_size = 0;
+    decoder->input_chunk_eos = false;
+    decoder->decoded_offset = 0;
+    decoder->decoded_size = 0;
+    decoder->eof = false;
+}
+
 bool mp3_decoder_is_open(const Mp3Decoder *decoder)
 {
     return decoder != nullptr && audio_source_is_open(decoder->source) && decoder->simple_handle != nullptr;

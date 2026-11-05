@@ -1486,8 +1486,11 @@ esp_err_t seek(uint32_t target_ms)
     // 6. 用 demuxer 实际恢复的时间轴位置对齐音频时钟。
     //     必须以 next_video_pts_ms() 为准，而不是索引时间戳：两者可能差 1~2 帧，
     //     音频时钟只要和视频 PTS 不同轴，Presenter 就会把后续帧全部判为迟到。
+    //     该调用在 AudioTask 内执行：静音→排空 DMA 旧 PCM→丢弃解码残留→淡入，避免 seek 爆音。
     const uint32_t base_pts_ms = AviDemuxer::next_video_pts_ms();
-    audio_service_video_mp3_reset_clock(base_pts_ms);
+    if (!audio_service_video_mp3_seek(base_pts_ms)) {
+        ESP_LOGW(TAG, "视频音频seek时钟失败：base=%lums", static_cast<unsigned long>(base_pts_ms));
+    }
 
     // 音频探针的 first_pts 是时钟零点基准，seek 后必须归零；
     // 同时立即刷新快照位置，让连续 seek 的目标计算保持正确。

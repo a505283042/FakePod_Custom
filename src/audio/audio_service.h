@@ -127,9 +127,9 @@ struct AudioVideoClockSnapshot
     uint64_t position_us = 0ULL;
 };
 bool audio_service_video_mp3_get_clock(AudioVideoClockSnapshot *out_snapshot);
-// seek 时把视频音频播放时钟复位到 base_ms 对应的绝对时间轴（不清空 bridge、不停止音频任务）。
-// 与自定义解复用器 seek 后保持绝对 PTS 一致，Presenter 才能继续按绝对时间轴同步。
-void audio_service_video_mp3_reset_clock(uint32_t base_ms);
+// seek 时在 AudioTask 内：静音 DAC、排空 DMA 旧 PCM、丢弃解码器残留数据、
+// 把视频音频时钟对齐到 base_ms，并让新位置首块 PCM 淡入后再解除静音。
+bool audio_service_video_mp3_seek(uint32_t base_ms, bool wait = true);
 
 // R6：传统 NESM NSF 只由唯一后台 6502 Sequencer 执行 INIT/PLAY；AudioTask
 // 消费同源 APU/Bank Event Timeline，经轻量 2A03 Renderer 产出 48kHz stereo PCM。

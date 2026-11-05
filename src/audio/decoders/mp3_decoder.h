@@ -171,6 +171,10 @@ esp_err_t mp3_decoder_seek_frame(
 );
 
 void mp3_decoder_close(Mp3Decoder *decoder);
+
+// seek 后丢弃解码器内部残留的旧压缩数据与已解码 PCM，避免用旧位置数据解新帧产生噪声。
+// 保持 codec 与 Source 打开，不重新预解首块 PCM。
+void mp3_decoder_flush_stream(Mp3Decoder *decoder);
 bool mp3_decoder_is_open(const Mp3Decoder *decoder);
 bool mp3_decoder_is_eof(const Mp3Decoder *decoder);
 
