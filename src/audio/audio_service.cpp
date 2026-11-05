@@ -6842,14 +6842,19 @@ bool audio_service_video_mp3_get_clock(AudioVideoClockSnapshot *out_snapshot)
     return true;
 }
 
-void audio_service_video_mp3_reset_clock()
+void audio_service_video_mp3_reset_clock(uint32_t base_ms)
 {
-    // seek 时 bridge 已清空，AudioTask 阻塞在数据等待上，此时重置时钟无竞态。
+    // seek 时 bridge 已清空，AudioTask 阻塞在数据等待上，此时复位时钟无竞态。
+    // 用 audio_playback_clock_seek 而不是 reset：保留 sample_rate，并把 start/submitted
+    // 直接对齐到 seek 目标时间，使音频位置与自定义解复用器恢复的绝对视频 PTS 同轴。
+    const uint64_t base_frames = g_video_mp3_sample_rate_hz > 0U
+        ? static_cast<uint64_t>(base_ms) * g_video_mp3_sample_rate_hz / 1000ULL
+        : 0ULL;
     portENTER_CRITICAL(&g_video_clock_snapshot_mux);
-    audio_playback_clock_reset(&g_video_playback_clock, g_video_mp3_sample_rate_hz);
-    g_video_clock_snapshot.submitted_frames = 0ULL;
-    g_video_clock_snapshot.decoder_frames = 0ULL;
-    g_video_clock_snapshot.position_us = 0ULL;
+    audio_playback_clock_seek(&g_video_playback_clock, base_frames);
+    g_video_clock_snapshot.submitted_frames = base_frames;
+    g_video_clock_snapshot.decoder_frames = base_frames;
+    g_video_clock_snapshot.position_us = static_cast<uint64_t>(base_ms) * 1000ULL;
     portEXIT_CRITICAL(&g_video_clock_snapshot_mux);
 }
 

@@ -83,11 +83,11 @@ function Read-AviFourCC([System.IO.FileStream]$fs, [int64]$off) {
 }
 
 # 生成 AVI 侧车索引(.fvix)，供设备端粗精度 seek 使用。
-# 索引粒度：每 10 秒一条，存储时间戳(ms) -> 视频 chunk 头偏移。
+# 索引粒度：每 2 秒一条，存储时间戳(ms) -> 视频 chunk 头偏移。
 # 直接解析 AVI 的 movi 结构（不依赖 ffprobe），记录的偏移正好是设备端
 # AviDemuxer::read_frame() 期望读取 chunk 头的位置。
 function New-SidecarIndex([string]$aviPath) {
-    $granularityMs = 10000  # 10 秒粒度
+    $granularityMs = 2000  # 2 秒粒度：seek 落点误差 <=2s，条目数仍然很小
     $outPath = $aviPath + ".fvix"
     $result = [pscustomobject]@{ Ok = $false; Path = $outPath; Count = 0; Message = "" }
 
@@ -788,7 +788,7 @@ $form.Controls.Add($btnPreset)
 
 # 对已有 AVI 单独补生成 .fvix 索引（不重新转码）。
 $btnSidecar = New-Object System.Windows.Forms.Button
-$btnSidecar.Text = "生成 .fvix 索引"
+$btnSidecar.Text = "生成 .fvix 索引(可多选)"
 $btnSidecar.Location = New-Object System.Drawing.Point(480,$y)
 $btnSidecar.Size = New-Object System.Drawing.Size(150,40)
 $form.Controls.Add($btnSidecar)
@@ -940,38 +940,56 @@ $btnOpen.Add_Click({
     }
 })
 
-# 补生成 .fvix 索引：优先用“输出文件”里的 AVI，否则弹出文件选择框挑已有视频。
+# 补生成 .fvix 索引：弹出文件选择框（支持多选）挑已有视频；
+# 若“输出文件”已是 AVI，则预选它并以其目录作为初始目录。
 $btnSidecar.Add_Click({
-    $target = $null
+    $targets = @()
     $outPath = $txtOutput.Text
-    if (-not [string]::IsNullOrWhiteSpace($outPath) -and
+    $hasOutAvi = -not [string]::IsNullOrWhiteSpace($outPath) -and
         $outPath.Trim().ToLower().EndsWith(".avi") -and
-        (Test-Path -LiteralPath $outPath)) {
-        $target = $outPath
-    } else {
-        $dlg = New-Object System.Windows.Forms.OpenFileDialog
-        $dlg.Title = "选择要生成 .fvix 索引的 AVI"
-        $dlg.Filter = "AVI 视频 (*.avi)|*.avi|所有文件 (*.*)|*.*"
-        $inPath = $txtInput.Text
-        if (-not [string]::IsNullOrWhiteSpace($inPath) -and (Test-Path -LiteralPath $inPath)) {
-            $dlg.InitialDirectory = [System.IO.Path]::GetDirectoryName($inPath)
-        }
-        if ($dlg.ShowDialog() -ne "OK") { return }
-        $target = $dlg.FileName
+        (Test-Path -LiteralPath $outPath)
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Title = "选择要生成 .fvix 索引的 AVI（可多选）"
+    $dlg.Filter = "AVI 视频 (*.avi)|*.avi|所有文件 (*.*)|*.*"
+    $dlg.Multiselect = $true
+    if ($hasOutAvi) {
+        $dlg.InitialDirectory = [System.IO.Path]::GetDirectoryName($outPath)
+        $dlg.FileName = [System.IO.Path]::GetFileName($outPath)
+    } elseif (-not [string]::IsNullOrWhiteSpace($txtInput.Text) -and
+        (Test-Path -LiteralPath $txtInput.Text)) {
+        $dlg.InitialDirectory = [System.IO.Path]::GetDirectoryName($txtInput.Text)
     }
+    if ($dlg.ShowDialog() -ne "OK") { return }
+    $targets = @($dlg.FileNames)
+    if ($targets.Count -eq 0) { return }
 
     $btnSidecar.Enabled = $false
     $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-    $lblStatus.Text = "正在扫描 AVI 生成索引：$([System.IO.Path]::GetFileName($target)) …"
-    [System.Windows.Forms.Application]::DoEvents()
+    $succeeded = 0
+    $failures = New-Object System.Collections.Generic.List[string]
     try {
-        $idx = New-SidecarIndex -aviPath $target
-        if ($idx.Ok) {
-            $lblStatus.Text = "索引已生成：$($idx.Path)（$($idx.Count) 条）"
-            [System.Windows.Forms.MessageBox]::Show("$($idx.Message)`r`n`r`n$($idx.Path)", "索引生成完成")
+        for ($i = 0; $i -lt $targets.Count; $i++) {
+            $target = $targets[$i]
+            $lblStatus.Text = "正在生成索引 ($($i + 1)/$($targets.Count))：$([System.IO.Path]::GetFileName($target)) …"
+            [System.Windows.Forms.Application]::DoEvents()
+            $idx = New-SidecarIndex -aviPath $target
+            if ($idx.Ok) {
+                $succeeded++
+            } else {
+                $failures.Add("$([System.IO.Path]::GetFileName($target))：$($idx.Message)")
+            }
+        }
+
+        if ($targets.Count -eq 1 -and $failures.Count -eq 0) {
+            $lblStatus.Text = "索引已生成：$($targets[0]).fvix"
+            [System.Windows.Forms.MessageBox]::Show("索引已生成`r`n`r`n$($targets[0]).fvix", "索引生成完成")
         } else {
-            $lblStatus.Text = "索引生成失败：$($idx.Message)"
-            [System.Windows.Forms.MessageBox]::Show($idx.Message, "索引生成失败")
+            $lblStatus.Text = "索引生成完成：成功 $succeeded / 共 $($targets.Count)"
+            $summary = "成功 $succeeded 个，失败 $($failures.Count) 个。"
+            if ($failures.Count -gt 0) {
+                $summary += "`r`n`r`n失败明细：`r`n" + ($failures -join "`r`n")
+            }
+            [System.Windows.Forms.MessageBox]::Show($summary, "批量生成完成")
         }
     } catch {
         $lblStatus.Text = "索引生成失败：$($_.Exception.Message)"

@@ -98,6 +98,8 @@ bool is_paused();
 esp_err_t seek(uint32_t target_ms);
 // 返回是否支持 seek（即侧车索引是否已加载）。
 bool can_seek();
+// 每次成功 seek 后自增；Presenter 据此重新锚定 Presentation Clock。
+uint32_t seek_epoch();
 
 bool get_snapshot(Snapshot *out_snapshot);
 // UI 在取得第一张帧时发布唯一 Presentation Clock；DecodeTask 只消费该时钟，不再自行锚定。

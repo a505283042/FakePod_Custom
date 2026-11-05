@@ -147,6 +147,7 @@ static bool g_pause_requested = false;
 static bool g_paused = false;
 static bool g_extract_pause_ack = false;
 static int64_t g_pause_started_us = 0LL;
+static uint32_t g_seek_epoch = 0U;
 static QueueHandle_t g_free_queue = nullptr;
 static QueueHandle_t g_ready_queue = nullptr;
 static QueueHandle_t g_compressed_free_queue = nullptr;
@@ -308,9 +309,26 @@ static void return_slot_to_free(uint8_t slot)
     (void)xQueueSend(g_free_queue, &slot, 0);
 }
 
+// 暂停请求/暂停生效期间，Producer 不能再阻塞在下游队列上：
+// 否则 Presenter 一停，Decode 卡在 send_ready、Extract 卡在 send_pipeline_message，
+// Extract 永远回不到 extract_pause_gate，seek 就等不到暂停确认而整条管线死锁。
+static bool pause_transition_active()
+{
+    bool active = false;
+    portENTER_CRITICAL(&g_mux);
+    active = g_pause_requested || g_paused;
+    portEXIT_CRITICAL(&g_mux);
+    return active;
+}
+
 static bool send_ready(uint8_t slot, uint32_t generation)
 {
     while (generation_current(generation)) {
+        if (pause_transition_active()) {
+            // 该帧在暂停/seek 期间无意义，直接归还空槽。
+            return_slot_to_free(slot);
+            return true;
+        }
         if (g_ready_queue != nullptr && xQueueSend(g_ready_queue, &slot, kQueuePollTicks) == pdTRUE) return true;
     }
     return false;
@@ -347,6 +365,11 @@ static void return_compressed_to_free(uint8_t slot)
 static bool send_pipeline_message(const PipelineMessage &message, uint32_t generation)
 {
     while (generation_current(generation)) {
+        // 暂停/seek 期间丢弃视频帧消息（含槽归还）。Eof/Failed/Stopped 必须送达 Decode。
+        if (message.type == PipelineMessageType::Frame && pause_transition_active()) {
+            if (message.slot < kCompressedSlotCount) return_compressed_to_free(message.slot);
+            return true;
+        }
         if (g_compressed_ready_queue != nullptr &&
             xQueueSend(g_compressed_ready_queue, &message, kQueuePollTicks) == pdTRUE) {
             return true;
@@ -556,6 +579,10 @@ static void extract_task(void *arg)
         return;
     }
 
+    ESP_LOGI(TAG, "VideoExtractTask启动：generation=%lu",
+        static_cast<unsigned long>(args->generation));
+    static uint32_t s_extract_debug_frames = 0U;  // 临时诊断：打印开头若干提取帧
+
     while (generation_current(args->generation)) {
         if (!extract_pause_gate(args->generation)) break;
         uint8_t compressed_slot_index = 0U;
@@ -593,6 +620,17 @@ static void extract_task(void *arg)
             }
             (void)send_pipeline_message(message, args->generation);
             break;
+        }
+
+        // 临时诊断：确认提取任务确实在产出帧
+        if (s_extract_debug_frames < 8U) {
+            ++s_extract_debug_frames;
+            ESP_LOGI(TAG, "提取#%lu %s size=%lu pts=%llums extract=%luus",
+                static_cast<unsigned long>(s_extract_debug_frames),
+                frame.is_video ? "video" : "audio",
+                static_cast<unsigned long>(frame.size),
+                static_cast<unsigned long long>(frame.pts),
+                static_cast<unsigned long>(extract_us));
         }
 
         if (!frame.is_video) {
@@ -699,13 +737,9 @@ static bool audio_master_late_us(uint32_t video_pts_ms, int64_t *out_late_us)
 {
     if (out_late_us != nullptr) *out_late_us = 0LL;
 
-    uint32_t audio_first_pts_ms = 0U;
     bool have_audio_pts = false;
     portENTER_CRITICAL(&g_mux);
-    if (g_audio_probe.frames_read != 0U) {
-        audio_first_pts_ms = g_audio_probe.first_pts_ms;
-        have_audio_pts = true;
-    }
+    have_audio_pts = g_audio_probe.frames_read != 0U;
     portEXIT_CRITICAL(&g_mux);
     if (!have_audio_pts) return false;
 
@@ -716,8 +750,9 @@ static bool audio_master_late_us(uint32_t video_pts_ms, int64_t *out_late_us)
         return false;
     }
 
-    const int64_t target_audio_us =
-        (static_cast<int64_t>(video_pts_ms) - static_cast<int64_t>(audio_first_pts_ms)) * 1000LL;
+    // 音频 PCM 时钟零点即视频时间轴零点（seek 时已对齐），不能再减音频第一帧 PTS：
+    // seek 后探针会记录新的第一帧 PTS，用它做基准会把目标整体拉回 0，导致全丢帧。
+    const int64_t target_audio_us = static_cast<int64_t>(video_pts_ms) * 1000LL;
     const int64_t late_us = static_cast<int64_t>(audio_clock.position_us) - target_audio_us;
     if (out_late_us != nullptr) *out_late_us = late_us;
     return true;
@@ -819,6 +854,7 @@ static void benchmark_task(void *arg)
     uint32_t pipe_qmax = 0U;
     DecodeTimingModel decode_timing = {};
     uint32_t predecode_drops = 0U;
+    uint32_t consecutive_decode_failures = 0U;
     uint32_t catchup_events = 0U;
     bool catchup_active = false;
     int64_t projected_late_us_max = 0LL;
@@ -847,10 +883,11 @@ static void benchmark_task(void *arg)
         ret = wait_audio_prebuffer(args->generation, &prebuffer, &prebuffer_wait_ms);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG,
-                "AVI MP3预取失败：need=%uB buffered=%uB high=%uB wait=%lums ret=%s；拒绝带欠载风险启动AudioTask",
+                "AVI MP3预取失败：need=%uB buffered=%uB high=%uB eof=%d wait=%lums ret=%s；拒绝带欠载风险启动AudioTask",
                 static_cast<unsigned>(kAudioPrebufferBytes),
                 static_cast<unsigned>(prebuffer.buffered_bytes),
                 static_cast<unsigned>(prebuffer.high_water_bytes),
+                prebuffer.eof ? 1 : 0,
                 static_cast<unsigned long>(prebuffer_wait_ms),
                 esp_err_to_name(ret));
             avi_mp3_bridge_cancel();
@@ -890,7 +927,14 @@ static void benchmark_task(void *arg)
         while (!done && generation_current(args->generation)) {
             if (!wait_while_paused(args->generation)) break;
             PipelineMessage message = {};
+            const uint32_t recv_epoch = seek_epoch();
             if (!receive_pipeline_message(&message, args->generation)) break;
+
+            // seek 期间从旧文件位置取出的压缩帧直接丢弃，避免解出 seek 前的画面。
+            if (message.type == PipelineMessageType::Frame && seek_epoch() != recv_epoch) {
+                return_compressed_to_free(message.slot);
+                continue;
+            }
 
             if (message.type == PipelineMessageType::PoolSkipped) {
                 ++result.frames_pool_skipped;
@@ -1006,17 +1050,28 @@ static void benchmark_task(void *arg)
 
             if (ret != ESP_OK) {
                 ++result.decode_failures;
+                ++consecutive_decode_failures;
                 return_slot_to_free(slot_index);
-                result.state = State::Failed;
-                result.result = ret;
-                ESP_LOGE(TAG, "MJPEG解码失败：frame=%lu pts=%lums bytes=%lu ret=%s",
+                // 单帧损坏（例如 seek 落点附近）不应终止整段播放：跳过并继续，
+                // 连续多帧都失败才判定管线异常。
+                if (consecutive_decode_failures >= 8U) {
+                    result.state = State::Failed;
+                    result.result = ret;
+                    ESP_LOGE(TAG, "MJPEG连续解码失败：frame=%lu pts=%lums bytes=%lu ret=%s",
+                        static_cast<unsigned long>(result.frames_read),
+                        static_cast<unsigned long>(pts_ms),
+                        static_cast<unsigned long>(compressed_bytes), esp_err_to_name(ret));
+                    stop_generation(args->generation);
+                    done = true;
+                    break;
+                }
+                ESP_LOGW(TAG, "MJPEG解码失败已跳过：frame=%lu pts=%lums bytes=%lu ret=%s",
                     static_cast<unsigned long>(result.frames_read),
                     static_cast<unsigned long>(pts_ms),
                     static_cast<unsigned long>(compressed_bytes), esp_err_to_name(ret));
-                stop_generation(args->generation);
-                done = true;
-                break;
+                continue;
             }
+            consecutive_decode_failures = 0U;
 
             slot.pts_ms = pts_ms;
             slot.compressed_bytes = compressed_bytes;
@@ -1343,6 +1398,15 @@ bool can_seek()
     return VideoSeekIndex::count() > 0U;
 }
 
+uint32_t seek_epoch()
+{
+    uint32_t epoch = 0U;
+    portENTER_CRITICAL(&g_mux);
+    epoch = g_seek_epoch;
+    portEXIT_CRITICAL(&g_mux);
+    return epoch;
+}
+
 esp_err_t seek(uint32_t target_ms)
 {
     if (!can_seek()) return ESP_ERR_NOT_SUPPORTED;
@@ -1381,9 +1445,13 @@ esp_err_t seek(uint32_t target_ms)
 
     // 2. 清空 compressed ready queue（未解码的压缩帧归还给 free）
     if (g_compressed_ready_queue != nullptr) {
-        uint8_t slot = 0U;
-        while (xQueueReceive(g_compressed_ready_queue, &slot, 0) == pdTRUE) {
-            return_compressed_to_free(slot);
+        PipelineMessage message = {};
+        while (xQueueReceive(g_compressed_ready_queue, &message, 0) == pdTRUE) {
+            // 队列元素是 PipelineMessage，必须按消息取 slot；直接读 uint8_t 会读到 type 字段。
+            if (message.type == PipelineMessageType::Frame &&
+                message.slot < kCompressedSlotCount) {
+                return_compressed_to_free(message.slot);
+            }
         }
     }
 
@@ -1398,10 +1466,7 @@ esp_err_t seek(uint32_t target_ms)
     // 4. 清空音频桥残留数据
     avi_mp3_bridge_clear();
 
-    // 5. 重置音频播放时钟到 seek 位置
-    audio_service_video_mp3_reset_clock();
-
-    // 6. demuxer seek 到索引偏移，重置帧计数器
+    // 5. demuxer seek 到索引偏移，恢复绝对时间轴的帧/字节计数
     // 音频字节按平均码率估算，使音频 PTS 与视频 PTS 在同一时间轴。
     uint32_t audio_bitrate = 0U;
     portENTER_CRITICAL(&g_mux);
@@ -1418,11 +1483,27 @@ esp_err_t seek(uint32_t target_ms)
         return ret;
     }
 
-    // 7. 重置 presentation clock
+    // 6. 用 demuxer 实际恢复的时间轴位置对齐音频时钟。
+    //     必须以 next_video_pts_ms() 为准，而不是索引时间戳：两者可能差 1~2 帧，
+    //     音频时钟只要和视频 PTS 不同轴，Presenter 就会把后续帧全部判为迟到。
+    const uint32_t base_pts_ms = AviDemuxer::next_video_pts_ms();
+    audio_service_video_mp3_reset_clock(base_pts_ms);
+
+    // 音频探针的 first_pts 是时钟零点基准，seek 后必须归零；
+    // 同时立即刷新快照位置，让连续 seek 的目标计算保持正确。
+    portENTER_CRITICAL(&g_mux);
+    g_audio_probe = {};
+    merge_audio_probe_unlocked(&g_snapshot);
+    g_snapshot.first_pts_ms = base_pts_ms;
+    g_snapshot.last_pts_ms = base_pts_ms;
+    portEXIT_CRITICAL(&g_mux);
+
+    // 7. 重置 presentation clock，并递增 seek epoch 让 Presenter 重新锚定
     portENTER_CRITICAL(&g_mux);
     g_presentation_clock = {};
     g_presentation_clock.generation = generation;
     g_presentation_clock.started = false;
+    ++g_seek_epoch;
     portEXIT_CRITICAL(&g_mux);
 
     // 8. 恢复播放

@@ -54,6 +54,9 @@ esp_err_t read_frame(FrameInfo *frame, uint8_t *data, uint32_t capacity);
 // 用于侧车索引定位后的跳转。
 esp_err_t seek_to_offset(uint32_t file_offset, uint32_t video_pts_ms, uint32_t audio_bytes_at_seek);
 
+// 返回下一个视频帧的时间戳（ms）。seek 之后用于让音频时钟与其严格同轴。
+uint32_t next_video_pts_ms();
+
 // 关闭并释放资源。
 void close();
 

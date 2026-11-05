@@ -20,6 +20,7 @@ uint32_t s_movi_data_end = 0;      // movi 数据区结束偏移
 uint32_t s_current_offset = 0;     // 当前读取位置
 uint32_t s_video_frame_index = 0;  // 已读取的视频帧计数（用于 PTS）
 uint32_t s_audio_bytes_total = 0;  // 已读取的音频字节数（用于 PTS）
+uint32_t s_debug_chunk_count = 0;  // 临时诊断：已扫描的 chunk 数量
 
 // 小端读取辅助
 inline uint16_t read_u16(const uint8_t *p) {
@@ -68,6 +69,7 @@ esp_err_t open(VideoMediaIo::Context *io, StreamInfo *out_info) {
     s_current_offset = 0;
     s_video_frame_index = 0;
     s_audio_bytes_total = 0;
+    s_debug_chunk_count = 0;
 
     // 读取 RIFF 头 (12 字节)
     uint8_t riff[12];
@@ -192,11 +194,18 @@ esp_err_t open(VideoMediaIo::Context *io, StreamInfo *out_info) {
     }
 
     *out_info = s_info;
+    // 顶层扫描（含其后的 idx1/HDRL 等 chunk）会移动 s_current_offset，
+    // 这里固定回 movi 起点，避免首帧读取直接从文件末尾开始。
+    s_current_offset = s_movi_data_offset;
     ESP_LOGI(TAG, "AVI解析成功: %ux%u %u.%02ufps dur=%ums frames=%u audio=%s",
         s_info.width, s_info.height,
         s_info.fps_x100 / 100, s_info.fps_x100 % 100,
         s_info.duration_ms, s_info.total_frames,
         s_info.has_audio ? "yes" : "no");
+    ESP_LOGI(TAG, "movi数据区: offset=%lu end=%lu 文件大小=%lu",
+        static_cast<unsigned long>(s_movi_data_offset),
+        static_cast<unsigned long>(s_movi_data_end),
+        static_cast<unsigned long>(file_size));
     return ESP_OK;
 }
 
@@ -211,6 +220,28 @@ esp_err_t read_frame(FrameInfo *frame, uint8_t *data, uint32_t capacity) {
             return ESP_FAIL;
         }
         const uint32_t chunk_size = read_u32(hdr + 4);
+
+        // 临时诊断：确认扫描起点与 chunk 头解析是否正确。
+        ++s_debug_chunk_count;
+        if (s_debug_chunk_count <= 6U) {
+            ESP_LOGI(TAG, "chunk#%lu @%lu '%c%c%c%c' size=%lu video=%lu audio=%luB",
+                static_cast<unsigned long>(s_debug_chunk_count),
+                static_cast<unsigned long>(s_current_offset),
+                hdr[0], hdr[1], hdr[2], hdr[3],
+                static_cast<unsigned long>(chunk_size),
+                static_cast<unsigned long>(s_video_frame_index),
+                static_cast<unsigned long>(s_audio_bytes_total));
+        }
+
+        if (chunk_size == 0U) {
+            // AVI 中可能存在 0 字节占位 chunk（如 '00dc' size=0），无法解码，直接跳过。
+            // 占位视频帧仍占一个帧位，计数继续推进，保证后续 PTS 与 avih 帧序一致。
+            // read_at 读头时已把 s_current_offset 推进到数据起点；size=0 无数据，直接继续。
+            if (match_fcc(hdr, "00dc") || match_fcc(hdr, "00db")) {
+                s_video_frame_index++;
+            }
+            continue;
+        }
 
         if (match_fcc(hdr, "00dc") || match_fcc(hdr, "00db")) {
             // 视频帧
@@ -258,19 +289,66 @@ esp_err_t read_frame(FrameInfo *frame, uint8_t *data, uint32_t capacity) {
         }
     }
 
+    ESP_LOGW(TAG, "到达movi末尾: off=%lu end=%lu chunks=%lu video=%lu audio=%luB",
+        static_cast<unsigned long>(s_current_offset),
+        static_cast<unsigned long>(s_movi_data_end),
+        static_cast<unsigned long>(s_debug_chunk_count),
+        static_cast<unsigned long>(s_video_frame_index),
+        static_cast<unsigned long>(s_audio_bytes_total));
     return kErrEof;
 }
 
 esp_err_t seek_to_offset(uint32_t file_offset, uint32_t video_pts_ms, uint32_t audio_bytes_at_seek) {
     if (s_io == nullptr) return ESP_ERR_INVALID_STATE;
-    s_current_offset = file_offset;
-    // seek 后音视频 PTS 都从 0 开始，与重置后的音频时钟对齐。
-    // video_pts_ms / audio_bytes_at_seek 仅用于诊断，不参与 PTS 计算。
-    (void)video_pts_ms;
-    (void)audio_bytes_at_seek;
-    s_video_frame_index = 0;
-    s_audio_bytes_total = 0;
+
+    // 侧车索引可能记录 chunk 头偏移，也可能记录数据起点（如 ffprobe 的 pkt_pos）。
+    // 这里按「chunk 头 + JPEG 起始标记」校验落点，必要时回退 8 字节。
+    auto video_chunk_at = [](uint32_t off) -> bool {
+        if (off + 10U > s_movi_data_end) return false;
+        uint8_t hdr[8];
+        if (read_at(off, hdr, 8) != ESP_OK) return false;
+        if (!(match_fcc(hdr, "00dc") || match_fcc(hdr, "00db"))) return false;
+        const uint32_t size = read_u32(hdr + 4);
+        if (size == 0U || size > (8U * 1024U * 1024U)) return false;
+        uint8_t sig[2];
+        if (read_at(off + 8U, sig, 2) != ESP_OK) return false;
+        return sig[0] == 0xFFU && sig[1] == 0xD8U;
+    };
+
+    uint32_t aligned = file_offset;
+    if (!video_chunk_at(file_offset)) {
+        if (file_offset >= 8U && video_chunk_at(file_offset - 8U)) {
+            aligned = file_offset - 8U;
+            ESP_LOGW(TAG, "Seek偏移按数据起点解释，回退8字节: %lu -> %lu",
+                static_cast<unsigned long>(file_offset),
+                static_cast<unsigned long>(aligned));
+        } else {
+            ESP_LOGW(TAG, "Seek偏移未落在视频chunk头，保持原偏移: %lu",
+                static_cast<unsigned long>(file_offset));
+        }
+    }
+
+    s_current_offset = aligned;
+    // 保持绝对时间轴：用 seek 目标时间恢复视频帧计数与音频字节计数，
+    // 这样 PTS 继续在整段视频的原始时间轴上累加（而不是从 0 重来）。
+    // 上层（Presenter/seek 目标计算）都以绝对 PTS 为准，无需再维护额外基准。
+    s_video_frame_index = s_info.fps_x100 > 0
+        ? static_cast<uint32_t>(static_cast<uint64_t>(video_pts_ms) * s_info.fps_x100 / 100000ULL)
+        : 0U;
+    s_audio_bytes_total = audio_bytes_at_seek;
+    ESP_LOGI(TAG, "seek恢复时间轴: frame_index=%lu fps=%lu.%02lu audio_bytes=%lu",
+        static_cast<unsigned long>(s_video_frame_index),
+        static_cast<unsigned long>(s_info.fps_x100 / 100U),
+        static_cast<unsigned long>(s_info.fps_x100 % 100U),
+        static_cast<unsigned long>(s_audio_bytes_total));
     return ESP_OK;
+}
+
+uint32_t next_video_pts_ms()
+{
+    if (s_info.fps_x100 == 0U) return 0U;
+    return static_cast<uint32_t>(
+        static_cast<uint64_t>(s_video_frame_index) * 100000ULL / s_info.fps_x100);
 }
 
 void close() {

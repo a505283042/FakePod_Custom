@@ -849,10 +849,13 @@ static bool benchmark_audio_master_snapshot(AudioVideoClockSnapshot *out_clock)
     return true;
 }
 
+// 音频 PCM 时钟的零点就是视频时间轴零点（seek 时音频时钟已对齐到该处）。
+// 不能再减 audio_first_pts_ms：seek 后音频探针会记录新的第一帧 PTS，
+// 若拿它做基准会把目标时刻整体拉回 0，导致画面被全部判为迟到而冻结。
 static int64_t benchmark_audio_master_target_us(uint32_t video_pts_ms, uint32_t audio_first_pts_ms)
 {
-    return (static_cast<int64_t>(video_pts_ms) -
-            static_cast<int64_t>(audio_first_pts_ms)) * 1000LL;
+    (void)audio_first_pts_ms;
+    return static_cast<int64_t>(video_pts_ms) * 1000LL;
 }
 
 static bool benchmark_presenter_wait_if_paused(bool clock_started, int64_t *clock_base_us)
@@ -882,6 +885,7 @@ static void benchmark_presenter_task(void *arg)
     (void)arg;
     bool bounded_session = false;
     bool clock_started = false;
+    uint32_t seek_epoch_seen = 0U;
     bool audio_master_expected = false;
     bool audio_master_logged = false;
     bool audio_start_barrier_released = false;
@@ -896,6 +900,17 @@ static void benchmark_presenter_task(void *arg)
 
     while (!benchmark_presenter_should_stop()) {
         if (!benchmark_presenter_wait_if_paused(clock_started, &clock_base_us)) break;
+
+        // seek 后 PTS 从 0 重新开始，且 VideoBenchmark 已重置 Presentation Clock：
+        // 这里必须重新锚定，否则时钟永远不 started，Decode 侧无法判丢帧并会堵塞整条管线。
+        const uint32_t epoch = VideoBenchmark::seek_epoch();
+        if (epoch != seek_epoch_seen) {
+            seek_epoch_seen = epoch;
+            clock_started = false;
+            audio_master_expected = false;
+            audio_master_logged = false;
+        }
+
         VideoBenchmark::FrameView frame = {};
         const bool got_frame = VideoBenchmark::wait_frame(&frame, kPresenterFrameWaitMs);
         const int64_t acquired_us = esp_timer_get_time();
@@ -982,8 +997,18 @@ static void benchmark_presenter_task(void *arg)
         portEXIT_CRITICAL(&g_benchmark_ui_mux);
 
         bool pts_waited = false;
+        bool epoch_invalidated = false;
+        const int64_t pts_wait_started_us = esp_timer_get_time();
         while (!benchmark_presenter_should_stop()) {
+            // seek 之后旧的 audio_target_us / fallback_target_us 全部失效，
+            // 必须立刻放弃等待，否则 Presenter 会空等数秒并冻住整条管线。
+            if (VideoBenchmark::seek_epoch() != seek_epoch_seen) {
+                epoch_invalidated = true;
+                break;
+            }
             if (!benchmark_presenter_wait_if_paused(clock_started, &clock_base_us)) break;
+            // 安全阀：任何时钟异常都不允许把 Presenter 钉在这里超过 300ms。
+            if (esp_timer_get_time() - pts_wait_started_us > 300000LL) break;
             int64_t wait_us = 0LL;
             if (use_audio_master) {
                 AudioVideoClockSnapshot latest_clock = {};
@@ -1004,6 +1029,11 @@ static void benchmark_presenter_task(void *arg)
             TickType_t wait_ticks = pdMS_TO_TICKS(wait_ms);
             if (wait_ticks == 0) wait_ticks = 1;
             vTaskDelay(wait_ticks);
+        }
+        if (epoch_invalidated) {
+            // 该帧属于 seek 前的旧时间轴，释放后回到外层重新锚定时钟。
+            VideoBenchmark::release_frame(frame.slot);
+            continue;
         }
         if (pts_waited) {
             portENTER_CRITICAL(&g_benchmark_ui_mux);
