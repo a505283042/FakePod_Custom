@@ -19,6 +19,8 @@ namespace
 static const char *TAG = "VideoIO";
 
 static constexpr uint32_t kMaxReadSliceBytes = 4096U;
+// Video独占播放（Music已挂起）时使用更大的切片，减少fread调用次数和锁竞争开销。
+static constexpr uint32_t kMaxReadSliceBytesExclusive = 16U * 1024U;
 static constexpr uint32_t kFlacSafePercent = 90U;
 static constexpr TickType_t kFlacGatePollTicks = pdMS_TO_TICKS(10);
 // R.40.2 的 50ms 一次性 timeout 会把正常的 TF mutex 争用直接升级成
@@ -50,6 +52,8 @@ static int32_t flac_ring_percent()
 static bool wait_for_storage_window(Context *io)
 {
     if (io == nullptr) return false;
+    // Video独占播放时Music已挂起，FLAC storage window不活跃，直接跳过水位门控。
+    if (io->skip_flac_gate) return true;
     int64_t wait_started_us = 0;
     while (generation_current(io)) {
         FlacStorageWindowSnapshot window = {};
@@ -91,12 +95,13 @@ static void log_cancelled(const char *op, const Context *io, uint32_t request_or
 
 } // namespace
 
-void configure(Context *io, uint32_t generation, GenerationCheck generation_check)
+void configure(Context *io, uint32_t generation, GenerationCheck generation_check, bool skip_flac_gate)
 {
     if (io == nullptr) return;
     *io = {};
     io->generation = generation;
     io->generation_check = generation_check;
+    io->skip_flac_gate = skip_flac_gate;
 }
 
 int read_cb(void *buffer, uint32_t size, void *ctx)
@@ -120,6 +125,9 @@ int read_cb(void *buffer, uint32_t size, void *ctx)
         return -1;
     }
 
+    // Video独占时用16KB切片减少锁竞争和fread调用；Music播放时保持4KB切片快速让路。
+    const uint32_t slice_bytes = io->skip_flac_gate ? kMaxReadSliceBytesExclusive : kMaxReadSliceBytes;
+
     const int64_t started_us = esp_timer_get_time();
     uint32_t total = 0U;
     uint32_t zero_progress = 0U;
@@ -134,13 +142,13 @@ int read_cb(void *buffer, uint32_t size, void *ctx)
         return result;
     };
 
-    if (size > kMaxReadSliceBytes) {
+    if (size > slice_bytes) {
         ++io->aggregate_read_requests;
         if (io->aggregate_read_requests == 1U) {
             ESP_LOGI(TAG,
                 "READ_AGGREGATE：extractor_request=%luB，底层按%luB TF切片补齐；每片释放storage锁并重检FLAC水位",
                 static_cast<unsigned long>(size),
-                static_cast<unsigned long>(kMaxReadSliceBytes));
+                static_cast<unsigned long>(slice_bytes));
         }
     }
 
@@ -155,7 +163,7 @@ int read_cb(void *buffer, uint32_t size, void *ctx)
         }
 
         const uint32_t remaining = size - total;
-        const uint32_t request = remaining > kMaxReadSliceBytes ? kMaxReadSliceBytes : remaining;
+        const uint32_t request = remaining > slice_bytes ? slice_bytes : remaining;
         const int64_t lock_wait_started_us = esp_timer_get_time();
         uint32_t retries = 0U;
         uint32_t last_log_ms = 0U;

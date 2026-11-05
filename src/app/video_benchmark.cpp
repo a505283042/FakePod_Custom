@@ -24,7 +24,7 @@ namespace VideoBenchmark
 namespace
 {
 
-static constexpr size_t kFrameSlotCount = 2U;
+static constexpr size_t kFrameSlotCount = 3U;
 static constexpr size_t kCompressedSlotCount = 8U;
 static constexpr size_t kCompressedSlotBytes = 128U * 1024U;
 static constexpr uint32_t kExtractorPoolBytes = 384U * 1024U;
@@ -44,7 +44,7 @@ static constexpr BaseType_t kExtractTaskCore = 0;
 static constexpr UBaseType_t kVideoWorkerStackCaps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
 static constexpr TickType_t kQueuePollTicks = pdMS_TO_TICKS(20);
 static constexpr uint32_t kPublishEveryFrames = 8U;
-static constexpr uint32_t kDecodeYieldEveryFrames = 8U;
+static constexpr uint32_t kDecodeYieldEveryFrames = 16U;
 static constexpr TickType_t kDecodeYieldTicks = 1U;
 static constexpr int64_t kUiEmergencyLateUs = 50000LL;
 static constexpr uint32_t kDeadlineSafetyBaseUs = 5000U;
@@ -52,7 +52,7 @@ static constexpr uint32_t kDeadlineSafetyMaxUs = 12000U;
 static constexpr uint32_t kDecodeJitterReserveMaxUs = 10000U;
 static constexpr uint8_t kDecodeTimingEwmaShift = 3U; // alpha = 1/8
 static constexpr size_t kAudioBridgeBytes = 32U * 1024U;
-static constexpr size_t kAudioPrebufferBytes = 4U * 1024U;
+static constexpr size_t kAudioPrebufferBytes = 8U * 1024U;
 static constexpr uint32_t kAudioPrebufferTimeoutMs = 1500U;
 static constexpr uint32_t kAudioBridgePushTimeoutMs = 250U;
 
@@ -100,6 +100,7 @@ struct TaskArgs
     char *path = nullptr; // PSRAM
     uint32_t generation = 0U;
     bool allow_fullcanvas_over20 = false;
+    bool music_suspended = false;
 };
 
 struct ExtractTaskArgs
@@ -832,7 +833,7 @@ static void benchmark_task(void *arg)
     result.result = ESP_FAIL;
 
     VideoMediaIo::Context io = {};
-    VideoMediaIo::configure(&io, args->generation, generation_current);
+    VideoMediaIo::configure(&io, args->generation, generation_current, args->music_suspended);
     esp_extractor_handle_t extractor = nullptr;
     jpeg_dec_handle_t decoder = nullptr;
 
@@ -1220,7 +1221,7 @@ static void free_resources_unlocked()
 
 } // namespace
 
-esp_err_t start(const char *path, bool allow_fullcanvas_over20)
+esp_err_t start(const char *path, bool allow_fullcanvas_over20, bool music_suspended)
 {
     if (path == nullptr || path[0] == '\0') return ESP_ERR_INVALID_ARG;
     const esp_err_t clean_ret = cleanup();
@@ -1278,6 +1279,7 @@ esp_err_t start(const char *path, bool allow_fullcanvas_over20)
     args->generation = g_generation;
     args->path = path_copy;
     args->allow_fullcanvas_over20 = allow_fullcanvas_over20;
+    args->music_suspended = music_suspended;
     g_snapshot = {};
     g_snapshot.state = State::Starting;
     g_snapshot.generation = g_generation;

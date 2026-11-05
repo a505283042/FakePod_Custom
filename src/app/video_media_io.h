@@ -17,6 +17,8 @@ struct Context
     uint32_t size = 0U;
     uint32_t generation = 0U;
     GenerationCheck generation_check = nullptr;
+    // Video独占播放时Music已挂起，FLAC storage window不活跃，跳过水位门控减少每次读取开销。
+    bool skip_flac_gate = false;
 
     uint64_t read_bytes = 0ULL;
     uint64_t read_us_total = 0ULL;
@@ -34,7 +36,7 @@ struct Context
     uint32_t aggregate_read_requests = 0U;
 };
 
-void configure(Context *io, uint32_t generation, GenerationCheck generation_check);
+void configure(Context *io, uint32_t generation, GenerationCheck generation_check, bool skip_flac_gate = false);
 esp_err_t open(const char *path, Context *io);
 void close(Context *io);
 

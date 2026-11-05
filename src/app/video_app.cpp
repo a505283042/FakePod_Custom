@@ -1662,7 +1662,7 @@ static bool benchmark_start_selected(bool allow_fullcanvas_over20)
     // 高负载风险已在VideoProbe预检阶段完成；真正进入这里才暂停Music并启动AVI。
     set_visible(g_root, false);
     g_benchmark_ui = {};
-    const esp_err_t ret = VideoBenchmark::start(g_selected_path, allow_fullcanvas_over20);
+    const esp_err_t ret = VideoBenchmark::start(g_selected_path, allow_fullcanvas_over20, benchmark_music_exclusive_active());
     if (ret != ESP_OK) {
         char line[128] = {};
         snprintf(line, sizeof(line), "Benchmark启动失败：%s", esp_err_to_name(ret));

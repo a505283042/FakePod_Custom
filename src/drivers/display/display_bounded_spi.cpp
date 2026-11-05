@@ -98,7 +98,9 @@ static DisplayBoundedSpiState g_bounded_spi = {};
 
 // R46.0.24: 8-row dual DMA staging keeps BoundedSPI bounded to 14,720B internal RAM;
 // 4 rows remains the low-memory fallback.  Full-width transfers are chunked, so wire format is unchanged.
-static constexpr uint16_t BOUNDED_SPI_STAGING_ROWS[] = {8U, 4U};
+// Video优化：主路径提升到16行（29,440B internal RAM），将460行的strip数从58降到29，
+// 减少producer调用和QSPI header开销；内存不足时自动降级到8行再到4行。
+static constexpr uint16_t BOUNDED_SPI_STAGING_ROWS[] = {16U, 8U, 4U};
 static constexpr uint32_t BOUNDED_SPI_PANEL_DRAIN_TIMEOUT_MS = 80U;
 static constexpr uint32_t BOUNDED_SPI_QUEUE_TIMEOUT_MS = 20U;
 static constexpr uint32_t BOUNDED_SPI_RESULT_TIMEOUT_MS = 80U;

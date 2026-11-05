@@ -89,7 +89,7 @@ struct FrameView
 // RGB565 输出固定为 CO5300 wire-order (big-endian)，供 BoundedSPI 直接提交。
 // allow_fullcanvas_over20=false 时，460x460 且 >20FPS 只做风险探测并返回 ESP_ERR_NOT_SUPPORTED；
 // UI 提示用户后可用 true 再启动一次。运行期不做 24->20 自动降帧。
-esp_err_t start(const char *path, bool allow_fullcanvas_over20 = false);
+esp_err_t start(const char *path, bool allow_fullcanvas_over20 = false, bool music_suspended = false);
 void stop();
 bool set_paused(bool paused);
 bool is_paused();
