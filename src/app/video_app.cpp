@@ -1228,6 +1228,31 @@ static esp_err_t benchmark_presenter_start()
     return ESP_OK;
 }
 
+// 侧车索引 seek：按相对毫秒跳转。依赖 .fvix 索引，无索引时静默忽略。
+static void benchmark_seek_by(int32_t delta_ms)
+{
+    if (!VideoBenchmark::can_seek()) {
+        ESP_LOGW(TAG, "Seek不可用：未找到侧车索引(.fvix)");
+        return;
+    }
+    VideoBenchmark::Snapshot snapshot = {};
+    if (!VideoBenchmark::get_snapshot(&snapshot)) return;
+    if (snapshot.state != VideoBenchmark::State::Running) return;
+
+    int64_t target = static_cast<int64_t>(snapshot.last_pts_ms) + delta_ms;
+    if (target < 0) target = 0;
+    if (snapshot.duration_ms > 0 && target > static_cast<int64_t>(snapshot.duration_ms)) {
+        target = snapshot.duration_ms;
+    }
+    const esp_err_t ret = VideoBenchmark::seek(static_cast<uint32_t>(target));
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Seek失败: delta=%dms ret=%s", delta_ms, esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "Seek: delta=%dms target=%lums",
+            delta_ms, static_cast<unsigned long>(target));
+    }
+}
+
 static bool benchmark_request_stop(const char *reason)
 {
     benchmark_presenter_request_stop();
@@ -1903,8 +1928,23 @@ static void timer_cb(lv_timer_t *timer)
         return;
     }
     switch (action) {
+        case UiGestureAction::SwipeLeft:
+            // 视频播放中左滑 = 快进 10 秒
+            if (g_page == VideoPage::Benchmark && !g_risk_prompt_active) {
+                benchmark_seek_by(+10000);
+            }
+            break;
         case UiGestureAction::SwipeRight:
-            go_back();
+            // 视频播放中：右滑 = 后退 10 秒；从屏幕最右 100px 起手的右滑 = 返回列表
+            if (g_page == VideoPage::Benchmark && !g_risk_prompt_active) {
+                if (gesture_router_press_started_in_rect(360, 0, 460, 460)) {
+                    go_back();
+                } else {
+                    benchmark_seek_by(-10000);
+                }
+            } else {
+                go_back();
+            }
             break;
         case UiGestureAction::SwipeUpTrack:
             if (g_page == VideoPage::Browser) shift_window(+1);

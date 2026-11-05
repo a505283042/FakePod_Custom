@@ -20,6 +20,8 @@ idf_component_register(
         "app/video_media_io.cpp"
         "app/video_benchmark.cpp"
         "app/video_probe.cpp"
+        "app/avi_demuxer.cpp"
+        "app/video_seek_index.cpp"
 
         "system/system_loop.cpp"
         "system/system_runtime.cpp"

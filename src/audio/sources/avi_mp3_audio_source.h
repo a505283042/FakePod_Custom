@@ -42,6 +42,8 @@ esp_err_t avi_mp3_bridge_push(const void *data, size_t bytes, uint32_t timeout_m
 // 正常 AVI EOS 与取消分开标记；AudioSource 会在 ring 排空后发布 EOF。
 void avi_mp3_bridge_mark_eof();
 void avi_mp3_bridge_cancel();
+// seek 时清空桥内残留数据，不释放桥。
+void avi_mp3_bridge_clear();
 
 // 仅在 ExtractTask 已退出且 AudioSource 已关闭后释放 PSRAM/semaphore。
 esp_err_t avi_mp3_bridge_release();

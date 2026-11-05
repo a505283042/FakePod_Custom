@@ -93,6 +93,11 @@ esp_err_t start(const char *path, bool allow_fullcanvas_over20 = false, bool mus
 void stop();
 bool set_paused(bool paused);
 bool is_paused();
+// seek 到指定毫秒位置。依赖侧车索引(.fvix)，无索引时返回 ESP_ERR_NOT_SUPPORTED。
+// seek 过程会清空音视频缓冲并重置时钟。
+esp_err_t seek(uint32_t target_ms);
+// 返回是否支持 seek（即侧车索引是否已加载）。
+bool can_seek();
 
 bool get_snapshot(Snapshot *out_snapshot);
 // UI 在取得第一张帧时发布唯一 Presentation Clock；DecodeTask 只消费该时钟，不再自行锚定。

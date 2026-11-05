@@ -268,6 +268,18 @@ void avi_mp3_bridge_cancel()
     bridge_signal_all();
 }
 
+// seek 时清空桥内残留的旧音频数据，不取消桥、不释放内存。
+void avi_mp3_bridge_clear()
+{
+    portENTER_CRITICAL(&g_bridge_mux);
+    g_read_pos = 0U;
+    g_write_pos = 0U;
+    g_buffered = 0U;
+    g_eof = false;
+    portEXIT_CRITICAL(&g_bridge_mux);
+    if (g_space_event != nullptr) xSemaphoreGive(g_space_event);
+}
+
 esp_err_t avi_mp3_bridge_release()
 {
     portENTER_CRITICAL(&g_bridge_mux);

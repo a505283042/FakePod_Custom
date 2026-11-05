@@ -6842,6 +6842,17 @@ bool audio_service_video_mp3_get_clock(AudioVideoClockSnapshot *out_snapshot)
     return true;
 }
 
+void audio_service_video_mp3_reset_clock()
+{
+    // seek 时 bridge 已清空，AudioTask 阻塞在数据等待上，此时重置时钟无竞态。
+    portENTER_CRITICAL(&g_video_clock_snapshot_mux);
+    audio_playback_clock_reset(&g_video_playback_clock, g_video_mp3_sample_rate_hz);
+    g_video_clock_snapshot.submitted_frames = 0ULL;
+    g_video_clock_snapshot.decoder_frames = 0ULL;
+    g_video_clock_snapshot.position_us = 0ULL;
+    portEXIT_CRITICAL(&g_video_clock_snapshot_mux);
+}
+
 bool audio_service_nsf_start(
     const uint8_t *prg,
     size_t prg_size,

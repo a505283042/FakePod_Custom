@@ -127,6 +127,8 @@ struct AudioVideoClockSnapshot
     uint64_t position_us = 0ULL;
 };
 bool audio_service_video_mp3_get_clock(AudioVideoClockSnapshot *out_snapshot);
+// seek 时重置视频音频播放时钟为 0，不清空 bridge，不停停音频任务。
+void audio_service_video_mp3_reset_clock();
 
 // R6：传统 NESM NSF 只由唯一后台 6502 Sequencer 执行 INIT/PLAY；AudioTask
 // 消费同源 APU/Bank Event Timeline，经轻量 2A03 Renderer 产出 48kHz stereo PCM。

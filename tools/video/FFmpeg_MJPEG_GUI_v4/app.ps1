@@ -68,6 +68,70 @@ function Get-DurationSeconds([string]$file, [string]$ffmpeg) {
     return 0
 }
 
+# 生成 AVI 侧车索引(.fvix)，供设备端粗精度 seek 使用。
+# 索引粒度：每 10 秒一条，存储时间戳(ms) -> 文件偏移。
+function New-SidecarIndex([string]$aviPath) {
+    $ffprobe = Find-Tool "ffprobe"
+    if (-not $ffprobe) {
+        Write-Warning "未找到 ffprobe，跳过侧车索引生成。"
+        return
+    }
+
+    $granularityMs = 10000  # 10 秒粒度
+    $outPath = $aviPath + ".fvix"
+
+    # 用 ffprobe 获取所有视频帧的 pkt_pos(文件偏移) 和 pts_time(时间戳秒)
+    $frames = & $ffprobe -v error -select_streams v:0 `
+        -show_entries frame=pkt_pos,pts_time -of csv=p=0 $aviPath 2>$null
+    if (-not $frames -or $frames.Count -eq 0) {
+        Write-Warning "ffprobe 未返回视频帧信息，跳过侧车索引。"
+        return
+    }
+
+    $entries = New-Object System.Collections.Generic.List[object]
+    $lastMs = -1
+    foreach ($line in $frames) {
+        $parts = $line -split ','
+        if ($parts.Count -lt 2) { continue }
+        $pktPos = 0
+        $ptsSec = 0.0
+        if (-not [int]::TryParse($parts[0], [ref]$pktPos)) { continue }
+        if (-not [double]::TryParse($parts[1], [ref]$ptsSec)) { continue }
+        $ptsMs = [int]($ptsSec * 1000)
+        # 每 granularityMs 取一条
+        if ($ptsMs -ge ($lastMs + $granularityMs)) {
+            $entries.Add([pscustomobject]@{ ts = $ptsMs; off = $pktPos })
+            $lastMs = $ptsMs
+        }
+    }
+
+    if ($entries.Count -eq 0) {
+        Write-Warning "未提取到有效帧，跳过侧车索引。"
+        return
+    }
+
+    # 写入二进制索引文件
+    # Header: "FVIX"(4) + version(uint16=1) + granularity_ms(uint16) + entry_count(uint32)
+    # Entry:  timestamp_ms(uint32) + file_offset(uint32)
+    $fs = [System.IO.File]::Open($outPath, [System.IO.FileMode]::Create)
+    try {
+        $bw = New-Object System.IO.BinaryWriter($fs)
+        $bw.Write([byte[]][char[]]"FVIX")
+        $bw.Write([uint16]1)
+        $bw.Write([uint16]$granularityMs)
+        $bw.Write([uint32]$entries.Count)
+        foreach ($e in $entries) {
+            $bw.Write([uint32]$e.ts)
+            $bw.Write([uint32]$e.off)
+        }
+        $bw.Flush()
+    } finally {
+        $fs.Dispose()
+    }
+
+    Write-Host "侧车索引已生成: $outPath ($($entries.Count) 条, 粒度 $($granularityMs)ms)"
+}
+
 function Detect-Crop([string]$file, [string]$ffmpeg, [System.Windows.Forms.Label]$statusLabel) {
     $duration = Get-DurationSeconds $file $ffmpeg
     if ($duration -le 0) {
@@ -878,6 +942,12 @@ $btnConvert.Add_Click({
         }
 
         if ($p.ExitCode -eq 0 -and (Test-Path -LiteralPath $txtOutput.Text)) {
+            # 生成侧车索引(.fvix)，供设备端 seek 使用。失败不影响播放。
+            try {
+                New-SidecarIndex -aviPath $txtOutput.Text
+            } catch {
+                Write-Warning "侧车索引生成失败（不影响播放）：$($_.Exception.Message)"
+            }
             $lblStatus.Text = "转换完成：$($txtOutput.Text)"
             [System.Media.SystemSounds]::Asterisk.Play()
             [System.Windows.Forms.MessageBox]::Show("转换完成。`r`n`r`n$($txtOutput.Text)","完成")
