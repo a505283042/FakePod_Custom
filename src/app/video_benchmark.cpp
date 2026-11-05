@@ -1463,10 +1463,15 @@ esp_err_t seek(uint32_t target_ms)
         }
     }
 
-    // 4. 清空音频桥残留数据
+    // 4. 音频必须先暂停：否则 AudioTask 在桥被清空、Extract 已停的情况下会阻塞在
+    //    Source read 的空等循环里，VideoMp3Seek 命令要等到 1.5s 超时才可能执行，
+    //    新旧位置音频就会混播一段，听起来就是“咔咔”。
+    (void)audio_service_video_mp3_pause(true);
+
+    // 5. 清空音频桥残留数据
     avi_mp3_bridge_clear();
 
-    // 5. demuxer seek 到索引偏移，恢复绝对时间轴的帧/字节计数
+    // 6. demuxer seek 到索引偏移，恢复绝对时间轴的帧/字节计数
     // 音频字节按平均码率估算，使音频 PTS 与视频 PTS 在同一时间轴。
     uint32_t audio_bitrate = 0U;
     portENTER_CRITICAL(&g_mux);
@@ -1483,7 +1488,7 @@ esp_err_t seek(uint32_t target_ms)
         return ret;
     }
 
-    // 6. 用 demuxer 实际恢复的时间轴位置对齐音频时钟。
+    // 7. 用 demuxer 实际恢复的时间轴位置对齐音频时钟。
     //     必须以 next_video_pts_ms() 为准，而不是索引时间戳：两者可能差 1~2 帧，
     //     音频时钟只要和视频 PTS 不同轴，Presenter 就会把后续帧全部判为迟到。
     //     该调用在 AudioTask 内执行：静音→排空 DMA 旧 PCM→丢弃解码残留→淡入，避免 seek 爆音。
@@ -1501,7 +1506,7 @@ esp_err_t seek(uint32_t target_ms)
     g_snapshot.last_pts_ms = base_pts_ms;
     portEXIT_CRITICAL(&g_mux);
 
-    // 7. 重置 presentation clock，并递增 seek epoch 让 Presenter 重新锚定
+    // 8. 重置 presentation clock，并递增 seek epoch 让 Presenter 重新锚定
     portENTER_CRITICAL(&g_mux);
     g_presentation_clock = {};
     g_presentation_clock.generation = generation;
@@ -1509,7 +1514,9 @@ esp_err_t seek(uint32_t target_ms)
     ++g_seek_epoch;
     portEXIT_CRITICAL(&g_mux);
 
-    // 8. 恢复播放
+    // 9. 恢复播放：音频 seek 已在 AudioTask 内完成时钟对齐与淡入，先恢复音频再放开
+    //    视频管线，避免视频先跑、音频后追。
+    (void)audio_service_video_mp3_resume(true);
     set_paused(false);
     return ESP_OK;
 }

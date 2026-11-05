@@ -63,11 +63,16 @@ static size_t bridge_copy_out(void *buffer, size_t bytes)
     return copied;
 }
 
+// 单次 read 的最长空等窗口。以前这里无限等，桥被清空（seek/暂停）时 AudioTask 会一直
+// 卡在 Source read 里，命令队列得不到处理，seek 请求只能超时后再补执行，导致新旧位置音频混播。
+static constexpr uint32_t BRIDGE_READ_TIMEOUT_MS = 40U;
+
 static esp_err_t bridge_source_read(void *, void *buffer, size_t bytes, size_t *out_bytes)
 {
     if (buffer == nullptr || out_bytes == nullptr) return ESP_ERR_INVALID_ARG;
     *out_bytes = 0U;
 
+    const int64_t read_started_us = esp_timer_get_time();
     while (true) {
         const size_t copied = bridge_copy_out(buffer, bytes);
         if (copied != 0U) {
@@ -81,6 +86,15 @@ static esp_err_t bridge_source_read(void *, void *buffer, size_t bytes, size_t *
         if (!terminal) ++g_read_wait_count;
         portEXIT_CRITICAL(&g_bridge_mux);
         if (terminal) return ESP_OK;
+
+        const int64_t waited_ms_signed = (esp_timer_get_time() - read_started_us) / 1000;
+        if (waited_ms_signed >= static_cast<int64_t>(BRIDGE_READ_TIMEOUT_MS)) {
+            // 让 AudioTask 有机会回到命令循环处理 seek/pause 等请求。
+            portENTER_CRITICAL(&g_bridge_mux);
+            ++g_read_wait_timeout_count;
+            portEXIT_CRITICAL(&g_bridge_mux);
+            return ESP_ERR_TIMEOUT;
+        }
 
         if (g_data_event == nullptr) return ESP_ERR_INVALID_STATE;
         const int64_t wait_started_us = esp_timer_get_time();
@@ -96,7 +110,7 @@ static esp_err_t bridge_source_read(void *, void *buffer, size_t bytes, size_t *
         if (waited_us >= 1000U) ++g_read_wait_over_1ms;
         if (waited_us >= 5000U) ++g_read_wait_over_5ms;
         if (waited_us >= 10000U) ++g_read_wait_over_10ms;
-        if (signalled != pdTRUE) ++g_read_wait_timeout_count;
+        (void)signalled;
         portEXIT_CRITICAL(&g_bridge_mux);
     }
 }

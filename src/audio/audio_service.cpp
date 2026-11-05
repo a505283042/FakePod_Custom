@@ -3645,6 +3645,9 @@ static void audio_task_handle_video_mp3_pause(AudioRequest *request)
         return;
     }
     if (!g_video_mp3_paused) {
+        // 暂停后 Service 只写静音，所以先把波形数字淡出到 0 再冻结时钟，
+        // 否则静音接续点会在非零波形处硬切，听感就是一声“咔”。
+        (void)audio_task_fade_video_output_to_zero(g_video_mp3_sample_rate_hz);
         g_video_mp3_paused = true;
         ++g_video_clock_revision;
         if (g_video_clock_revision == 0U) ++g_video_clock_revision;
@@ -3788,6 +3791,17 @@ static void audio_task_service_video_mp3()
         AUDIO_STREAM_FRAMES,
         &frames);
     if (ret != ESP_OK) {
+        if (ret == ESP_ERR_TIMEOUT && g_video_mp3_decoder.streaming_source) {
+            // AVI Bridge 暂时没有新数据（seek 清桥、暂停等）：只维持静音，
+            // 让 AudioTask 尽快回到命令循环，不能当成播放故障关门。
+            audio_task_reset_video_last_pcm();
+            const esp_err_t silence_ret =
+                i2s_output_stream_write_silence(AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
+            if (silence_ret != ESP_OK) {
+                ESP_LOGE(TAG, "AVI MP3欠载静音维持失败：%s", esp_err_to_name(silence_ret));
+            }
+            return;
+        }
         ESP_LOGE(TAG, "AVI MP3读取PCM失败：%s；本段Video后续保持静音", esp_err_to_name(ret));
         audio_task_reset_video_last_pcm();
         (void)cs43131_set_pcm_mute(true);
