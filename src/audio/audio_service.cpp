@@ -72,6 +72,10 @@ static constexpr size_t AUDIO_MAX_PATH_SIZE = 4096;
 static constexpr size_t AUDIO_STREAM_FRAMES = 256;
 static constexpr uint32_t AUDIO_PCM_FADE_IN_MS = 30;
 static constexpr uint32_t AUDIO_PCM_FADE_OUT_MS = 10;
+// 视频 seek 的淡入更长：新位置首帧缺少 MP3 bit reservoir，解码残响要更长斜坡才压得住。
+static constexpr uint32_t AUDIO_VIDEO_SEEK_FADE_IN_MS = 60;
+// seek 后丢弃约 30ms（约一个 MPEG-1 帧）解码结果，避开 bit reservoir 缺失造成的脏首帧。
+static constexpr uint32_t AUDIO_VIDEO_SEEK_DISCARD_MS = 30;
 static constexpr uint8_t AUDIO_PCM_UNMUTE_PRIME_BLOCKS = 4;
 static constexpr uint32_t AUDIO_I2S_WRITE_TIMEOUT_MS = 100;
 static constexpr uint32_t AUDIO_PCM_MUTE_SETTLE_MS = 150;
@@ -245,6 +249,8 @@ static bool g_music_last_pcm_valid = false;
 static int32_t g_video_last_pcm_left = 0;
 static int32_t g_video_last_pcm_right = 0;
 static bool g_video_last_pcm_valid = false;
+// seek 后需要丢弃的 PCM 帧数：新位置首帧缺少 bit reservoir，解码结果是脏的。
+static uint32_t g_video_seek_discard_frames = 0U;
 
 static void audio_task_reset_music_last_pcm();
 
@@ -1108,13 +1114,16 @@ static void audio_task_reset_pcm_fade_in()
     g_pcm_fade_in_logged_done = true;
 }
 
-static void audio_task_begin_pcm_fade_in(const char *reason, uint32_t sample_rate_hz = 0U)
+static void audio_task_begin_pcm_fade_in(
+    const char *reason,
+    uint32_t sample_rate_hz = 0U,
+    uint32_t duration_ms = AUDIO_PCM_FADE_IN_MS)
 {
     const uint32_t sample_rate = sample_rate_hz > 0U
         ? sample_rate_hz
         : (g_task_sample_rate_hz > 0U ? g_task_sample_rate_hz : 48000U);
     g_pcm_fade_in_total_frames = static_cast<uint32_t>(
-        (static_cast<uint64_t>(sample_rate) * AUDIO_PCM_FADE_IN_MS + 999ULL) / 1000ULL
+        (static_cast<uint64_t>(sample_rate) * duration_ms + 999ULL) / 1000ULL
     );
     if (g_pcm_fade_in_total_frames == 0) {
         g_pcm_fade_in_total_frames = 1;
@@ -1124,7 +1133,7 @@ static void audio_task_begin_pcm_fade_in(const char *reason, uint32_t sample_rat
     AUDIO_POP_TRACE_LOG(
         "PCM_FADE_IN_BEGIN reason=%s duration=%lums frames=%lu",
         reason != nullptr ? reason : "unknown",
-        static_cast<unsigned long>(AUDIO_PCM_FADE_IN_MS),
+        static_cast<unsigned long>(duration_ms),
         static_cast<unsigned long>(g_pcm_fade_in_total_frames));
 }
 
@@ -3452,6 +3461,7 @@ static esp_err_t audio_task_stop_video_mp3_internal(bool restore_music_hardware,
     audio_task_video_mp3_close_decoder();
     const bool should_restore = restore_music_hardware && g_video_restore_paused_music_hardware;
     audio_task_reset_video_last_pcm();
+    g_video_seek_discard_frames = 0U;
     g_video_mp3_active = false;
     g_video_mp3_eof = false;
     g_video_mp3_start_released = true;
@@ -3596,8 +3606,9 @@ static void audio_task_handle_video_mp3_start(AudioRequest *request)
     if (g_video_clock_revision == 0U) ++g_video_clock_revision;
     g_video_mp3_active = true;
     g_video_mp3_start_released = !request->video_start_barrier_armed;
-    // 新一段视频音频从零开始，清掉上一段残留的最后样本。
+    // 新一段视频音频从零开始，清掉上一段残留的最后样本与 seek 丢弃计数。
     audio_task_reset_video_last_pcm();
+    g_video_seek_discard_frames = 0U;
     audio_task_publish_video_clock_snapshot();
     ESP_LOGI(TAG, "视频音频已%s：%luHz/%uch",
         g_video_mp3_start_released ? "启动" : "预备",
@@ -3671,20 +3682,13 @@ static void audio_task_handle_video_mp3_seek(AudioRequest *request)
         return;
     }
 
-    // 1. 先做数字淡出，把最后提交样本平滑收敛到 0，再硬件静音；
-    //    直接在非零波形处 mute，听感同样是一声“咔”。
+    // 1. 先做数字淡出，把最后提交样本平滑收敛到 0。
+    //    直接在非零波形处 mute 或切到静音，听感都是一声“咔”。
     (void)audio_task_fade_video_output_to_zero(g_video_mp3_sample_rate_hz);
 
-    // 2. 静音 DAC，把整条 DMA runway 用零数据顶出去。
-    //    否则旧位置的 PCM 会和新位置 PCM 硬拼接。
-    esp_err_t ret = cs43131_set_pcm_mute(true);
-    if (ret != ESP_OK) {
-        audio_request_complete(request, false, ret);
-        return;
-    }
-    g_pcm_unmute_pending = false;
-    audio_task_reset_pcm_fade_in();
-
+    // 2. 用零数据把整条 DMA runway 顶出去：先让淡出斜坡真正播完，
+    //    也让旧位置 PCM 全部离开 DMA，避免它和新位置 PCM 硬拼接。
+    esp_err_t ret = ESP_OK;
     if (g_pipeline_i2s_started && i2s_output_is_started()) {
         AudioRateProfile rate_profile = {};
         if (audio_rate_profile_get(g_video_mp3_sample_rate_hz, &rate_profile) &&
@@ -3699,11 +3703,20 @@ static void audio_task_handle_video_mp3_seek(AudioRequest *request)
         }
     }
 
-    // 3. 清掉解码器里旧位置残留的压缩/PCM 数据，避免用旧帧数据解新帧产生持续噪声。
+    // 3. 此刻 DMA 里只剩静音，再静音 DAC，切换本身不会被听见。
+    ret = cs43131_set_pcm_mute(true);
+    if (ret != ESP_OK) {
+        audio_request_complete(request, false, ret);
+        return;
+    }
+    g_pcm_unmute_pending = false;
+    audio_task_reset_pcm_fade_in();
+
+    // 4. 清掉解码器里旧位置残留的压缩/PCM 数据，避免用旧帧数据解新帧产生持续噪声。
     mp3_decoder_flush_stream(&g_video_mp3_decoder);
     g_video_mp3_eof = false;
 
-    // 4. 时钟对齐到 seek 位置（绝对时间轴）
+    // 5. 时钟对齐到 seek 位置（绝对时间轴）
     const uint64_t base_frames = static_cast<uint64_t>(request->video_seek_base_ms) *
         g_video_mp3_sample_rate_hz / 1000ULL;
     audio_playback_clock_seek(&g_video_playback_clock, base_frames);
@@ -3711,14 +3724,20 @@ static void audio_task_handle_video_mp3_seek(AudioRequest *request)
     if (g_video_clock_revision == 0U) ++g_video_clock_revision;
     audio_task_publish_video_clock_snapshot();
 
-    // 5. 新位置首块 PCM 到达时淡入并解除静音，把拼接点变成平滑斜坡。
-    audio_task_begin_pcm_fade_in("video_seek", g_video_mp3_sample_rate_hz);
+    // 6. 新位置首帧缺少 bit reservoir，解码结果是脏的：先丢弃约 25ms PCM，
+    //    再用更长的淡入接上，避免把脏波形直接送进 DAC。
+    g_video_seek_discard_frames = static_cast<uint32_t>(
+        (static_cast<uint64_t>(g_video_mp3_sample_rate_hz) * AUDIO_VIDEO_SEEK_DISCARD_MS + 999ULL) /
+        1000ULL);
+    audio_task_begin_pcm_fade_in(
+        "video_seek", g_video_mp3_sample_rate_hz, AUDIO_VIDEO_SEEK_FADE_IN_MS);
     g_pcm_unmute_pending = true;
 
-    ESP_LOGI(TAG, "视频音频seek：base=%lums frames=%llu 淡入=%lums",
+    ESP_LOGI(TAG, "视频音频seek：base=%lums frames=%llu 丢弃=%lu帧 淡入=%lums",
         static_cast<unsigned long>(request->video_seek_base_ms),
         static_cast<unsigned long long>(base_frames),
-        static_cast<unsigned long>(AUDIO_PCM_FADE_IN_MS));
+        static_cast<unsigned long>(g_video_seek_discard_frames),
+        static_cast<unsigned long>(AUDIO_VIDEO_SEEK_FADE_IN_MS));
     audio_request_complete(request, true, ESP_OK);
 }
 
@@ -3787,6 +3806,25 @@ static void audio_task_service_video_mp3()
                 static_cast<unsigned long long>(audio_playback_clock_position_ms(&g_video_playback_clock)));
         }
         return;
+    }
+
+    // seek 后先丢掉一小段脏 PCM：新位置首帧缺少 bit reservoir，解码结果不一定干净。
+    // 丢弃期间继续写静音，保持 I2S 时钟，且不推进音频时钟（后面会整体对齐）。
+    if (g_video_seek_discard_frames > 0U) {
+        const size_t skip = frames < g_video_seek_discard_frames
+            ? frames : static_cast<size_t>(g_video_seek_discard_frames);
+        g_video_seek_discard_frames -= static_cast<uint32_t>(skip);
+        if (skip >= frames) {
+            const esp_err_t silence_ret =
+                i2s_output_stream_write_silence(AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
+            if (silence_ret != ESP_OK) {
+                ESP_LOGE(TAG, "AVI MP3 seek丢弃期静音维持失败：%s", esp_err_to_name(silence_ret));
+            }
+            return;
+        }
+        const size_t remain = frames - skip;
+        memmove(g_pcm_block, g_pcm_block + skip * 2U, remain * 2U * sizeof(int32_t));
+        frames = remain;
     }
 
     audio_task_apply_pcm_fade_in(g_pcm_block, frames);

@@ -1366,6 +1366,29 @@ void mp3_decoder_flush_stream(Mp3Decoder *decoder)
     decoder->decoded_offset = 0;
     decoder->decoded_size = 0;
     decoder->eof = false;
+
+    // 只清缓冲还不够：MP3 codec 内部仍持有旧位置的 bit reservoir 与合成滤波器状态，
+    // 拿这些状态解新位置的帧会产生几十毫秒的噪声。关闭后在同一个 Source 上重建 codec。
+    if (decoder->simple_handle != nullptr) {
+        esp_audio_simple_dec_close(
+            static_cast<esp_audio_simple_dec_handle_t>(decoder->simple_handle));
+        decoder->simple_handle = nullptr;
+    }
+
+    esp_audio_simple_dec_cfg_t cfg = {};
+    cfg.dec_type = ESP_AUDIO_SIMPLE_DEC_TYPE_MP3;
+    cfg.dec_cfg = nullptr;
+    cfg.cfg_size = 0;
+    cfg.use_frame_dec = false;
+    esp_audio_simple_dec_handle_t handle = nullptr;
+    const esp_audio_err_t codec_ret = esp_audio_simple_dec_open(&cfg, &handle);
+    if (codec_ret != ESP_AUDIO_ERR_OK || handle == nullptr) {
+        ESP_LOGE(TAG, "MP3 flush 后重建 codec 失败：%d", static_cast<int>(codec_ret));
+        return;
+    }
+    decoder->simple_handle = handle;
+    // 输出格式在视频音频启动时已经确认，重建后沿用，避免首帧再走一次格式校验。
+    decoder->runtime_info_verified = true;
 }
 
 bool mp3_decoder_is_open(const Mp3Decoder *decoder)
