@@ -52,7 +52,9 @@ static constexpr uint32_t kDeadlineSafetyMaxUs = 12000U;
 static constexpr uint32_t kDecodeJitterReserveMaxUs = 10000U;
 static constexpr uint8_t kDecodeTimingEwmaShift = 3U; // alpha = 1/8
 static constexpr size_t kAudioBridgeBytes = 32U * 1024U;
-static constexpr size_t kAudioPrebufferBytes = 8U * 1024U;
+// 预缓冲阈值：4KB约等于128kbps MP3的250ms音频，足以防止启动欠载。
+// 注意：不能设太大，某些AVI的视频/音频交错间隔大，高帧率视频需要较长时间才能凑满音频数据。
+static constexpr size_t kAudioPrebufferBytes = 4U * 1024U;
 static constexpr uint32_t kAudioPrebufferTimeoutMs = 1500U;
 static constexpr uint32_t kAudioBridgePushTimeoutMs = 250U;
 
