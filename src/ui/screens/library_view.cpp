@@ -2344,8 +2344,11 @@ static void library_view_apply_list_layout()
             lv_obj_set_height(row.accent, accent_h);
         }
         if (row.label != nullptr) {
-            lv_obj_set_pos(row.label, 18, (row_h - (g_search.active ? 30 : 32)) / 2);
-            lv_obj_set_height(row.label, g_search.active ? 30 : 32);
+            const lv_font_t *ui_font = font_manager_get_ui_font();
+            const int32_t font_line_h = ui_font != nullptr ? static_cast<int32_t>(ui_font->line_height) : 32;
+            const int32_t label_h = font_line_h > 32 ? font_line_h : 32;
+            lv_obj_set_pos(row.label, 18, (row_h - label_h) / 2);
+            lv_obj_set_height(row.label, label_h);
         }
         if (row.arrow != nullptr) {
             lv_obj_align(row.arrow, LV_ALIGN_RIGHT_MID, -16, 0);
@@ -2443,7 +2446,10 @@ static void library_search_keyboard_cb(uint8_t key_index, void *user_data)
 static void library_view_set_row_text(LibraryVirtualRow &row, const char *primary, const char *secondary)
 {
     const char *safe_primary = primary != nullptr && primary[0] != '\0' ? primary : "未知";
-    const int32_t text_h = g_search.active ? 30 : 32;
+    // 用字体实际行高作为label高度，避免LV_LABEL_LONG_SCROLL因垂直溢出而向上滚动。
+    const lv_font_t *ui_font = font_manager_get_ui_font();
+    const int32_t font_line_h = ui_font != nullptr ? static_cast<int32_t>(ui_font->line_height) : 32;
+    const int32_t text_h = font_line_h > 32 ? font_line_h : 32;
     lv_obj_set_y(row.label, (library_view_row_h() - text_h) / 2);
     lv_obj_set_height(row.label, text_h);
     if (row.meta != nullptr) {
@@ -2461,7 +2467,10 @@ static void library_view_set_folder_row_text(
 {
     const char *safe_name = name != nullptr && name[0] != '\0' ? name : "未知";
     lv_label_set_text(row.label, safe_name);
-    const int32_t text_h = g_search.active ? 30 : 32;
+    // 用字体实际行高作为label高度，避免LV_LABEL_LONG_SCROLL因垂直溢出而向上滚动。
+    const lv_font_t *ui_font = font_manager_get_ui_font();
+    const int32_t font_line_h = ui_font != nullptr ? static_cast<int32_t>(ui_font->line_height) : 32;
+    const int32_t text_h = font_line_h > 32 ? font_line_h : 32;
     lv_obj_set_y(row.label, (library_view_row_h() - text_h) / 2);
     lv_obj_set_height(row.label, text_h);
     lv_obj_set_width(row.label, LIBRARY_ROW_W - 146);
