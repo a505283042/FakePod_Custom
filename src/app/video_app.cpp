@@ -1515,7 +1515,7 @@ static void benchmark_seek_by(int32_t delta_ms)
     }
 }
 
-// 播放页左右滑：按滑动距离映射目标时间，约 10px = 1s（向左为快进，向右为后退）。
+// 播放页左右滑：按滑动距离映射目标时间，约 10px = 1s（向右为快进，向左为后退）。
 // 抬手后一次执行，避免拖动过程中连续 seek。
 // 双击切换暂停/继续：视频 pipeline 与视频 MP3 音频必须一起停/一起走，
 // 否则暂停时画面静止但声音继续，恢复后音画不同轴。
@@ -1540,7 +1540,8 @@ static void benchmark_seek_by_swipe()
     int16_t dx = 0;
     int16_t dy = 0;
     if (!gesture_router_last_displacement(&dx, &dy)) return;
-    benchmark_seek_by(-static_cast<int32_t>(dx) * 100);
+    // 与主流播放器一致：右滑（dx>0）快进，左滑（dx<0）后退。
+    benchmark_seek_by(static_cast<int32_t>(dx) * 100);
 }
 
 // 拖动中的 seek 实时预览：每 tick 把“当前位移 + 起点时间”换成目标时间，刷新同一个浮层。
@@ -1583,7 +1584,8 @@ static void benchmark_seek_preview_tick()
         g_seek_preview_active = false;
         return;
     }
-    int64_t target = static_cast<int64_t>(g_seek_preview_base_ms) -
+    // 与抬手后的 seek 保持同一方向：右滑前进、左滑后退。
+    int64_t target = static_cast<int64_t>(g_seek_preview_base_ms) +
         static_cast<int64_t>(dx) * 100;
     if (target < 0) target = 0;
     if (snapshot.duration_ms > 0U && target > static_cast<int64_t>(snapshot.duration_ms)) {
