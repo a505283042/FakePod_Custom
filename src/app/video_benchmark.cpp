@@ -1488,6 +1488,16 @@ esp_err_t seek(uint32_t target_ms)
         return ret;
     }
 
+    // 6.5 索引粒度为 2 秒，索引落点未必等于目标时间；顺序扫描丢弃 PTS 早于目标的视频帧，
+    //     精确定位到目标帧。跳过的音频 chunk 只累加字节计数，保持音视频同一时间轴。
+    const esp_err_t scan_ret = AviDemuxer::scan_forward_to(target_ms);
+    if (scan_ret != ESP_OK && scan_ret != AviDemuxer::kErrEof) {
+        ESP_LOGE(TAG, "Demuxer精确定位失败: target=%ums ret=%s",
+            static_cast<unsigned>(target_ms), esp_err_to_name(scan_ret));
+        set_paused(false);
+        return scan_ret;
+    }
+
     // 7. 用 demuxer 实际恢复的时间轴位置对齐音频时钟。
     //     必须以 next_video_pts_ms() 为准，而不是索引时间戳：两者可能差 1~2 帧，
     //     音频时钟只要和视频 PTS 不同轴，Presenter 就会把后续帧全部判为迟到。

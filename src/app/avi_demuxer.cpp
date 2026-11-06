@@ -344,6 +344,80 @@ esp_err_t seek_to_offset(uint32_t file_offset, uint32_t video_pts_ms, uint32_t a
     return ESP_OK;
 }
 
+esp_err_t scan_forward_to(uint32_t target_ms) {
+    if (s_io == nullptr) return ESP_ERR_INVALID_STATE;
+    if (s_info.fps_x100 == 0U) return ESP_OK;
+
+    uint32_t last_video_offset = 0U;
+    uint32_t last_video_index = 0U;
+    bool have_last = false;
+    uint32_t skipped = 0U;
+
+    while (s_current_offset + 8 <= s_movi_data_end) {
+        const uint32_t chunk_offset = s_current_offset;
+        uint8_t hdr[8];
+        if (read_at(s_current_offset, hdr, 8) != ESP_OK) return ESP_FAIL;
+        const uint32_t chunk_size = read_u32(hdr + 4);
+
+        if (chunk_size == 0U) {
+            // 与 read_frame 一致：占位视频帧占用帧序号，但不参与定位。
+            if (match_fcc(hdr, "00dc") || match_fcc(hdr, "00db")) {
+                ++s_video_frame_index;
+            }
+            continue;
+        }
+
+        if (match_fcc(hdr, "00dc") || match_fcc(hdr, "00db")) {
+            const uint32_t pts_ms = static_cast<uint32_t>(
+                static_cast<uint64_t>(s_video_frame_index) * 100000ULL / s_info.fps_x100);
+            if (pts_ms >= target_ms) {
+                // 回退到 chunk 头，后续 read_frame 会从这里取出该帧。
+                s_current_offset = chunk_offset;
+                ESP_LOGI(TAG, "seek精确定位: target=%lums frame_index=%lu pts=%lums skipped=%lu",
+                    static_cast<unsigned long>(target_ms),
+                    static_cast<unsigned long>(s_video_frame_index),
+                    static_cast<unsigned long>(pts_ms),
+                    static_cast<unsigned long>(skipped));
+                return ESP_OK;
+            }
+            last_video_offset = chunk_offset;
+            last_video_index = s_video_frame_index;
+            have_last = true;
+            ++s_video_frame_index;
+            ++skipped;
+            s_current_offset = chunk_offset + 8U + chunk_size + (chunk_size & 1U);
+            continue;
+        }
+
+        if (match_fcc(hdr, "01wb") || match_fcc(hdr, "00wb")) {
+            // 跳过的音频帧仍累加字节数，保持音频 PTS 与视频同一时间轴。
+            s_audio_bytes_total += chunk_size;
+            s_current_offset = chunk_offset + 8U + chunk_size + (chunk_size & 1U);
+            continue;
+        }
+
+        if (match_fcc(hdr, "LIST")) {
+            s_current_offset += 4U;
+            continue;
+        }
+
+        s_current_offset = chunk_offset + 8U + chunk_size + (chunk_size & 1U);
+    }
+
+    if (have_last) {
+        // 目标超出最后一个可解码帧：停在最后一帧，避免 seek 到末尾直接触发 EOF 切换视频。
+        s_current_offset = last_video_offset;
+        s_video_frame_index = last_video_index;
+        ESP_LOGW(TAG, "seek目标超出末尾，回退到最后一帧: frame_index=%lu",
+            static_cast<unsigned long>(last_video_index));
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG, "seek扫描未找到可解码视频帧: target=%lums",
+        static_cast<unsigned long>(target_ms));
+    return kErrEof;
+}
+
 uint32_t next_video_pts_ms()
 {
     if (s_info.fps_x100 == 0U) return 0U;

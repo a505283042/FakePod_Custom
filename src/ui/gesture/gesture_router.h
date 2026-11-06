@@ -58,6 +58,14 @@ bool gesture_router_press_was_tap(int16_t max_move_px);
 bool gesture_router_press_started_in_rect(
     int16_t left, int16_t top, int16_t right, int16_t bottom);
 
+// 返回最近一次触摸的最终位移（相对按下起点）。播放页用它把滑动距离映射成 seek 目标。
+// 新一轮按下后刷新；同一次动作在 take_action() 消费时读取有效。
+bool gesture_router_last_displacement(int16_t *out_dx, int16_t *out_dy);
+
+// 播放页 seek 实时预览：返回触摸是否仍在按下拖动中（未抬手、未被控件捕获、未进入纵向调节），
+// 以及相对按下起点的实时位移。只用于拖动过程的预览，最终动作仍由 take_action() 在抬手后给出。
+bool gesture_router_current_drag(int16_t *out_dx, int16_t *out_dy);
+
 // latest-wins 单槽动作。调用方应在 LVGL task/timer 上下文消费。
 bool gesture_router_take_action(UiGestureAction *out_action);
 

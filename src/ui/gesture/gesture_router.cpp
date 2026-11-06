@@ -324,6 +324,30 @@ bool gesture_router_press_started_in_rect(
         g_state.start_y >= top && g_state.start_y <= bottom;
 }
 
+bool gesture_router_last_displacement(int16_t *out_dx, int16_t *out_dy)
+{
+    if (out_dx == nullptr || out_dy == nullptr || !g_state.press_origin_valid) {
+        return false;
+    }
+    *out_dx = static_cast<int16_t>(static_cast<int32_t>(g_state.last_x) - g_state.start_x);
+    *out_dy = static_cast<int16_t>(static_cast<int32_t>(g_state.last_y) - g_state.start_y);
+    return true;
+}
+
+bool gesture_router_current_drag(int16_t *out_dx, int16_t *out_dy)
+{
+    if (!g_state.pressed || g_state.control_capture || g_state.vertical_adjust_active) {
+        return false;
+    }
+    if (out_dx != nullptr) {
+        *out_dx = static_cast<int16_t>(static_cast<int32_t>(g_state.last_x) - g_state.start_x);
+    }
+    if (out_dy != nullptr) {
+        *out_dy = static_cast<int16_t>(static_cast<int32_t>(g_state.last_y) - g_state.start_y);
+    }
+    return true;
+}
+
 bool gesture_router_take_action(UiGestureAction *out_action)
 {
     if (out_action == nullptr || g_state.pending == UiGestureAction::None) {

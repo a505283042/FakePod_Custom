@@ -712,6 +712,191 @@ static bool benchmark_presenter_wait_stopped(uint32_t timeout_ms)
     return true;
 }
 
+// SEEK 完成后的短暂浮层：底部进度条 + “当前时间 / 总时长”，显示 2 秒后自动消失。
+// 浮层直接叠加在 Presenter 合成的 RGB565 帧上，不暂停推流、不影响音频管线。
+static constexpr int64_t kSeekOverlayHoldUs = 2000000LL;
+static constexpr uint16_t kSeekOverlayMarginX = 40U;
+static constexpr uint16_t kSeekOverlayPanelHeight = 48U;
+static constexpr uint16_t kSeekOverlayBottomGap = 18U;
+static constexpr uint16_t kSeekOverlayGlyphScale = 3U;
+
+struct SeekOverlayState
+{
+    bool active = false;
+    int64_t until_us = 0LL;
+    uint32_t target_ms = 0U;
+    uint32_t duration_ms = 0U;
+};
+
+static SeekOverlayState g_seek_overlay = {};
+static portMUX_TYPE g_seek_overlay_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void benchmark_seek_overlay_show(
+    uint32_t target_ms,
+    uint32_t duration_ms,
+    int64_t hold_us = kSeekOverlayHoldUs)
+{
+    portENTER_CRITICAL(&g_seek_overlay_mux);
+    g_seek_overlay.active = true;
+    g_seek_overlay.until_us = esp_timer_get_time() + hold_us;
+    g_seek_overlay.target_ms = target_ms;
+    g_seek_overlay.duration_ms = duration_ms;
+    portEXIT_CRITICAL(&g_seek_overlay_mux);
+}
+
+// Presenter 每帧取一次快照；超过 2 秒自动失效，不需要额外的 UI 定时器。
+static bool benchmark_seek_overlay_snapshot(uint32_t *out_target_ms, uint32_t *out_duration_ms)
+{
+    bool active = false;
+    const int64_t now_us = esp_timer_get_time();
+    portENTER_CRITICAL(&g_seek_overlay_mux);
+    if (g_seek_overlay.active) {
+        if (now_us >= g_seek_overlay.until_us) {
+            g_seek_overlay.active = false;
+        } else {
+            active = true;
+            if (out_target_ms != nullptr) *out_target_ms = g_seek_overlay.target_ms;
+            if (out_duration_ms != nullptr) *out_duration_ms = g_seek_overlay.duration_ms;
+        }
+    }
+    portEXIT_CRITICAL(&g_seek_overlay_mux);
+    return active;
+}
+
+// 3x5 点阵数字，bit2=最左列。只覆盖时间显示需要的字符。
+static const uint8_t kSeekGlyphDigits[10][5] = {
+    {0x7, 0x5, 0x5, 0x5, 0x7}, // 0
+    {0x2, 0x6, 0x2, 0x2, 0x7}, // 1
+    {0x7, 0x1, 0x7, 0x4, 0x7}, // 2
+    {0x7, 0x1, 0x7, 0x1, 0x7}, // 3
+    {0x5, 0x5, 0x7, 0x1, 0x1}, // 4
+    {0x7, 0x4, 0x7, 0x1, 0x7}, // 5
+    {0x7, 0x4, 0x7, 0x5, 0x7}, // 6
+    {0x7, 0x1, 0x1, 0x1, 0x1}, // 7
+    {0x7, 0x5, 0x7, 0x5, 0x7}, // 8
+    {0x7, 0x5, 0x7, 0x1, 0x7}, // 9
+};
+static const uint8_t kSeekGlyphColon[5] = {0x0, 0x2, 0x0, 0x2, 0x0};
+static const uint8_t kSeekGlyphSlash[5] = {0x1, 0x1, 0x2, 0x4, 0x4};
+
+static const uint8_t *benchmark_seek_glyph(char c)
+{
+    if (c >= '0' && c <= '9') return kSeekGlyphDigits[c - '0'];
+    if (c == ':') return kSeekGlyphColon;
+    if (c == '/') return kSeekGlyphSlash;
+    return nullptr; // 空格等不绘制
+}
+
+// dst 与 rgb565_be 同字节序（大端），这里按大端读写像素。
+static inline void benchmark_seek_put_be(uint8_t *row, uint16_t x, uint16_t rgb565)
+{
+    row[x * 2U] = static_cast<uint8_t>((rgb565 >> 8) & 0xFFU);
+    row[x * 2U + 1U] = static_cast<uint8_t>(rgb565 & 0xFFU);
+}
+
+static inline uint16_t benchmark_seek_get_be(const uint8_t *row, uint16_t x)
+{
+    return static_cast<uint16_t>((static_cast<uint16_t>(row[x * 2U]) << 8) |
+        static_cast<uint16_t>(row[x * 2U + 1U]));
+}
+
+// 底衬暗化：R/G/B 各取半，近似半透明黑色遮罩。
+static inline uint16_t benchmark_seek_dim(uint16_t rgb565)
+{
+    const uint16_t r = static_cast<uint16_t>(((rgb565 >> 11) & 0x1FU) >> 1);
+    const uint16_t g = static_cast<uint16_t>(((rgb565 >> 5) & 0x3FU) >> 1);
+    const uint16_t b = static_cast<uint16_t>((rgb565 & 0x1FU) >> 1);
+    return static_cast<uint16_t>((r << 11) | (g << 5) | b);
+}
+
+static void benchmark_seek_overlay_draw(
+    uint8_t *dst,
+    uint16_t strip_y,
+    uint16_t rows,
+    uint16_t width,
+    uint16_t height,
+    uint32_t target_ms,
+    uint32_t duration_ms)
+{
+    if (dst == nullptr || rows == 0U || width == 0U) return;
+    if (width < kSeekOverlayMarginX * 2U + 8U) return;
+    if (height < kSeekOverlayPanelHeight + 4U) return;
+
+    const uint16_t panel_left = kSeekOverlayMarginX;
+    const uint16_t panel_right = static_cast<uint16_t>(width - kSeekOverlayMarginX);
+    const uint16_t panel_bottom = static_cast<uint16_t>(height - kSeekOverlayBottomGap);
+    const uint16_t panel_top = static_cast<uint16_t>(panel_bottom - kSeekOverlayPanelHeight);
+    if (strip_y + rows <= panel_top || strip_y >= panel_bottom) return;
+
+    char text[32] = {};
+    const uint32_t target_s = target_ms / 1000U;
+    if (duration_ms > 0U) {
+        const uint32_t duration_s = duration_ms / 1000U;
+        snprintf(text, sizeof(text), "%u:%02u / %u:%02u",
+            static_cast<unsigned>(target_s / 60U), static_cast<unsigned>(target_s % 60U),
+            static_cast<unsigned>(duration_s / 60U), static_cast<unsigned>(duration_s % 60U));
+    } else {
+        snprintf(text, sizeof(text), "%u:%02u",
+            static_cast<unsigned>(target_s / 60U), static_cast<unsigned>(target_s % 60U));
+    }
+
+    const uint16_t glyph_width = 3U * kSeekOverlayGlyphScale;
+    const uint16_t glyph_height = 5U * kSeekOverlayGlyphScale;
+    const uint16_t advance = glyph_width + kSeekOverlayGlyphScale;
+    const uint16_t text_width = static_cast<uint16_t>(
+        strlen(text) * static_cast<size_t>(advance));
+    const uint16_t panel_width = static_cast<uint16_t>(panel_right - panel_left);
+    uint16_t text_left = panel_left;
+    if (text_width < panel_width) {
+        text_left = static_cast<uint16_t>(panel_left + (panel_width - text_width) / 2U);
+    }
+    const uint16_t text_top = static_cast<uint16_t>(panel_top + 6U);
+    const uint16_t bar_top = static_cast<uint16_t>(panel_bottom - 12U);
+    const uint16_t bar_bottom = static_cast<uint16_t>(panel_bottom - 6U);
+
+    uint32_t percent = 0U;
+    if (duration_ms > 0U) {
+        percent = static_cast<uint32_t>(
+            static_cast<uint64_t>(target_ms) * 100ULL / duration_ms);
+        if (percent > 100U) percent = 100U;
+    }
+    const uint16_t progress_x = static_cast<uint16_t>(
+        panel_left + static_cast<uint32_t>(panel_width) * percent / 100U);
+
+    const size_t text_len = strlen(text);
+    for (uint16_t r = 0; r < rows; ++r) {
+        const uint16_t y = static_cast<uint16_t>(strip_y + r);
+        if (y < panel_top || y >= panel_bottom) continue;
+        uint8_t *row = dst + static_cast<size_t>(r) * width * 2U;
+
+        for (uint16_t x = panel_left; x < panel_right; ++x) {
+            benchmark_seek_put_be(row, x, benchmark_seek_dim(benchmark_seek_get_be(row, x)));
+        }
+
+        if (y >= bar_top && y < bar_bottom) {
+            for (uint16_t x = panel_left; x < panel_right; ++x) {
+                benchmark_seek_put_be(row, x, x < progress_x ? 0xFFFFU : 0x4208U);
+            }
+        }
+
+        if (y >= text_top && y < text_top + glyph_height) {
+            const uint16_t dot_row = static_cast<uint16_t>((y - text_top) / kSeekOverlayGlyphScale);
+            for (size_t i = 0; i < text_len; ++i) {
+                const uint8_t *glyph = benchmark_seek_glyph(text[i]);
+                if (glyph == nullptr) continue;
+                const uint16_t glyph_left = static_cast<uint16_t>(text_left + i * advance);
+                for (uint16_t col = 0; col < glyph_width; ++col) {
+                    const uint16_t dot_col = static_cast<uint16_t>(col / kSeekOverlayGlyphScale);
+                    if ((glyph[dot_row] & (0x04U >> dot_col)) == 0U) continue;
+                    const uint16_t x = static_cast<uint16_t>(glyph_left + col);
+                    if (x < panel_left || x >= panel_right) continue;
+                    benchmark_seek_put_be(row, x, 0xFFFFU);
+                }
+            }
+        }
+    }
+}
+
 static esp_err_t benchmark_black_strip_producer(
     void *context,
     uint16_t source_y,
@@ -737,6 +922,10 @@ struct BenchmarkFrameStripContext
     uint16_t height = 0U;
     uint32_t phase_delay_us = 0U;
     bool phase_applied = false;
+    // SEEK 完成后的短暂浮层（2 秒），由 Presenter 每帧快照，直接叠加到推流缓冲。
+    bool overlay_active = false;
+    uint32_t overlay_target_ms = 0U;
+    uint32_t overlay_duration_ms = 0U;
 };
 
 static uint32_t benchmark_scan_phase_delay_us(uint16_t frame_y)
@@ -776,6 +965,12 @@ static esp_err_t benchmark_frame_strip_producer(
     const uint8_t *src = frame->rgb565_be +
         static_cast<size_t>(source_y) * static_cast<size_t>(width) * 2U;
     memcpy(dst_rgb565, src, required);
+
+    if (frame->overlay_active) {
+        benchmark_seek_overlay_draw(
+            dst_rgb565, source_y, rows, frame->width, frame->height,
+            frame->overlay_target_ms, frame->overlay_duration_ms);
+    }
     return ESP_OK;
 }
 
@@ -1138,6 +1333,9 @@ static void benchmark_presenter_task(void *arg)
         strip_context.width = frame_width;
         strip_context.height = frame_height;
         strip_context.phase_delay_us = scan_phase_delay_us;
+        // seek 浮层只在完成后显示 2 秒；每帧取一次快照，过期自动失效。
+        strip_context.overlay_active =
+            benchmark_seek_overlay_snapshot(&strip_context.overlay_target_ms, &strip_context.overlay_duration_ms);
 
         int64_t present_start_master_late_us = 0LL;
         bool present_start_master_valid = false;
@@ -1280,7 +1478,70 @@ static void benchmark_seek_by(int32_t delta_ms)
     } else {
         ESP_LOGI(TAG, "Seek: delta=%dms target=%lums",
             delta_ms, static_cast<unsigned long>(target));
+        // 抬手后 seek 已完成，显示 2 秒进度条 + 时间浮层（叠加在视频帧上）。
+        benchmark_seek_overlay_show(
+            static_cast<uint32_t>(target), snapshot.duration_ms);
     }
+}
+
+// 播放页左右滑：按滑动距离映射目标时间，约 10px = 1s（向左为快进，向右为后退）。
+// 抬手后一次执行，避免拖动过程中连续 seek。
+static void benchmark_seek_by_swipe()
+{
+    int16_t dx = 0;
+    int16_t dy = 0;
+    if (!gesture_router_last_displacement(&dx, &dy)) return;
+    benchmark_seek_by(-static_cast<int32_t>(dx) * 100);
+}
+
+// 拖动中的 seek 实时预览：每 tick 把“当前位移 + 起点时间”换成目标时间，刷新同一个浮层。
+// 只是显示，不执行 seek；抬手后由 benchmark_seek_by_swipe() 真正跳转并显示 2 秒结果浮层。
+static constexpr int32_t kSeekPreviewStartPx = 18;
+static constexpr int64_t kSeekPreviewHoldUs = 250000LL;
+static bool g_seek_preview_active = false;
+static uint32_t g_seek_preview_base_ms = 0U;
+
+static void benchmark_seek_preview_tick()
+{
+    if (g_page != VideoPage::Benchmark || g_risk_prompt_active ||
+        !VideoBenchmark::can_seek()) {
+        g_seek_preview_active = false;
+        return;
+    }
+
+    int16_t dx = 0;
+    int16_t dy = 0;
+    if (!gesture_router_current_drag(&dx, &dy)) {
+        // 抬手：保留最后一帧预览 250ms，随后由 seek 结果浮层接管。
+        g_seek_preview_active = false;
+        return;
+    }
+
+    const int32_t adx = dx < 0 ? -dx : dx;
+    const int32_t ady = dy < 0 ? -dy : dy;
+    if (!g_seek_preview_active) {
+        // 只对明确的水平拖动预览；纵向留给“下滑返回列表”。
+        if (adx < kSeekPreviewStartPx || adx <= ady) return;
+        VideoBenchmark::Snapshot snapshot = {};
+        if (!VideoBenchmark::get_snapshot(&snapshot)) return;
+        if (snapshot.state != VideoBenchmark::State::Running) return;
+        g_seek_preview_active = true;
+        g_seek_preview_base_ms = snapshot.last_pts_ms;
+    }
+
+    VideoBenchmark::Snapshot snapshot = {};
+    if (!VideoBenchmark::get_snapshot(&snapshot)) {
+        g_seek_preview_active = false;
+        return;
+    }
+    int64_t target = static_cast<int64_t>(g_seek_preview_base_ms) -
+        static_cast<int64_t>(dx) * 100;
+    if (target < 0) target = 0;
+    if (snapshot.duration_ms > 0U && target > static_cast<int64_t>(snapshot.duration_ms)) {
+        target = snapshot.duration_ms;
+    }
+    benchmark_seek_overlay_show(
+        static_cast<uint32_t>(target), snapshot.duration_ms, kSeekPreviewHoldUs);
 }
 
 static bool benchmark_request_stop(const char *reason)
@@ -1950,6 +2211,7 @@ static void timer_cb(lv_timer_t *timer)
     browser_load_tick();
     profile_probe_tick();
     benchmark_tick();
+    benchmark_seek_preview_tick();
 
     UiGestureAction action = UiGestureAction::None;
     if (!gesture_router_take_action(&action)) return;
@@ -1959,19 +2221,15 @@ static void timer_cb(lv_timer_t *timer)
     }
     switch (action) {
         case UiGestureAction::SwipeLeft:
-            // 视频播放中左滑 = 快进 10 秒
-            if (g_page == VideoPage::Benchmark && !g_risk_prompt_active) {
-                benchmark_seek_by(+10000);
+            // 视频播放中左滑 = 按距离快进
+            if (g_page == VideoPage::Benchmark) {
+                if (!g_risk_prompt_active) benchmark_seek_by_swipe();
             }
             break;
         case UiGestureAction::SwipeRight:
-            // 视频播放中：右滑 = 后退 10 秒；从屏幕最右 100px 起手的右滑 = 返回列表
-            if (g_page == VideoPage::Benchmark && !g_risk_prompt_active) {
-                if (gesture_router_press_started_in_rect(360, 0, 460, 460)) {
-                    go_back();
-                } else {
-                    benchmark_seek_by(-10000);
-                }
+            // 视频播放中右滑 = 按距离后退；播放页返回列表改由下滑完成
+            if (g_page == VideoPage::Benchmark) {
+                if (!g_risk_prompt_active) benchmark_seek_by_swipe();
             } else {
                 go_back();
             }
@@ -1980,7 +2238,16 @@ static void timer_cb(lv_timer_t *timer)
             if (g_page == VideoPage::Browser) shift_window(+1);
             break;
         case UiGestureAction::SwipeDownTrack:
-            if (g_page == VideoPage::Browser) shift_window(-1);
+            // 视频播放中下滑 = 返回视频列表；列表页仍用于向上翻页
+            if (g_page == VideoPage::Benchmark) {
+                if (!g_risk_prompt_active) go_back();
+            } else {
+                shift_window(-1);
+            }
+            break;
+        case UiGestureAction::PullDownFromTop:
+            // 从顶部 42px 内起手的下滑同样是“下滑返回”，避免顶部区域手势失效
+            if (g_page == VideoPage::Benchmark && !g_risk_prompt_active) go_back();
             break;
         case UiGestureAction::PullUpFromBottom:
             if (g_page == VideoPage::Browser) show_launcher();

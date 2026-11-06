@@ -54,6 +54,11 @@ esp_err_t read_frame(FrameInfo *frame, uint8_t *data, uint32_t capacity);
 // 用于侧车索引定位后的跳转。
 esp_err_t seek_to_offset(uint32_t file_offset, uint32_t video_pts_ms, uint32_t audio_bytes_at_seek);
 
+// 从当前偏移顺序扫描，丢弃 PTS 早于 target_ms 的视频帧（只读 chunk 头，不读取帧数据），
+// 停在目标帧的 chunk 头，使随后的 read_frame() 直接返回该帧。
+// 目标超出最后一个可解码帧时回退到最后一帧并返回 ESP_OK；无任何视频帧时返回 kErrEof。
+esp_err_t scan_forward_to(uint32_t target_ms);
+
 // 返回下一个视频帧的时间戳（ms）。seek 之后用于让音频时钟与其严格同轴。
 uint32_t next_video_pts_ms();
 
