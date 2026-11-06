@@ -283,6 +283,8 @@ $ffmpeg = Find-Tool "ffmpeg"
 
 # 当前输入视频时长（秒），选择文件时探测，用于片尾裁剪计算 -t。
 $script:g_input_duration = 0
+# 批量模式：一次可多选输入视频；g_inputs 保存选中的完整列表。
+$script:g_inputs = @()
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "FFmpeg MJPEG 视频转换器"
@@ -799,14 +801,16 @@ $lblTools.Size = New-Object System.Drawing.Size(100,28)
 $lblTools.TextAlign = "MiddleRight"
 $form.Controls.Add($lblTools)
 
-function Update-CommandPreview {
-    if ([string]::IsNullOrWhiteSpace($txtInput.Text) -or [string]::IsNullOrWhiteSpace($txtOutput.Text)) {
-        $txtCommand.Text = "选择输入视频后，这里会显示实际 FFmpeg 命令。"
-        return
-    }
+# 批量模式默认输出名：与单文件默认命名一致，放在源文件同目录。
+function Get-DefaultOutputPath([string]$inputPath) {
+    $dir = [System.IO.Path]::GetDirectoryName($inputPath)
+    $name = [System.IO.Path]::GetFileNameWithoutExtension($inputPath)
+    return [System.IO.Path]::Combine($dir, "${name}_460_$([int]$numFps.Value)fps_MJPEG.avi")
+}
 
+# 视频滤镜链：黑边裁切（可选）→ 方形/等比缩放 → 帧率。
+function Build-VideoFilterChain {
     $filters = New-Object System.Collections.Generic.List[string]
-    # 黑边裁切（可选）始终在最前，方形裁切叠加在其后。
     if ($chkCrop.Checked -and -not [string]::IsNullOrWhiteSpace($txtCrop.Text)) {
         $cropText = $txtCrop.Text.Trim()
         if ($cropText.StartsWith("crop=")) { $cropText = $cropText.Substring(5) }
@@ -821,7 +825,65 @@ function Update-CommandPreview {
         [void]$filters.Add("scale='if(gt(iw,ih),$([int]$numWidth.Value),-2)':'if(gt(iw,ih),-2,$([int]$numWidth.Value))'")
     }
     [void]$filters.Add("fps=$([int]$numFps.Value)")
-    $vf = ($filters -join ",")
+    return ($filters -join ",")
+}
+
+# 组装单个文件的完整 ffmpeg 参数串（含片头/片尾裁剪）。
+# 片尾裁剪需要该文件自身时长；裁剪后剩余时长无效时返回 $null。
+function Build-FfmpegArguments([string]$inPath, [string]$outPath) {
+    $vf = Build-VideoFilterChain
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $startTrim = [double]$numTrimStart.Value
+    $endTrim = [double]$numTrimEnd.Value
+    $argList = New-Object System.Collections.Generic.List[string]
+    [void]$argList.Add("-y")
+    if ($startTrim -gt 0) {
+        [void]$argList.Add("-ss")
+        [void]$argList.Add($startTrim.ToString("0.###", $inv))
+    }
+    [void]$argList.Add("-i")
+    [void]$argList.Add((Quote-Arg $inPath))
+    if ($endTrim -gt 0) {
+        $dur = Get-DurationSeconds $inPath $ffmpeg
+        $remain = $dur - $startTrim - $endTrim
+        if ($dur -le 0 -or $remain -le 0) { return $null }
+        [void]$argList.Add("-t")
+        [void]$argList.Add($remain.ToString("0.###", $inv))
+    }
+    [void]$argList.Add("-vf")
+    [void]$argList.Add((Quote-Arg $vf))
+    [void]$argList.Add("-c:v")
+    [void]$argList.Add("mjpeg")
+    [void]$argList.Add("-q:v")
+    [void]$argList.Add("$([int]$numQ.Value)")
+    if ($chkYuv420.Checked) {
+        [void]$argList.Add("-pix_fmt")
+        [void]$argList.Add("yuvj420p")
+    }
+    [void]$argList.Add("-c:a")
+    [void]$argList.Add("libmp3lame")
+    [void]$argList.Add("-b:a")
+    [void]$argList.Add("$($cmbBitrate.SelectedItem)")
+    if ($cmbRate.SelectedItem -ne "保持默认") {
+        [void]$argList.Add("-ar")
+        [void]$argList.Add("$($cmbRate.SelectedItem)")
+    }
+    if ($cmbChannels.SelectedItem -eq "单声道") {
+        [void]$argList.Add("-ac"); [void]$argList.Add("1")
+    } elseif ($cmbChannels.SelectedItem -eq "双声道") {
+        [void]$argList.Add("-ac"); [void]$argList.Add("2")
+    }
+    [void]$argList.Add((Quote-Arg $outPath))
+    return ($argList -join " ")
+}
+
+function Update-CommandPreview {
+    if ([string]::IsNullOrWhiteSpace($txtInput.Text) -or [string]::IsNullOrWhiteSpace($txtOutput.Text)) {
+        $txtCommand.Text = "选择输入视频后，这里会显示实际 FFmpeg 命令。"
+        return
+    }
+
+    $vf = Build-VideoFilterChain
 
     $inv = [System.Globalization.CultureInfo]::InvariantCulture
     $startTrim = [double]$numTrimStart.Value
@@ -851,25 +913,35 @@ function Update-CommandPreview {
     if ($cmbChannels.SelectedItem -eq "双声道") { $parts += "-ac 2" }
     $parts += (Quote-Arg $txtOutput.Text)
 
-    $txtCommand.Text = ($parts -join " ")
+    $command = ($parts -join " ")
+    if ($script:g_inputs.Count -gt 1) {
+        $command = "批量模式（共 $($script:g_inputs.Count) 个视频，逐个转换，输出到各自源目录；以下为第一个文件的命令）`r`n" + $command
+    }
+    $txtCommand.Text = $command
 }
 
 $btnInput.Add_Click({
     $dlg = New-Object System.Windows.Forms.OpenFileDialog
     $dlg.Filter = "视频文件|*.mp4;*.mkv;*.mov;*.avi;*.webm;*.m4v|所有文件|*.*"
+    $dlg.Multiselect = $true
     if ($dlg.ShowDialog() -eq "OK") {
-        $txtInput.Text = $dlg.FileName
-        # 探测时长：片尾裁剪和命令预览需要
+        $files = @($dlg.FileNames)
+        if ($files.Count -eq 0) { return }
+        $script:g_inputs = $files
+        $txtInput.Text = $files[0]
+        # 探测时长：片尾裁剪和命令预览需要（批量模式下以第一个文件为基准做预览）
         if ($ffmpeg) {
-            $script:g_input_duration = Get-DurationSeconds $txtInput.Text $ffmpeg
+            $script:g_input_duration = Get-DurationSeconds $files[0] $ffmpeg
         } else {
             $script:g_input_duration = 0
         }
-        $dir = [System.IO.Path]::GetDirectoryName($dlg.FileName)
-        $name = [System.IO.Path]::GetFileNameWithoutExtension($dlg.FileName)
-        $txtOutput.Text = [System.IO.Path]::Combine($dir, "${name}_460_24fps_MJPEG.avi")
+        $txtOutput.Text = Get-DefaultOutputPath $files[0]
         $txtCrop.Text = ""
-        $lblStatus.Text = "已选择视频。需要裁黑边时点击【自动检测黑边】。"
+        if ($files.Count -gt 1) {
+            $lblStatus.Text = "已选择 $($files.Count) 个视频：将按当前参数逐个转换，输出到各自源目录。"
+        } else {
+            $lblStatus.Text = "已选择视频。需要裁黑边时点击【自动检测黑边】。"
+        }
         Update-CommandPreview
     }
 })
@@ -1005,17 +1077,25 @@ $btnConvert.Add_Click({
         [System.Windows.Forms.MessageBox]::Show("找不到 ffmpeg。请确认 FFmpeg 已安装并且 `ffmpeg -version` 可以运行。","缺少 FFmpeg")
         return
     }
-    if ([string]::IsNullOrWhiteSpace($txtInput.Text) -or -not (Test-Path -LiteralPath $txtInput.Text)) {
+
+    # 解析输入列表：多选时用 g_inputs；手工输入路径时退化为单文件。
+    $typed = $txtInput.Text.Trim()
+    $inputs = @()
+    if ($script:g_inputs.Count -gt 0 -and $typed -eq $script:g_inputs[0]) {
+        $inputs = @($script:g_inputs)
+    } elseif (-not [string]::IsNullOrWhiteSpace($typed) -and (Test-Path -LiteralPath $typed)) {
+        $inputs = @($typed)
+    }
+    if ($inputs.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show("输入文件不存在，请重新选择。","错误")
         return
     }
-    if ([string]::IsNullOrWhiteSpace($txtOutput.Text)) {
+    if ($inputs.Count -eq 1 -and [string]::IsNullOrWhiteSpace($txtOutput.Text)) {
         [System.Windows.Forms.MessageBox]::Show("请选择输出文件。","错误")
         return
     }
 
-    $filters = New-Object System.Collections.Generic.List[string]
-    # 黑边裁切（可选）始终在最前，方形裁切叠加在其后。
+    # 手动裁剪参数先整体校验，避免批量跑到一半才逐个失败。
     if ($chkCrop.Checked -and -not [string]::IsNullOrWhiteSpace($txtCrop.Text)) {
         $cropText = $txtCrop.Text.Trim()
         if ($cropText.StartsWith("crop=")) { $cropText = $cropText.Substring(5) }
@@ -1023,120 +1103,108 @@ $btnConvert.Add_Click({
             [System.Windows.Forms.MessageBox]::Show("裁剪参数格式不正确。示例：crop=1424:1056:250:8","裁剪参数错误")
             return
         }
-        [void]$filters.Add("crop=$cropText")
     }
-    if ($chkSquare.Checked) {
-        # 方形裁切：短边缩放到边长，长边两侧居中裁掉 → 边长×边长。
-        $side = [int]$numWidth.Value
-        [void]$filters.Add("scale=${side}:${side}:force_original_aspect_ratio=increase")
-        [void]$filters.Add("crop=${side}:${side}")
-    } else {
-        [void]$filters.Add("scale='if(gt(iw,ih),$([int]$numWidth.Value),-2)':'if(gt(iw,ih),-2,$([int]$numWidth.Value))'")
-    }
-    [void]$filters.Add("fps=$([int]$numFps.Value)")
-    $vf = ($filters -join ",")
 
-    $inv = [System.Globalization.CultureInfo]::InvariantCulture
-    $startTrim = [double]$numTrimStart.Value
-    $endTrim = [double]$numTrimEnd.Value
-    $argList = New-Object System.Collections.Generic.List[string]
-    [void]$argList.Add("-y")
-    if ($startTrim -gt 0) {
-        [void]$argList.Add("-ss")
-        [void]$argList.Add($startTrim.ToString("0.###", $inv))
-    }
-    [void]$argList.Add("-i")
-    [void]$argList.Add((Quote-Arg $txtInput.Text))
-    if ($endTrim -gt 0) {
-        $dur = Get-DurationSeconds $txtInput.Text $ffmpeg
-        $script:g_input_duration = $dur
-        $remain = $dur - $startTrim - $endTrim
-        if ($remain -le 0) {
-            [System.Windows.Forms.MessageBox]::Show("裁剪后剩余时长为 0 或负数，请调整片头/片尾秒数。","裁剪参数错误")
-            return
-        }
-        [void]$argList.Add("-t")
-        [void]$argList.Add($remain.ToString("0.###", $inv))
-    }
-    [void]$argList.Add("-vf")
-    [void]$argList.Add((Quote-Arg $vf))
-    [void]$argList.Add("-c:v")
-    [void]$argList.Add("mjpeg")
-    [void]$argList.Add("-q:v")
-    [void]$argList.Add("$([int]$numQ.Value)")
-    if ($chkYuv420.Checked) {
-        [void]$argList.Add("-pix_fmt")
-        [void]$argList.Add("yuvj420p")
-    }
-    [void]$argList.Add("-c:a")
-    [void]$argList.Add("libmp3lame")
-    [void]$argList.Add("-b:a")
-    [void]$argList.Add("$($cmbBitrate.SelectedItem)")
-    if ($cmbRate.SelectedItem -ne "保持默认") {
-        [void]$argList.Add("-ar")
-        [void]$argList.Add("$($cmbRate.SelectedItem)")
-    }
-    if ($cmbChannels.SelectedItem -eq "单声道") {
-        [void]$argList.Add("-ac"); [void]$argList.Add("1")
-    } elseif ($cmbChannels.SelectedItem -eq "双声道") {
-        [void]$argList.Add("-ac"); [void]$argList.Add("2")
-    }
-    [void]$argList.Add((Quote-Arg $txtOutput.Text))
-
-    $arguments = ($argList -join " ")
-    Update-CommandPreview
-
-    $outDir = [System.IO.Path]::GetDirectoryName($txtOutput.Text)
-    if (-not (Test-Path -LiteralPath $outDir)) {
-        [System.IO.Directory]::CreateDirectory($outDir) | Out-Null
-    }
+    $total = $inputs.Count
+    $succeeded = 0
+    $sidecarCount = 0
+    $failures = New-Object System.Collections.Generic.List[string]
+    $singleOutput = $txtOutput.Text.Trim()
 
     $btnConvert.Enabled = $false
     $btnCrop.Enabled = $false
+    $btnInput.Enabled = $false
+    $btnOutput.Enabled = $false
+    $btnSidecar.Enabled = $false
     $progress.Style = "Marquee"
     $progress.MarqueeAnimationSpeed = 30
-    $lblStatus.Text = "正在转换，请勿关闭本窗口…"
     $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
     [System.Windows.Forms.Application]::DoEvents()
 
     try {
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = $ffmpeg
-        $psi.Arguments = $arguments
-        $psi.UseShellExecute = $false
-        $psi.CreateNoWindow = $true
+        for ($i = 0; $i -lt $total; $i++) {
+            $inPath = $inputs[$i]
+            $fileName = [System.IO.Path]::GetFileName($inPath)
+            # 单文件沿用“另存为”路径；批量时逐个输出到各自源目录，默认命名与单文件一致。
+            $outPath = if ($total -eq 1) { $singleOutput } else { Get-DefaultOutputPath $inPath }
+            if ($outPath.ToLower() -eq $inPath.ToLower()) {
+                $outPath = [System.IO.Path]::Combine(
+                    [System.IO.Path]::GetDirectoryName($inPath),
+                    ([System.IO.Path]::GetFileNameWithoutExtension($inPath) + "_out.avi"))
+            }
 
-        $p = New-Object System.Diagnostics.Process
-        $p.StartInfo = $psi
-        [void]$p.Start()
-
-        while (-not $p.HasExited) {
+            $lblStatus.Text = if ($total -eq 1) {
+                "正在转换，请勿关闭本窗口…"
+            } else {
+                "正在转换 ($($i + 1)/$total)：$fileName …"
+            }
             [System.Windows.Forms.Application]::DoEvents()
-            Start-Sleep -Milliseconds 100
+
+            $arguments = Build-FfmpegArguments $inPath $outPath
+            if ($null -eq $arguments) {
+                $failures.Add("${fileName}：片尾裁剪后剩余时长为 0 或负数，已跳过")
+                continue
+            }
+            $txtCommand.Text = $arguments
+            [System.Windows.Forms.Application]::DoEvents()
+
+            $outDir = [System.IO.Path]::GetDirectoryName($outPath)
+            if (-not (Test-Path -LiteralPath $outDir)) {
+                [System.IO.Directory]::CreateDirectory($outDir) | Out-Null
+            }
+
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $ffmpeg
+            $psi.Arguments = $arguments
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+
+            $p = New-Object System.Diagnostics.Process
+            $p.StartInfo = $psi
+            [void]$p.Start()
+
+            while (-not $p.HasExited) {
+                [System.Windows.Forms.Application]::DoEvents()
+                Start-Sleep -Milliseconds 100
+            }
+
+            if ($p.ExitCode -eq 0 -and (Test-Path -LiteralPath $outPath)) {
+                $succeeded++
+                # 生成侧车索引(.fvix)，供设备端 seek 使用。失败不影响播放。
+                try {
+                    $lblStatus.Text = "正在生成 .fvix 索引 ($($i + 1)/$total)…"
+                    [System.Windows.Forms.Application]::DoEvents()
+                    $idx = New-SidecarIndex -aviPath $outPath
+                    if ($idx.Ok) { $sidecarCount++ } else { Write-Warning "侧车索引生成失败（不影响播放）：$($idx.Message)" }
+                } catch {
+                    Write-Warning "侧车索引生成失败（不影响播放）：$($_.Exception.Message)"
+                }
+            } else {
+                $failures.Add("${fileName}：FFmpeg 退出代码 $($p.ExitCode)")
+            }
         }
 
-        if ($p.ExitCode -eq 0 -and (Test-Path -LiteralPath $txtOutput.Text)) {
-            # 生成侧车索引(.fvix)，供设备端 seek 使用。失败不影响播放。
-            $sidecarOk = $false
-            try {
-                $lblStatus.Text = "正在生成 .fvix 索引…"
-                [System.Windows.Forms.Application]::DoEvents()
-                $idx = New-SidecarIndex -aviPath $txtOutput.Text
-                $sidecarOk = $idx.Ok
-                if (-not $idx.Ok) { Write-Warning "侧车索引生成失败（不影响播放）：$($idx.Message)" }
-            } catch {
-                Write-Warning "侧车索引生成失败（不影响播放）：$($_.Exception.Message)"
-            }
-            $lblStatus.Text = if ($sidecarOk) {
-                "转换完成（含 .fvix 索引）：$($txtOutput.Text)"
+        if ($total -eq 1) {
+            if ($failures.Count -eq 0) {
+                $lblStatus.Text = if ($sidecarCount -gt 0) {
+                    "转换完成（含 .fvix 索引）：$singleOutput"
+                } else {
+                    "转换完成（未生成 .fvix 索引）：$singleOutput"
+                }
+                [System.Media.SystemSounds]::Asterisk.Play()
+                [System.Windows.Forms.MessageBox]::Show("转换完成。`r`n`r`n$singleOutput","完成")
             } else {
-                "转换完成（未生成 .fvix 索引）：$($txtOutput.Text)"
+                $lblStatus.Text = "转换失败：$($failures[0])"
+                [System.Windows.Forms.MessageBox]::Show("转换失败。$($failures[0])`r`n可复制界面中的命令到 PowerShell 查看详细错误。","失败")
             }
-            [System.Media.SystemSounds]::Asterisk.Play()
-            [System.Windows.Forms.MessageBox]::Show("转换完成。`r`n`r`n$($txtOutput.Text)","完成")
         } else {
-            $lblStatus.Text = "转换失败，FFmpeg 退出代码：$($p.ExitCode)"
-            [System.Windows.Forms.MessageBox]::Show("转换失败。FFmpeg 退出代码：$($p.ExitCode)`r`n可复制界面中的命令到 PowerShell 查看详细错误。","失败")
+            $lblStatus.Text = "批量转换结束：成功 $succeeded / 共 $total"
+            [System.Media.SystemSounds]::Asterisk.Play()
+            $summary = "成功 $succeeded 个，失败 $($failures.Count) 个。`r`n输出已生成在各自源视频所在目录。"
+            if ($failures.Count -gt 0) {
+                $summary += "`r`n`r`n失败明细：`r`n" + ($failures -join "`r`n")
+            }
+            [System.Windows.Forms.MessageBox]::Show($summary, "批量转换完成")
         }
     } catch {
         $lblStatus.Text = "转换失败：$($_.Exception.Message)"
@@ -1146,6 +1214,9 @@ $btnConvert.Add_Click({
         $progress.Value = 0
         $btnConvert.Enabled = $true
         $btnCrop.Enabled = $true
+        $btnInput.Enabled = $true
+        $btnOutput.Enabled = $true
+        $btnSidecar.Enabled = $true
         $form.Cursor = [System.Windows.Forms.Cursors]::Default
     }
 })
