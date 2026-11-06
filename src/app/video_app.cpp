@@ -1517,6 +1517,24 @@ static void benchmark_seek_by(int32_t delta_ms)
 
 // 播放页左右滑：按滑动距离映射目标时间，约 10px = 1s（向左为快进，向右为后退）。
 // 抬手后一次执行，避免拖动过程中连续 seek。
+// 双击切换暂停/继续：视频 pipeline 与视频 MP3 音频必须一起停/一起走，
+// 否则暂停时画面静止但声音继续，恢复后音画不同轴。
+static void benchmark_toggle_pause()
+{
+    const bool pause_now = !VideoBenchmark::is_paused();
+    if (pause_now) {
+        if (!VideoBenchmark::set_paused(true)) {
+            ESP_LOGW(TAG, "双击暂停失败：当前状态不可暂停");
+            return;
+        }
+        (void)audio_service_video_mp3_pause(true);
+    } else {
+        (void)audio_service_video_mp3_resume(true);
+        (void)VideoBenchmark::set_paused(false);
+    }
+    ESP_LOGI(TAG, "双击：%s", pause_now ? "暂停播放" : "继续播放");
+}
+
 static void benchmark_seek_by_swipe()
 {
     int16_t dx = 0;
@@ -1913,6 +1931,7 @@ static void benchmark_tick()
 
     VideoBenchmark::Snapshot snapshot = {};
     if (!VideoBenchmark::get_snapshot(&snapshot)) return;
+
     if (!benchmark_presenter_is_running() && snapshot.state == VideoBenchmark::State::Eof) {
         eof_transition_begin(snapshot);
         return;
@@ -2282,6 +2301,13 @@ static void timer_cb(lv_timer_t *timer)
             break;
         case UiGestureAction::PullUpFromBottom:
             if (g_page == VideoPage::Browser) show_launcher();
+            break;
+        case UiGestureAction::DoubleTap:
+            // 播放页原地双击 = 暂停/继续；列表页与风险确认浮层不响应
+            if (g_page == VideoPage::Benchmark && !g_risk_prompt_active &&
+                !g_benchmark_ui.terminal_shown) {
+                benchmark_toggle_pause();
+            }
             break;
         default:
             break;

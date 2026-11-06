@@ -25,7 +25,9 @@ namespace
 {
 
 static constexpr size_t kFrameSlotCount = 3U;
-static constexpr size_t kCompressedSlotCount = 8U;
+// 压缩帧队列深度决定“提取能跑多前”：8 帧约 0.5 秒（15fps），解码/Presenter 一次抖动就会让
+// ExtractTask 停在 send_pipeline_message，音频桥随之被抽干。24 帧约 1.6 秒，可吸收这类抖动。
+static constexpr size_t kCompressedSlotCount = 24U;
 static constexpr size_t kCompressedSlotBytes = 128U * 1024U;
 static constexpr uint32_t kTaskStack = 8192U;
 static constexpr uint32_t kExtractTaskStack = 6144U;

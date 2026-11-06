@@ -15,6 +15,8 @@ enum class UiGestureAction : uint8_t
     SwipeDownTrack,
     PullDownFromTop,
     PullUpFromBottom,
+    // 原地双击（两次轻点，间隔与落点都在容差内）。播放页用它切换暂停/继续。
+    DoubleTap,
 };
 
 void gesture_router_reset();

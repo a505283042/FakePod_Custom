@@ -3667,6 +3667,9 @@ static void audio_task_handle_video_mp3_resume(AudioRequest *request)
     }
     if (g_video_mp3_paused) {
         g_video_mp3_paused = false;
+        // 与暂停时的数字淡出对称：暂停期间 Service 只写静音，恢复瞬间若直接从
+        // 静音跳到非零波形会硬切出声，这里补一段 30ms 淡入。
+        audio_task_begin_pcm_fade_in("video_resume", g_video_mp3_sample_rate_hz);
         ++g_video_clock_revision;
         if (g_video_clock_revision == 0U) ++g_video_clock_revision;
         audio_task_publish_video_clock_snapshot();

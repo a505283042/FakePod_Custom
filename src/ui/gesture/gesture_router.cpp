@@ -18,6 +18,10 @@ constexpr uint32_t kHorizontalMinSpeedPxPerSec = 45U;
 constexpr uint32_t kEdgeMinSpeedPxPerSec = 40U;
 constexpr int16_t kVerticalAdjustTriggerPx = 12;
 constexpr int16_t kVerticalAdjustDominancePercent = 135;
+// 双击：两次触摸都必须近似“原地轻点”，且间隔/落点在容差内，避免与短滑混淆。
+constexpr int16_t kTapMaxMovePx = 14;
+constexpr int16_t kDoubleTapSlopPx = 40;
+constexpr uint32_t kDoubleTapWindowMs = 320U;
 
 enum class GestureAxis : uint8_t
 {
@@ -46,6 +50,11 @@ struct GestureState
     uint32_t start_tick_ms = 0U;
     GestureAxis axis = GestureAxis::None;
     UiGestureAction pending = UiGestureAction::None;
+    // 双击识别：记录上一次轻点的抬手时刻与落点。
+    bool last_tap_valid = false;
+    uint32_t last_tap_tick_ms = 0U;
+    int16_t last_tap_x = 0;
+    int16_t last_tap_y = 0;
 };
 
 GestureState g_state = {};
@@ -242,6 +251,25 @@ void gesture_router_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t ti
         if (action != UiGestureAction::None) {
             g_state.pending = action;
             g_state.suppress_click = true;
+            g_state.last_tap_valid = false;
+        } else if (ax <= kTapMaxMovePx && ay <= kTapMaxMovePx) {
+            // 原地轻点：与上一次轻点在时间/落点容差内即判为双击，并丢弃这次 LVGL CLICKED。
+            const bool double_tap = g_state.last_tap_valid &&
+                tick_ms - g_state.last_tap_tick_ms <= kDoubleTapWindowMs &&
+                gesture_abs(static_cast<int32_t>(x) - g_state.last_tap_x) <= kDoubleTapSlopPx &&
+                gesture_abs(static_cast<int32_t>(y) - g_state.last_tap_y) <= kDoubleTapSlopPx;
+            if (double_tap) {
+                g_state.pending = UiGestureAction::DoubleTap;
+                g_state.suppress_click = true;
+                g_state.last_tap_valid = false;
+            } else {
+                g_state.last_tap_valid = true;
+                g_state.last_tap_tick_ms = tick_ms;
+                g_state.last_tap_x = x;
+                g_state.last_tap_y = y;
+            }
+        } else {
+            g_state.last_tap_valid = false;
         }
     }
 
@@ -367,6 +395,7 @@ const char *gesture_router_action_name(UiGestureAction action)
         case UiGestureAction::SwipeDownTrack: return "下滑切上一曲";
         case UiGestureAction::PullDownFromTop: return "顶部下拉";
         case UiGestureAction::PullUpFromBottom: return "底部上滑";
+        case UiGestureAction::DoubleTap: return "双击";
         default: return "无";
     }
 }
