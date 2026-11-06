@@ -50,7 +50,10 @@ static constexpr uint32_t kDeadlineSafetyBaseUs = 5000U;
 static constexpr uint32_t kDeadlineSafetyMaxUs = 12000U;
 static constexpr uint32_t kDecodeJitterReserveMaxUs = 10000U;
 static constexpr uint8_t kDecodeTimingEwmaShift = 3U; // alpha = 1/8
-static constexpr size_t kAudioBridgeBytes = 32U * 1024U;
+// AVI ExtractTask -> AudioTask 桥容量。96KB 约等于 6 秒 128kbps MP3。
+// 视频侧反压（压缩帧队列满）时 ExtractTask 会暂停读文件，32KB 只能撑约 2 秒，
+// 高码率大关键帧处会被抽干并触发音频欠载，进而把音频主时钟拖慢。
+static constexpr size_t kAudioBridgeBytes = 96U * 1024U;
 // 预缓冲阈值：4KB约等于128kbps MP3的250ms音频，足以防止启动欠载。
 // 注意：不能设太大，某些AVI的视频/音频交错间隔大，高帧率视频需要较长时间才能凑满音频数据。
 static constexpr size_t kAudioPrebufferBytes = 4U * 1024U;

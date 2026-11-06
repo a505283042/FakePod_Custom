@@ -61,6 +61,9 @@ static constexpr size_t kScanBatchNoFlac = 8U;
 static constexpr size_t kScanBatchWithFlac = 1U;
 static constexpr uint32_t kWaitLogIntervalMs = 1000U;
 static constexpr int64_t kVideoLateDropUs = 50000LL;
+// 音频主时钟看门狗：音频欠载时“已提交 PCM 时钟”会停滞，累计落后视频 PTS 超过该值后，
+// 本段改用墙钟节拍，避免音频缺料把整段画面拖成慢放。
+static constexpr int64_t kAudioMasterMaxLagUs = 200000LL;
 // 59.8Hz TE 半周期约 8.4ms；Dedicated Presenter 在 RGB ready queue 唤醒后直接做 PTS pacing。
 // 本轮保持 R.40.3.3.2 的 14ms TE arm 不变，只隔离“LVGL轮询”这一变量。
 static constexpr int64_t kBenchmarkTeArmLeadUs = 14000LL;
@@ -1084,6 +1087,11 @@ static void benchmark_presenter_task(void *arg)
     bool audio_master_expected = false;
     bool audio_master_logged = false;
     bool audio_start_barrier_released = false;
+    // 音频主时钟看门狗状态：用“视频 PTS 进度 vs 音频已提交 PCM 进度”的累计差值判断欠载。
+    int64_t audio_master_drift_us = 0LL;
+    int64_t audio_master_last_pos_us = 0LL;
+    int64_t audio_master_last_pts_us = 0LL;
+    bool audio_master_drift_valid = false;
     uint32_t first_pts_ms = 0U;
     uint32_t audio_first_pts_ms = 0U;
     int64_t clock_base_us = 0LL;
@@ -1104,6 +1112,8 @@ static void benchmark_presenter_task(void *arg)
             clock_started = false;
             audio_master_expected = false;
             audio_master_logged = false;
+            audio_master_drift_us = 0LL;
+            audio_master_drift_valid = false;
         }
 
         VideoBenchmark::FrameView frame = {};
@@ -1170,6 +1180,27 @@ static void benchmark_presenter_task(void *arg)
         AudioVideoClockSnapshot audio_clock = {};
         bool use_audio_master =
             audio_master_expected && benchmark_audio_master_snapshot(&audio_clock);
+
+        // 音频欠载会让 position_us 停滞，而视频 PTS 仍在推进；累计落后超过阈值说明音频缺料，
+        // 此时切回墙钟节拍，避免整段画面跟着音频主时钟一起慢放（代价是这段内轻微音画偏移）。
+        if (use_audio_master) {
+            const int64_t pos_us = static_cast<int64_t>(audio_clock.position_us);
+            const int64_t pts_us = static_cast<int64_t>(frame.pts_ms) * 1000LL;
+            if (audio_master_drift_valid) {
+                audio_master_drift_us +=
+                    (pts_us - audio_master_last_pts_us) - (pos_us - audio_master_last_pos_us);
+                if (audio_master_drift_us > kAudioMasterMaxLagUs) {
+                    audio_master_expected = false;
+                    use_audio_master = false;
+                    ESP_LOGW(TAG, "音频时钟落后视频PTS %lldms，本段改用墙钟节拍",
+                        static_cast<long long>(audio_master_drift_us / 1000LL));
+                }
+            }
+            audio_master_last_pos_us = pos_us;
+            audio_master_last_pts_us = pts_us;
+            audio_master_drift_valid = true;
+        }
+
         const int64_t ready_late_us = use_audio_master
             ? static_cast<int64_t>(audio_clock.position_us) - audio_target_us
             : acquired_us - fallback_target_us;
