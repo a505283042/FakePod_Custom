@@ -14,6 +14,7 @@
 #include "device_settings.h"
 #include "screen_lock_simple.h"
 #include "app/app_manager.h"
+#include "app/video_app.h"
 #include "usb_storage_service.h"
 
 static const char *TAG = "电源";
@@ -149,8 +150,13 @@ void power_service_update()
                             ESP_LOGI(TAG, "电源键短按释放：hold=%lums → 上一曲（投递LVGL任务）",
                                 (unsigned long)held_ms);
                             (void)lv_async_call(power_previous_track_async, nullptr);
+                        } else if (foreground == AppId::Video && video_app_remote_control_active()) {
+                            // 视频播放中复用同一“辅助键模式”：切歌档位切换上一个视频。
+                            ESP_LOGI(TAG, "电源键短按释放：hold=%lums → 上一个视频",
+                                (unsigned long)held_ms);
+                            (void)video_app_remote_submit(VideoRemoteCommand::Previous);
                         } else {
-                            ESP_LOGI(TAG, "电源键短按释放：hold=%lums → 非音乐/电子书前台，切歌不生效",
+                            ESP_LOGI(TAG, "电源键短按释放：hold=%lums → 非音乐/电子书/视频播放前台，切歌不生效",
                                 (unsigned long)held_ms);
                         }
                     } else {

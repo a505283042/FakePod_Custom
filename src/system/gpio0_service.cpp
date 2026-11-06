@@ -11,6 +11,7 @@
 #include "screen_lock_simple.h"
 #include "player/player_control.h"
 #include "app/app_manager.h"
+#include "app/video_app.h"
 #include "device_settings.h"
 
 static const char *TAG = "GPIO0按键";
@@ -138,8 +139,13 @@ void gpio0_service_update()
                         ESP_LOGI(TAG, "GPIO0 释放：短按 %lums → 下一曲（投递LVGL任务）",
                             (unsigned long)held);
                         (void)lv_async_call(gpio0_next_track_async, nullptr);
+                    } else if (foreground == AppId::Video && video_app_remote_control_active()) {
+                        // 视频播放中复用同一“辅助键模式”：切歌档位切换下一个视频。
+                        ESP_LOGI(TAG, "GPIO0 释放：短按 %lums → 下一个视频",
+                            (unsigned long)held);
+                        (void)video_app_remote_submit(VideoRemoteCommand::Next);
                     } else {
-                        ESP_LOGI(TAG, "GPIO0 释放：短按 %lums → 非音乐/电子书前台，切歌不生效",
+                        ESP_LOGI(TAG, "GPIO0 释放：短按 %lums → 非音乐/电子书/视频播放前台，切歌不生效",
                             (unsigned long)held);
                     }
                 } else {
