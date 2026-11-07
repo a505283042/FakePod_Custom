@@ -72,7 +72,7 @@ inline bool match_fcc(const uint8_t *p, const char *fcc)
         p[2] == fcc[2] && p[3] == fcc[3];
 }
 
-// 从文件绝对偏移读取 size 字节到 buf。连续读取时复用 FILE 当前游标，避免每个 AVI chunk 都 fseeko。
+// 从文件绝对偏移读取 size 字节到 buf。连续读取时复用 FatFs FIL 当前游标，避免每个 AVI chunk 都 fseeko。
 esp_err_t read_at(uint32_t offset, void *buf, uint32_t size)
 {
     if (s_io == nullptr || s_io->file == nullptr) return ESP_ERR_INVALID_STATE;
@@ -119,7 +119,7 @@ esp_err_t read_forward(void *buf, uint32_t size)
     return ret;
 }
 
-// 顺序消费不需要解码的 payload，保持 FILE 游标连续，避免长文件 SEEK 时逐 chunk 随机定位。
+// 顺序消费不需要解码的 payload，保持 FatFs FIL 游标连续，避免长文件 SEEK 时逐 chunk 随机定位。
 esp_err_t skip_forward_bytes(
     uint32_t size, uint8_t *scratch, uint32_t scratch_capacity, uint64_t *out_skipped_bytes)
 {
@@ -620,7 +620,7 @@ esp_err_t read_frame(
                     static_cast<unsigned long>(video_capacity));
                 return ESP_ERR_NO_MEM;
             }
-            // 读头时已将 FILE 游标推进到 payload 起点；无论首次读取还是 pending 重试，都顺序取帧。
+            // 读头时已将 FatFs FIL 游标推进到 payload 起点；无论首次读取还是 pending 重试，都顺序取帧。
             if (s_current_offset != payload_offset) return ESP_ERR_INVALID_STATE;
             if (read_forward(video_data, chunk_size) != ESP_OK) return ESP_FAIL;
             if ((chunk_size & 1U) != 0U) {
@@ -675,7 +675,7 @@ esp_err_t read_frame(
             continue;
         }
 
-        // 未知 chunk 按 payload 顺序读过，保持 FILE 游标连续，不再通过下一轮 fseek 跳过。
+        // 未知 chunk 按 payload 顺序读过，保持 FatFs FIL 游标连续，不再通过下一轮 fseek 跳过。
         if (skip_forward_bytes(padded_chunk_size, audio_data, audio_capacity, nullptr) != ESP_OK) {
             return ESP_FAIL;
         }

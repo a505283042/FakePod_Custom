@@ -1,15 +1,20 @@
 #include "video_media_io.h"
 
-#include <errno.h>
-#include <sys/stat.h>
-#include <sys/types.h>
+#include <limits.h>
+#include <string.h>
 
 #include "audio/decoders/flac_decoder.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "storage_io.h"
+
+// 当前 AVI/FVIX 偏移契约为 uint32_t；FSIZE_t 不能宽于该契约，
+// 否则文件尺寸转换前必须同步升级 Demuxer、Extractor 与索引格式。
+static_assert(sizeof(FSIZE_t) <= sizeof(uint32_t),
+    "VideoMediaIo requires FSIZE_t to fit the current 32-bit AVI offset contract");
 
 namespace VideoMediaIo
 {
@@ -116,6 +121,11 @@ int read_cb(void *buffer, uint32_t size, void *ctx)
         return -1;
     }
     if (size == 0U) return 0;
+    // 回调返回类型为 int，单次读取不能超过 INT_MAX；实际 AVI 读取按 4/16KB 切片执行。
+    if (size > static_cast<uint32_t>(INT_MAX)) {
+        ESP_LOGE(TAG, "READ请求超过回调返回值范围：size=%lu", static_cast<unsigned long>(size));
+        return -1;
+    }
     if (!generation_current(io)) {
         log_cancelled("READ", io, size);
         return -1;
@@ -125,7 +135,7 @@ int read_cb(void *buffer, uint32_t size, void *ctx)
         return -1;
     }
 
-    // Video独占时用16KB切片减少锁竞争和fread调用；Music播放时保持4KB切片快速让路。
+    // Video独占时用16KB切片减少锁竞争和f_read调用；Music播放时保持4KB切片快速让路。
     const uint32_t slice_bytes = io->skip_flac_gate ? kMaxReadSliceBytesExclusive : kMaxReadSliceBytes;
 
     const int64_t started_us = esp_timer_get_time();
@@ -173,24 +183,24 @@ int read_cb(void *buffer, uint32_t size, void *ctx)
             {
                 StorageSdLockGuard guard(kStorageLockSlice);
                 if (guard) {
-                    const off_t pos_before = ftello(io->file);
-                    errno = 0;
-                    const size_t got = fread(out + total, 1U, request, io->file);
-                    const int saved_errno = errno;
-                    const int eof_flag = feof(io->file);
-                    const int error_flag = ferror(io->file);
+                    const FSIZE_t pos_before = f_tell(io->file);
+                    UINT got = 0U;
+                    const FRESULT fatfs_ret = f_read(
+                        io->file, out + total, static_cast<UINT>(request), &got);
+                    const int eof_flag = f_eof(io->file);
+                    const int error_flag = f_error(io->file);
                     total += static_cast<uint32_t>(got);
 
-                    if (error_flag != 0) {
+                    if (fatfs_ret != FR_OK || error_flag != 0) {
                         ++io->read_errors;
                         ESP_LOGE(TAG,
-                            "READ_FREAD_ERROR：pos=%lld callback=%lu slice=%lu got=%lu total=%lu errno=%d feof=%d ferror=%d retries=%lu wait=%lums ring=%ld%%",
-                            static_cast<long long>(pos_before),
+                            "READ_FATFS_ERROR：pos=%llu callback=%lu slice=%lu got=%lu total=%lu fr=%d ferr=%d retries=%lu wait=%lums ring=%ld%%",
+                            static_cast<unsigned long long>(pos_before),
                             static_cast<unsigned long>(size),
                             static_cast<unsigned long>(request),
                             static_cast<unsigned long>(got),
                             static_cast<unsigned long>(total),
-                            saved_errno, eof_flag, error_flag,
+                            static_cast<int>(fatfs_ret), error_flag,
                             static_cast<unsigned long>(retries),
                             static_cast<unsigned long>(elapsed_ms(lock_wait_started_us)),
                             static_cast<long>(flac_ring_percent()));
@@ -200,8 +210,8 @@ int read_cb(void *buffer, uint32_t size, void *ctx)
                     if (retries != 0U) {
                         ++io->lock_recoveries;
                         ESP_LOGW(TAG,
-                            "READ_LOCK_RECOVERED：pos=%lld callback=%lu slice=%lu got=%lu total=%lu retries=%lu wait=%lums ring=%ld%%",
-                            static_cast<long long>(pos_before),
+                            "READ_LOCK_RECOVERED：pos=%llu callback=%lu slice=%lu got=%lu total=%lu retries=%lu wait=%lums ring=%ld%%",
+                            static_cast<unsigned long long>(pos_before),
                             static_cast<unsigned long>(size),
                             static_cast<unsigned long>(request),
                             static_cast<unsigned long>(got),
@@ -217,10 +227,10 @@ int read_cb(void *buffer, uint32_t size, void *ctx)
                         if (zero_progress >= 3U) {
                             ++io->read_errors;
                             ESP_LOGE(TAG,
-                                "READ_ZERO_PROGRESS：callback=%lu total=%lu pos=%lld 连续=%lu ring=%ld%%",
+                                "READ_ZERO_PROGRESS：callback=%lu total=%lu pos=%llu 连续=%lu ring=%ld%%",
                                 static_cast<unsigned long>(size),
                                 static_cast<unsigned long>(total),
-                                static_cast<long long>(pos_before),
+                                static_cast<unsigned long long>(pos_before),
                                 static_cast<unsigned long>(zero_progress),
                                 static_cast<long>(flac_ring_percent()));
                             return finish_read(-1);
@@ -234,7 +244,7 @@ int read_cb(void *buffer, uint32_t size, void *ctx)
                     }
                     if (got < request && got != 0U) {
                         ESP_LOGW(TAG,
-                            "READ_STDIO_SHORT：callback=%lu slice=%lu got=%lu total=%lu feof=0 ferror=0；继续补齐",
+                            "READ_FATFS_SHORT：callback=%lu slice=%lu got=%lu total=%lu eof=0；继续补齐",
                             static_cast<unsigned long>(size),
                             static_cast<unsigned long>(request),
                             static_cast<unsigned long>(got),
@@ -314,14 +324,13 @@ int seek_cb(uint32_t position, void *ctx)
         {
             StorageSdLockGuard guard(kStorageLockSlice);
             if (guard) {
-                errno = 0;
-                const int ret = fseeko(io->file, static_cast<off_t>(position), SEEK_SET);
-                const int saved_errno = errno;
-                if (ret != 0) {
+                // FatFs 的 FSIZE_t 在当前 FAT32 配置下是无符号 32 位，可直接定位到 2GB 以上。
+                const FRESULT ret = f_lseek(io->file, static_cast<FSIZE_t>(position));
+                if (ret != FR_OK) {
                     ++io->seek_errors;
                     ESP_LOGE(TAG,
-                        "SEEK_FSEEK_ERROR：pos=%lu errno=%d retries=%lu wait=%lums ring=%ld%%",
-                        static_cast<unsigned long>(position), saved_errno,
+                        "SEEK_FATFS_ERROR：pos=%lu fr=%d retries=%lu wait=%lums ring=%ld%%",
+                        static_cast<unsigned long>(position), static_cast<int>(ret),
                         static_cast<unsigned long>(retries),
                         static_cast<unsigned long>(elapsed_ms(lock_wait_started_us)),
                         static_cast<long>(flac_ring_percent()));
@@ -384,20 +393,73 @@ esp_err_t open(const char *path, Context *io)
     if (path == nullptr || io == nullptr) return ESP_ERR_INVALID_ARG;
     if (!generation_current(io) || !wait_for_storage_window(io)) return ESP_ERR_INVALID_STATE;
 
-    struct stat info = {};
+    // FatFs 低层 API 使用挂载点内的相对路径；不要把 /sdcard VFS 前缀传给 f_open。
+    static constexpr char kMountPrefix[] = "/sdcard";
+    constexpr size_t kMountPrefixBytes = sizeof(kMountPrefix) - 1U;
+    if (strncmp(path, kMountPrefix, kMountPrefixBytes) != 0 ||
+        (path[kMountPrefixBytes] != '/' && path[kMountPrefixBytes] != '\0')) {
+        ESP_LOGE(TAG, "AVI路径不在 /sdcard 挂载点内：%s", path);
+        return ESP_ERR_INVALID_ARG;
+    }
+    const char *fatfs_path = path + kMountPrefixBytes;
+    if (fatfs_path[0] == '\0') fatfs_path = "/";
+
+    // FIL 内含 FatFs 扇区缓存，放入 PSRAM，避免为 2GB+ 文件支持额外占用内部 RAM。
+    FIL *file = static_cast<FIL *>(heap_caps_calloc(
+        1U, sizeof(FIL), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (file == nullptr) {
+        ESP_LOGE(TAG, "分配 AVI FatFs 文件句柄失败：%uB PSRAM不足", static_cast<unsigned>(sizeof(FIL)));
+        return ESP_ERR_NO_MEM;
+    }
+
+    FRESULT open_result = FR_OK;
+    FSIZE_t file_size = 0U;
+    bool file_size_invalid = false;
     {
         StorageSdLockGuard guard(kOpenLockTimeout);
         if (!guard) {
             ESP_LOGE(TAG, "OPEN_LOCK_TIMEOUT：path=%s timeout=250ms ring=%ld%%",
                 path, static_cast<long>(flac_ring_percent()));
+            heap_caps_free(file);
             return ESP_ERR_TIMEOUT;
         }
-        if (stat(path, &info) != 0 || !S_ISREG(info.st_mode)) return ESP_ERR_NOT_FOUND;
-        if (info.st_size <= 0 || static_cast<uint64_t>(info.st_size) > UINT32_MAX) return ESP_ERR_INVALID_SIZE;
-        io->file = fopen(path, "rb");
+        if (!generation_current(io)) {
+            heap_caps_free(file);
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        open_result = f_open(file, fatfs_path, FA_READ);
+        if (open_result == FR_OK) {
+            file_size = f_size(file);
+            // 当前 FatFs 配置下 FSIZE_t 为无符号 32 位；大于 UINT32_MAX 不可能成立。
+            // 只需拒绝小于 AVI 最小 RIFF 头长度的文件，2GB 以上偏移保持有效。
+            if (file_size < 12U) {
+                file_size_invalid = true;
+                const FRESULT close_result = f_close(file);
+                if (close_result != FR_OK) {
+                    ESP_LOGW(TAG, "关闭尺寸非法的AVI句柄失败：fr=%d", static_cast<int>(close_result));
+                }
+            }
+        }
     }
-    if (io->file == nullptr) return ESP_ERR_NOT_FOUND;
-    io->size = static_cast<uint32_t>(info.st_size);
+
+    if (open_result != FR_OK) {
+        heap_caps_free(file);
+        ESP_LOGE(TAG, "FatFs打开AVI失败：path=%s fr=%d", fatfs_path, static_cast<int>(open_result));
+        return (open_result == FR_NO_FILE || open_result == FR_NO_PATH)
+            ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+    }
+    if (file_size_invalid) {
+        heap_caps_free(file);
+        ESP_LOGE(TAG, "AVI文件长度小于最小RIFF头尺寸：size=%llu",
+            static_cast<unsigned long long>(file_size));
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    io->file = file;
+    io->size = static_cast<uint32_t>(file_size);
+    ESP_LOGI(TAG, "AVI使用FatFs原生句柄：size=%llu bytes；绕过stdio 2GB有符号偏移限制",
+        static_cast<unsigned long long>(file_size));
     return ESP_OK;
 }
 
@@ -405,8 +467,19 @@ void close(Context *io)
 {
     if (io == nullptr || io->file == nullptr) return;
     StorageSdLockGuard guard(portMAX_DELAY);
-    if (guard) fclose(io->file);
+    if (!guard) {
+        ESP_LOGE(TAG, "关闭AVI FatFs句柄失败：无法取得Storage锁");
+        return;
+    }
+
+    FIL *file = io->file;
+    const FRESULT close_result = f_close(file);
     io->file = nullptr;
+    io->size = 0U;
+    heap_caps_free(file);
+    if (close_result != FR_OK) {
+        ESP_LOGW(TAG, "关闭AVI FatFs句柄返回错误：fr=%d", static_cast<int>(close_result));
+    }
 }
 
 esp_err_t map_extractor_error(esp_extractor_err_t err)

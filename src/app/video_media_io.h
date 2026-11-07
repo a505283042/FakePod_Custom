@@ -1,9 +1,9 @@
 #pragma once
 
 #include <stdint.h>
-#include <stdio.h>
 
 #include "esp_err.h"
+#include "ff.h"
 #include "esp_extractor.h"
 
 namespace VideoMediaIo
@@ -13,7 +13,9 @@ using GenerationCheck = bool (*)(uint32_t generation);
 
 struct Context
 {
-    FILE *file = nullptr;
+    // 直接使用 FatFs FIL，避免 32 位有符号 off_t 在 2GB 处回绕。
+    FIL *file = nullptr;
+    // AVI/FVIX 当前使用 uint32_t 绝对偏移，支持 FAT32 单文件最大范围（小于 4GB）。
     uint32_t size = 0U;
     uint32_t generation = 0U;
     GenerationCheck generation_check = nullptr;
