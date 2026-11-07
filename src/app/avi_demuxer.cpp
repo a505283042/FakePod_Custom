@@ -301,7 +301,8 @@ esp_err_t read_frame(FrameInfo *frame, uint8_t *data, uint32_t capacity) {
     return kErrEof;
 }
 
-esp_err_t seek_to_offset(uint32_t file_offset, uint32_t video_pts_ms, uint32_t audio_bytes_at_seek) {
+esp_err_t seek_to_offset(uint32_t file_offset, uint32_t video_pts_ms,
+    uint32_t audio_bytes_at_seek, uint32_t video_frame_index) {
     if (s_io == nullptr) return ESP_ERR_INVALID_STATE;
 
     // 侧车索引可能记录 chunk 头偏移，也可能记录数据起点（如 ffprobe 的 pkt_pos）。
@@ -340,9 +341,13 @@ esp_err_t seek_to_offset(uint32_t file_offset, uint32_t video_pts_ms, uint32_t a
     // 保持绝对时间轴：用 seek 目标时间恢复视频帧计数与音频字节计数，
     // 这样 PTS 继续在整段视频的原始时间轴上累加（而不是从 0 重来）。
     // 上层（Presenter/seek 目标计算）都以绝对 PTS 为准，无需再维护额外基准。
-    s_video_frame_index = s_info.fps_x100 > 0
-        ? static_cast<uint32_t>(static_cast<uint64_t>(video_pts_ms) * s_info.fps_x100 / 100000ULL)
-        : 0U;
+    // V2 索引直接保存原始帧序号，避免电脑端与设备端的帧率取整差异。
+    // V1 索引没有帧序号，继续按时间戳和设备端帧率回推。
+    s_video_frame_index = video_frame_index != 0xFFFFFFFFU
+        ? video_frame_index
+        : (s_info.fps_x100 > 0
+            ? static_cast<uint32_t>(static_cast<uint64_t>(video_pts_ms) * s_info.fps_x100 / 100000ULL)
+            : 0U);
     s_audio_bytes_total = audio_bytes_at_seek;
     ESP_LOGI(TAG, "seek恢复时间轴: frame_index=%lu fps=%lu.%02lu audio_bytes=%lu",
         static_cast<unsigned long>(s_video_frame_index),
@@ -358,6 +363,7 @@ esp_err_t scan_forward_to(uint32_t target_ms) {
 
     uint32_t last_video_offset = 0U;
     uint32_t last_video_index = 0U;
+    uint32_t last_audio_bytes_total = 0U;
     bool have_last = false;
     uint32_t skipped = 0U;
 
@@ -390,6 +396,7 @@ esp_err_t scan_forward_to(uint32_t target_ms) {
             }
             last_video_offset = chunk_offset;
             last_video_index = s_video_frame_index;
+            last_audio_bytes_total = s_audio_bytes_total;
             have_last = true;
             ++s_video_frame_index;
             ++skipped;
@@ -416,6 +423,7 @@ esp_err_t scan_forward_to(uint32_t target_ms) {
         // 目标超出最后一个可解码帧：停在最后一帧，避免 seek 到末尾直接触发 EOF 切换视频。
         s_current_offset = last_video_offset;
         s_video_frame_index = last_video_index;
+        s_audio_bytes_total = last_audio_bytes_total;
         ESP_LOGW(TAG, "seek目标超出末尾，回退到最后一帧: frame_index=%lu",
             static_cast<unsigned long>(last_video_index));
         return ESP_OK;

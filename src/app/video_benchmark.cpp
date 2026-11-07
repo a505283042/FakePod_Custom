@@ -824,12 +824,14 @@ static void benchmark_task(void *arg)
     VideoMediaIo::Context io = {};
     VideoMediaIo::configure(&io, args->generation, generation_current, args->music_suspended);
     jpeg_dec_handle_t decoder = nullptr;
+    uint32_t source_fps_x100 = 0U;
 
     esp_err_t ret = VideoMediaIo::open(args->path, &io);
     if (ret == ESP_OK && generation_current(args->generation)) {
         AviDemuxer::StreamInfo avi_info = {};
         ret = AviDemuxer::open(&io, &avi_info);
         if (ret == ESP_OK) {
+            source_fps_x100 = avi_info.fps_x100;
             ret = validate_demuxer_stream(avi_info, &result, args->allow_fullcanvas_over20);
         }
     }
@@ -838,11 +840,15 @@ static void benchmark_task(void *arg)
     if (ret == ESP_OK && generation_current(args->generation)) {
         char sidecar_path[512];
         snprintf(sidecar_path, sizeof(sidecar_path), "%s.fvix", args->path);
-        const esp_err_t idx_ret = VideoSeekIndex::load(sidecar_path);
+        const esp_err_t idx_ret = VideoSeekIndex::load(sidecar_path, &io, source_fps_x100);
         if (idx_ret == ESP_OK) {
-            ESP_LOGI(TAG, "侧车索引已加载，%u 条目，支持 seek", VideoSeekIndex::count());
+            ESP_LOGI(TAG, "侧车索引已加载，%u 条目，来源抽样校验=%s，音频字节锚点=%s",
+                VideoSeekIndex::count(),
+                VideoSeekIndex::has_source_fingerprint() ? "通过" : "旧版未验证",
+                VideoSeekIndex::has_audio_byte_anchor() ? "是" : "否");
         } else {
-            ESP_LOGW(TAG, "未找到侧车索引，seek 不可用: %s", sidecar_path);
+            ESP_LOGW(TAG, "侧车索引不可用（缺失、版本不支持或来源校验失败），seek 不可用: %s",
+                sidecar_path);
         }
     }
 
@@ -1514,17 +1520,23 @@ esp_err_t seek(uint32_t target_ms)
     // 5. 清空音频桥残留数据
     avi_mp3_bridge_clear();
 
-    // 6. demuxer seek 到索引偏移，恢复绝对时间轴的帧/字节计数
-    // 音频字节按平均码率估算，使音频 PTS 与视频 PTS 在同一时间轴。
-    uint32_t audio_bitrate = 0U;
-    portENTER_CRITICAL(&g_mux);
-    audio_bitrate = g_snapshot.audio_bitrate;
-    portEXIT_CRITICAL(&g_mux);
-    const uint32_t audio_avg_bps = audio_bitrate / 8U;
-    const uint32_t audio_bytes_at_seek = audio_avg_bps > 0
-        ? static_cast<uint32_t>(static_cast<uint64_t>(entry.timestamp_ms) * audio_avg_bps / 1000ULL)
-        : 0U;
-    ret = AviDemuxer::seek_to_offset(entry.file_offset, entry.timestamp_ms, audio_bytes_at_seek);
+    // 6. demuxer seek 到索引偏移，恢复绝对时间轴的帧/字节计数。
+    // V2 直接使用索引生成时累计的音频字节数和原始视频帧序号；V1 保留旧估算方式。
+    uint32_t audio_bytes_at_seek = entry.audio_bytes_before;
+    uint32_t video_frame_index = entry.video_frame_index;
+    if (!VideoSeekIndex::has_audio_byte_anchor()) {
+        uint32_t audio_bitrate = 0U;
+        portENTER_CRITICAL(&g_mux);
+        audio_bitrate = g_snapshot.audio_bitrate;
+        portEXIT_CRITICAL(&g_mux);
+        const uint32_t audio_avg_bps = audio_bitrate / 8U;
+        audio_bytes_at_seek = audio_avg_bps > 0U
+            ? static_cast<uint32_t>(static_cast<uint64_t>(entry.timestamp_ms) * audio_avg_bps / 1000ULL)
+            : 0U;
+        video_frame_index = 0xFFFFFFFFU;
+    }
+    ret = AviDemuxer::seek_to_offset(
+        entry.file_offset, entry.timestamp_ms, audio_bytes_at_seek, video_frame_index);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Demuxer seek 失败: offset=%u", entry.file_offset);
         return abort_seek(ret);

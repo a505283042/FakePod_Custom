@@ -82,12 +82,45 @@ function Read-AviFourCC([System.IO.FileStream]$fs, [int64]$off) {
     return [System.Text.Encoding]::ASCII.GetString($b)
 }
 
-# 生成 AVI 侧车索引(.fvix)，供设备端粗精度 seek 使用。
-# 索引粒度：每 2 秒一条，存储时间戳(ms) -> 视频 chunk 头偏移。
-# 直接解析 AVI 的 movi 结构（不依赖 ffprobe），记录的偏移正好是设备端
-# AviDemuxer::read_frame() 期望读取 chunk 头的位置。
+# 计算与设备端完全一致的 AVI 抽样 CRC32：文件头、1/3、2/3、文件尾各取 512 字节。
+function Get-AviSampleCrc32([System.IO.FileStream]$fs, [int64]$fileLen) {
+    [uint32]$crc = 4294967295
+    [int64[]]$offsets = @(
+        0,
+        [int64][Math]::Floor($fileLen / 3.0),
+        [int64][Math]::Floor(($fileLen * 2.0) / 3.0),
+        [int64][Math]::Max(0, $fileLen - 512)
+    )
+
+    foreach ($offset in $offsets) {
+        $sampleLength = [int][Math]::Min(512, $fileLen - $offset)
+        if ($sampleLength -le 0) { throw "AVI 指纹抽样范围无效：offset=$offset" }
+        $fs.Position = $offset
+        $buffer = New-Object byte[] $sampleLength
+        $got = $fs.Read($buffer, 0, $sampleLength)
+        if ($got -ne $sampleLength) { throw "读取 AVI 指纹样本失败：offset=$offset" }
+
+        foreach ($value in $buffer) {
+            $crc = [uint32](([uint64]$crc) -bxor ([uint64]$value))
+            for ($bit = 0; $bit -lt 8; $bit++) {
+                if (([uint64]$crc -band [uint64]1) -ne 0) {
+                    $shifted = ([uint64]$crc -shr 1)
+                    $crc = [uint32]($shifted -bxor [uint64]3988292384)
+                } else {
+                    $crc = [uint32]([uint64]$crc -shr 1)
+                }
+            }
+        }
+    }
+
+    return [uint32](([uint64]$crc) -bxor [uint64]4294967295)
+}
+
+# 生成 AVI 侧车索引(.fvix V2)。
+# 每约 2 秒记录视频帧序号、chunk 头偏移，以及该帧之前累计的 MP3 字节数。
+# 同时保存文件长度和抽样 CRC32，设备端加载时验证索引是否属于当前 AVI。
 function New-SidecarIndex([string]$aviPath) {
-    $granularityMs = 2000  # 2 秒粒度：seek 落点误差 <=2s，条目数仍然很小
+    $granularityMs = 2000
     $outPath = $aviPath + ".fvix"
     $result = [pscustomobject]@{ Ok = $false; Path = $outPath; Count = 0; Message = "" }
 
@@ -96,28 +129,39 @@ function New-SidecarIndex([string]$aviPath) {
         return $result
     }
 
+    # 重新生成前先删除旧索引；若本次生成失败，不留下可能属于旧 AVI 的 V1/V2 文件。
+    try {
+        if (Test-Path -LiteralPath $outPath) {
+            Remove-Item -LiteralPath $outPath -Force -ErrorAction Stop
+        }
+    } catch {
+        $result.Message = "无法删除旧索引：$($_.Exception.Message)"
+        return $result
+    }
+
     $fs = $null
     try {
         $fs = [System.IO.File]::Open($aviPath, [System.IO.FileMode]::Open,
             [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
         $fileLen = $fs.Length
-        if ($fileLen -lt 12 -or (Read-AviFourCC $fs 0) -ne 'RIFF' -or (Read-AviFourCC $fs 8) -ne 'AVI ') {
-            $result.Message = "不是有效的 AVI 文件"
+        if ($fileLen -lt 12 -or $fileLen -gt [uint32]::MaxValue -or
+            (Read-AviFourCC $fs 0) -ne 'RIFF' -or (Read-AviFourCC $fs 8) -ne 'AVI ') {
+            $result.Message = "不是有效的 AVI 文件，或文件超过 4GB 索引范围"
             return $result
         }
 
-        # 第一遍：解析 hdrl 取视频帧率，并定位 movi 数据区。
-        $usPerFrame = 0.0
-        $scale = 0.0
-        $rate = 0.0
+        # 第一遍：读取 avih 帧间隔，并定位 movi 数据区。
+        # 必须与设备端 AviDemuxer::open() 使用相同的 avih -> fps_x100 取整规则。
+        $usPerFrame = [uint32]0
         $moviStart = [int64]-1
         $moviEnd = [int64]-1
-
         $pos = [int64]12
         while ($pos + 8 -le $fileLen) {
             $id = Read-AviFourCC $fs $pos
             $size = [int64](Read-AviU32 $fs ($pos + 4))
             $data = $pos + 8
+            if ($size -gt ($fileLen - $data)) { throw "AVI 顶层 chunk 越过文件末尾：offset=$pos" }
+
             if ($id -eq 'LIST' -and $size -ge 4) {
                 $listType = Read-AviFourCC $fs $data
                 if ($listType -eq 'hdrl') {
@@ -127,29 +171,9 @@ function New-SidecarIndex([string]$aviPath) {
                         $sid = Read-AviFourCC $fs $p
                         $ssize = [int64](Read-AviU32 $fs ($p + 4))
                         $sdata = $p + 8
-                        if ($sid -eq 'avih' -and $ssize -ge 40) {
-                            $candidate = Read-AviU32 $fs $sdata
-                            if ($candidate -gt 0) { $usPerFrame = [double]$candidate }
-                        } elseif ($sid -eq 'LIST' -and $ssize -ge 4) {
-                            $stype = Read-AviFourCC $fs $sdata
-                            if ($stype -eq 'strl') {
-                                $q = $sdata + 4
-                                $strlEnd = $sdata + $ssize
-                                while ($q + 8 -le $strlEnd) {
-                                    $iid = Read-AviFourCC $fs $q
-                                    $isize = [int64](Read-AviU32 $fs ($q + 4))
-                                    $idata = $q + 8
-                                    if ($iid -eq 'strh' -and $isize -ge 32) {
-                                        $streamType = Read-AviFourCC $fs $idata
-                                        if ($streamType -eq 'vids') {
-                                            # strh: dwScale@20, dwRate@24；fps = dwRate / dwScale
-                                            $scale = [double](Read-AviU32 $fs ($idata + 20))
-                                            $rate = [double](Read-AviU32 $fs ($idata + 24))
-                                        }
-                                    }
-                                    $q = $idata + $isize + ($isize -band 1)
-                                }
-                            }
+                        if ($ssize -gt ($hdrEnd - $sdata)) { throw "AVI hdrl 子 chunk 越界：offset=$p" }
+                        if ($sid -eq 'avih' -and $ssize -ge 56) {
+                            $usPerFrame = Read-AviU32 $fs $sdata
                         }
                         $p = $sdata + $ssize + ($ssize -band 1)
                     }
@@ -161,66 +185,100 @@ function New-SidecarIndex([string]$aviPath) {
             $pos = $data + $size + ($size -band 1)
         }
 
-        $frameMs = 0.0
-        if ($scale -gt 0 -and $rate -gt 0) {
-            $frameMs = 1000.0 * $scale / $rate
-        } elseif ($usPerFrame -gt 0) {
-            $frameMs = $usPerFrame / 1000.0
-        }
-        if ($frameMs -le 0) {
-            $result.Message = "无法确定视频帧率"
+        if ($usPerFrame -eq 0) {
+            $result.Message = "AVI 主头 avih 未提供有效帧间隔"
             return $result
         }
-        if ($moviStart -lt 0 -or $moviEnd -le $moviStart) {
-            $result.Message = "未找到 movi 数据区"
+        $fpsX100 = [uint32][Math]::Floor(([decimal]100000000) / ([decimal]$usPerFrame))
+        if ($fpsX100 -eq 0) {
+            $result.Message = "AVI 帧率超出设备端支持范围"
+            return $result
+        }
+        if ($moviStart -lt 0 -or $moviEnd -le $moviStart -or $moviEnd -gt $fileLen) {
+            $result.Message = "未找到有效 movi 数据区"
             return $result
         }
 
-        # 第二遍：顺序扫描 movi，每 granularityMs 记录一条视频 chunk 头偏移。
+        # 第二遍：顺序扫描 movi。时间戳严格采用设备端 frame_index / fps_x100 公式。
         $entries = New-Object System.Collections.Generic.List[object]
-        $frameIndex = 0
-        $nextMarkMs = 0.0
+        [uint64]$frameIndex = 0
+        [uint64]$audioBytesTotal = 0
+        [uint64]$nextMarkMs = 0
         $pos = $moviStart
         while ($pos + 8 -le $moviEnd) {
             $id = Read-AviFourCC $fs $pos
             $size = [int64](Read-AviU32 $fs ($pos + 4))
             $data = $pos + 8
+            if ($size -gt ($moviEnd - $data)) { throw "AVI movi chunk 越界：offset=$pos" }
             $advance = $data + $size + ($size -band 1)
-            if ($id -eq 'LIST' -and $size -ge 4 -and
-                (Read-AviFourCC $fs $data) -eq 'rec ') {
-                # rec 组内直接包含帧 chunk，进入后继续按 chunk 逐个扫描
+            if ($advance -gt $moviEnd) { throw "AVI movi chunk 补齐字节越界：offset=$pos" }
+
+            if ($id -eq 'LIST' -and $size -ge 4 -and (Read-AviFourCC $fs $data) -eq 'rec ') {
+                # rec 组内继续扫描子 chunk，不把 LIST 本身计入媒体帧。
                 $pos = $data + 4
                 continue
             }
+
             if ($id -eq '00dc' -or $id -eq '00db') {
-                $tsMs = [int64]($frameIndex * $frameMs)
-                if ($tsMs -ge $nextMarkMs) {
-                    $entries.Add([pscustomobject]@{ ts = [uint32]$tsMs; off = [uint32]$pos })
-                    $nextMarkMs = $tsMs + $granularityMs
+                if ($size -ge 2) {
+                    $tsMs64 = [Math]::Floor((([decimal]$frameIndex * [decimal]100000) / [decimal]$fpsX100))
+                    if ($tsMs64 -gt [uint32]::MaxValue) { throw "AVI 时长超出 FVIX 时间戳范围" }
+                    if ($tsMs64 -ge $nextMarkMs) {
+                        # 只把 JPEG SOI 有效的帧写入索引，避免首个落点本身不可解码。
+                        $fs.Position = $data
+                        $jpegSignature = New-Object byte[] 2
+                        $signatureRead = $fs.Read($jpegSignature, 0, 2)
+                        if ($signatureRead -eq 2 -and
+                            $jpegSignature[0] -eq 0xFF -and $jpegSignature[1] -eq 0xD8) {
+                            if ($frameIndex -gt [uint32]::MaxValue) { throw "视频帧序号超出 FVIX 范围" }
+                            if ($audioBytesTotal -gt [uint32]::MaxValue) { throw "音频累计字节数超出 FVIX 范围" }
+                            $entries.Add([pscustomobject]@{
+                                ts = [uint32]$tsMs64
+                                off = [uint32]$pos
+                                frame = [uint32]$frameIndex
+                                audio = [uint32]$audioBytesTotal
+                            })
+                            $nextMarkMs = [uint64]$tsMs64 + [uint64]$granularityMs
+                        }
+                    }
                 }
+                # 与设备端一致：即使是 0 字节占位视频 chunk，也占用一个帧序号。
                 $frameIndex++
+            } elseif ($id -eq '01wb' -or $id -eq '00wb') {
+                $audioBytesTotal += [uint64]$size
+                if ($audioBytesTotal -gt [uint32]::MaxValue) { throw "音频累计字节数超出 FVIX 范围" }
             }
+
             $pos = $advance
         }
 
         if ($entries.Count -eq 0) {
-            $result.Message = "未找到视频帧，无法生成索引"
+            $result.Message = "未找到有效视频帧，无法生成索引"
             return $result
         }
+        if ($entries.Count -gt 100000) {
+            throw "索引条目超过设备端上限 100000，无法安全加载到 PSRAM"
+        }
 
-        # 写入二进制索引文件
-        # Header: "FVIX"(4) + version(uint16=1) + granularity_ms(uint16) + entry_count(uint32)
-        # Entry:  timestamp_ms(uint32) + file_offset(uint32)
+        # 抽样指纹在索引生成时计算；设备端按相同位置和长度重新计算后比对。
+        $sourceCrc32 = Get-AviSampleCrc32 $fs $fileLen
+
+        # V2 文件头：FVIX + 版本号 + 索引粒度 + 条目数 + AVI 文件长度 + 抽样 CRC32。
+        # V2 条目：时间戳 + 视频 chunk 偏移 + 视频帧序号 + 此帧之前累计的音频字节数。
         $outFs = [System.IO.File]::Open($outPath, [System.IO.FileMode]::Create)
         try {
             $bw = New-Object System.IO.BinaryWriter($outFs)
             $bw.Write([byte[]][char[]]"FVIX")
-            $bw.Write([uint16]1)
+            $bw.Write([uint16]2)
             $bw.Write([uint16]$granularityMs)
             $bw.Write([uint32]$entries.Count)
+            $bw.Write([uint32]$fileLen)
+            $bw.Write([uint32]$sourceCrc32)
             foreach ($e in $entries) {
                 $bw.Write([uint32]$e.ts)
                 $bw.Write([uint32]$e.off)
+                $bw.Write([uint32]$e.frame)
+                $bw.Write([uint32]$e.audio)
             }
             $bw.Flush()
         } finally {
@@ -229,9 +287,12 @@ function New-SidecarIndex([string]$aviPath) {
 
         $result.Ok = $true
         $result.Count = $entries.Count
-        $result.Message = "索引已生成：$($entries.Count) 条，粒度 $($granularityMs)ms，共 $($frameIndex) 个视频帧"
+        $result.Message = "V2 索引已生成：$($entries.Count) 条，粒度 $($granularityMs)ms，帧率 $($fpsX100 / 100.0)fps，来源指纹已写入"
         return $result
     } catch {
+        if (Test-Path -LiteralPath $outPath) {
+            Remove-Item -LiteralPath $outPath -Force -ErrorAction SilentlyContinue
+        }
         $result.Message = $_.Exception.Message
         return $result
     } finally {
@@ -788,7 +849,7 @@ $btnPreset.Location = New-Object System.Drawing.Point(340,$y)
 $btnPreset.Size = New-Object System.Drawing.Size(130,40)
 $form.Controls.Add($btnPreset)
 
-# 对已有 AVI 单独补生成 .fvix 索引（不重新转码）。
+# 对已有 AVI 单独补生成 .fvix V2 索引（不重新转码）。
 $btnSidecar = New-Object System.Windows.Forms.Button
 $btnSidecar.Text = "生成 .fvix 索引(可多选)"
 $btnSidecar.Location = New-Object System.Drawing.Point(480,$y)
@@ -1012,7 +1073,7 @@ $btnOpen.Add_Click({
     }
 })
 
-# 补生成 .fvix 索引：弹出文件选择框（支持多选）挑已有视频；
+# 补生成 .fvix V2 索引：弹出文件选择框（支持多选）挑已有视频；
 # 若“输出文件”已是 AVI，则预选它并以其目录作为初始目录。
 $btnSidecar.Add_Click({
     $targets = @()
@@ -1021,7 +1082,7 @@ $btnSidecar.Add_Click({
         $outPath.Trim().ToLower().EndsWith(".avi") -and
         (Test-Path -LiteralPath $outPath)
     $dlg = New-Object System.Windows.Forms.OpenFileDialog
-    $dlg.Title = "选择要生成 .fvix 索引的 AVI（可多选）"
+    $dlg.Title = "选择要生成 .fvix V2 索引的 AVI（可多选）"
     $dlg.Filter = "AVI 视频 (*.avi)|*.avi|所有文件 (*.*)|*.*"
     $dlg.Multiselect = $true
     if ($hasOutAvi) {
@@ -1042,7 +1103,7 @@ $btnSidecar.Add_Click({
     try {
         for ($i = 0; $i -lt $targets.Count; $i++) {
             $target = $targets[$i]
-            $lblStatus.Text = "正在生成索引 ($($i + 1)/$($targets.Count))：$([System.IO.Path]::GetFileName($target)) …"
+            $lblStatus.Text = "正在生成 V2 索引 ($($i + 1)/$($targets.Count))：$([System.IO.Path]::GetFileName($target)) …"
             [System.Windows.Forms.Application]::DoEvents()
             $idx = New-SidecarIndex -aviPath $target
             if ($idx.Ok) {
@@ -1053,8 +1114,8 @@ $btnSidecar.Add_Click({
         }
 
         if ($targets.Count -eq 1 -and $failures.Count -eq 0) {
-            $lblStatus.Text = "索引已生成：$($targets[0]).fvix"
-            [System.Windows.Forms.MessageBox]::Show("索引已生成`r`n`r`n$($targets[0]).fvix", "索引生成完成")
+            $lblStatus.Text = "V2 索引已生成：$($targets[0]).fvix"
+            [System.Windows.Forms.MessageBox]::Show("V2 索引已生成`r`n`r`n$($targets[0]).fvix", "V2 索引生成完成")
         } else {
             $lblStatus.Text = "索引生成完成：成功 $succeeded / 共 $($targets.Count)"
             $summary = "成功 $succeeded 个，失败 $($failures.Count) 个。"
@@ -1153,6 +1214,17 @@ $btnConvert.Add_Click({
                 [System.IO.Directory]::CreateDirectory($outDir) | Out-Null
             }
 
+            # 转码开始前先移除目标文件的旧索引，防止 FFmpeg 中途失败后留下可被误用的旧 V1 索引。
+            $outSidecarPath = $outPath + ".fvix"
+            if (Test-Path -LiteralPath $outSidecarPath) {
+                try {
+                    Remove-Item -LiteralPath $outSidecarPath -Force -ErrorAction Stop
+                } catch {
+                    $failures.Add("${fileName}：无法删除输出文件的旧 .fvix 索引：$($_.Exception.Message)")
+                    continue
+                }
+            }
+
             $psi = New-Object System.Diagnostics.ProcessStartInfo
             $psi.FileName = $ffmpeg
             $psi.Arguments = $arguments
@@ -1170,9 +1242,9 @@ $btnConvert.Add_Click({
 
             if ($p.ExitCode -eq 0 -and (Test-Path -LiteralPath $outPath)) {
                 $succeeded++
-                # 生成侧车索引(.fvix)，供设备端 seek 使用。失败不影响播放。
+        # 生成侧车索引(.fvix V2)，供设备端 SEEK 使用。失败不影响播放。
                 try {
-                    $lblStatus.Text = "正在生成 .fvix 索引 ($($i + 1)/$total)…"
+                    $lblStatus.Text = "正在生成 .fvix V2 索引 ($($i + 1)/$total)…"
                     [System.Windows.Forms.Application]::DoEvents()
                     $idx = New-SidecarIndex -aviPath $outPath
                     if ($idx.Ok) { $sidecarCount++ } else { Write-Warning "侧车索引生成失败（不影响播放）：$($idx.Message)" }
@@ -1187,9 +1259,9 @@ $btnConvert.Add_Click({
         if ($total -eq 1) {
             if ($failures.Count -eq 0) {
                 $lblStatus.Text = if ($sidecarCount -gt 0) {
-                    "转换完成（含 .fvix 索引）：$singleOutput"
+                    "转换完成（含 .fvix V2 索引）：$singleOutput"
                 } else {
-                    "转换完成（未生成 .fvix 索引）：$singleOutput"
+                    "转换完成（未生成 .fvix V2 索引）：$singleOutput"
                 }
                 [System.Media.SystemSounds]::Asterisk.Play()
                 [System.Windows.Forms.MessageBox]::Show("转换完成。`r`n`r`n$singleOutput","完成")

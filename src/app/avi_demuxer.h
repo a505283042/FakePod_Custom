@@ -52,7 +52,8 @@ esp_err_t read_frame(FrameInfo *frame, uint8_t *data, uint32_t capacity);
 
 // seek 到指定文件偏移，并重置帧计数器。
 // 用于侧车索引定位后的跳转。
-esp_err_t seek_to_offset(uint32_t file_offset, uint32_t video_pts_ms, uint32_t audio_bytes_at_seek);
+esp_err_t seek_to_offset(uint32_t file_offset, uint32_t video_pts_ms,
+    uint32_t audio_bytes_at_seek, uint32_t video_frame_index = 0xFFFFFFFFU);
 
 // 从当前偏移顺序扫描，丢弃 PTS 早于 target_ms 的视频帧（只读 chunk 头，不读取帧数据），
 // 停在目标帧的 chunk 头，使随后的 read_frame() 直接返回该帧。
