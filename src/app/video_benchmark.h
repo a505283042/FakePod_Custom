@@ -78,6 +78,7 @@ struct FrameView
     uint16_t width = 0U;
     uint16_t height = 0U;
     uint32_t pts_ms = 0U;
+    uint32_t seek_epoch = 0U;  // 帧所属的 SEEK 世代，防止旧帧被 Presenter 显示
     uint32_t compressed_bytes = 0U;
     uint32_t extract_us = 0U;
     uint32_t storage_us = 0U;
@@ -98,12 +99,15 @@ bool is_paused();
 esp_err_t seek(uint32_t target_ms);
 // 返回是否支持 seek（即侧车索引是否已加载）。
 bool can_seek();
-// 每次成功 seek 后自增；Presenter 据此重新锚定 Presentation Clock。
+// 每次成功 SEEK 后自增；Presenter 据此重新锚定 Presentation Clock。
 uint32_t seek_epoch();
+// SEEK 后音频保持暂停，直到新位置第一帧显示完成。
+bool seek_audio_resume_pending();
+bool resume_audio_after_seek();
 
 bool get_snapshot(Snapshot *out_snapshot);
 // UI 在取得第一张帧时发布唯一 Presentation Clock；DecodeTask 只消费该时钟，不再自行锚定。
-bool set_presentation_clock(uint32_t first_pts_ms, int64_t clock_base_us);
+bool set_presentation_clock(uint32_t frame_seek_epoch, uint32_t first_pts_ms, int64_t clock_base_us);
 bool take_frame(FrameView *out_frame);
 // Presenter 专用阻塞式取帧；直接等待 RGB ready queue，避免 LVGL timer 轮询引入几十毫秒空洞。
 bool wait_frame(FrameView *out_frame, uint32_t timeout_ms);

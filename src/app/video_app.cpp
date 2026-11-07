@@ -1104,8 +1104,12 @@ static void benchmark_presenter_task(void *arg)
     while (!benchmark_presenter_should_stop()) {
         if (!benchmark_presenter_wait_if_paused(clock_started, &clock_base_us)) break;
 
-        // seek 后 PTS 从 0 重新开始，且 VideoBenchmark 已重置 Presentation Clock：
-        // 这里必须重新锚定，否则时钟永远不 started，Decode 侧无法判丢帧并会堵塞整条管线。
+        VideoBenchmark::FrameView frame = {};
+        const bool got_frame = VideoBenchmark::wait_frame(&frame, kPresenterFrameWaitMs);
+        const int64_t acquired_us = esp_timer_get_time();
+
+        // 在 wait_frame 之后检查世代，覆盖 SEEK 恰好发生在 Presenter 阻塞取帧期间的竞态。
+        // SEEK 后 PTS 仍沿用 AVI 绝对时间轴，但 Presentation Clock 必须重新锚定。
         const uint32_t epoch = VideoBenchmark::seek_epoch();
         if (epoch != seek_epoch_seen) {
             seek_epoch_seen = epoch;
@@ -1113,12 +1117,16 @@ static void benchmark_presenter_task(void *arg)
             audio_master_expected = false;
             audio_master_logged = false;
             audio_master_drift_us = 0LL;
+            audio_master_last_pos_us = 0LL;
+            audio_master_last_pts_us = 0LL;
             audio_master_drift_valid = false;
+            // 新时间轴重新给予首帧显示机会，不能沿用 SEEK 前的累计显示帧数。
+            presented_local = 0U;
+            last_present_done_us = 0LL;
+            first_pts_ms = 0U;
+            audio_first_pts_ms = 0U;
+            clock_base_us = 0LL;
         }
-
-        VideoBenchmark::FrameView frame = {};
-        const bool got_frame = VideoBenchmark::wait_frame(&frame, kPresenterFrameWaitMs);
-        const int64_t acquired_us = esp_timer_get_time();
 
         portENTER_CRITICAL(&g_benchmark_ui_mux);
         CadenceProbeWindow &probe = g_benchmark_ui.probe;
@@ -1148,6 +1156,11 @@ static void benchmark_presenter_task(void *arg)
             VideoBenchmark::release_frame(frame.slot);
             break;
         }
+        // Presenter 可能在 SEEK 开始前已经取到一帧；暂停等待结束后必须再次检查世代。
+        if (frame.seek_epoch != VideoBenchmark::seek_epoch()) {
+            VideoBenchmark::release_frame(frame.slot);
+            continue;
+        }
 
         if (!clock_started) {
             clock_started = true;
@@ -1165,7 +1178,11 @@ static void benchmark_presenter_task(void *arg)
             g_benchmark_ui.first_pts_ms = first_pts_ms;
             g_benchmark_ui.clock_base_us = clock_base_us;
             portEXIT_CRITICAL(&g_benchmark_ui_mux);
-            if (!VideoBenchmark::set_presentation_clock(first_pts_ms, clock_base_us)) {
+            if (!VideoBenchmark::set_presentation_clock(frame.seek_epoch, first_pts_ms, clock_base_us)) {
+                if (frame.seek_epoch != VideoBenchmark::seek_epoch()) {
+                    VideoBenchmark::release_frame(frame.slot);
+                    continue;
+                }
                 ESP_LOGW(TAG, "Fallback PTS时钟发布失败；Audio PCM Master不可用时Decode将暂不做PreDecode时钟判断");
             }
         }
@@ -1379,6 +1396,12 @@ static void benchmark_presenter_task(void *arg)
             }
         }
 
+        // SPI 提交前再次检查；若 SEEK 恰好发生在帧准备期间，不提交旧时间轴画面。
+        if (frame.seek_epoch != VideoBenchmark::seek_epoch()) {
+            VideoBenchmark::release_frame(frame.slot);
+            continue;
+        }
+
         const int64_t present_start_us = esp_timer_get_time();
         DisplayBoundedSpiStats stats = {};
         const esp_err_t present_ret = display_launcher_bounded_spi_present_stream(
@@ -1446,6 +1469,15 @@ static void benchmark_presenter_task(void *arg)
         last_present_done_us = present_done_us;
 
         VideoBenchmark::release_frame(frame.slot);
+
+        // SEEK 后音频保持暂停；新位置首帧已真正写入 LCD 后才恢复音频时钟。
+        if (frame.seek_epoch == VideoBenchmark::seek_epoch() &&
+            VideoBenchmark::seek_audio_resume_pending() &&
+            !VideoBenchmark::resume_audio_after_seek()) {
+            benchmark_presenter_set_error(ESP_FAIL);
+            VideoBenchmark::stop();
+            break;
+        }
     }
 
     if (bounded_session) display_launcher_bounded_spi_session_end();
@@ -1539,8 +1571,12 @@ static void benchmark_toggle_pause()
         }
         (void)audio_service_video_mp3_pause(true);
     } else {
-        (void)audio_service_video_mp3_resume(true);
-        (void)VideoBenchmark::set_paused(false);
+        const bool wait_for_seek_frame = VideoBenchmark::seek_audio_resume_pending();
+        if (!wait_for_seek_frame) (void)audio_service_video_mp3_resume(true);
+        if (!VideoBenchmark::set_paused(false)) {
+            if (!wait_for_seek_frame) (void)audio_service_video_mp3_pause(true);
+            ESP_LOGW(TAG, "双击恢复播放失败");
+        }
     }
     ESP_LOGI(TAG, "双击：%s", pause_now ? "暂停播放" : "继续播放");
 }
@@ -1919,9 +1955,12 @@ static void process_remote_command()
             if (ok && has_video_audio) ok = audio_service_video_mp3_pause(true);
             if (!ok) (void)VideoBenchmark::set_paused(false);
         } else {
-            ok = !has_video_audio || audio_service_video_mp3_resume(true);
+            const bool wait_for_seek_frame = VideoBenchmark::seek_audio_resume_pending();
+            ok = wait_for_seek_frame || !has_video_audio || audio_service_video_mp3_resume(true);
             if (ok) ok = VideoBenchmark::set_paused(false);
-            if (!ok && has_video_audio) (void)audio_service_video_mp3_pause(true);
+            if (!ok && has_video_audio && !wait_for_seek_frame) {
+                (void)audio_service_video_mp3_pause(true);
+            }
         }
         if (ok) {
             remote_playback_changed();

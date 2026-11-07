@@ -69,6 +69,7 @@ struct FrameSlot
     uint16_t width = 0U;
     uint16_t height = 0U;
     uint32_t pts_ms = 0U;
+    uint32_t seek_epoch = 0U;  // 帧所属的 SEEK 世代，禁止旧帧进入新时间轴
     uint32_t compressed_bytes = 0U;
     uint32_t extract_us = 0U;
     uint32_t storage_us = 0U;
@@ -80,6 +81,7 @@ struct CompressedSlot
     uint8_t *data = nullptr;
     uint32_t bytes = 0U;
     uint32_t pts_ms = 0U;
+    uint32_t seek_epoch = 0U;  // 提取时记录，解码前后再次校验
     uint32_t extract_us = 0U;
     uint32_t storage_us = 0U;
     uint32_t copy_us = 0U;
@@ -153,6 +155,7 @@ static bool g_paused = false;
 static bool g_extract_pause_ack = false;
 static int64_t g_pause_started_us = 0LL;
 static uint32_t g_seek_epoch = 0U;
+static bool g_seek_audio_resume_pending = false;  // SEEK 后首帧显示前保持音频暂停
 static esp_err_t g_seek_failure = ESP_OK;  // 本轮 SEEK 致命错误，仅随新播放世代清除
 static QueueHandle_t g_free_queue = nullptr;
 static QueueHandle_t g_ready_queue = nullptr;
@@ -313,6 +316,7 @@ static void publish_task_exit(const Snapshot &snapshot)
     g_paused = false;
     g_extract_pause_ack = false;
     g_pause_started_us = 0LL;
+    g_seek_audio_resume_pending = false;
     g_task = nullptr;
     portEXIT_CRITICAL(&g_mux);
 }
@@ -335,11 +339,11 @@ static bool pause_transition_active()
     return active;
 }
 
-static bool send_ready(uint8_t slot, uint32_t generation)
+static bool send_ready(uint8_t slot, uint32_t generation, uint32_t frame_seek_epoch)
 {
     while (generation_current(generation)) {
-        if (pause_transition_active()) {
-            // 该帧在暂停/seek 期间无意义，直接归还空槽。
+        // 队列清空时 DecodeTask 可能仍持有一帧；世代变化后不能再排入新时间轴。
+        if (seek_epoch() != frame_seek_epoch || pause_transition_active()) {
             return_slot_to_free(slot);
             return true;
         }
@@ -413,6 +417,7 @@ static void stop_generation(uint32_t generation)
         g_paused = false;
         g_extract_pause_ack = false;
         g_pause_started_us = 0LL;
+        g_seek_audio_resume_pending = false;
     }
     portEXIT_CRITICAL(&g_mux);
 }
@@ -676,6 +681,7 @@ static void extract_task(void *arg)
         // 视频帧：data 已在 slot.data 中（零拷贝），直接填充元数据。
         slot.bytes = frame.size;
         slot.pts_ms = static_cast<uint32_t>(frame.pts);
+        slot.seek_epoch = seek_epoch();
         slot.extract_us = extract_us;
         slot.storage_us = storage_us;
         slot.copy_us = 0U;  // 零拷贝
@@ -947,14 +953,7 @@ static void benchmark_task(void *arg)
         while (!done && generation_current(args->generation)) {
             if (!wait_while_paused(args->generation)) break;
             PipelineMessage message = {};
-            const uint32_t recv_epoch = seek_epoch();
             if (!receive_pipeline_message(&message, args->generation)) break;
-
-            // seek 期间从旧文件位置取出的压缩帧直接丢弃，避免解出 seek 前的画面。
-            if (message.type == PipelineMessageType::Frame && seek_epoch() != recv_epoch) {
-                return_compressed_to_free(message.slot);
-                continue;
-            }
 
             if (message.type == PipelineMessageType::PoolSkipped) {
                 ++result.frames_pool_skipped;
@@ -998,6 +997,12 @@ static void benchmark_task(void *arg)
             if (depth > pipe_qmax) pipe_qmax = depth;
 
             CompressedSlot &compressed = g_compressed_slots[message.slot];
+            const uint32_t compressed_seek_epoch = compressed.seek_epoch;
+            // 以 ExtractTask 给该帧盖的世代戳为准，不能把“等待队列期间发生 SEEK”误判成旧帧。
+            if (compressed_seek_epoch != seek_epoch()) {
+                return_compressed_to_free(message.slot);
+                continue;
+            }
             ++result.frames_read;
             result.extract_us_total += compressed.extract_us;
             if (compressed.extract_us > result.extract_us_max) result.extract_us_max = compressed.extract_us;
@@ -1093,7 +1098,14 @@ static void benchmark_task(void *arg)
             }
             consecutive_decode_failures = 0U;
 
+            // JPEG 解码期间可能发生 SEEK；旧帧即使解码成功，也不能进入新时间轴。
+            if (compressed_seek_epoch != seek_epoch()) {
+                return_slot_to_free(slot_index);
+                continue;
+            }
+
             slot.pts_ms = pts_ms;
+            slot.seek_epoch = compressed_seek_epoch;
             slot.compressed_bytes = compressed_bytes;
             slot.extract_us = extract_us;
             slot.storage_us = storage_us;
@@ -1110,7 +1122,7 @@ static void benchmark_task(void *arg)
             result.storage_gate_wait_us = io.gate_wait_us_total;
             result.storage_gate_wait_count = io.gate_wait_count;
 
-            if (!send_ready(slot_index, args->generation)) {
+            if (!send_ready(slot_index, args->generation, compressed_seek_epoch)) {
                 return_slot_to_free(slot_index);
                 break;
             }
@@ -1293,6 +1305,7 @@ esp_err_t start(const char *path, bool allow_fullcanvas_over20, bool music_suspe
     g_paused = false;
     g_extract_pause_ack = false;
     g_pause_started_us = 0LL;
+    g_seek_audio_resume_pending = false;
     g_extract_task = nullptr;
     g_leased_mask = 0U;
     g_presentation_clock = {};
@@ -1332,6 +1345,7 @@ void stop()
         g_paused = false;
         g_extract_pause_ack = false;
         g_pause_started_us = 0LL;
+        g_seek_audio_resume_pending = false;
         g_snapshot.state = State::Stopped;
         g_snapshot.paused = false;
         g_snapshot.result = ESP_OK;
@@ -1428,6 +1442,55 @@ uint32_t seek_epoch()
     return epoch;
 }
 
+bool seek_audio_resume_pending()
+{
+    bool pending = false;
+    portENTER_CRITICAL(&g_mux);
+    pending = g_seek_audio_resume_pending &&
+        g_task != nullptr && g_stop_generation != g_generation;
+    portEXIT_CRITICAL(&g_mux);
+    return pending;
+}
+
+bool resume_audio_after_seek()
+{
+    uint32_t generation = 0U;
+    uint32_t epoch = 0U;
+    bool pending = false;
+    bool pause_requested = false;
+    portENTER_CRITICAL(&g_mux);
+    generation = g_generation;
+    epoch = g_seek_epoch;
+    pending = g_seek_audio_resume_pending &&
+        g_task != nullptr && g_stop_generation != g_generation;
+    pause_requested = g_pause_requested || g_paused;
+    portEXIT_CRITICAL(&g_mux);
+
+    if (!pending) return true;
+    // 用户可能在首帧显示前再次暂停，或已经开始下一次 SEEK；此时不能提前放开音频。
+    if (pause_requested || seek_epoch() != epoch) return true;
+    if (!audio_service_video_mp3_resume(true)) {
+        ESP_LOGE(TAG, "SEEK首帧显示后恢复音频失败");
+        return false;
+    }
+
+    // 防止音频恢复命令执行期间发生暂停、下一次 SEEK 或播放世代切换。
+    portENTER_CRITICAL(&g_mux);
+    const bool must_pause = generation != g_generation || epoch != g_seek_epoch ||
+        g_pause_requested || g_paused || g_stop_generation == g_generation;
+    if (!must_pause && generation == g_generation) {
+        g_seek_audio_resume_pending = false;
+    }
+    portEXIT_CRITICAL(&g_mux);
+    if (must_pause) {
+        (void)audio_service_video_mp3_pause(true);
+        return true;
+    }
+
+    ESP_LOGI(TAG, "SEEK首帧已显示，音频时钟恢复推进");
+    return true;
+}
+
 esp_err_t seek(uint32_t target_ms)
 {
     if (!can_seek()) return ESP_ERR_NOT_SUPPORTED;
@@ -1452,6 +1515,7 @@ esp_err_t seek(uint32_t target_ms)
             g_paused = false;
             g_extract_pause_ack = false;
             g_pause_started_us = 0LL;
+            g_seek_audio_resume_pending = false;
             g_snapshot.state = State::Failed;
             g_snapshot.result = error;
             g_snapshot.paused = false;
@@ -1577,20 +1641,20 @@ esp_err_t seek(uint32_t target_ms)
     g_presentation_clock.generation = generation;
     g_presentation_clock.started = false;
     ++g_seek_epoch;
+    g_seek_audio_resume_pending = has_audio;
+    const uint32_t completed_epoch = g_seek_epoch;
     portEXIT_CRITICAL(&g_mux);
 
-    // 9. 恢复播放：音频 seek 已在 AudioTask 内完成时钟对齐与淡入，先恢复音频再放开
-    //    视频管线，避免视频先跑、音频后追。
-    // 如果 SEEK 前是暂停状态，保持暂停；否则先恢复音频再恢复视频。
-    if (!was_paused) {
-        if (has_audio && !audio_service_video_mp3_resume(true)) {
-            ESP_LOGE(TAG, "Seek恢复音频失败，终止当前视频");
-            return abort_seek(ESP_FAIL);
-        }
-        if (!set_paused(false)) {
-            ESP_LOGE(TAG, "Seek恢复视频失败，终止当前视频");
-            return abort_seek(ESP_FAIL);
-        }
+    ESP_LOGI(TAG, "SEEK新时间轴已就绪：epoch=%lu base=%lums audio_barrier=%s",
+        static_cast<unsigned long>(completed_epoch),
+        static_cast<unsigned long>(base_pts_ms),
+        has_audio ? "等待首帧显示" : "无音轨");
+
+    // SEEK 前正在播放时只恢复视频提取/解码；音频保持暂停，直到新位置首帧真正显示。
+    // SEEK 前已经暂停则继续保持暂停，用户手动恢复后仍由首帧显示逻辑释放音频。
+    if (!was_paused && !set_paused(false)) {
+        ESP_LOGE(TAG, "Seek恢复视频失败，终止当前视频");
+        return abort_seek(ESP_FAIL);
     }
     return ESP_OK;
 }
@@ -1604,13 +1668,15 @@ bool get_snapshot(Snapshot *out_snapshot)
     return true;
 }
 
-bool set_presentation_clock(uint32_t first_pts_ms, int64_t clock_base_us)
+bool set_presentation_clock(uint32_t frame_seek_epoch, uint32_t first_pts_ms, int64_t clock_base_us)
 {
     if (clock_base_us <= 0LL) return false;
 
     bool published = false;
     portENTER_CRITICAL(&g_mux);
-    if (g_task != nullptr && g_stop_generation != g_generation) {
+    // 与 SEEK 世代在同一临界区校验，防止旧帧在 SEEK 重置时钟后重新写入旧 PTS。
+    if (frame_seek_epoch == g_seek_epoch &&
+        g_task != nullptr && g_stop_generation != g_generation) {
         if (!g_presentation_clock.started ||
             g_presentation_clock.generation != g_generation) {
             g_presentation_clock.started = true;
@@ -1644,6 +1710,7 @@ static bool receive_frame(FrameView *out_frame, TickType_t wait_ticks)
     out_frame->width = slot.width;
     out_frame->height = slot.height;
     out_frame->pts_ms = slot.pts_ms;
+    out_frame->seek_epoch = slot.seek_epoch;
     out_frame->compressed_bytes = slot.compressed_bytes;
     out_frame->extract_us = slot.extract_us;
     out_frame->storage_us = slot.storage_us;
