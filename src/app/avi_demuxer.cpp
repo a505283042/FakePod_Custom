@@ -15,221 +15,475 @@ namespace
 
 VideoMediaIo::Context *s_io = nullptr;
 StreamInfo s_info = {};
-uint32_t s_movi_data_offset = 0;   // movi LIST 数据区起始偏移（跳过 LIST+size+type 12 字节）
-uint32_t s_movi_data_end = 0;      // movi 数据区结束偏移
-uint32_t s_current_offset = 0;     // 当前读取位置
-uint32_t s_video_frame_index = 0;  // 已读取的视频帧计数（用于 PTS）
-uint32_t s_audio_bytes_total = 0;  // 已读取的音频字节数（用于 PTS）
-uint32_t s_debug_chunk_count = 0;  // 临时诊断：已扫描的 chunk 数量
 
-// 小端读取辅助
-inline uint16_t read_u16(const uint8_t *p) {
-    return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+static constexpr uint32_t kMaxMoviRanges = 16U;
+
+struct MoviRange
+{
+    uint32_t begin = 0U;
+    uint32_t end = 0U;
+};
+
+MoviRange s_movi_ranges[kMaxMoviRanges] = {};
+uint32_t s_movi_range_count = 0U;
+uint32_t s_current_movi_range = 0U;
+uint32_t s_current_offset = 0U;
+uint32_t s_video_frame_index = 0U;
+uint32_t s_audio_bytes_total = 0U;
+uint32_t s_debug_chunk_count = 0U;
+
+uint32_t s_avih_total_frames = 0U;
+uint32_t s_dmlh_total_frames = 0U;
+uint32_t s_video_strh_length = 0U;
+uint32_t s_video_strh_scale = 0U;
+uint32_t s_video_strh_rate = 0U;
+
+// 小端读取辅助。
+inline uint16_t read_u16(const uint8_t *p)
+{
+    return static_cast<uint16_t>(p[0]) |
+        (static_cast<uint16_t>(p[1]) << 8);
 }
-inline uint32_t read_u32(const uint8_t *p) {
+
+inline uint32_t read_u32(const uint8_t *p)
+{
     return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
+        (static_cast<uint32_t>(p[1]) << 8) |
+        (static_cast<uint32_t>(p[2]) << 16) |
+        (static_cast<uint32_t>(p[3]) << 24);
 }
-inline bool match_fcc(const uint8_t *p, const char *fcc) {
-    return p[0] == fcc[0] && p[1] == fcc[1] && p[2] == fcc[2] && p[3] == fcc[3];
+
+inline bool match_fcc(const uint8_t *p, const char *fcc)
+{
+    return p[0] == fcc[0] && p[1] == fcc[1] &&
+        p[2] == fcc[2] && p[3] == fcc[3];
 }
 
 // 从文件绝对偏移读取 size 字节到 buf。成功返回 ESP_OK。
-esp_err_t read_at(uint32_t offset, void *buf, uint32_t size) {
+esp_err_t read_at(uint32_t offset, void *buf, uint32_t size)
+{
     if (s_io == nullptr || s_io->file == nullptr) return ESP_ERR_INVALID_STATE;
+    if (offset > s_io->size || size > s_io->size - offset) return ESP_ERR_INVALID_SIZE;
     if (VideoMediaIo::seek_cb(offset, s_io) < 0) {
         s_io->seek_errors++;
         return ESP_FAIL;
     }
     const int got = VideoMediaIo::read_cb(buf, size, s_io);
-    if (got != static_cast<int>(size)) {
-        return ESP_FAIL;
-    }
+    if (got != static_cast<int>(size)) return ESP_FAIL;
     s_current_offset = offset + size;
     return ESP_OK;
 }
 
 // 从当前位置读取 size 字节。
-esp_err_t read_forward(void *buf, uint32_t size) {
+esp_err_t read_forward(void *buf, uint32_t size)
+{
     return read_at(s_current_offset, buf, size);
+}
+
+bool add_movi_range(uint32_t begin, uint32_t end)
+{
+    if (begin >= end || s_movi_range_count >= kMaxMoviRanges) return false;
+    if (s_movi_range_count > 0U &&
+        begin < s_movi_ranges[s_movi_range_count - 1U].end) {
+        return false;
+    }
+    s_movi_ranges[s_movi_range_count].begin = begin;
+    s_movi_ranges[s_movi_range_count].end = end;
+    ++s_movi_range_count;
+    return true;
+}
+
+int32_t find_movi_range(uint32_t offset)
+{
+    for (uint32_t i = 0U; i < s_movi_range_count; ++i) {
+        if (offset >= s_movi_ranges[i].begin && offset < s_movi_ranges[i].end) {
+            return static_cast<int32_t>(i);
+        }
+    }
+    return -1;
+}
+
+// 当前 movi 段读完后，自动切换到下一个 RIFF/AVIX 段。
+bool select_readable_movi_range()
+{
+    while (s_current_movi_range < s_movi_range_count) {
+        const MoviRange &range = s_movi_ranges[s_current_movi_range];
+        if (s_current_offset < range.begin || s_current_offset > range.end) {
+            s_current_offset = range.begin;
+        }
+        if (s_current_offset < range.end &&
+            range.end - s_current_offset >= 8U) {
+            return true;
+        }
+        ++s_current_movi_range;
+        if (s_current_movi_range < s_movi_range_count) {
+            s_current_offset = s_movi_ranges[s_current_movi_range].begin;
+        }
+    }
+    return false;
+}
+
+esp_err_t parse_stream_list(uint32_t list_data, uint32_t list_size,
+    bool *out_found_video)
+{
+    if (out_found_video == nullptr || list_size < 4U) return ESP_ERR_INVALID_ARG;
+
+    uint32_t pos = list_data + 4U;
+    const uint32_t list_end = list_data + list_size;
+    bool has_strh = false;
+    uint8_t strh[56] = {};
+    uint8_t strf[256] = {};
+    uint32_t strf_size = 0U;
+
+    while (pos <= list_end && list_end - pos >= 8U) {
+        uint8_t hdr[8];
+        if (read_at(pos, hdr, sizeof(hdr)) != ESP_OK) return ESP_FAIL;
+        const uint32_t chunk_size = read_u32(hdr + 4U);
+        const uint32_t data = pos + 8U;
+        if (chunk_size > list_end - data) return ESP_ERR_INVALID_SIZE;
+
+        if (match_fcc(hdr, "strh")) {
+            if (chunk_size < sizeof(strh)) return ESP_ERR_INVALID_SIZE;
+            if (read_at(data, strh, sizeof(strh)) != ESP_OK) return ESP_FAIL;
+            has_strh = true;
+        } else if (match_fcc(hdr, "strf")) {
+            strf_size = chunk_size < sizeof(strf) ? chunk_size : sizeof(strf);
+            if (strf_size > 0U && read_at(data, strf, strf_size) != ESP_OK) {
+                return ESP_FAIL;
+            }
+        }
+
+        const uint64_t next = static_cast<uint64_t>(data) +
+            chunk_size + (chunk_size & 1U);
+        if (next > list_end) return ESP_ERR_INVALID_SIZE;
+        pos = static_cast<uint32_t>(next);
+    }
+
+    if (!has_strh) return ESP_OK;
+
+    if (match_fcc(strh, "vids")) {
+        if (!*out_found_video) {
+            if (strf_size >= 40U) {
+                s_info.width = static_cast<uint16_t>(read_u32(strf + 4U));
+                s_info.height = static_cast<uint16_t>(read_u32(strf + 8U));
+            }
+            s_video_strh_scale = read_u32(strh + 20U);
+            s_video_strh_rate = read_u32(strh + 24U);
+            s_video_strh_length = read_u32(strh + 32U);
+            *out_found_video = true;
+        }
+    } else if (match_fcc(strh, "auds")) {
+        if (strf_size >= 18U) {
+            s_info.audio_format = read_u16(strf + 0U);
+            s_info.audio_channels = static_cast<uint8_t>(read_u16(strf + 2U));
+            s_info.audio_sample_rate = static_cast<uint16_t>(read_u32(strf + 4U));
+            s_info.audio_avg_bps = read_u32(strf + 8U);
+            s_info.audio_bits_per_sample = static_cast<uint8_t>(read_u16(strf + 14U));
+            s_info.audio_bitrate = s_info.audio_avg_bps * 8U;
+            s_info.has_audio = true;
+        }
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t parse_odml_list(uint32_t list_data, uint32_t list_size)
+{
+    if (list_size < 4U) return ESP_ERR_INVALID_SIZE;
+    uint32_t pos = list_data + 4U;
+    const uint32_t list_end = list_data + list_size;
+
+    while (pos <= list_end && list_end - pos >= 8U) {
+        uint8_t hdr[8];
+        if (read_at(pos, hdr, sizeof(hdr)) != ESP_OK) return ESP_FAIL;
+        const uint32_t chunk_size = read_u32(hdr + 4U);
+        const uint32_t data = pos + 8U;
+        if (chunk_size > list_end - data) return ESP_ERR_INVALID_SIZE;
+
+        if (match_fcc(hdr, "dmlh") && chunk_size >= 4U) {
+            uint8_t total_frames[4];
+            if (read_at(data, total_frames, sizeof(total_frames)) != ESP_OK) {
+                return ESP_FAIL;
+            }
+            s_dmlh_total_frames = read_u32(total_frames);
+        }
+
+        const uint64_t next = static_cast<uint64_t>(data) +
+            chunk_size + (chunk_size & 1U);
+        if (next > list_end) return ESP_ERR_INVALID_SIZE;
+        pos = static_cast<uint32_t>(next);
+    }
+    return ESP_OK;
+}
+
+esp_err_t parse_hdrl_list(uint32_t list_data, uint32_t list_size,
+    bool *out_found_avih, bool *out_found_video)
+{
+    if (out_found_avih == nullptr || out_found_video == nullptr || list_size < 4U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint32_t pos = list_data + 4U;
+    const uint32_t list_end = list_data + list_size;
+
+    while (pos <= list_end && list_end - pos >= 8U) {
+        uint8_t hdr[8];
+        if (read_at(pos, hdr, sizeof(hdr)) != ESP_OK) return ESP_FAIL;
+        const uint32_t chunk_size = read_u32(hdr + 4U);
+        const uint32_t data = pos + 8U;
+        if (chunk_size > list_end - data) return ESP_ERR_INVALID_SIZE;
+
+        if (match_fcc(hdr, "avih")) {
+            if (chunk_size < 56U) return ESP_ERR_INVALID_SIZE;
+            uint8_t avih[56];
+            if (read_at(data, avih, sizeof(avih)) != ESP_OK) return ESP_FAIL;
+            const uint32_t us_per_frame = read_u32(avih + 0U);
+            if (us_per_frame > 0U) {
+                s_info.fps_x100 = static_cast<uint32_t>(
+                    100000000ULL / us_per_frame);
+            }
+            s_avih_total_frames = read_u32(avih + 16U);
+            *out_found_avih = true;
+        } else if (match_fcc(hdr, "LIST") && chunk_size >= 4U) {
+            uint8_t list_type[4];
+            if (read_at(data, list_type, sizeof(list_type)) != ESP_OK) return ESP_FAIL;
+            if (match_fcc(list_type, "strl")) {
+                const esp_err_t ret = parse_stream_list(data, chunk_size, out_found_video);
+                if (ret != ESP_OK) return ret;
+            } else if (match_fcc(list_type, "odml")) {
+                const esp_err_t ret = parse_odml_list(data, chunk_size);
+                if (ret != ESP_OK) return ret;
+            }
+        }
+
+        const uint64_t next = static_cast<uint64_t>(data) +
+            chunk_size + (chunk_size & 1U);
+        if (next > list_end) return ESP_ERR_INVALID_SIZE;
+        pos = static_cast<uint32_t>(next);
+    }
+    return ESP_OK;
 }
 
 } // namespace
 
-esp_err_t open(VideoMediaIo::Context *io, StreamInfo *out_info) {
+esp_err_t open(VideoMediaIo::Context *io, StreamInfo *out_info)
+{
     if (io == nullptr || io->file == nullptr || out_info == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (io->size < 12U) return ESP_ERR_INVALID_SIZE;
+
     s_io = io;
     s_info = {};
-    s_movi_data_offset = 0;
-    s_movi_data_end = 0;
-    s_current_offset = 0;
-    s_video_frame_index = 0;
-    s_audio_bytes_total = 0;
-    s_debug_chunk_count = 0;
+    memset(s_movi_ranges, 0, sizeof(s_movi_ranges));
+    s_movi_range_count = 0U;
+    s_current_movi_range = 0U;
+    s_current_offset = 0U;
+    s_video_frame_index = 0U;
+    s_audio_bytes_total = 0U;
+    s_debug_chunk_count = 0U;
+    s_avih_total_frames = 0U;
+    s_dmlh_total_frames = 0U;
+    s_video_strh_length = 0U;
+    s_video_strh_scale = 0U;
+    s_video_strh_rate = 0U;
 
-    // 读取 RIFF 头 (12 字节)
-    uint8_t riff[12];
-    if (read_at(0, riff, sizeof(riff)) != ESP_OK) {
-        ESP_LOGE(TAG, "读取RIFF头失败");
-        return ESP_FAIL;
-    }
-    if (!match_fcc(riff, "RIFF") || !match_fcc(riff + 8, "AVI ")) {
-        ESP_LOGE(TAG, "不是AVI文件");
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-
-    // 遍历顶层 chunk，找 hdrl 和 movi
-    uint32_t pos = 12;
-    const uint32_t file_size = io->size;
     bool found_avih = false;
     bool found_video_strl = false;
+    bool found_first_riff = false;
+    uint32_t riff_count = 0U;
+    uint32_t riff_pos = 0U;
+    const uint32_t file_size = io->size;
 
-    while (pos + 8 <= file_size) {
-        uint8_t hdr[8];
-        if (read_at(pos, hdr, sizeof(hdr)) != ESP_OK) break;
-        const uint32_t chunk_size = read_u32(hdr + 4);
-        const uint32_t chunk_data_start = pos + 8;
-
-        if (match_fcc(hdr, "LIST")) {
-            // LIST 后面 4 字节是类型
-            uint8_t list_type[4];
-            if (read_at(chunk_data_start, list_type, 4) != ESP_OK) break;
-
-            if (match_fcc(list_type, "hdrl")) {
-                // 解析 hdrl：avih + 多个 strl
-                uint32_t p = chunk_data_start + 4;
-                const uint32_t list_end = chunk_data_start + chunk_size;
-                while (p + 8 <= list_end) {
-                    uint8_t sub[8];
-                    if (read_at(p, sub, sizeof(sub)) != ESP_OK) break;
-                    const uint32_t sub_size = read_u32(sub + 4);
-                    const uint32_t sub_data = p + 8;
-
-                    if (match_fcc(sub, "avih")) {
-                        // 主 AVI 头 (56 字节)
-                        uint8_t avih[56];
-                        if (sub_size >= 56 && read_at(sub_data, avih, 56) == ESP_OK) {
-                            const uint32_t us_per_frame = read_u32(avih + 0);
-                            if (us_per_frame > 0) {
-                                // fps = 1000000 / us_per_frame, 存为 fps_x100
-                                s_info.fps_x100 = static_cast<uint32_t>(100000000ULL / us_per_frame);
-                            }
-                            s_info.total_frames = read_u32(avih + 16);
-                            // 先提升到64位再乘，避免30分钟以上视频的时长在32位乘法中回绕。
-                            s_info.duration_ms = s_info.total_frames > 0 && s_info.fps_x100 > 0
-                                ? static_cast<uint32_t>(
-                                      static_cast<uint64_t>(s_info.total_frames) * 100000ULL /
-                                      s_info.fps_x100)
-                                : 0U;
-                            found_avih = true;
-                        }
-                    } else if (match_fcc(sub, "LIST")) {
-                        // strl LIST
-                        uint8_t strl_type[4];
-                        if (read_at(sub_data, strl_type, 4) != ESP_OK) break;
-                        if (match_fcc(strl_type, "strl")) {
-                            uint32_t sp = sub_data + 4;
-                            const uint32_t strl_end = sub_data + sub_size;
-                            bool has_strh = false;
-                            uint8_t strh[56] = {};
-                            uint8_t strf[256] = {};
-                            uint32_t strf_size = 0;
-                            while (sp + 8 <= strl_end) {
-                                uint8_t sh[8];
-                                if (read_at(sp, sh, sizeof(sh)) != ESP_OK) break;
-                                const uint32_t sh_size = read_u32(sh + 4);
-                                const uint32_t sh_data = sp + 8;
-                                if (match_fcc(sh, "strh") && sh_size >= 56) {
-                                    if (read_at(sh_data, strh, 56) == ESP_OK) has_strh = true;
-                                } else if (match_fcc(sh, "strf")) {
-                                    strf_size = sh_size < sizeof(strf) ? sh_size : sizeof(strf);
-                                    if (strf_size > 0) read_at(sh_data, strf, strf_size);
-                                }
-                                sp = sh_data + sh_size + (sh_size & 1); // 奇数补齐
-                            }
-                            if (has_strh) {
-                                const char *stype = reinterpret_cast<const char *>(strh);
-                                if (stype[0] == 'v' && stype[1] == 'i' && stype[2] == 'd' && stype[3] == 's') {
-                                    // 视频流
-                                    if (strf_size >= 40) {
-                                        s_info.width = read_u32(strf + 4);
-                                        s_info.height = read_u32(strf + 8);
-                                    }
-                                    found_video_strl = true;
-                                } else if (stype[0] == 'a' && stype[1] == 'u' && stype[2] == 'd' && stype[3] == 's') {
-                                    // 音频流
-                                    if (strf_size >= 18) {
-                                        s_info.audio_format = read_u16(strf + 0);
-                                        s_info.audio_channels = strf[2];
-                                        s_info.audio_sample_rate = read_u32(strf + 4);
-                                        s_info.audio_avg_bps = read_u32(strf + 8);
-                                        s_info.audio_bits_per_sample = strf[14];
-                                        s_info.audio_bitrate = s_info.audio_avg_bps * 8;
-                                        s_info.has_audio = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    p = sub_data + sub_size + (sub_size & 1);
-                }
-            } else if (match_fcc(list_type, "movi")) {
-                // movi 数据区：跳过 LIST(4)+size(4)+type(4)=12 字节
-                s_movi_data_offset = chunk_data_start + 4;
-                s_movi_data_end = chunk_data_start + chunk_size;
-                s_current_offset = s_movi_data_offset;
-            }
-            pos = chunk_data_start + chunk_size + (chunk_size & 1);
-        } else {
-            // idx1 或其他顶层 chunk，跳过
-            pos = chunk_data_start + chunk_size + (chunk_size & 1);
+    // OpenDML AVI 可以由一个 RIFF AVI 段和多个 RIFF AVIX 段组成。
+    // 每个段分别包含自己的 movi；必须全部记录，不能只播放第一个约 1GB 段。
+    while (riff_pos <= file_size && file_size - riff_pos >= 12U) {
+        uint8_t riff[12];
+        if (read_at(riff_pos, riff, sizeof(riff)) != ESP_OK) {
+            if (!found_first_riff) return ESP_FAIL;
+            break;
         }
+        if (!match_fcc(riff, "RIFF")) {
+            if (!found_first_riff) {
+                ESP_LOGE(TAG, "AVI文件头不是 RIFF");
+                return ESP_ERR_NOT_SUPPORTED;
+            }
+            break;
+        }
+
+        const uint32_t riff_size = read_u32(riff + 4U);
+        if (riff_size < 4U || riff_size > file_size - riff_pos - 8U) {
+            ESP_LOGE(TAG, "RIFF段长度非法：segment=%lu size=%lu file=%lu",
+                static_cast<unsigned long>(riff_count),
+                static_cast<unsigned long>(riff_size),
+                static_cast<unsigned long>(file_size));
+            return ESP_ERR_INVALID_SIZE;
+        }
+
+        const bool is_avi = match_fcc(riff + 8U, "AVI ");
+        const bool is_avix = match_fcc(riff + 8U, "AVIX");
+        if ((!found_first_riff && !is_avi) ||
+            (found_first_riff && !is_avi && !is_avix)) {
+            ESP_LOGE(TAG, "不支持的 RIFF 类型：segment=%lu type=%c%c%c%c",
+                static_cast<unsigned long>(riff_count),
+                riff[8], riff[9], riff[10], riff[11]);
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+        found_first_riff = true;
+
+        const uint32_t riff_end = riff_pos + 8U + riff_size;
+        uint32_t chunk_pos = riff_pos + 12U;
+
+        while (chunk_pos <= riff_end && riff_end - chunk_pos >= 8U) {
+            uint8_t hdr[8];
+            if (read_at(chunk_pos, hdr, sizeof(hdr)) != ESP_OK) return ESP_FAIL;
+            const uint32_t chunk_size = read_u32(hdr + 4U);
+            const uint32_t data = chunk_pos + 8U;
+            if (chunk_size > riff_end - data) {
+                ESP_LOGE(TAG, "RIFF子chunk越界：riff=%lu offset=%lu size=%lu",
+                    static_cast<unsigned long>(riff_count),
+                    static_cast<unsigned long>(chunk_pos),
+                    static_cast<unsigned long>(chunk_size));
+                return ESP_ERR_INVALID_SIZE;
+            }
+
+            if (match_fcc(hdr, "LIST") && chunk_size >= 4U) {
+                uint8_t list_type[4];
+                if (read_at(data, list_type, sizeof(list_type)) != ESP_OK) return ESP_FAIL;
+
+                if (match_fcc(list_type, "hdrl") && !found_avih) {
+                    const esp_err_t ret = parse_hdrl_list(
+                        data, chunk_size, &found_avih, &found_video_strl);
+                    if (ret != ESP_OK) {
+                        ESP_LOGE(TAG, "AVI hdrl解析失败：%s", esp_err_to_name(ret));
+                        return ret;
+                    }
+                } else if (match_fcc(list_type, "movi")) {
+                    const uint32_t movi_begin = data + 4U;
+                    const uint32_t movi_end = data + chunk_size;
+                    if (!add_movi_range(movi_begin, movi_end)) {
+                        ESP_LOGE(TAG, "AVI movi段数量/顺序非法：max=%lu count=%lu",
+                            static_cast<unsigned long>(kMaxMoviRanges),
+                            static_cast<unsigned long>(s_movi_range_count));
+                        return ESP_ERR_INVALID_SIZE;
+                    }
+                }
+            }
+
+            const uint64_t next = static_cast<uint64_t>(data) +
+                chunk_size + (chunk_size & 1U);
+            if (next > riff_end) return ESP_ERR_INVALID_SIZE;
+            chunk_pos = static_cast<uint32_t>(next);
+        }
+
+        const uint64_t next_riff = static_cast<uint64_t>(riff_end) + (riff_size & 1U);
+        if (next_riff > file_size || next_riff <= riff_pos) break;
+        if (next_riff == file_size) break;
+        riff_pos = static_cast<uint32_t>(next_riff);
+        ++riff_count;
     }
 
-    if (!found_avih || !found_video_strl || s_movi_data_offset == 0) {
-        ESP_LOGE(TAG, "AVI头部解析失败: avih=%d video_strl=%d movi=%d",
-            found_avih, found_video_strl, s_movi_data_offset);
+    if (!found_first_riff || !found_avih || !found_video_strl ||
+        s_movi_range_count == 0U) {
+        ESP_LOGE(TAG, "AVI头部解析失败: riff=%d avih=%d video_strl=%d movi_segments=%lu",
+            found_first_riff, found_avih, found_video_strl,
+            static_cast<unsigned long>(s_movi_range_count));
         return ESP_ERR_NOT_SUPPORTED;
     }
 
+    if (s_info.fps_x100 == 0U && s_video_strh_scale > 0U && s_video_strh_rate > 0U) {
+        s_info.fps_x100 = static_cast<uint32_t>(
+            (static_cast<uint64_t>(s_video_strh_rate) * 100ULL +
+             s_video_strh_scale / 2U) / s_video_strh_scale);
+    }
+    if (s_info.fps_x100 == 0U) {
+        ESP_LOGE(TAG, "AVI帧率无效：avih/strh均未提供有效帧率");
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    // OpenDML 的 dmlh 通常记录跨全部 RIFF/AVIX 段的总帧数；
+    // 个别封装器只更新视频 strh.dwLength 或 avih.dwTotalFrames，取有效值中的最大值。
+    s_info.total_frames = s_dmlh_total_frames;
+    if (s_video_strh_length > s_info.total_frames) {
+        s_info.total_frames = s_video_strh_length;
+    }
+    if (s_avih_total_frames > s_info.total_frames) {
+        s_info.total_frames = s_avih_total_frames;
+    }
+
+    uint64_t duration_ms = 0ULL;
+    if (s_info.total_frames > 0U) {
+        if (s_video_strh_scale > 0U && s_video_strh_rate > 0U) {
+            duration_ms = static_cast<uint64_t>(s_info.total_frames) *
+                s_video_strh_scale * 1000ULL / s_video_strh_rate;
+        } else {
+            duration_ms = static_cast<uint64_t>(s_info.total_frames) *
+                100000ULL / s_info.fps_x100;
+        }
+    }
+    if (duration_ms == 0ULL || duration_ms > UINT32_MAX) {
+        ESP_LOGE(TAG, "AVI总时长无效：frames=%lu duration=%llu",
+            static_cast<unsigned long>(s_info.total_frames),
+            static_cast<unsigned long long>(duration_ms));
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    s_info.duration_ms = static_cast<uint32_t>(duration_ms);
+
     *out_info = s_info;
-    // 顶层扫描（含其后的 idx1/HDRL 等 chunk）会移动 s_current_offset，
-    // 这里固定回 movi 起点，避免首帧读取直接从文件末尾开始。
-    s_current_offset = s_movi_data_offset;
-    ESP_LOGI(TAG, "AVI解析成功: %ux%u %u.%02ufps dur=%ums frames=%u audio=%s",
+    s_current_movi_range = 0U;
+    s_current_offset = s_movi_ranges[0].begin;
+
+    ESP_LOGI(TAG,
+        "AVI时长来源：avih_frames=%lu strh_frames=%lu dmlh_frames=%lu selected=%lu",
+        static_cast<unsigned long>(s_avih_total_frames),
+        static_cast<unsigned long>(s_video_strh_length),
+        static_cast<unsigned long>(s_dmlh_total_frames),
+        static_cast<unsigned long>(s_info.total_frames));
+    ESP_LOGI(TAG,
+        "AVI解析成功: %ux%u %u.%02ufps dur=%ums frames=%u audio=%s movi_segments=%lu",
         s_info.width, s_info.height,
-        s_info.fps_x100 / 100, s_info.fps_x100 % 100,
+        s_info.fps_x100 / 100U, s_info.fps_x100 % 100U,
         s_info.duration_ms, s_info.total_frames,
-        s_info.has_audio ? "yes" : "no");
-    ESP_LOGI(TAG, "movi数据区: offset=%lu end=%lu 文件大小=%lu",
-        static_cast<unsigned long>(s_movi_data_offset),
-        static_cast<unsigned long>(s_movi_data_end),
-        static_cast<unsigned long>(file_size));
+        s_info.has_audio ? "yes" : "no",
+        static_cast<unsigned long>(s_movi_range_count));
+    for (uint32_t i = 0U; i < s_movi_range_count; ++i) {
+        ESP_LOGI(TAG, "AVI movi段[%lu]: offset=%lu end=%lu bytes=%lu",
+            static_cast<unsigned long>(i),
+            static_cast<unsigned long>(s_movi_ranges[i].begin),
+            static_cast<unsigned long>(s_movi_ranges[i].end),
+            static_cast<unsigned long>(s_movi_ranges[i].end - s_movi_ranges[i].begin));
+    }
     return ESP_OK;
 }
 
-esp_err_t read_frame(FrameInfo *frame, uint8_t *data, uint32_t capacity) {
+esp_err_t read_frame(FrameInfo *frame, uint8_t *data, uint32_t capacity)
+{
     if (frame == nullptr || data == nullptr || s_io == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    while (s_current_offset + 8 <= s_movi_data_end) {
+    while (select_readable_movi_range()) {
+        const MoviRange &range = s_movi_ranges[s_current_movi_range];
+        const uint32_t chunk_offset = s_current_offset;
         uint8_t hdr[8];
-        if (read_at(s_current_offset, hdr, 8) != ESP_OK) {
-            return ESP_FAIL;
+        if (read_at(chunk_offset, hdr, sizeof(hdr)) != ESP_OK) return ESP_FAIL;
+        const uint32_t chunk_size = read_u32(hdr + 4U);
+        const uint32_t padded_chunk_size = chunk_size + (chunk_size & 1U);
+        if (padded_chunk_size < chunk_size ||
+            padded_chunk_size > range.end - s_current_offset) {
+            ESP_LOGE(TAG, "movi chunk越界：range=%lu offset=%lu size=%lu end=%lu",
+                static_cast<unsigned long>(s_current_movi_range),
+                static_cast<unsigned long>(chunk_offset),
+                static_cast<unsigned long>(chunk_size),
+                static_cast<unsigned long>(range.end));
+            return ESP_ERR_INVALID_SIZE;
         }
-        const uint32_t chunk_size = read_u32(hdr + 4);
 
-        // 临时诊断：确认扫描起点与 chunk 头解析是否正确。
         ++s_debug_chunk_count;
         if (s_debug_chunk_count <= 6U) {
             ESP_LOGI(TAG, "chunk#%lu @%lu '%c%c%c%c' size=%lu video=%lu audio=%luB",
                 static_cast<unsigned long>(s_debug_chunk_count),
-                static_cast<unsigned long>(s_current_offset),
+                static_cast<unsigned long>(chunk_offset),
                 hdr[0], hdr[1], hdr[2], hdr[3],
                 static_cast<unsigned long>(chunk_size),
                 static_cast<unsigned long>(s_video_frame_index),
@@ -237,17 +491,13 @@ esp_err_t read_frame(FrameInfo *frame, uint8_t *data, uint32_t capacity) {
         }
 
         if (chunk_size == 0U) {
-            // AVI 中可能存在 0 字节占位 chunk（如 '00dc' size=0），无法解码，直接跳过。
-            // 占位视频帧仍占一个帧位，计数继续推进，保证后续 PTS 与 avih 帧序一致。
-            // read_at 读头时已把 s_current_offset 推进到数据起点；size=0 无数据，直接继续。
             if (match_fcc(hdr, "00dc") || match_fcc(hdr, "00db")) {
-                s_video_frame_index++;
+                ++s_video_frame_index;
             }
             continue;
         }
 
         if (match_fcc(hdr, "00dc") || match_fcc(hdr, "00db")) {
-            // 视频帧
             if (chunk_size > capacity) {
                 ESP_LOGE(TAG, "视频帧过大: %u > %u", chunk_size, capacity);
                 return ESP_ERR_NO_MEM;
@@ -256,45 +506,44 @@ esp_err_t read_frame(FrameInfo *frame, uint8_t *data, uint32_t capacity) {
             frame->is_video = true;
             frame->data = data;
             frame->size = chunk_size;
-            frame->file_offset = s_current_offset;
-            // PTS = 视频帧序号 * 1000 / fps
-            frame->pts = s_info.fps_x100 > 0
-                ? static_cast<uint64_t>(s_video_frame_index) * 100000ULL / s_info.fps_x100
-                : 0;
-            s_video_frame_index++;
-            // read_forward 已推进 s_current_offset 到数据末尾，只需补齐字节。
-            s_current_offset += (chunk_size & 1);
+            frame->file_offset = chunk_offset;
+            frame->pts = static_cast<uint64_t>(s_video_frame_index) *
+                100000ULL / s_info.fps_x100;
+            ++s_video_frame_index;
+            s_current_offset += (chunk_size & 1U);
             return ESP_OK;
-        } else if (match_fcc(hdr, "01wb") || match_fcc(hdr, "00wb")) {
-            // 音频帧
-            if (chunk_size > capacity) {
-                return ESP_ERR_NO_MEM;
-            }
+        }
+
+        if (match_fcc(hdr, "01wb") || match_fcc(hdr, "00wb")) {
+            if (chunk_size > capacity) return ESP_ERR_NO_MEM;
             if (read_forward(data, chunk_size) != ESP_OK) return ESP_FAIL;
             frame->is_video = false;
             frame->data = data;
             frame->size = chunk_size;
-            frame->file_offset = s_current_offset;
-            // PTS = 已读音频字节 * 1000 / 平均字节率
-            frame->pts = s_info.audio_avg_bps > 0
-                ? static_cast<uint64_t>(s_audio_bytes_total) * 1000ULL / s_info.audio_avg_bps
-                : 0;
+            frame->file_offset = chunk_offset;
+            frame->pts = s_info.audio_avg_bps > 0U
+                ? static_cast<uint64_t>(s_audio_bytes_total) * 1000ULL /
+                    s_info.audio_avg_bps
+                : 0ULL;
             s_audio_bytes_total += chunk_size;
-            s_current_offset += (chunk_size & 1);
+            s_current_offset += (chunk_size & 1U);
             return ESP_OK;
-        } else if (match_fcc(hdr, "LIST")) {
-            // movi 内嵌的 rec LIST：跳过 4 字节类型字段
-            s_current_offset += 4;
-            continue;
-        } else {
-            // 未知 chunk，跳过数据+补齐字节
-            s_current_offset += chunk_size + (chunk_size & 1);
         }
+
+        if (match_fcc(hdr, "LIST")) {
+            if (chunk_size >= 4U) {
+                uint8_t list_type[4];
+                if (read_forward(list_type, sizeof(list_type)) != ESP_OK) return ESP_FAIL;
+                if (match_fcc(list_type, "rec ")) continue;
+            }
+        }
+
+        // 未知 chunk 或非 rec LIST，按完整 chunk 跳过。
+        s_current_offset = chunk_offset + 8U + chunk_size + (chunk_size & 1U);
     }
 
-    ESP_LOGW(TAG, "到达movi末尾: off=%lu end=%lu chunks=%lu video=%lu audio=%luB",
-        static_cast<unsigned long>(s_current_offset),
-        static_cast<unsigned long>(s_movi_data_end),
+    ESP_LOGW(TAG, "到达全部movi末尾：segments=%lu chunks=%lu video=%lu audio=%luB",
+        static_cast<unsigned long>(s_movi_range_count),
         static_cast<unsigned long>(s_debug_chunk_count),
         static_cast<unsigned long>(s_video_frame_index),
         static_cast<unsigned long>(s_audio_bytes_total));
@@ -302,54 +551,57 @@ esp_err_t read_frame(FrameInfo *frame, uint8_t *data, uint32_t capacity) {
 }
 
 esp_err_t seek_to_offset(uint32_t file_offset, uint32_t video_pts_ms,
-    uint32_t audio_bytes_at_seek, uint32_t video_frame_index) {
+    uint32_t audio_bytes_at_seek, uint32_t video_frame_index)
+{
     if (s_io == nullptr) return ESP_ERR_INVALID_STATE;
 
-    // 侧车索引可能记录 chunk 头偏移，也可能记录数据起点（如 ffprobe 的 pkt_pos）。
-    // 这里按「chunk 头 + JPEG 起始标记」校验落点，必要时回退 8 字节。
-    auto video_chunk_at = [](uint32_t off) -> bool {
-        // 先做减法式边界校验，避免坏索引偏移导致加法溢出或越过 movi。
-        if (off < s_movi_data_offset || off >= s_movi_data_end ||
-            s_movi_data_end - off < 10U) return false;
+    auto video_chunk_at = [](uint32_t off, int32_t *out_range) -> bool {
+        if (out_range == nullptr) return false;
+        const int32_t range_index = find_movi_range(off);
+        if (range_index < 0) return false;
+        const MoviRange &range = s_movi_ranges[static_cast<uint32_t>(range_index)];
+        if (range.end - off < 10U) return false;
+
         uint8_t hdr[8];
-        if (read_at(off, hdr, 8) != ESP_OK) return false;
+        if (read_at(off, hdr, sizeof(hdr)) != ESP_OK) return false;
         if (!(match_fcc(hdr, "00dc") || match_fcc(hdr, "00db"))) return false;
-        const uint32_t size = read_u32(hdr + 4);
+        const uint32_t size = read_u32(hdr + 4U);
+        const uint32_t padded_size = size + (size & 1U);
         if (size < 2U || size > (8U * 1024U * 1024U) ||
-            size > s_movi_data_end - off - 8U) return false;
+            padded_size < size || padded_size > range.end - off - 8U) return false;
         uint8_t sig[2];
-        if (read_at(off + 8U, sig, 2) != ESP_OK) return false;
-        return sig[0] == 0xFFU && sig[1] == 0xD8U;
+        if (read_at(off + 8U, sig, sizeof(sig)) != ESP_OK) return false;
+        if (sig[0] != 0xFFU || sig[1] != 0xD8U) return false;
+        *out_range = range_index;
+        return true;
     };
 
     uint32_t aligned = file_offset;
-    if (!video_chunk_at(file_offset)) {
-        if (file_offset >= 8U && video_chunk_at(file_offset - 8U)) {
+    int32_t range_index = -1;
+    if (!video_chunk_at(file_offset, &range_index)) {
+        if (file_offset >= 8U &&
+            video_chunk_at(file_offset - 8U, &range_index)) {
             aligned = file_offset - 8U;
             ESP_LOGW(TAG, "Seek偏移按数据起点解释，回退8字节: %lu -> %lu",
                 static_cast<unsigned long>(file_offset),
                 static_cast<unsigned long>(aligned));
         } else {
-            // 不允许把未经验证的偏移交给解复用器，否则旧索引可能读出随机帧。
             ESP_LOGE(TAG, "Seek偏移无效，拒绝跳转: %lu",
                 static_cast<unsigned long>(file_offset));
             return ESP_ERR_INVALID_ARG;
         }
     }
 
+    s_current_movi_range = static_cast<uint32_t>(range_index);
     s_current_offset = aligned;
-    // 保持绝对时间轴：用 seek 目标时间恢复视频帧计数与音频字节计数，
-    // 这样 PTS 继续在整段视频的原始时间轴上累加（而不是从 0 重来）。
-    // 上层（Presenter/seek 目标计算）都以绝对 PTS 为准，无需再维护额外基准。
-    // V2 索引直接保存原始帧序号，避免电脑端与设备端的帧率取整差异。
-    // V1 索引没有帧序号，继续按时间戳和设备端帧率回推。
     s_video_frame_index = video_frame_index != 0xFFFFFFFFU
         ? video_frame_index
-        : (s_info.fps_x100 > 0
-            ? static_cast<uint32_t>(static_cast<uint64_t>(video_pts_ms) * s_info.fps_x100 / 100000ULL)
-            : 0U);
+        : static_cast<uint32_t>(
+            static_cast<uint64_t>(video_pts_ms) * s_info.fps_x100 / 100000ULL);
     s_audio_bytes_total = audio_bytes_at_seek;
-    ESP_LOGI(TAG, "seek恢复时间轴: frame_index=%lu fps=%lu.%02lu audio_bytes=%lu",
+
+    ESP_LOGI(TAG, "seek恢复时间轴: segment=%lu frame_index=%lu fps=%lu.%02lu audio_bytes=%lu",
+        static_cast<unsigned long>(s_current_movi_range),
         static_cast<unsigned long>(s_video_frame_index),
         static_cast<unsigned long>(s_info.fps_x100 / 100U),
         static_cast<unsigned long>(s_info.fps_x100 % 100U),
@@ -357,24 +609,31 @@ esp_err_t seek_to_offset(uint32_t file_offset, uint32_t video_pts_ms,
     return ESP_OK;
 }
 
-esp_err_t scan_forward_to(uint32_t target_ms) {
+esp_err_t scan_forward_to(uint32_t target_ms)
+{
     if (s_io == nullptr) return ESP_ERR_INVALID_STATE;
     if (s_info.fps_x100 == 0U) return ESP_OK;
 
     uint32_t last_video_offset = 0U;
     uint32_t last_video_index = 0U;
     uint32_t last_audio_bytes_total = 0U;
+    uint32_t last_range_index = 0U;
     bool have_last = false;
     uint32_t skipped = 0U;
 
-    while (s_current_offset + 8 <= s_movi_data_end) {
+    while (select_readable_movi_range()) {
+        const MoviRange &range = s_movi_ranges[s_current_movi_range];
         const uint32_t chunk_offset = s_current_offset;
         uint8_t hdr[8];
-        if (read_at(s_current_offset, hdr, 8) != ESP_OK) return ESP_FAIL;
-        const uint32_t chunk_size = read_u32(hdr + 4);
+        if (read_at(chunk_offset, hdr, sizeof(hdr)) != ESP_OK) return ESP_FAIL;
+        const uint32_t chunk_size = read_u32(hdr + 4U);
+        const uint32_t padded_chunk_size = chunk_size + (chunk_size & 1U);
+        if (padded_chunk_size < chunk_size ||
+            padded_chunk_size > range.end - s_current_offset) {
+            return ESP_ERR_INVALID_SIZE;
+        }
 
         if (chunk_size == 0U) {
-            // 与 read_frame 一致：占位视频帧占用帧序号，但不参与定位。
             if (match_fcc(hdr, "00dc") || match_fcc(hdr, "00db")) {
                 ++s_video_frame_index;
             }
@@ -383,12 +642,13 @@ esp_err_t scan_forward_to(uint32_t target_ms) {
 
         if (match_fcc(hdr, "00dc") || match_fcc(hdr, "00db")) {
             const uint32_t pts_ms = static_cast<uint32_t>(
-                static_cast<uint64_t>(s_video_frame_index) * 100000ULL / s_info.fps_x100);
+                static_cast<uint64_t>(s_video_frame_index) *
+                100000ULL / s_info.fps_x100);
             if (pts_ms >= target_ms) {
-                // 回退到 chunk 头，后续 read_frame 会从这里取出该帧。
                 s_current_offset = chunk_offset;
-                ESP_LOGI(TAG, "seek精确定位: target=%lums frame_index=%lu pts=%lums skipped=%lu",
+                ESP_LOGI(TAG, "seek精确定位: target=%lums segment=%lu frame_index=%lu pts=%lums skipped=%lu",
                     static_cast<unsigned long>(target_ms),
+                    static_cast<unsigned long>(s_current_movi_range),
                     static_cast<unsigned long>(s_video_frame_index),
                     static_cast<unsigned long>(pts_ms),
                     static_cast<unsigned long>(skipped));
@@ -397,6 +657,7 @@ esp_err_t scan_forward_to(uint32_t target_ms) {
             last_video_offset = chunk_offset;
             last_video_index = s_video_frame_index;
             last_audio_bytes_total = s_audio_bytes_total;
+            last_range_index = s_current_movi_range;
             have_last = true;
             ++s_video_frame_index;
             ++skipped;
@@ -405,26 +666,27 @@ esp_err_t scan_forward_to(uint32_t target_ms) {
         }
 
         if (match_fcc(hdr, "01wb") || match_fcc(hdr, "00wb")) {
-            // 跳过的音频帧仍累加字节数，保持音频 PTS 与视频同一时间轴。
             s_audio_bytes_total += chunk_size;
             s_current_offset = chunk_offset + 8U + chunk_size + (chunk_size & 1U);
             continue;
         }
 
-        if (match_fcc(hdr, "LIST")) {
-            s_current_offset += 4U;
-            continue;
+        if (match_fcc(hdr, "LIST") && chunk_size >= 4U) {
+            uint8_t list_type[4];
+            if (read_forward(list_type, sizeof(list_type)) != ESP_OK) return ESP_FAIL;
+            if (match_fcc(list_type, "rec ")) continue;
         }
 
         s_current_offset = chunk_offset + 8U + chunk_size + (chunk_size & 1U);
     }
 
     if (have_last) {
-        // 目标超出最后一个可解码帧：停在最后一帧，避免 seek 到末尾直接触发 EOF 切换视频。
+        s_current_movi_range = last_range_index;
         s_current_offset = last_video_offset;
         s_video_frame_index = last_video_index;
         s_audio_bytes_total = last_audio_bytes_total;
-        ESP_LOGW(TAG, "seek目标超出末尾，回退到最后一帧: frame_index=%lu",
+        ESP_LOGW(TAG, "seek目标超出末尾，回退到最后一帧: segment=%lu frame_index=%lu",
+            static_cast<unsigned long>(last_range_index),
             static_cast<unsigned long>(last_video_index));
         return ESP_OK;
     }
@@ -441,14 +703,22 @@ uint32_t next_video_pts_ms()
         static_cast<uint64_t>(s_video_frame_index) * 100000ULL / s_info.fps_x100);
 }
 
-void close() {
+void close()
+{
     s_io = nullptr;
     s_info = {};
-    s_movi_data_offset = 0;
-    s_movi_data_end = 0;
-    s_current_offset = 0;
-    s_video_frame_index = 0;
-    s_audio_bytes_total = 0;
+    memset(s_movi_ranges, 0, sizeof(s_movi_ranges));
+    s_movi_range_count = 0U;
+    s_current_movi_range = 0U;
+    s_current_offset = 0U;
+    s_video_frame_index = 0U;
+    s_audio_bytes_total = 0U;
+    s_debug_chunk_count = 0U;
+    s_avih_total_frames = 0U;
+    s_dmlh_total_frames = 0U;
+    s_video_strh_length = 0U;
+    s_video_strh_scale = 0U;
+    s_video_strh_rate = 0U;
 }
 
 } // namespace AviDemuxer

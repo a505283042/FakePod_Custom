@@ -131,7 +131,8 @@ static bool validate_entry(const Entry &entry, const Entry *previous,
 } // namespace
 
 esp_err_t load(const char *sidecar_path, VideoMediaIo::Context *source_io,
-    uint32_t source_fps_x100)
+    uint32_t source_fps_x100, uint32_t source_total_frames,
+    uint32_t source_duration_ms)
 {
     unload();
     if (sidecar_path == nullptr || source_io == nullptr || source_io->file == nullptr) {
@@ -277,6 +278,38 @@ esp_err_t load(const char *sidecar_path, VideoMediaIo::Context *source_io,
         ESP_LOGE(TAG, "索引条目无效或顺序错误");
         unload();
         return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    // 旧版生成器只扫描第一个 RIFF/movi；若文件实际包含 AVIX 段，
+    // 旧索引虽然指纹正确，但只覆盖前半段，必须拒绝用于全片 SEEK。
+    const Entry &last_entry = s_entries[hdr.entry_count - 1U];
+    if (hdr.version == kVersionV2 && source_total_frames > 0U &&
+        source_fps_x100 > 0U) {
+        const uint64_t granularity_frames =
+            static_cast<uint64_t>(source_fps_x100) * hdr.granularity_ms / 100000ULL;
+        const uint64_t coverage_slack_frames =
+            granularity_frames + static_cast<uint64_t>(source_fps_x100 / 100U) + 2ULL;
+        if (static_cast<uint64_t>(last_entry.video_frame_index) +
+            coverage_slack_frames < source_total_frames) {
+            ESP_LOGE(TAG,
+                "侧车索引覆盖不完整：last_frame=%lu total_frames=%lu；请重新生成全段V2索引",
+                static_cast<unsigned long>(last_entry.video_frame_index),
+                static_cast<unsigned long>(source_total_frames));
+            unload();
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+    } else if (source_duration_ms > 0U) {
+        const uint64_t covered_until =
+            static_cast<uint64_t>(last_entry.timestamp_ms) +
+            hdr.granularity_ms + 1000ULL;
+        if (covered_until < source_duration_ms) {
+            ESP_LOGE(TAG,
+                "侧车索引时长覆盖不完整：index=%lums avi=%lums；请重新生成索引",
+                static_cast<unsigned long>(last_entry.timestamp_ms),
+                static_cast<unsigned long>(source_duration_ms));
+            unload();
+            return ESP_ERR_INVALID_RESPONSE;
+        }
     }
 
     s_count = hdr.entry_count;

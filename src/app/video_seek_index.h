@@ -21,10 +21,11 @@ struct Entry {
 };
 
 // 加载侧车索引文件。sidecar_path 通常为 video_path + ".fvix"。
-// V2 会校验 AVI 文件长度和抽样 CRC32；索引条目存储在 PSRAM。
-// V1 仍可读取，但不具备来源指纹和累计音频字节锚点。
+// V2 会校验 AVI 文件长度和抽样 CRC32；同时用源视频总帧数检查索引是否覆盖全片。
+// V1 仍可读取，但不具备来源指纹和累计音频字节锚点；不完整索引会被拒绝。
 esp_err_t load(const char *sidecar_path, VideoMediaIo::Context *source_io,
-    uint32_t source_fps_x100);
+    uint32_t source_fps_x100, uint32_t source_total_frames,
+    uint32_t source_duration_ms);
 
 // 查找不超过 target_ms 的最近条目。
 // 成功返回 ESP_OK，entry 填充为找到的条目；

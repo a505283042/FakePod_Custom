@@ -150,39 +150,82 @@ function New-SidecarIndex([string]$aviPath) {
             return $result
         }
 
-        # 第一遍：读取 avih 帧间隔，并定位 movi 数据区。
-        # 必须与设备端 AviDemuxer::open() 使用相同的 avih -> fps_x100 取整规则。
+        # 第一遍：逐个解析 RIFF AVI / RIFF AVIX 段，收集全部 movi 区间。
+        # 长 AVI 超过 RIFF 单段容量后会追加 AVIX；不能只记录第一个 movi。
+        # 帧率仍使用设备端相同的 avih -> fps_x100 取整规则。
         $usPerFrame = [uint32]0
-        $moviStart = [int64]-1
-        $moviEnd = [int64]-1
-        $pos = [int64]12
-        while ($pos + 8 -le $fileLen) {
-            $id = Read-AviFourCC $fs $pos
-            $size = [int64](Read-AviU32 $fs ($pos + 4))
-            $data = $pos + 8
-            if ($size -gt ($fileLen - $data)) { throw "AVI 顶层 chunk 越过文件末尾：offset=$pos" }
-
-            if ($id -eq 'LIST' -and $size -ge 4) {
-                $listType = Read-AviFourCC $fs $data
-                if ($listType -eq 'hdrl') {
-                    $p = $data + 4
-                    $hdrEnd = $data + $size
-                    while ($p + 8 -le $hdrEnd) {
-                        $sid = Read-AviFourCC $fs $p
-                        $ssize = [int64](Read-AviU32 $fs ($p + 4))
-                        $sdata = $p + 8
-                        if ($ssize -gt ($hdrEnd - $sdata)) { throw "AVI hdrl 子 chunk 越界：offset=$p" }
-                        if ($sid -eq 'avih' -and $ssize -ge 56) {
-                            $usPerFrame = Read-AviU32 $fs $sdata
-                        }
-                        $p = $sdata + $ssize + ($ssize -band 1)
-                    }
-                } elseif ($listType -eq 'movi') {
-                    $moviStart = $data + 4
-                    $moviEnd = $data + $size
-                }
+        $moviRanges = New-Object System.Collections.Generic.List[object]
+        $pos = [int64]0
+        $riffIndex = 0
+        while ($pos + 12 -le $fileLen) {
+            $riffId = Read-AviFourCC $fs $pos
+            if ($riffId -ne 'RIFF') {
+                if ($riffIndex -eq 0) { throw "AVI 文件起点不是 RIFF" }
+                break
             }
-            $pos = $data + $size + ($size -band 1)
+
+            $riffSize = [int64](Read-AviU32 $fs ($pos + 4))
+            $riffType = Read-AviFourCC $fs ($pos + 8)
+            if ($riffSize -lt 4 -or $riffSize -gt ($fileLen - $pos - 8)) {
+                throw "AVI RIFF 段长度非法：segment=$riffIndex offset=$pos size=$riffSize"
+            }
+            if (($riffIndex -eq 0 -and $riffType -ne 'AVI ') -or
+                ($riffIndex -gt 0 -and $riffType -ne 'AVIX' -and $riffType -ne 'AVI ')) {
+                throw "不支持的 AVI RIFF 段类型：segment=$riffIndex type=$riffType"
+            }
+
+            $riffEnd = $pos + 8 + $riffSize
+            $chunkPos = $pos + 12
+            while ($chunkPos + 8 -le $riffEnd) {
+                $id = Read-AviFourCC $fs $chunkPos
+                $size = [int64](Read-AviU32 $fs ($chunkPos + 4))
+                $data = $chunkPos + 8
+                if ($size -gt ($riffEnd - $data)) {
+                    throw "AVI RIFF 子 chunk 越界：segment=$riffIndex offset=$chunkPos"
+                }
+                $advance = $data + $size + ($size -band 1)
+                if ($advance -gt $riffEnd) {
+                    throw "AVI RIFF 子 chunk 补齐字节越界：segment=$riffIndex offset=$chunkPos"
+                }
+
+                if ($id -eq 'LIST' -and $size -ge 4) {
+                    $listType = Read-AviFourCC $fs $data
+                    if ($listType -eq 'hdrl') {
+                        $p = $data + 4
+                        $hdrEnd = $data + $size
+                        while ($p + 8 -le $hdrEnd) {
+                            $sid = Read-AviFourCC $fs $p
+                            $ssize = [int64](Read-AviU32 $fs ($p + 4))
+                            $sdata = $p + 8
+                            if ($ssize -gt ($hdrEnd - $sdata)) {
+                                throw "AVI hdrl 子 chunk 越界：offset=$p"
+                            }
+                            if ($sid -eq 'avih' -and $ssize -ge 56 -and $usPerFrame -eq 0) {
+                                $usPerFrame = Read-AviU32 $fs $sdata
+                            }
+                            $p = $sdata + $ssize + ($ssize -band 1)
+                        }
+                    } elseif ($listType -eq 'movi') {
+                        $moviStart = $data + 4
+                        $moviEnd = $data + $size
+                        if ($moviEnd -le $moviStart) {
+                            throw "AVI movi 区间无效：segment=$riffIndex"
+                        }
+                        $moviRanges.Add([pscustomobject]@{
+                            Start = [int64]$moviStart
+                            End = [int64]$moviEnd
+                        })
+                    }
+                }
+
+                $chunkPos = $advance
+            }
+
+            $nextRiff = $riffEnd + ($riffSize -band 1)
+            if ($nextRiff -le $pos) { throw "AVI RIFF 段偏移没有前进" }
+            if ($nextRiff -ge $fileLen) { break }
+            $pos = $nextRiff
+            $riffIndex++
         }
 
         if ($usPerFrame -eq 0) {
@@ -194,62 +237,69 @@ function New-SidecarIndex([string]$aviPath) {
             $result.Message = "AVI 帧率超出设备端支持范围"
             return $result
         }
-        if ($moviStart -lt 0 -or $moviEnd -le $moviStart -or $moviEnd -gt $fileLen) {
+        if ($moviRanges.Count -eq 0) {
             $result.Message = "未找到有效 movi 数据区"
             return $result
         }
 
-        # 第二遍：顺序扫描 movi。时间戳严格采用设备端 frame_index / fps_x100 公式。
+        # 第二遍：按文件顺序扫描全部 movi 区间；帧序号和音频字节数跨 AVIX 连续累计。
         $entries = New-Object System.Collections.Generic.List[object]
         [uint64]$frameIndex = 0
         [uint64]$audioBytesTotal = 0
         [uint64]$nextMarkMs = 0
-        $pos = $moviStart
-        while ($pos + 8 -le $moviEnd) {
-            $id = Read-AviFourCC $fs $pos
-            $size = [int64](Read-AviU32 $fs ($pos + 4))
-            $data = $pos + 8
-            if ($size -gt ($moviEnd - $data)) { throw "AVI movi chunk 越界：offset=$pos" }
-            $advance = $data + $size + ($size -band 1)
-            if ($advance -gt $moviEnd) { throw "AVI movi chunk 补齐字节越界：offset=$pos" }
+        foreach ($moviRange in $moviRanges) {
+            $pos = [int64]$moviRange.Start
+            $moviEnd = [int64]$moviRange.End
+            while ($pos + 8 -le $moviEnd) {
+                $id = Read-AviFourCC $fs $pos
+                $size = [int64](Read-AviU32 $fs ($pos + 4))
+                $data = $pos + 8
+                if ($size -gt ($moviEnd - $data)) {
+                    throw "AVI movi chunk 越界：offset=$pos"
+                }
+                $advance = $data + $size + ($size -band 1)
+                if ($advance -gt $moviEnd) {
+                    throw "AVI movi chunk 补齐字节越界：offset=$pos"
+                }
 
-            if ($id -eq 'LIST' -and $size -ge 4 -and (Read-AviFourCC $fs $data) -eq 'rec ') {
-                # rec 组内继续扫描子 chunk，不把 LIST 本身计入媒体帧。
-                $pos = $data + 4
-                continue
-            }
+                if ($id -eq 'LIST' -and $size -ge 4 -and (Read-AviFourCC $fs $data) -eq 'rec ') {
+                    # rec 组内继续扫描子 chunk，不把 LIST 本身计入媒体帧。
+                    $pos = $data + 4
+                    continue
+                }
 
-            if ($id -eq '00dc' -or $id -eq '00db') {
-                if ($size -ge 2) {
-                    $tsMs64 = [Math]::Floor((([decimal]$frameIndex * [decimal]100000) / [decimal]$fpsX100))
-                    if ($tsMs64 -gt [uint32]::MaxValue) { throw "AVI 时长超出 FVIX 时间戳范围" }
-                    if ($tsMs64 -ge $nextMarkMs) {
-                        # 只把 JPEG SOI 有效的帧写入索引，避免首个落点本身不可解码。
-                        $fs.Position = $data
-                        $jpegSignature = New-Object byte[] 2
-                        $signatureRead = $fs.Read($jpegSignature, 0, 2)
-                        if ($signatureRead -eq 2 -and
-                            $jpegSignature[0] -eq 0xFF -and $jpegSignature[1] -eq 0xD8) {
-                            if ($frameIndex -gt [uint32]::MaxValue) { throw "视频帧序号超出 FVIX 范围" }
-                            if ($audioBytesTotal -gt [uint32]::MaxValue) { throw "音频累计字节数超出 FVIX 范围" }
-                            $entries.Add([pscustomobject]@{
-                                ts = [uint32]$tsMs64
-                                off = [uint32]$pos
-                                frame = [uint32]$frameIndex
-                                audio = [uint32]$audioBytesTotal
-                            })
-                            $nextMarkMs = [uint64]$tsMs64 + [uint64]$granularityMs
+                if ($id -eq '00dc' -or $id -eq '00db') {
+                    if ($size -ge 2) {
+                        $tsMs64 = [Math]::Floor((([decimal]$frameIndex * [decimal]100000) / [decimal]$fpsX100))
+                        if ($tsMs64 -gt [uint32]::MaxValue) { throw "AVI 时长超出 FVIX 时间戳范围" }
+                        if ($tsMs64 -ge $nextMarkMs) {
+                            # 只把 JPEG SOI 有效的帧写入索引，避免首个落点本身不可解码。
+                            $fs.Position = $data
+                            $jpegSignature = New-Object byte[] 2
+                            $signatureRead = $fs.Read($jpegSignature, 0, 2)
+                            if ($signatureRead -eq 2 -and
+                                $jpegSignature[0] -eq 0xFF -and $jpegSignature[1] -eq 0xD8) {
+                                if ($frameIndex -gt [uint32]::MaxValue) { throw "视频帧序号超出 FVIX 范围" }
+                                if ($audioBytesTotal -gt [uint32]::MaxValue) { throw "音频累计字节数超出 FVIX 范围" }
+                                $entries.Add([pscustomobject]@{
+                                    ts = [uint32]$tsMs64
+                                    off = [uint32]$pos
+                                    frame = [uint32]$frameIndex
+                                    audio = [uint32]$audioBytesTotal
+                                })
+                                $nextMarkMs = [uint64]$tsMs64 + [uint64]$granularityMs
+                            }
                         }
                     }
+                    # 与设备端一致：即使是 0 字节占位视频 chunk，也占用一个帧序号。
+                    $frameIndex++
+                } elseif ($id -eq '01wb' -or $id -eq '00wb') {
+                    $audioBytesTotal += [uint64]$size
+                    if ($audioBytesTotal -gt [uint32]::MaxValue) { throw "音频累计字节数超出 FVIX 范围" }
                 }
-                # 与设备端一致：即使是 0 字节占位视频 chunk，也占用一个帧序号。
-                $frameIndex++
-            } elseif ($id -eq '01wb' -or $id -eq '00wb') {
-                $audioBytesTotal += [uint64]$size
-                if ($audioBytesTotal -gt [uint32]::MaxValue) { throw "音频累计字节数超出 FVIX 范围" }
-            }
 
-            $pos = $advance
+                $pos = $advance
+            }
         }
 
         if ($entries.Count -eq 0) {
@@ -287,7 +337,7 @@ function New-SidecarIndex([string]$aviPath) {
 
         $result.Ok = $true
         $result.Count = $entries.Count
-        $result.Message = "V2 索引已生成：$($entries.Count) 条，粒度 $($granularityMs)ms，帧率 $($fpsX100 / 100.0)fps，来源指纹已写入"
+        $result.Message = "V2 索引已生成：$($entries.Count) 条，movi段 $($moviRanges.Count)，视频帧 $frameIndex，粒度 $($granularityMs)ms，帧率 $($fpsX100 / 100.0)fps，来源指纹已写入"
         return $result
     } catch {
         if (Test-Path -LiteralPath $outPath) {

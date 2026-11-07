@@ -831,10 +831,11 @@ static void benchmark_task(void *arg)
     VideoMediaIo::configure(&io, args->generation, generation_current, args->music_suspended);
     jpeg_dec_handle_t decoder = nullptr;
     uint32_t source_fps_x100 = 0U;
+    // AVI 元信息需要同时供 Demuxer 初始化和后续 FVIX V2 完整性校验使用。
+    AviDemuxer::StreamInfo avi_info = {};
 
     esp_err_t ret = VideoMediaIo::open(args->path, &io);
     if (ret == ESP_OK && generation_current(args->generation)) {
-        AviDemuxer::StreamInfo avi_info = {};
         ret = AviDemuxer::open(&io, &avi_info);
         if (ret == ESP_OK) {
             source_fps_x100 = avi_info.fps_x100;
@@ -846,7 +847,9 @@ static void benchmark_task(void *arg)
     if (ret == ESP_OK && generation_current(args->generation)) {
         char sidecar_path[512];
         snprintf(sidecar_path, sizeof(sidecar_path), "%s.fvix", args->path);
-        const esp_err_t idx_ret = VideoSeekIndex::load(sidecar_path, &io, source_fps_x100);
+        const esp_err_t idx_ret = VideoSeekIndex::load(
+            sidecar_path, &io, source_fps_x100,
+            avi_info.total_frames, avi_info.duration_ms);
         if (idx_ret == ESP_OK) {
             ESP_LOGI(TAG, "侧车索引已加载，%u 条目，来源抽样校验=%s，音频字节锚点=%s",
                 VideoSeekIndex::count(),
