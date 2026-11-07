@@ -401,14 +401,29 @@ esp_err_t open(VideoMediaIo::Context *io, StreamInfo *out_info)
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    // OpenDML 的 dmlh 通常记录跨全部 RIFF/AVIX 段的总帧数；
-    // 个别封装器只更新视频 strh.dwLength 或 avih.dwTotalFrames，取有效值中的最大值。
-    s_info.total_frames = s_dmlh_total_frames;
-    if (s_video_strh_length > s_info.total_frames) {
+    // dwLength 属于具体视频流，单位是该流的样本数（视频流即视频帧）。
+    // 部分封装器会把 dmlh 写成所有媒体 chunk 数，或让 avih 只保留首个 RIFF 段帧数；
+    // 因此不能对三个字段取最大值，优先使用视频 strh.dwLength。
+    const char *frame_count_source = nullptr;
+    if (s_video_strh_length > 0U) {
         s_info.total_frames = s_video_strh_length;
-    }
-    if (s_avih_total_frames > s_info.total_frames) {
+        frame_count_source = "video_strh.dwLength";
+    } else if (s_dmlh_total_frames > 0U) {
+        s_info.total_frames = s_dmlh_total_frames;
+        frame_count_source = "odml.dmlh";
+    } else {
         s_info.total_frames = s_avih_total_frames;
+        frame_count_source = "avih.dwTotalFrames";
+    }
+
+    if (s_video_strh_length > 0U &&
+        ((s_dmlh_total_frames > 0U && s_dmlh_total_frames != s_video_strh_length) ||
+         (s_avih_total_frames > 0U && s_avih_total_frames != s_video_strh_length))) {
+        ESP_LOGW(TAG,
+            "AVI帧数元数据不一致：avih=%lu video_strh=%lu dmlh=%lu；采用视频流长度",
+            static_cast<unsigned long>(s_avih_total_frames),
+            static_cast<unsigned long>(s_video_strh_length),
+            static_cast<unsigned long>(s_dmlh_total_frames));
     }
 
     uint64_t duration_ms = 0ULL;
@@ -434,11 +449,12 @@ esp_err_t open(VideoMediaIo::Context *io, StreamInfo *out_info)
     s_current_offset = s_movi_ranges[0].begin;
 
     ESP_LOGI(TAG,
-        "AVI时长来源：avih_frames=%lu strh_frames=%lu dmlh_frames=%lu selected=%lu",
+        "AVI时长来源：avih_frames=%lu strh_frames=%lu dmlh_frames=%lu selected=%lu source=%s",
         static_cast<unsigned long>(s_avih_total_frames),
         static_cast<unsigned long>(s_video_strh_length),
         static_cast<unsigned long>(s_dmlh_total_frames),
-        static_cast<unsigned long>(s_info.total_frames));
+        static_cast<unsigned long>(s_info.total_frames),
+        frame_count_source != nullptr ? frame_count_source : "unknown");
     ESP_LOGI(TAG,
         "AVI解析成功: %ux%u %u.%02ufps dur=%ums frames=%u audio=%s movi_segments=%lu",
         s_info.width, s_info.height,

@@ -26,7 +26,7 @@ struct StreamInfo {
     uint16_t height = 0;
     uint32_t fps_x100 = 0;      // fps * 100，例如 2400 表示 24fps
     uint32_t duration_ms = 0;    // 全片时长，优先使用视频流 time base
-    uint32_t total_frames = 0;   // 全片总帧数，优先使用 OpenDML dmlh
+    uint32_t total_frames = 0;   // 全片视频帧数，优先使用视频流 strh.dwLength
 
     // 音频
     uint16_t audio_sample_rate = 0;
