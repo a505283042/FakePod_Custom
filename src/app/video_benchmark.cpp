@@ -1,6 +1,7 @@
 #include "video_benchmark.h"
 
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "esp_heap_caps.h"
@@ -25,9 +26,10 @@ namespace
 {
 
 static constexpr size_t kFrameSlotCount = 3U;
-// 压缩帧队列深度决定“提取能跑多前”：8 帧约 0.5 秒（15fps），解码/Presenter 一次抖动就会让
-// ExtractTask 停在 send_pipeline_message，音频桥随之被抽干。24 帧约 1.6 秒，可吸收这类抖动。
+// 24 个 PSRAM 压缩槽中，23 个供视频队列使用（约 1.5 秒@15fps），最后一个 128KB 专供 MP3 chunk。
 static constexpr size_t kCompressedSlotCount = 24U;
+static constexpr size_t kCompressedVideoSlotCount = kCompressedSlotCount - 1U;
+static constexpr size_t kAudioScratchSlotIndex = kCompressedVideoSlotCount;
 static constexpr size_t kCompressedSlotBytes = 128U * 1024U;
 static constexpr uint32_t kTaskStack = 8192U;
 static constexpr uint32_t kExtractTaskStack = 6144U;
@@ -52,15 +54,16 @@ static constexpr uint32_t kDeadlineSafetyBaseUs = 5000U;
 static constexpr uint32_t kDeadlineSafetyMaxUs = 12000U;
 static constexpr uint32_t kDecodeJitterReserveMaxUs = 10000U;
 static constexpr uint8_t kDecodeTimingEwmaShift = 3U; // alpha = 1/8
-// AVI ExtractTask -> AudioTask 桥容量。96KB 约等于 6 秒 128kbps MP3。
+// AVI ExtractTask -> AudioTask 桥容量。96KB 约等于 4 秒 192kbps MP3。
 // 视频侧反压（压缩帧队列满）时 ExtractTask 会暂停读文件，32KB 只能撑约 2 秒，
 // 高码率大关键帧处会被抽干并触发音频欠载，进而把音频主时钟拖慢。
 static constexpr size_t kAudioBridgeBytes = 96U * 1024U;
-// 预缓冲阈值：4KB约等于128kbps MP3的250ms音频，足以防止启动欠载。
+// 预缓冲阈值：4KB约等于192kbps MP3的170ms音频，足以防止启动欠载。
 // 注意：不能设太大，某些AVI的视频/音频交错间隔大，高帧率视频需要较长时间才能凑满音频数据。
 static constexpr size_t kAudioPrebufferBytes = 4U * 1024U;
 static constexpr uint32_t kAudioPrebufferTimeoutMs = 1500U;
-static constexpr uint32_t kAudioBridgePushTimeoutMs = 250U;
+// Bridge 满是正常的生产者反压：等待 AudioTask 消费；仅在取消或 Source 关闭时退出。
+static constexpr uint32_t kAudioBridgePushWaitForever = UINT32_MAX;
 
 struct FrameSlot
 {
@@ -362,12 +365,26 @@ static bool take_free(uint8_t *slot, uint32_t generation)
 }
 
 
-static bool take_compressed_free(uint8_t *slot, uint32_t generation)
+static bool try_take_compressed_free(uint8_t *slot)
 {
-    if (slot == nullptr) return false;
+    return slot != nullptr && g_compressed_free_queue != nullptr &&
+        xQueueReceive(g_compressed_free_queue, slot, 0) == pdTRUE;
+}
+
+// 只有 Demuxer 已确认下一个 chunk 是视频帧时才等待槽位；等待期间仍响应 SEEK 暂停。
+static bool take_compressed_free_for_extract(
+    uint8_t *slot, uint32_t generation, bool *out_waited)
+{
+    if (out_waited != nullptr) *out_waited = false;
+    if (slot == nullptr || !extract_pause_gate(generation)) return false;
+    if (try_take_compressed_free(slot)) return true;
+    if (out_waited != nullptr) *out_waited = true;
+
     while (generation_current(generation)) {
+        if (!extract_pause_gate(generation)) return false;
+        // 队列收到 DecodeTask 归还的槽位时立即唤醒；最多等待 1 tick 后重新检查暂停请求。
         if (g_compressed_free_queue != nullptr &&
-            xQueueReceive(g_compressed_free_queue, slot, kQueuePollTicks) == pdTRUE) {
+            xQueueReceive(g_compressed_free_queue, slot, 1) == pdTRUE) {
             return true;
         }
     }
@@ -376,7 +393,7 @@ static bool take_compressed_free(uint8_t *slot, uint32_t generation)
 
 static void return_compressed_to_free(uint8_t slot)
 {
-    if (g_compressed_free_queue == nullptr || slot >= kCompressedSlotCount) return;
+    if (g_compressed_free_queue == nullptr || slot >= kCompressedVideoSlotCount) return;
     (void)xQueueSend(g_compressed_free_queue, &slot, 0);
 }
 
@@ -385,7 +402,7 @@ static bool send_pipeline_message(const PipelineMessage &message, uint32_t gener
     while (generation_current(generation)) {
         // 暂停/seek 期间丢弃视频帧消息（含槽归还）。Eof/Failed/Stopped 必须送达 Decode。
         if (message.type == PipelineMessageType::Frame && pause_transition_active()) {
-            if (message.slot < kCompressedSlotCount) return_compressed_to_free(message.slot);
+            if (message.slot < kCompressedVideoSlotCount) return_compressed_to_free(message.slot);
             return true;
         }
         if (g_compressed_ready_queue != nullptr &&
@@ -601,23 +618,75 @@ static void extract_task(void *arg)
     ESP_LOGI(TAG, "VideoExtractTask启动：generation=%lu",
         static_cast<unsigned long>(args->generation));
     static uint32_t s_extract_debug_frames = 0U;  // 临时诊断：打印开头若干提取帧
+    uint32_t audio_chunks_pushed = 0U;
+    uint64_t audio_bytes_pushed = 0ULL;
+    uint64_t audio_push_us_total = 0ULL;
+    uint32_t audio_push_us_max = 0U;
+    uint32_t video_slot_wait_count = 0U;
+    uint64_t video_slot_wait_us_total = 0ULL;
+    uint32_t video_slot_wait_us_max = 0U;
+
+    uint8_t compressed_slot_index = 0xFFU;
+    bool have_video_slot = false;
 
     while (generation_current(args->generation)) {
         if (!extract_pause_gate(args->generation)) break;
-        uint8_t compressed_slot_index = 0U;
-        if (!take_compressed_free(&compressed_slot_index, args->generation)) break;
 
-        CompressedSlot &slot = g_compressed_slots[compressed_slot_index];
+        // 有空闲槽位时先非阻塞借用；若池已满，仍允许 Demuxer 直接读取音频 chunk。
+        // 只有确认当前 chunk 是视频帧且无槽位时，才等待并重试同一帧，绝不主动丢帧。
+        if (!have_video_slot) {
+            have_video_slot = try_take_compressed_free(&compressed_slot_index);
+        }
+        uint8_t *video_buffer = have_video_slot
+            ? g_compressed_slots[compressed_slot_index].data : nullptr;
+        uint8_t *audio_buffer = g_compressed_slots[kAudioScratchSlotIndex].data;
+
         AviDemuxer::FrameInfo frame = {};
         const uint64_t storage_before = args->io->read_us_total;
         const int64_t extract_started_us = esp_timer_get_time();
-        // 自定义解复用器直接读入 compressed slot，零拷贝。
-        const esp_err_t ex = AviDemuxer::read_frame(&frame, slot.data, kCompressedSlotBytes);
+        const esp_err_t ex = AviDemuxer::read_frame(
+            &frame,
+            video_buffer, have_video_slot ? kCompressedSlotBytes : 0U,
+            audio_buffer, kCompressedSlotBytes);
         const uint32_t extract_us = static_cast<uint32_t>(esp_timer_get_time() - extract_started_us);
         const uint32_t storage_us = static_cast<uint32_t>(args->io->read_us_total - storage_before);
 
+        if (ex == AviDemuxer::kErrNeedVideoSlot) {
+            if (have_video_slot) {
+                ESP_LOGE(TAG, "已有视频槽位但 Demuxer 仍请求槽位，状态异常");
+                return_compressed_to_free(compressed_slot_index);
+                have_video_slot = false;
+                avi_mp3_bridge_cancel();
+                PipelineMessage message = {};
+                message.type = PipelineMessageType::Failed;
+                message.result = ESP_ERR_INVALID_STATE;
+                (void)send_pipeline_message(message, args->generation);
+                break;
+            }
+
+            const int64_t wait_started_us = esp_timer_get_time();
+            bool slot_was_waited = false;
+            if (!take_compressed_free_for_extract(
+                    &compressed_slot_index, args->generation, &slot_was_waited)) {
+                break;
+            }
+            have_video_slot = true;
+            if (slot_was_waited) {
+                ++video_slot_wait_count;
+                const int64_t wait_elapsed = esp_timer_get_time() - wait_started_us;
+                const uint32_t wait_us = wait_elapsed > 0LL
+                    ? static_cast<uint32_t>(wait_elapsed) : 0U;
+                video_slot_wait_us_total += wait_us;
+                if (wait_us > video_slot_wait_us_max) video_slot_wait_us_max = wait_us;
+            }
+            continue;
+        }
+
         if (ex == AviDemuxer::kErrEof) {
-            return_compressed_to_free(compressed_slot_index);
+            if (have_video_slot) {
+                return_compressed_to_free(compressed_slot_index);
+                have_video_slot = false;
+            }
             avi_mp3_bridge_mark_eof();
             PipelineMessage message = {};
             message.type = PipelineMessageType::Eof;
@@ -627,7 +696,10 @@ static void extract_task(void *arg)
         }
 
         if (ex != ESP_OK) {
-            return_compressed_to_free(compressed_slot_index);
+            if (have_video_slot) {
+                return_compressed_to_free(compressed_slot_index);
+                have_video_slot = false;
+            }
             avi_mp3_bridge_cancel();
             PipelineMessage message = {};
             if (!generation_current(args->generation)) {
@@ -641,7 +713,6 @@ static void extract_task(void *arg)
             break;
         }
 
-        // 临时诊断：确认提取任务确实在产出帧
         if (s_extract_debug_frames < 8U) {
             ++s_extract_debug_frames;
             ESP_LOGI(TAG, "提取#%lu %s size=%lu pts=%llums extract=%luus",
@@ -653,13 +724,25 @@ static void extract_task(void *arg)
         }
 
         if (!frame.is_video) {
+            // 音频 chunk 不持有视频槽位；若 SEEK 后状态变化导致暂借了槽位，先立即归还。
+            if (have_video_slot) {
+                return_compressed_to_free(compressed_slot_index);
+                have_video_slot = false;
+            }
             esp_err_t audio_push_ret = ESP_OK;
             if (frame.data != nullptr && frame.size != 0U) {
                 (void)record_audio_probe(frame, extract_us, storage_us, args->generation);
+                const int64_t push_started_us = esp_timer_get_time();
                 audio_push_ret = avi_mp3_bridge_push(
-                    frame.data, frame.size, kAudioBridgePushTimeoutMs);
+                    frame.data, frame.size, kAudioBridgePushWaitForever);
+                const int64_t push_elapsed_signed = esp_timer_get_time() - push_started_us;
+                const uint32_t push_elapsed_us = push_elapsed_signed > 0LL
+                    ? static_cast<uint32_t>(push_elapsed_signed) : 0U;
+                ++audio_chunks_pushed;
+                audio_bytes_pushed += frame.size;
+                audio_push_us_total += push_elapsed_us;
+                if (push_elapsed_us > audio_push_us_max) audio_push_us_max = push_elapsed_us;
             }
-            return_compressed_to_free(compressed_slot_index);
             if (audio_push_ret != ESP_OK) {
                 const bool generation_alive = generation_current(args->generation);
                 PipelineMessage message = {};
@@ -678,13 +761,23 @@ static void extract_task(void *arg)
             continue;
         }
 
-        // 视频帧：data 已在 slot.data 中（零拷贝），直接填充元数据。
+        if (!have_video_slot || compressed_slot_index >= kCompressedVideoSlotCount) {
+            ESP_LOGE(TAG, "Demuxer返回视频帧但没有有效压缩槽位");
+            avi_mp3_bridge_cancel();
+            PipelineMessage message = {};
+            message.type = PipelineMessageType::Failed;
+            message.result = ESP_ERR_INVALID_STATE;
+            (void)send_pipeline_message(message, args->generation);
+            break;
+        }
+
+        CompressedSlot &slot = g_compressed_slots[compressed_slot_index];
         slot.bytes = frame.size;
         slot.pts_ms = static_cast<uint32_t>(frame.pts);
         slot.seek_epoch = seek_epoch();
         slot.extract_us = extract_us;
         slot.storage_us = storage_us;
-        slot.copy_us = 0U;  // 零拷贝
+        slot.copy_us = 0U;
 
         PipelineMessage message = {};
         message.type = PipelineMessageType::Frame;
@@ -692,9 +785,26 @@ static void extract_task(void *arg)
         message.result = ESP_OK;
         if (!send_pipeline_message(message, args->generation)) {
             return_compressed_to_free(compressed_slot_index);
+            have_video_slot = false;
             break;
         }
+        // 成功发送后槽位所有权转交给 DecodeTask；暂停期间的发送路径也会自行归还槽位。
+        have_video_slot = false;
     }
+
+    if (have_video_slot) return_compressed_to_free(compressed_slot_index);
+
+    ESP_LOGI(TAG,
+        "Extractor供数汇总：audio_chunks=%lu audio_bytes=%llu push_avg=%luus push_max=%luus video_slot_waits=%lu wait_avg=%lluus wait_max=%luus",
+        static_cast<unsigned long>(audio_chunks_pushed),
+        static_cast<unsigned long long>(audio_bytes_pushed),
+        static_cast<unsigned long>(audio_chunks_pushed != 0U
+            ? audio_push_us_total / audio_chunks_pushed : 0ULL),
+        static_cast<unsigned long>(audio_push_us_max),
+        static_cast<unsigned long>(video_slot_wait_count),
+        static_cast<unsigned long long>(video_slot_wait_count != 0U
+            ? video_slot_wait_us_total / video_slot_wait_count : 0ULL),
+        static_cast<unsigned long>(video_slot_wait_us_max));
 
     heap_caps_free(args);
     portENTER_CRITICAL(&g_mux);
@@ -986,7 +1096,7 @@ static void benchmark_task(void *arg)
                 done = true;
                 break;
             }
-            if (message.type != PipelineMessageType::Frame || message.slot >= kCompressedSlotCount) {
+            if (message.type != PipelineMessageType::Frame || message.slot >= kCompressedVideoSlotCount) {
                 result.state = State::Failed;
                 result.result = ESP_ERR_INVALID_STATE;
                 ret = ESP_ERR_INVALID_STATE;
@@ -1160,6 +1270,25 @@ static void benchmark_task(void *arg)
     }
 
     if (decoder != nullptr) jpeg_dec_close(decoder);
+    AviDemuxer::IoStats demux_io_stats = {};
+    AviDemuxer::get_io_stats(&demux_io_stats);
+    const uint32_t demux_seek_avg_us = demux_io_stats.fseek_calls != 0U
+        ? static_cast<uint32_t>(demux_io_stats.fseek_us_total / demux_io_stats.fseek_calls)
+        : 0U;
+    ESP_LOGI(TAG,
+        "AVI顺序IO统计：fseek=%lu seq_skip=%lu seek_avg=%luus seek_max=%luus forward_reads=%lu forward_bytes=%llu audio_chunks=%lu audio_bytes=%llu seek_scan=%llums scan_chunks=%lu scan_bytes=%llu scan_fseek=%lu",
+        static_cast<unsigned long>(demux_io_stats.fseek_calls),
+        static_cast<unsigned long>(demux_io_stats.sequential_seek_skips),
+        static_cast<unsigned long>(demux_seek_avg_us),
+        static_cast<unsigned long>(demux_io_stats.fseek_us_max),
+        static_cast<unsigned long>(demux_io_stats.forward_reads),
+        static_cast<unsigned long long>(demux_io_stats.forward_bytes),
+        static_cast<unsigned long>(demux_io_stats.audio_chunks),
+        static_cast<unsigned long long>(demux_io_stats.audio_bytes),
+        static_cast<unsigned long long>(demux_io_stats.seek_scan_duration_us / 1000ULL),
+        static_cast<unsigned long>(demux_io_stats.seek_scan_chunks),
+        static_cast<unsigned long long>(demux_io_stats.seek_scan_skipped_bytes),
+        static_cast<unsigned long>(demux_io_stats.seek_scan_fseek_calls));
     AviDemuxer::close();
     VideoSeekIndex::unload();
     VideoMediaIo::close(&io);
@@ -1270,15 +1399,15 @@ esp_err_t start(const char *path, bool allow_fullcanvas_over20, bool music_suspe
 
     g_free_queue = xQueueCreate(kFrameSlotCount, sizeof(uint8_t));
     g_ready_queue = xQueueCreate(kFrameSlotCount, sizeof(uint8_t));
-    g_compressed_free_queue = xQueueCreate(kCompressedSlotCount, sizeof(uint8_t));
-    g_compressed_ready_queue = xQueueCreate(kCompressedSlotCount + 2U, sizeof(PipelineMessage));
+    g_compressed_free_queue = xQueueCreate(kCompressedVideoSlotCount, sizeof(uint8_t));
+    g_compressed_ready_queue = xQueueCreate(kCompressedVideoSlotCount + 2U, sizeof(PipelineMessage));
     if (g_free_queue == nullptr || g_ready_queue == nullptr ||
         g_compressed_free_queue == nullptr || g_compressed_ready_queue == nullptr) {
         free_resources_unlocked();
         return ESP_ERR_NO_MEM;
     }
     for (uint8_t i = 0U; i < kFrameSlotCount; ++i) (void)xQueueSend(g_free_queue, &i, 0);
-    for (uint8_t i = 0U; i < kCompressedSlotCount; ++i) {
+    for (uint8_t i = 0U; i < kCompressedVideoSlotCount; ++i) {
         (void)xQueueSend(g_compressed_free_queue, &i, 0);
     }
 
@@ -1562,7 +1691,7 @@ esp_err_t seek(uint32_t target_ms)
         while (xQueueReceive(g_compressed_ready_queue, &message, 0) == pdTRUE) {
             // 队列元素是 PipelineMessage，必须按消息取 slot；直接读 uint8_t 会读到 type 字段。
             if (message.type == PipelineMessageType::Frame &&
-                message.slot < kCompressedSlotCount) {
+                message.slot < kCompressedVideoSlotCount) {
                 return_compressed_to_free(message.slot);
             }
         }
@@ -1611,7 +1740,10 @@ esp_err_t seek(uint32_t target_ms)
 
     // 6.5 索引粒度为 2 秒，索引落点未必等于目标时间；顺序扫描丢弃 PTS 早于目标的视频帧，
     //     精确定位到目标帧。跳过的音频 chunk 只累加字节计数，保持音视频同一时间轴。
-    const esp_err_t scan_ret = AviDemuxer::scan_forward_to(target_ms);
+    // SEEK 时 ExtractTask 已确认暂停，复用独立 MP3 scratch 作为顺序丢弃缓冲，不额外分配 RAM。
+    uint8_t *seek_scan_scratch = g_compressed_slots[kAudioScratchSlotIndex].data;
+    const esp_err_t scan_ret = AviDemuxer::scan_forward_to(
+        target_ms, seek_scan_scratch, kCompressedSlotBytes);
     if (scan_ret != ESP_OK) {
         ESP_LOGE(TAG, "Demuxer精确定位失败: target=%ums ret=%s",
             static_cast<unsigned>(target_ms), esp_err_to_name(scan_ret));

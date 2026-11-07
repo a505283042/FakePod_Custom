@@ -22,6 +22,8 @@ static bool g_active = false;
 static bool g_eof = false;
 static bool g_cancelled = false;
 static bool g_source_open = false;
+// 允许启动预缓冲阶段在 Source 尚未打开时写入；一旦 Source 打开后又关闭，写入方必须退出。
+static bool g_consumer_closed = false;
 static uint64_t g_bytes_pushed = 0ULL;
 static uint64_t g_bytes_read = 0ULL;
 static uint32_t g_push_wait_count = 0U;
@@ -131,6 +133,7 @@ static esp_err_t bridge_source_close(void *context)
     source->open = false;
     portENTER_CRITICAL(&g_bridge_mux);
     g_source_open = false;
+    g_consumer_closed = true;
     portEXIT_CRITICAL(&g_bridge_mux);
     bridge_signal_all();
     return ESP_OK;
@@ -198,6 +201,7 @@ esp_err_t avi_mp3_bridge_begin(size_t capacity_bytes)
     g_eof = false;
     g_cancelled = false;
     g_source_open = false;
+    g_consumer_closed = false;
     g_bytes_pushed = 0ULL;
     g_bytes_read = 0ULL;
     g_push_wait_count = 0U;
@@ -219,15 +223,17 @@ esp_err_t avi_mp3_bridge_push(const void *data, size_t bytes, uint32_t timeout_m
     if (data == nullptr || bytes == 0U) return ESP_ERR_INVALID_ARG;
     const uint8_t *src = static_cast<const uint8_t *>(data);
     size_t offset = 0U;
-    TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
-    if (timeout_ms != 0U && timeout_ticks == 0) timeout_ticks = 1;
+    const bool wait_forever = timeout_ms == UINT32_MAX;
+    TickType_t timeout_ticks = wait_forever ? 0 : pdMS_TO_TICKS(timeout_ms);
+    if (timeout_ms != 0U && !wait_forever && timeout_ticks == 0) timeout_ticks = 1;
     const TickType_t started = xTaskGetTickCount();
 
     while (offset < bytes) {
         size_t copied = 0U;
         bool active = false;
         portENTER_CRITICAL(&g_bridge_mux);
-        active = g_active && !g_cancelled && !g_eof && g_buffer != nullptr;
+        active = g_active && !g_cancelled && !g_eof &&
+            !g_consumer_closed && g_buffer != nullptr;
         if (active && g_buffered < g_capacity) {
             const size_t free_bytes = g_capacity - g_buffered;
             copied = (bytes - offset) < free_bytes ? (bytes - offset) : free_bytes;
@@ -254,12 +260,16 @@ esp_err_t avi_mp3_bridge_push(const void *data, size_t bytes, uint32_t timeout_m
         portENTER_CRITICAL(&g_bridge_mux);
         ++g_push_wait_count;
         portEXIT_CRITICAL(&g_bridge_mux);
-        if (timeout_ticks == 0) return ESP_ERR_TIMEOUT;
-        const TickType_t elapsed = xTaskGetTickCount() - started;
-        if (elapsed >= timeout_ticks) return ESP_ERR_TIMEOUT;
-        TickType_t wait_ticks = timeout_ticks - elapsed;
-        const TickType_t slice = pdMS_TO_TICKS(20);
-        if (slice != 0 && wait_ticks > slice) wait_ticks = slice;
+        TickType_t wait_ticks = pdMS_TO_TICKS(20);
+        if (wait_ticks == 0) wait_ticks = 1;
+        if (!wait_forever) {
+            if (timeout_ticks == 0) return ESP_ERR_TIMEOUT;
+            const TickType_t elapsed = xTaskGetTickCount() - started;
+            if (elapsed >= timeout_ticks) return ESP_ERR_TIMEOUT;
+            wait_ticks = timeout_ticks - elapsed;
+            const TickType_t slice = pdMS_TO_TICKS(20);
+            if (slice != 0 && wait_ticks > slice) wait_ticks = slice;
+        }
         if (g_space_event == nullptr) return ESP_ERR_INVALID_STATE;
         (void)xSemaphoreTake(g_space_event, wait_ticks);
     }
@@ -323,6 +333,7 @@ esp_err_t avi_mp3_bridge_release()
     g_active = false;
     g_eof = false;
     g_cancelled = false;
+    g_consumer_closed = false;
     g_bytes_pushed = 0ULL;
     g_bytes_read = 0ULL;
     g_push_wait_count = 0U;
@@ -369,7 +380,10 @@ esp_err_t avi_mp3_audio_source_open(AudioSource *out_source, AviMp3AudioSource *
     bool ready = false;
     portENTER_CRITICAL(&g_bridge_mux);
     ready = g_active && !g_cancelled && g_buffer != nullptr && !g_source_open;
-    if (ready) g_source_open = true;
+    if (ready) {
+        g_source_open = true;
+        g_consumer_closed = false;
+    }
     portEXIT_CRITICAL(&g_bridge_mux);
     if (!ready) return ESP_ERR_INVALID_STATE;
 

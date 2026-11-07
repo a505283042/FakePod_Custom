@@ -33,10 +33,11 @@ struct AviMp3BridgeSnapshot
     uint32_t read_wait_timeout_count = 0U;
 };
 
-// 每次 AVI 启动前重建一个干净 bridge。当前 V1 使用 32KB，约可容纳 2 秒 128kbps MP3。
+// 每次 AVI 启动前重建一个干净 bridge；当前播放配置使用 96KB PSRAM 环形缓冲。
 esp_err_t avi_mp3_bridge_begin(size_t capacity_bytes);
 
 // ExtractTask 写入 MP3 payload；必须完整写入，不允许静默丢音频字节。
+// timeout_ms == UINT32_MAX 时，缓冲区满则持续等待空间；取消或 AudioSource 关闭时退出。
 esp_err_t avi_mp3_bridge_push(const void *data, size_t bytes, uint32_t timeout_ms);
 
 // 正常 AVI EOS 与取消分开标记；AudioSource 会在 ring 排空后发布 EOF。

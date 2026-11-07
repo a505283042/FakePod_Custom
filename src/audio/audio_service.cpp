@@ -1,6 +1,7 @@
 #include "audio_service.h"
 
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -304,6 +305,23 @@ static bool g_video_restore_paused_music_hardware = false;
 static uint32_t g_video_mp3_sample_rate_hz = 0U;
 static uint16_t g_video_mp3_channels = 0U;
 static uint16_t g_video_mp3_bits_per_sample = 0U;
+struct VideoMp3TimingStats
+{
+    uint64_t decoder_read_us_total = 0ULL;
+    uint32_t decoder_read_us_max = 0U;
+    uint32_t decoder_read_calls = 0U;
+    uint32_t decoder_timeout_count = 0U;
+    uint64_t i2s_write_us_total = 0ULL;
+    uint32_t i2s_write_us_max = 0U;
+    uint32_t i2s_write_calls = 0U;
+    uint32_t i2s_write_error_count = 0U;
+    uint32_t service_gap_us_max = 0U;
+    uint32_t service_gap_over_10ms = 0U;
+    uint32_t service_gap_over_20ms = 0U;
+    uint32_t service_gap_over_40ms = 0U;
+    int64_t last_service_started_us = 0LL;
+};
+static VideoMp3TimingStats g_video_mp3_timing = {};
 
 // VM10：NSF 6502/2A03 由 AudioTask 独占输出硬件；
 // 传统 NSF v1 没有 Subsong 时长：后台确认可靠循环后，在3分钟附近的完整循环边界结束；
@@ -3435,16 +3453,17 @@ static esp_err_t audio_task_stop_video_mp3_internal(bool restore_music_hardware,
     audio_task_remember_first_error(
         audio_task_shutdown_output_hardware(video_rate, "AVI-MP3"), &first_error);
 
-#if APP_DIAG_MP3_PERFORMANCE
+    // Bridge 供数水位和欠载统计只在视频停止时输出一次，RELEASE 也保留这条低频诊断。
     AviMp3BridgeSnapshot bridge_perf = {};
     if (avi_mp3_bridge_get_snapshot(&bridge_perf)) {
         const uint32_t read_wait_avg_us = bridge_perf.read_wait_count != 0U
             ? static_cast<uint32_t>(bridge_perf.read_wait_us_total / bridge_perf.read_wait_count)
             : 0U;
         ESP_LOGI(TAG,
-            "AVI MP3 Bridge汇总：high=%u/%uB pushed=%lluB read=%lluB push_wait=%lu；read_wait avg=%luus max=%luus >1/5/10ms=%lu/%lu/%lu timeout=%lu calls=%lu",
+            "AVI MP3 Bridge汇总：high=%u/%uB buffered=%uB pushed=%lluB read=%lluB push_wait=%lu；read_wait avg=%luus max=%luus >1/5/10ms=%lu/%lu/%lu timeout=%lu calls=%lu",
             static_cast<unsigned>(bridge_perf.high_water_bytes),
             static_cast<unsigned>(bridge_perf.capacity_bytes),
+            static_cast<unsigned>(bridge_perf.buffered_bytes),
             static_cast<unsigned long long>(bridge_perf.bytes_pushed),
             static_cast<unsigned long long>(bridge_perf.bytes_read),
             static_cast<unsigned long>(bridge_perf.push_wait_count),
@@ -3456,7 +3475,26 @@ static esp_err_t audio_task_stop_video_mp3_internal(bool restore_music_hardware,
             static_cast<unsigned long>(bridge_perf.read_wait_timeout_count),
             static_cast<unsigned long>(bridge_perf.read_wait_count));
     }
-#endif
+    const uint32_t decoder_read_avg_us = g_video_mp3_timing.decoder_read_calls != 0U
+        ? static_cast<uint32_t>(g_video_mp3_timing.decoder_read_us_total /
+            g_video_mp3_timing.decoder_read_calls) : 0U;
+    const uint32_t i2s_write_avg_us = g_video_mp3_timing.i2s_write_calls != 0U
+        ? static_cast<uint32_t>(g_video_mp3_timing.i2s_write_us_total /
+            g_video_mp3_timing.i2s_write_calls) : 0U;
+    ESP_LOGI(TAG,
+        "AVI MP3 AudioTask耗时：decode_avg/max=%lu/%luus calls=%lu timeout=%lu；I2S_avg/max=%lu/%luus calls=%lu error=%lu；service_gap_max=%luus >10/20/40ms=%lu/%lu/%lu",
+        static_cast<unsigned long>(decoder_read_avg_us),
+        static_cast<unsigned long>(g_video_mp3_timing.decoder_read_us_max),
+        static_cast<unsigned long>(g_video_mp3_timing.decoder_read_calls),
+        static_cast<unsigned long>(g_video_mp3_timing.decoder_timeout_count),
+        static_cast<unsigned long>(i2s_write_avg_us),
+        static_cast<unsigned long>(g_video_mp3_timing.i2s_write_us_max),
+        static_cast<unsigned long>(g_video_mp3_timing.i2s_write_calls),
+        static_cast<unsigned long>(g_video_mp3_timing.i2s_write_error_count),
+        static_cast<unsigned long>(g_video_mp3_timing.service_gap_us_max),
+        static_cast<unsigned long>(g_video_mp3_timing.service_gap_over_10ms),
+        static_cast<unsigned long>(g_video_mp3_timing.service_gap_over_20ms),
+        static_cast<unsigned long>(g_video_mp3_timing.service_gap_over_40ms));
 
     audio_task_video_mp3_close_decoder();
     const bool should_restore = restore_music_hardware && g_video_restore_paused_music_hardware;
@@ -3577,6 +3615,7 @@ static void audio_task_handle_video_mp3_start(AudioRequest *request)
     g_video_mp3_sample_rate_hz = g_video_mp3_decoder.sample_rate_hz;
     g_video_mp3_channels = g_video_mp3_decoder.channels;
     g_video_mp3_bits_per_sample = g_video_mp3_decoder.bits_per_sample;
+    g_video_mp3_timing = {};
     audio_playback_clock_reset(&g_video_playback_clock, g_video_mp3_sample_rate_hz);
     g_video_mp3_eof = false;
     g_video_mp3_paused = false;
@@ -3787,14 +3826,40 @@ static void audio_task_service_video_mp3()
         return;
     }
 
+    const int64_t service_started_us = esp_timer_get_time();
+    if (g_video_mp3_timing.last_service_started_us != 0LL) {
+        const int64_t gap_signed = service_started_us -
+            g_video_mp3_timing.last_service_started_us;
+        const uint32_t gap_us = gap_signed > static_cast<int64_t>(UINT32_MAX)
+            ? UINT32_MAX : (gap_signed > 0LL ? static_cast<uint32_t>(gap_signed) : 0U);
+        if (gap_us > g_video_mp3_timing.service_gap_us_max) {
+            g_video_mp3_timing.service_gap_us_max = gap_us;
+        }
+        if (gap_us >= 10000U) ++g_video_mp3_timing.service_gap_over_10ms;
+        if (gap_us >= 20000U) ++g_video_mp3_timing.service_gap_over_20ms;
+        if (gap_us >= 40000U) ++g_video_mp3_timing.service_gap_over_40ms;
+    }
+    g_video_mp3_timing.last_service_started_us = service_started_us;
+
     size_t frames = 0U;
+    const int64_t decoder_read_started_us = esp_timer_get_time();
     esp_err_t ret = mp3_decoder_read_pcm32(
         &g_video_mp3_decoder,
         g_pcm_block,
         AUDIO_STREAM_FRAMES,
         &frames);
+    const int64_t decoder_read_elapsed_signed =
+        esp_timer_get_time() - decoder_read_started_us;
+    const uint32_t decoder_read_elapsed_us = decoder_read_elapsed_signed > 0LL
+        ? static_cast<uint32_t>(decoder_read_elapsed_signed) : 0U;
+    g_video_mp3_timing.decoder_read_us_total += decoder_read_elapsed_us;
+    ++g_video_mp3_timing.decoder_read_calls;
+    if (decoder_read_elapsed_us > g_video_mp3_timing.decoder_read_us_max) {
+        g_video_mp3_timing.decoder_read_us_max = decoder_read_elapsed_us;
+    }
     if (ret != ESP_OK) {
         if (ret == ESP_ERR_TIMEOUT && g_video_mp3_decoder.streaming_source) {
+            ++g_video_mp3_timing.decoder_timeout_count;
             // AVI Bridge 暂时没有新数据（seek 清桥、暂停等）：只维持静音，
             // 让 AudioTask 尽快回到命令循环，不能当成播放故障关门。
             audio_task_reset_video_last_pcm();
@@ -3852,8 +3917,18 @@ static void audio_task_service_video_mp3()
         audio_task_publish_video_clock_snapshot();
         return;
     }
+    const int64_t i2s_write_started_us = esp_timer_get_time();
     ret = i2s_output_stream_write_pcm32(g_pcm_block, frames, AUDIO_I2S_WRITE_TIMEOUT_MS);
+    const int64_t i2s_write_elapsed_signed = esp_timer_get_time() - i2s_write_started_us;
+    const uint32_t i2s_write_elapsed_us = i2s_write_elapsed_signed > 0LL
+        ? static_cast<uint32_t>(i2s_write_elapsed_signed) : 0U;
+    g_video_mp3_timing.i2s_write_us_total += i2s_write_elapsed_us;
+    ++g_video_mp3_timing.i2s_write_calls;
+    if (i2s_write_elapsed_us > g_video_mp3_timing.i2s_write_us_max) {
+        g_video_mp3_timing.i2s_write_us_max = i2s_write_elapsed_us;
+    }
     if (ret != ESP_OK) {
+        ++g_video_mp3_timing.i2s_write_error_count;
         ESP_LOGE(TAG, "AVI MP3 I2S发送失败：%s", esp_err_to_name(ret));
         g_video_mp3_eof = true;
         audio_task_publish_video_clock_snapshot();
