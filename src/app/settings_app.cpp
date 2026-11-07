@@ -148,11 +148,11 @@ static bool g_music_scope_dirty[2] = {false, false};
 static DeviceMusicLibrarySource g_music_source_saved = DeviceMusicLibrarySource::Local;
 static DeviceMusicLibrarySource g_music_source_pending = DeviceMusicLibrarySource::Local;
 static bool g_music_source_dirty = false;
-static bool g_cassette_tint_saved = false;
-static bool g_cassette_tint_pending = false;
+static bool g_cassette_tint_saved = true;
+static bool g_cassette_tint_pending = true;
 static bool g_cassette_tint_dirty = false;
-static bool g_motion_controls_saved = true;
-static bool g_motion_controls_pending = true;
+static bool g_motion_controls_saved = false;
+static bool g_motion_controls_pending = false;
 static bool g_motion_controls_dirty = false;
 static uint8_t g_nsf_gain_saved_db = 3U;
 static uint8_t g_nsf_gain_pending_db = 3U;
@@ -288,7 +288,7 @@ static uint16_t detail_row_count_for_page(SettingsPage page)
         case SettingsPage::MusicPlayer: return 3U;
         case SettingsPage::ElectronicFlow: return 1U;
         case SettingsPage::System: return 6U;
-        case SettingsPage::About: return 8U;
+        case SettingsPage::About: return 6U;
         case SettingsPage::Main:
         default:
             return 0U;
@@ -2424,18 +2424,6 @@ static void create_about_page()
     }
     add_detail_row(5, "当前电池", value, SettingsDetailIcon::None);
 
-    BatteryHalfRecord half = {};
-    if (battery_service_get_half_record(&half)) {
-        snprintf(value, sizeof(value), "%umV (%u%%)",
-            static_cast<unsigned>(half.measured_mv),
-            static_cast<unsigned>(half.percent));
-        add_detail_row(6, "上次50%实测", value, SettingsDetailIcon::None);
-        snprintf(value, sizeof(value), "%umV", static_cast<unsigned>(half.filtered_mv));
-    } else {
-        add_detail_row(6, "上次50%实测", "待记录", SettingsDetailIcon::None);
-        snprintf(value, sizeof(value), "--");
-    }
-    add_detail_row(7, "上次50%滤波", value, SettingsDetailIcon::None);
 }
 
 static void show_page(SettingsPage page)
@@ -2615,19 +2603,6 @@ static void refresh_timer_cb(lv_timer_t *timer)
                 snprintf(value, sizeof(value), "--");
             }
             lv_label_set_text(g_detail_values[5], value);
-        }
-        BatteryHalfRecord half = {};
-        if (battery_service_get_half_record(&half)) {
-            if (g_detail_values[6] != nullptr) {
-                snprintf(value, sizeof(value), "%umV (%u%%)",
-                    static_cast<unsigned>(half.measured_mv),
-                    static_cast<unsigned>(half.percent));
-                lv_label_set_text(g_detail_values[6], value);
-            }
-            if (g_detail_values[7] != nullptr) {
-                snprintf(value, sizeof(value), "%umV", static_cast<unsigned>(half.filtered_mv));
-                lv_label_set_text(g_detail_values[7], value);
-            }
         }
     }
 }

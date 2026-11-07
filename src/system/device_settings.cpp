@@ -75,7 +75,7 @@ static DeviceSettingsSnapshot make_defaults()
     defaults.ready = false;
     defaults.loaded_from_nvs = false;
     defaults.usb_mode = DeviceUsbMode::Serial;
-    defaults.ble_enabled = false;
+    defaults.ble_enabled = true;
     defaults.wifi_enabled = false;
     defaults.audio_output_mode = DeviceAudioOutputMode::NormalHeadphones;
     defaults.brightness_level = 60U;
@@ -85,11 +85,11 @@ static DeviceSettingsSnapshot make_defaults()
     defaults.animation_mode = DeviceAnimationMode::Auto;
     defaults.music_list_scope = DeviceMusicListScope::All;
     defaults.music_library_source = DeviceMusicLibrarySource::Local;
-    defaults.cassette_dynamic_tint_enabled = false;
-    defaults.motion_controls_enabled = true;
+    defaults.cassette_dynamic_tint_enabled = true;
+    defaults.motion_controls_enabled = false;
     defaults.nsf_gain_compensation_db = 3U;
     defaults.remember_volume = true;
-    defaults.ui_font_file[0] = '\0';
+    snprintf(defaults.ui_font_file, sizeof(defaults.ui_font_file), "%s", "思源粗黑.bin");
     return defaults;
 }
 
@@ -342,8 +342,11 @@ esp_err_t device_settings_init()
         g_settings.remember_volume = u8 != 0U;
     }
     size_t font_file_bytes = sizeof(g_settings.ui_font_file);
-    if (nvs_get_str(handle, "fontfile", g_settings.ui_font_file, &font_file_bytes) != ESP_OK) {
-        g_settings.ui_font_file[0] = '\0';
+    const esp_err_t font_file_ret =
+        nvs_get_str(handle, "fontfile", g_settings.ui_font_file, &font_file_bytes);
+    if (font_file_ret != ESP_OK && font_file_ret != ESP_ERR_NVS_NOT_FOUND) {
+        // 字体设置损坏或长度异常时恢复默认字体；未保存过字体时保留 make_defaults() 的思源粗黑。
+        snprintf(g_settings.ui_font_file, sizeof(g_settings.ui_font_file), "%s", "思源粗黑.bin");
     }
 
     nvs_close(handle);
@@ -755,8 +758,8 @@ esp_err_t device_settings_reset_defaults()
     if (ret != ESP_OK) return ret;
     ret = nvs_erase_all(handle);
     if (ret == ESP_OK) ret = nvs_set_u16(handle, "schema", kSchemaVersion);
-    // 恢复默认值明确表示两种无线都关闭；同时写入两个 key，避免下次启动又触发旧版 Wi-Fi 迁移。
-    if (ret == ESP_OK) ret = nvs_set_u8(handle, "ble", 0U);
+    // 恢复默认值使用蓝牙遥控；Wi-Fi 默认关闭，同时写入两个 key，避免触发旧版迁移。
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, "ble", 1U);
     if (ret == ESP_OK) ret = nvs_set_u8(handle, "wifi", 0U);
     if (ret == ESP_OK) ret = nvs_commit(handle);
     nvs_close(handle);

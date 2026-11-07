@@ -234,19 +234,19 @@ void system_runtime_update()
     if (device_settings_ret == ESP_OK) {
         DeviceSettingsSnapshot settings_snapshot = {};
         if (device_settings_get_snapshot(&settings_snapshot)) {
-            // R46.0.68：旧版没有 Wi-Fi 开关键，只要保存过凭据就会自动接管。首次升级时仅迁移一次，
-            // 把旧的实际启动行为固化为 Wi-Fi=ON / BLE=OFF；之后严格按两个保存开关恢复。
+            // 旧版没有显式 Wi-Fi 开关键时，保存过的 Wi-Fi 凭据不再代表用户要求开机联网。
+            // 新默认策略为 BLE=ON / Wi-Fi=OFF；仅迁移缺少 Wi-Fi 开关键的旧配置，明确保存新默认。
             if (wifi_ret == ESP_OK && !device_settings_wifi_enabled_is_explicit() &&
                 wifi_service_has_credentials()) {
-                const esp_err_t migrate_ret = device_settings_set_wireless_enabled(false, true);
+                const esp_err_t migrate_ret = device_settings_set_wireless_enabled(true, false);
                 if (migrate_ret == ESP_OK) {
                     (void)device_settings_get_snapshot(&settings_snapshot);
-                    ESP_LOGI(TAG, "无线设置迁移：旧版已保存Wi-Fi凭据 -> Wi-Fi=开 BLE=关");
+                    ESP_LOGI(TAG, "无线设置迁移：旧版未明确选择无线模式 -> BLE=开 Wi-Fi=关");
                 } else {
-                    // NVS 偶发写失败时本次仍保持旧版实际行为，避免一次升级突然切到 BLE。
-                    settings_snapshot.ble_enabled = false;
-                    settings_snapshot.wifi_enabled = true;
-                    ESP_LOGW(TAG, "无线设置迁移保存失败：%s；本次临时保持Wi-Fi启动",
+                    // NVS 写入失败时本次仍按新默认运行，不因旧 Wi-Fi 凭据自动联网。
+                    settings_snapshot.ble_enabled = true;
+                    settings_snapshot.wifi_enabled = false;
+                    ESP_LOGW(TAG, "无线设置迁移保存失败：%s；本次临时使用BLE=开 Wi-Fi=关",
                         esp_err_to_name(migrate_ret));
                 }
             }

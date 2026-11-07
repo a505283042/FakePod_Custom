@@ -65,7 +65,7 @@ struct DeviceSettingsSnapshot {
     bool ready = false;
     bool loaded_from_nvs = false;
     DeviceUsbMode usb_mode = DeviceUsbMode::Serial;
-    bool ble_enabled = false;
+    bool ble_enabled = true;
     bool wifi_enabled = false;
     DeviceAudioOutputMode audio_output_mode = DeviceAudioOutputMode::NormalHeadphones;
     uint8_t brightness_level = 60U;          // CO5300 正常显示亮度 5~100%；0 保留给熄屏。
@@ -75,11 +75,11 @@ struct DeviceSettingsSnapshot {
     DeviceAnimationMode animation_mode = DeviceAnimationMode::Auto;
     DeviceMusicListScope music_list_scope = DeviceMusicListScope::All;
     DeviceMusicLibrarySource music_library_source = DeviceMusicLibrarySource::Local;
-    bool cassette_dynamic_tint_enabled = false;
-    bool motion_controls_enabled = true;
+    bool cassette_dynamic_tint_enabled = true;
+    bool motion_controls_enabled = false;
     uint8_t nsf_gain_compensation_db = 3U;  // 电子音流专用 CS43131 数字衰减补偿，0~6dB。
     bool remember_volume = true;
-    char ui_font_file[DEVICE_UI_FONT_FILENAME_MAX] = {};  // /FONTS 下的 UTF-8 文件名；空=自动选择。
+    char ui_font_file[DEVICE_UI_FONT_FILENAME_MAX] = "思源粗黑.bin";  // /FONTS 下的默认界面字体文件名。
 };
 
 // NVS namespace: device_cfg。初始化只加载设置，不主动应用硬件状态。
