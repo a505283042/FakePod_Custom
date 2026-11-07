@@ -309,6 +309,7 @@ static esp_err_t cleanup_create_failure(esp_err_t err)
     g_selected_index = kInvalidEntryIndex;
     g_eof_transition = EofTransition::None;
     g_page = VideoPage::Browser;
+    gesture_router_set_video_seek_mode(false);
     return err;
 }
 
@@ -657,6 +658,7 @@ static void show_browser()
     g_page = VideoPage::Browser;
     g_fullcanvas_risk_authorized = false;
     g_risk_prompt_active = false;
+    gesture_router_set_video_seek_mode(false);
     if (g_timer != nullptr) lv_timer_set_period(g_timer, kBrowserTimerPeriodMs);
     set_visible(g_root, true);
     set_visible(g_browser_host, true);
@@ -1630,15 +1632,21 @@ static void benchmark_seek_preview_tick()
 
     const int32_t adx = dx < 0 ? -dx : dx;
     const int32_t ady = dy < 0 ? -dy : dy;
+    // 每个触摸采样都复核方向，确保预览始终满足抬手时Router的提交条件。
+    if (adx < kSeekPreviewStartPx || adx * 100 < ady * 135) {
+        g_seek_preview_active = false;
+        return;
+    }
     if (!g_seek_preview_active) {
-        // 只对明确的水平拖动预览；纵向留给“下滑返回列表”。
-        if (adx < kSeekPreviewStartPx || adx <= ady) return;
         VideoBenchmark::Snapshot snapshot = {};
         if (!VideoBenchmark::get_snapshot(&snapshot)) return;
         if (snapshot.state != VideoBenchmark::State::Running) return;
+        // 同一轮触摸短暂偏离水平后又回到水平时，继续沿用最初的预览基准。
+        if (!g_seek_preview_base_valid) {
+            g_seek_preview_base_valid = true;
+            g_seek_preview_base_ms = snapshot.last_pts_ms;
+        }
         g_seek_preview_active = true;
-        g_seek_preview_base_valid = true;
-        g_seek_preview_base_ms = snapshot.last_pts_ms;
     }
 
     VideoBenchmark::Snapshot snapshot = {};
@@ -1800,6 +1808,7 @@ static void eof_transition_tick()
     // 下一条先走与手动点击完全相同的规格预检。Music播放状态始终保持暂停，
     // 因此不会出现“视频A结束 -> Music短暂出声 -> 视频B再暂停”的听感断点。
     g_page = VideoPage::Browser;
+    gesture_router_set_video_seek_mode(false);
     if (g_timer != nullptr) lv_timer_set_period(g_timer, kBrowserTimerPeriodMs);
     set_visible(g_root, false);
     g_fullcanvas_risk_authorized = false;
@@ -1944,6 +1953,7 @@ static bool remote_switch_video(int direction)
     }
 
     g_page = VideoPage::Browser;
+    gesture_router_set_video_seek_mode(false);
     if (g_timer != nullptr) lv_timer_set_period(g_timer, kBrowserTimerPeriodMs);
     set_visible(g_root, false);
     g_fullcanvas_risk_authorized = false;
@@ -2081,6 +2091,7 @@ static bool benchmark_start_selected(bool allow_fullcanvas_over20)
 
     remote_context_begin();
     g_page = VideoPage::Benchmark;
+    gesture_router_set_video_seek_mode(true);
     if (g_timer != nullptr) lv_timer_set_period(g_timer, kBenchmarkTimerPeriodMs);
     set_visible(g_browser_host, false);
     set_visible(g_probe_host, true);
@@ -2102,6 +2113,7 @@ static bool benchmark_start_selected(bool allow_fullcanvas_over20)
         lv_label_set_text(g_probe_video, line);
         g_benchmark_ui.terminal_shown = true;
         g_benchmark_ui.cleanup_pending = true;
+        gesture_router_set_video_seek_mode(false);
         (void)benchmark_stop_avi_audio("benchmark_start_failed");
         benchmark_restore_music_after_exclusive("benchmark_start_failed");
         remote_context_end();
@@ -2115,6 +2127,7 @@ static bool benchmark_start_selected(bool allow_fullcanvas_over20)
         VideoBenchmark::stop();
         g_benchmark_ui.display_error = presenter_ret;
         g_benchmark_ui.cleanup_pending = true;
+        gesture_router_set_video_seek_mode(false);
         if (benchmark_stop_avi_audio("presenter_start_failed")) {
             benchmark_restore_music_after_exclusive("presenter_start_failed");
         }
@@ -2136,6 +2149,7 @@ static void show_fullcanvas_risk_prompt(const VideoProbe::Snapshot &snapshot)
     g_fullcanvas_risk_authorized = false;
     g_risk_prompt_active = true;
     g_page = VideoPage::Benchmark;
+    gesture_router_set_video_seek_mode(false);
     g_benchmark_ui = {};
     // 当前没有VideoBenchmark在运行，防止benchmark_tick读取上一轮terminal snapshot覆盖提示。
     g_benchmark_ui.terminal_shown = true;
@@ -2331,7 +2345,13 @@ static void timer_cb(lv_timer_t *timer)
     benchmark_seek_preview_tick();
 
     UiGestureAction action = UiGestureAction::None;
-    if (!gesture_router_take_action(&action)) return;
+    if (!gesture_router_take_action(&action)) {
+        // 预览结束但没有形成有效横向手势时，清除旧基准，避免下一次短滑误用上一轮时间。
+        if (g_seek_preview_base_valid && !gesture_router_current_drag(nullptr, nullptr)) {
+            g_seek_preview_base_valid = false;
+        }
+        return;
+    }
     if (app_launcher_overlay_is_visible()) {
         app_launcher_overlay_hide();
         g_seek_preview_base_valid = false;
@@ -2550,6 +2570,7 @@ static esp_err_t video_enter()
 {
     if (g_root == nullptr) return ESP_ERR_INVALID_STATE;
     g_page = VideoPage::Browser;
+    gesture_router_set_video_seek_mode(false);
     snprintf(g_current_dir, VideoBrowser::kPathBytes, "%s", VideoBrowser::kRootDirectory);
     set_visible(g_root, true);
     set_visible(g_browser_host, true);
@@ -2596,6 +2617,7 @@ static esp_err_t video_leave(AppRunState next_state)
     }
     g_page = VideoPage::Browser;
     g_risk_prompt_active = false;
+    gesture_router_set_video_seek_mode(false);
     g_eof_transition = EofTransition::None;
     cancel_browser_load();
     if (g_timer != nullptr) lv_timer_pause(g_timer);
@@ -2608,6 +2630,7 @@ static esp_err_t video_leave(AppRunState next_state)
 
 static void video_destroy()
 {
+    gesture_router_set_video_seek_mode(false);
     remote_context_end();
     VideoProbe::cancel();
     g_profile_probe_pending = false;

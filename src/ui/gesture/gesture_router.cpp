@@ -6,6 +6,7 @@ namespace
 {
 constexpr int16_t kAxisLockDistancePx = 18;
 constexpr int16_t kHorizontalTriggerPx = 72;
+constexpr int16_t kVideoSeekHorizontalTriggerPx = 18;
 constexpr int16_t kEdgeTriggerPx = 72;
 constexpr int16_t kTopEdgePx = 42;
 constexpr int16_t kBottomEdgePx = 417; // 460 - 43
@@ -15,6 +16,7 @@ constexpr int16_t kTrackVerticalTriggerPx = 86;
 constexpr int16_t kTrackVerticalDominancePercent = 135;
 constexpr uint32_t kTrackVerticalMinSpeedPxPerSec = 110U;
 constexpr uint32_t kHorizontalMinSpeedPxPerSec = 45U;
+constexpr uint32_t kVideoSeekHorizontalMinSpeedPxPerSec = 0U;
 constexpr uint32_t kEdgeMinSpeedPxPerSec = 40U;
 constexpr int16_t kVerticalAdjustTriggerPx = 12;
 constexpr int16_t kVerticalAdjustDominancePercent = 135;
@@ -58,6 +60,10 @@ struct GestureState
 };
 
 GestureState g_state = {};
+
+// 横向手势策略独立于触摸状态，gesture_router_reset() 不会清除页面策略。
+int16_t g_horizontal_trigger_px = kHorizontalTriggerPx;
+uint32_t g_horizontal_min_speed_px_per_sec = kHorizontalMinSpeedPxPerSec;
 
 static int32_t gesture_abs(int32_t value)
 {
@@ -161,9 +167,9 @@ static UiGestureAction gesture_classify(uint32_t tick_ms)
         return UiGestureAction::None;
     }
 
-    if (g_state.axis == GestureAxis::Horizontal && ax >= kHorizontalTriggerPx &&
+    if (g_state.axis == GestureAxis::Horizontal && ax >= g_horizontal_trigger_px &&
         ax * 100 >= ay * 135 &&
-        gesture_speed_ok(ax, elapsed_ms, kHorizontalMinSpeedPxPerSec)) {
+        gesture_speed_ok(ax, elapsed_ms, g_horizontal_min_speed_px_per_sec)) {
         return dx < 0 ? UiGestureAction::SwipeLeft : UiGestureAction::SwipeRight;
     }
 
@@ -174,6 +180,15 @@ static UiGestureAction gesture_classify(uint32_t tick_ms)
 void gesture_router_reset()
 {
     g_state = {};
+}
+
+void gesture_router_set_video_seek_mode(bool enabled)
+{
+    // 视频播放页允许18px短滑、慢速拖动；其他页面继续使用72px和45px/s门槛。
+    g_horizontal_trigger_px = enabled
+        ? kVideoSeekHorizontalTriggerPx : kHorizontalTriggerPx;
+    g_horizontal_min_speed_px_per_sec = enabled
+        ? kVideoSeekHorizontalMinSpeedPxPerSec : kHorizontalMinSpeedPxPerSec;
 }
 
 void gesture_router_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick_ms)

@@ -21,6 +21,9 @@ enum class UiGestureAction : uint8_t
 
 void gesture_router_reset();
 
+// 视频播放页启用短距离、慢速 SEEK；false 时恢复其他页面原有横向手势门槛。
+void gesture_router_set_video_seek_mode(bool enabled);
+
 // 由 CST820 -> LVGL 输入桥接层喂入原始指针状态。
 void gesture_router_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick_ms);
 
