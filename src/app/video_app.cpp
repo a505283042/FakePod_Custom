@@ -1526,6 +1526,22 @@ static bool g_seek_preview_active = false;
 static bool g_seek_preview_base_valid = false;
 static uint32_t g_seek_preview_base_ms = 0U;
 
+// 根据触摸起点选择固定的 SEEK 步进，拖动跨过屏幕中线也不会改变速度。
+// 上半屏：5px 对应 10 秒（2000ms/px）；下半屏：5px 对应 1 秒（200ms/px）。
+static constexpr int32_t kSeekFineMsPerPx = 200;
+static constexpr int32_t kSeekCoarseMsPerPx = 2000;
+
+static int32_t benchmark_seek_ms_per_px()
+{
+    // Router 在抬手后仍保留本次触摸起点；预览和最终提交使用完全相同的判断。
+    const int16_t half_height = static_cast<int16_t>(VideoBenchmark::kHeight / 2U);
+    const bool from_lower_half = gesture_router_press_started_in_rect(
+        0, half_height,
+        static_cast<int16_t>(VideoBenchmark::kWidth - 1U),
+        static_cast<int16_t>(VideoBenchmark::kHeight - 1U));
+    return from_lower_half ? kSeekFineMsPerPx : kSeekCoarseMsPerPx;
+}
+
 // 侧车索引 seek：按相对毫秒跳转。依赖 .fvix 索引，无索引时静默忽略。
 static void benchmark_seek_by(int32_t delta_ms)
 {
@@ -1557,7 +1573,7 @@ static void benchmark_seek_by(int32_t delta_ms)
     }
 }
 
-// 播放页左右滑：按滑动距离映射目标时间，约 10px = 1s（向右为快进，向左为后退）。
+// 播放页左右滑：上半屏 5px=1 秒，下半屏 5px=10 秒（右滑快进，左滑后退）。
 // 抬手后一次执行，避免拖动过程中连续 seek。
 // 双击切换暂停/继续：视频 pipeline 与视频 MP3 音频必须一起停/一起走，
 // 否则暂停时画面静止但声音继续，恢复后音画不同轴。
@@ -1586,8 +1602,8 @@ static void benchmark_seek_by_swipe()
     int16_t dx = 0;
     int16_t dy = 0;
     if (gesture_router_last_displacement(&dx, &dy)) {
-        // 与拖动浮层共享起始时间；抬手后才清掉基准。
-        benchmark_seek_by(static_cast<int32_t>(dx) * 100);
+        // 使用起点所在半屏的固定步进，与拖动预览共享时间基准和速度。
+        benchmark_seek_by(static_cast<int32_t>(dx) * benchmark_seek_ms_per_px());
     }
     g_seek_preview_base_valid = false;
 }
@@ -1630,9 +1646,9 @@ static void benchmark_seek_preview_tick()
         g_seek_preview_active = false;
         return;
     }
-    // 与抬手后的 seek 保持同一方向：右滑前进、左滑后退。
+    // 预览与抬手提交使用同一个触摸起点和同一个步进，跨越屏幕中线不改变速度。
     int64_t target = static_cast<int64_t>(g_seek_preview_base_ms) +
-        static_cast<int64_t>(dx) * 100;
+        static_cast<int64_t>(dx) * benchmark_seek_ms_per_px();
     if (target < 0) target = 0;
     if (snapshot.duration_ms > 0U && target > static_cast<int64_t>(snapshot.duration_ms)) {
         target = snapshot.duration_ms;
