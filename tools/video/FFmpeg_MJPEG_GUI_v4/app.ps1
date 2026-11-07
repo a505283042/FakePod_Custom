@@ -5,6 +5,15 @@ $ErrorActionPreference = "Continue"
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+# 使用本地 C# 顺序扫描器处理大量 AVI Chunk，避免 PowerShell 逐 Chunk 小读造成性能瓶颈。
+$sidecarGeneratorSource = Join-Path $PSScriptRoot "SidecarIndexGenerator.cs"
+if (-not (Test-Path -LiteralPath $sidecarGeneratorSource)) {
+    throw "缺少索引生成组件：$sidecarGeneratorSource"
+}
+if (-not ("FakePod.VideoTools.SidecarIndexGenerator" -as [type])) {
+    Add-Type -Path $sidecarGeneratorSource -ErrorAction Stop
+}
+
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 function Find-Tool([string]$name) {
@@ -68,288 +77,6 @@ function Get-DurationSeconds([string]$file, [string]$ffmpeg) {
     return 0
 }
 
-function Read-AviU32([System.IO.FileStream]$fs, [int64]$off) {
-    $b = New-Object byte[] 4
-    $fs.Position = $off
-    [void]$fs.Read($b, 0, 4)
-    return [System.BitConverter]::ToUInt32($b, 0)
-}
-
-function Read-AviFourCC([System.IO.FileStream]$fs, [int64]$off) {
-    $b = New-Object byte[] 4
-    $fs.Position = $off
-    [void]$fs.Read($b, 0, 4)
-    return [System.Text.Encoding]::ASCII.GetString($b)
-}
-
-# 计算与设备端完全一致的 AVI 抽样 CRC32：文件头、1/3、2/3、文件尾各取 512 字节。
-function Get-AviSampleCrc32([System.IO.FileStream]$fs, [int64]$fileLen) {
-    [uint32]$crc = 4294967295
-    [int64[]]$offsets = @(
-        0,
-        [int64][Math]::Floor($fileLen / 3.0),
-        [int64][Math]::Floor(($fileLen * 2.0) / 3.0),
-        [int64][Math]::Max(0, $fileLen - 512)
-    )
-
-    foreach ($offset in $offsets) {
-        $sampleLength = [int][Math]::Min(512, $fileLen - $offset)
-        if ($sampleLength -le 0) { throw "AVI 指纹抽样范围无效：offset=$offset" }
-        $fs.Position = $offset
-        $buffer = New-Object byte[] $sampleLength
-        $got = $fs.Read($buffer, 0, $sampleLength)
-        if ($got -ne $sampleLength) { throw "读取 AVI 指纹样本失败：offset=$offset" }
-
-        foreach ($value in $buffer) {
-            $crc = [uint32](([uint64]$crc) -bxor ([uint64]$value))
-            for ($bit = 0; $bit -lt 8; $bit++) {
-                if (([uint64]$crc -band [uint64]1) -ne 0) {
-                    $shifted = ([uint64]$crc -shr 1)
-                    $crc = [uint32]($shifted -bxor [uint64]3988292384)
-                } else {
-                    $crc = [uint32]([uint64]$crc -shr 1)
-                }
-            }
-        }
-    }
-
-    return [uint32](([uint64]$crc) -bxor [uint64]4294967295)
-}
-
-# 生成 AVI 侧车索引(.fvix V2)。
-# 每约 2 秒记录视频帧序号、chunk 头偏移，以及该帧之前累计的 MP3 字节数。
-# 同时保存文件长度和抽样 CRC32，设备端加载时验证索引是否属于当前 AVI。
-function New-SidecarIndex([string]$aviPath) {
-    $granularityMs = 2000
-    $outPath = $aviPath + ".fvix"
-    $result = [pscustomobject]@{ Ok = $false; Path = $outPath; Count = 0; Message = "" }
-
-    if ([string]::IsNullOrWhiteSpace($aviPath) -or -not (Test-Path -LiteralPath $aviPath)) {
-        $result.Message = "AVI 文件不存在"
-        return $result
-    }
-
-    # 重新生成前先删除旧索引；若本次生成失败，不留下可能属于旧 AVI 的 V1/V2 文件。
-    try {
-        if (Test-Path -LiteralPath $outPath) {
-            Remove-Item -LiteralPath $outPath -Force -ErrorAction Stop
-        }
-    } catch {
-        $result.Message = "无法删除旧索引：$($_.Exception.Message)"
-        return $result
-    }
-
-    $fs = $null
-    try {
-        $fs = [System.IO.File]::Open($aviPath, [System.IO.FileMode]::Open,
-            [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
-        $fileLen = $fs.Length
-        if ($fileLen -lt 12 -or $fileLen -gt [uint32]::MaxValue -or
-            (Read-AviFourCC $fs 0) -ne 'RIFF' -or (Read-AviFourCC $fs 8) -ne 'AVI ') {
-            $result.Message = "不是有效的 AVI 文件，或文件超过 4GB 索引范围"
-            return $result
-        }
-
-        # 第一遍：逐个解析 RIFF AVI / RIFF AVIX 段，收集全部 movi 区间。
-        # 长 AVI 超过 RIFF 单段容量后会追加 AVIX；不能只记录第一个 movi。
-        # 帧率仍使用设备端相同的 avih -> fps_x100 取整规则。
-        $usPerFrame = [uint32]0
-        $moviRanges = New-Object System.Collections.Generic.List[object]
-        $pos = [int64]0
-        $riffIndex = 0
-        while ($pos + 12 -le $fileLen) {
-            $riffId = Read-AviFourCC $fs $pos
-            if ($riffId -ne 'RIFF') {
-                if ($riffIndex -eq 0) { throw "AVI 文件起点不是 RIFF" }
-                break
-            }
-
-            $riffSize = [int64](Read-AviU32 $fs ($pos + 4))
-            $riffType = Read-AviFourCC $fs ($pos + 8)
-            if ($riffSize -lt 4 -or $riffSize -gt ($fileLen - $pos - 8)) {
-                throw "AVI RIFF 段长度非法：segment=$riffIndex offset=$pos size=$riffSize"
-            }
-            if (($riffIndex -eq 0 -and $riffType -ne 'AVI ') -or
-                ($riffIndex -gt 0 -and $riffType -ne 'AVIX' -and $riffType -ne 'AVI ')) {
-                throw "不支持的 AVI RIFF 段类型：segment=$riffIndex type=$riffType"
-            }
-
-            $riffEnd = $pos + 8 + $riffSize
-            $chunkPos = $pos + 12
-            while ($chunkPos + 8 -le $riffEnd) {
-                $id = Read-AviFourCC $fs $chunkPos
-                $size = [int64](Read-AviU32 $fs ($chunkPos + 4))
-                $data = $chunkPos + 8
-                if ($size -gt ($riffEnd - $data)) {
-                    throw "AVI RIFF 子 chunk 越界：segment=$riffIndex offset=$chunkPos"
-                }
-                $advance = $data + $size + ($size -band 1)
-                if ($advance -gt $riffEnd) {
-                    throw "AVI RIFF 子 chunk 补齐字节越界：segment=$riffIndex offset=$chunkPos"
-                }
-
-                if ($id -eq 'LIST' -and $size -ge 4) {
-                    $listType = Read-AviFourCC $fs $data
-                    if ($listType -eq 'hdrl') {
-                        $p = $data + 4
-                        $hdrEnd = $data + $size
-                        while ($p + 8 -le $hdrEnd) {
-                            $sid = Read-AviFourCC $fs $p
-                            $ssize = [int64](Read-AviU32 $fs ($p + 4))
-                            $sdata = $p + 8
-                            if ($ssize -gt ($hdrEnd - $sdata)) {
-                                throw "AVI hdrl 子 chunk 越界：offset=$p"
-                            }
-                            if ($sid -eq 'avih' -and $ssize -ge 56 -and $usPerFrame -eq 0) {
-                                $usPerFrame = Read-AviU32 $fs $sdata
-                            }
-                            $p = $sdata + $ssize + ($ssize -band 1)
-                        }
-                    } elseif ($listType -eq 'movi') {
-                        $moviStart = $data + 4
-                        $moviEnd = $data + $size
-                        if ($moviEnd -le $moviStart) {
-                            throw "AVI movi 区间无效：segment=$riffIndex"
-                        }
-                        $moviRanges.Add([pscustomobject]@{
-                            Start = [int64]$moviStart
-                            End = [int64]$moviEnd
-                        })
-                    }
-                }
-
-                $chunkPos = $advance
-            }
-
-            $nextRiff = $riffEnd + ($riffSize -band 1)
-            if ($nextRiff -le $pos) { throw "AVI RIFF 段偏移没有前进" }
-            if ($nextRiff -ge $fileLen) { break }
-            $pos = $nextRiff
-            $riffIndex++
-        }
-
-        if ($usPerFrame -eq 0) {
-            $result.Message = "AVI 主头 avih 未提供有效帧间隔"
-            return $result
-        }
-        $fpsX100 = [uint32][Math]::Floor(([decimal]100000000) / ([decimal]$usPerFrame))
-        if ($fpsX100 -eq 0) {
-            $result.Message = "AVI 帧率超出设备端支持范围"
-            return $result
-        }
-        if ($moviRanges.Count -eq 0) {
-            $result.Message = "未找到有效 movi 数据区"
-            return $result
-        }
-
-        # 第二遍：按文件顺序扫描全部 movi 区间；帧序号和音频字节数跨 AVIX 连续累计。
-        $entries = New-Object System.Collections.Generic.List[object]
-        [uint64]$frameIndex = 0
-        [uint64]$audioBytesTotal = 0
-        [uint64]$nextMarkMs = 0
-        foreach ($moviRange in $moviRanges) {
-            $pos = [int64]$moviRange.Start
-            $moviEnd = [int64]$moviRange.End
-            while ($pos + 8 -le $moviEnd) {
-                $id = Read-AviFourCC $fs $pos
-                $size = [int64](Read-AviU32 $fs ($pos + 4))
-                $data = $pos + 8
-                if ($size -gt ($moviEnd - $data)) {
-                    throw "AVI movi chunk 越界：offset=$pos"
-                }
-                $advance = $data + $size + ($size -band 1)
-                if ($advance -gt $moviEnd) {
-                    throw "AVI movi chunk 补齐字节越界：offset=$pos"
-                }
-
-                if ($id -eq 'LIST' -and $size -ge 4 -and (Read-AviFourCC $fs $data) -eq 'rec ') {
-                    # rec 组内继续扫描子 chunk，不把 LIST 本身计入媒体帧。
-                    $pos = $data + 4
-                    continue
-                }
-
-                if ($id -eq '00dc' -or $id -eq '00db') {
-                    if ($size -ge 2) {
-                        $tsMs64 = [Math]::Floor((([decimal]$frameIndex * [decimal]100000) / [decimal]$fpsX100))
-                        if ($tsMs64 -gt [uint32]::MaxValue) { throw "AVI 时长超出 FVIX 时间戳范围" }
-                        if ($tsMs64 -ge $nextMarkMs) {
-                            # 只把 JPEG SOI 有效的帧写入索引，避免首个落点本身不可解码。
-                            $fs.Position = $data
-                            $jpegSignature = New-Object byte[] 2
-                            $signatureRead = $fs.Read($jpegSignature, 0, 2)
-                            if ($signatureRead -eq 2 -and
-                                $jpegSignature[0] -eq 0xFF -and $jpegSignature[1] -eq 0xD8) {
-                                if ($frameIndex -gt [uint32]::MaxValue) { throw "视频帧序号超出 FVIX 范围" }
-                                if ($audioBytesTotal -gt [uint32]::MaxValue) { throw "音频累计字节数超出 FVIX 范围" }
-                                $entries.Add([pscustomobject]@{
-                                    ts = [uint32]$tsMs64
-                                    off = [uint32]$pos
-                                    frame = [uint32]$frameIndex
-                                    audio = [uint32]$audioBytesTotal
-                                })
-                                $nextMarkMs = [uint64]$tsMs64 + [uint64]$granularityMs
-                            }
-                        }
-                    }
-                    # 与设备端一致：即使是 0 字节占位视频 chunk，也占用一个帧序号。
-                    $frameIndex++
-                } elseif ($id -eq '01wb' -or $id -eq '00wb') {
-                    $audioBytesTotal += [uint64]$size
-                    if ($audioBytesTotal -gt [uint32]::MaxValue) { throw "音频累计字节数超出 FVIX 范围" }
-                }
-
-                $pos = $advance
-            }
-        }
-
-        if ($entries.Count -eq 0) {
-            $result.Message = "未找到有效视频帧，无法生成索引"
-            return $result
-        }
-        if ($entries.Count -gt 100000) {
-            throw "索引条目超过设备端上限 100000，无法安全加载到 PSRAM"
-        }
-
-        # 抽样指纹在索引生成时计算；设备端按相同位置和长度重新计算后比对。
-        $sourceCrc32 = Get-AviSampleCrc32 $fs $fileLen
-
-        # V2 文件头：FVIX + 版本号 + 索引粒度 + 条目数 + AVI 文件长度 + 抽样 CRC32。
-        # V2 条目：时间戳 + 视频 chunk 偏移 + 视频帧序号 + 此帧之前累计的音频字节数。
-        $outFs = [System.IO.File]::Open($outPath, [System.IO.FileMode]::Create)
-        try {
-            $bw = New-Object System.IO.BinaryWriter($outFs)
-            $bw.Write([byte[]][char[]]"FVIX")
-            $bw.Write([uint16]2)
-            $bw.Write([uint16]$granularityMs)
-            $bw.Write([uint32]$entries.Count)
-            $bw.Write([uint32]$fileLen)
-            $bw.Write([uint32]$sourceCrc32)
-            foreach ($e in $entries) {
-                $bw.Write([uint32]$e.ts)
-                $bw.Write([uint32]$e.off)
-                $bw.Write([uint32]$e.frame)
-                $bw.Write([uint32]$e.audio)
-            }
-            $bw.Flush()
-        } finally {
-            $outFs.Dispose()
-        }
-
-        $result.Ok = $true
-        $result.Count = $entries.Count
-        $result.Message = "V2 索引已生成：$($entries.Count) 条，movi段 $($moviRanges.Count)，视频帧 $frameIndex，粒度 $($granularityMs)ms，帧率 $($fpsX100 / 100.0)fps，来源指纹已写入"
-        return $result
-    } catch {
-        if (Test-Path -LiteralPath $outPath) {
-            Remove-Item -LiteralPath $outPath -Force -ErrorAction SilentlyContinue
-        }
-        $result.Message = $_.Exception.Message
-        return $result
-    } finally {
-        if ($fs -ne $null) { $fs.Dispose() }
-    }
-}
-
 function Detect-Crop([string]$file, [string]$ffmpeg, [System.Windows.Forms.Label]$statusLabel) {
     $duration = Get-DurationSeconds $file $ffmpeg
     if ($duration -le 0) {
@@ -396,6 +123,9 @@ $ffmpeg = Find-Tool "ffmpeg"
 $script:g_input_duration = 0
 # 批量模式：一次可多选输入视频；g_inputs 保存选中的完整列表。
 $script:g_inputs = @()
+# 输出目录默认跟随第一个输入文件；用户手动选择后，切换输入列表时保留该目录。
+$script:g_output_dir_user_selected = $false
+$script:g_updating_output_dir = $false
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "FFmpeg MJPEG 视频转换器"
@@ -432,17 +162,23 @@ $btnInput.Size = New-Object System.Drawing.Size(90,30)
 $form.Controls.Add($btnInput)
 $y += 45
 
-Add-Label "输出文件：" 20 $y 90 | Out-Null
-$txtOutput = New-Object System.Windows.Forms.TextBox
-$txtOutput.Location = New-Object System.Drawing.Point(110,$y)
-$txtOutput.Size = New-Object System.Drawing.Size(530,25)
-$form.Controls.Add($txtOutput)
+Add-Label "输出目录：" 20 $y 90 | Out-Null
+$txtOutputDir = New-Object System.Windows.Forms.TextBox
+$txtOutputDir.Location = New-Object System.Drawing.Point(110,$y)
+$txtOutputDir.Size = New-Object System.Drawing.Size(430,25)
+$form.Controls.Add($txtOutputDir)
 
 $btnOutput = New-Object System.Windows.Forms.Button
-$btnOutput.Text = "另存为…"
-$btnOutput.Location = New-Object System.Drawing.Point(650, ($y - 2))
-$btnOutput.Size = New-Object System.Drawing.Size(90,30)
+$btnOutput.Text = "选择目录…"
+$btnOutput.Location = New-Object System.Drawing.Point(550, ($y - 2))
+$btnOutput.Size = New-Object System.Drawing.Size(95,30)
 $form.Controls.Add($btnOutput)
+
+$btnSourceDir = New-Object System.Windows.Forms.Button
+$btnSourceDir.Text = "源目录"
+$btnSourceDir.Location = New-Object System.Drawing.Point(650, ($y - 2))
+$btnSourceDir.Size = New-Object System.Drawing.Size(90,30)
+$form.Controls.Add($btnSourceDir)
 $y += 55
 
 $grpVideo = New-Object System.Windows.Forms.GroupBox
@@ -912,11 +648,150 @@ $lblTools.Size = New-Object System.Drawing.Size(100,28)
 $lblTools.TextAlign = "MiddleRight"
 $form.Controls.Add($lblTools)
 
-# 批量模式默认输出名：与单文件默认命名一致，放在源文件同目录。
-function Get-DefaultOutputPath([string]$inputPath) {
-    $dir = [System.IO.Path]::GetDirectoryName($inputPath)
+# 索引扫描在后台线程执行，UI 线程只接收进度并更新控件。
+$script:g_indexWorker = New-Object FakePod.VideoTools.SidecarIndexWorker
+$script:g_indexWorkerDone = $false
+$script:g_indexWorkerShowDialog = $false
+$script:g_indexWorkerResults = @()
+$script:g_indexWorkerError = ""
+
+$script:g_indexWorker.add_ProgressChanged({
+    param($sender, $e)
+    if ($progress.Style -ne [System.Windows.Forms.ProgressBarStyle]::Blocks) {
+        $progress.Style = [System.Windows.Forms.ProgressBarStyle]::Blocks
+    }
+    $value = [Math]::Max(0, [Math]::Min(100, [int]$e.ProgressPercentage))
+    $progress.Value = $value
+    if ($e.UserState) { $lblStatus.Text = [string]$e.UserState }
+}.GetNewClosure())
+
+$script:g_indexWorker.add_RunWorkerCompleted({
+    param($sender, $e)
+
+    $script:g_indexWorkerDone = $true
+    $script:g_indexWorkerError = ""
+    $script:g_indexWorkerResults = @()
+
+    if ($e.Error) {
+        $script:g_indexWorkerError = $e.Error.Exception.Message
+    } elseif ($null -ne $e.Result) {
+        $script:g_indexWorkerResults = @($e.Result)
+    }
+
+    if ($script:g_indexWorkerShowDialog) {
+        $btnSidecar.Enabled = $true
+        $btnConvert.Enabled = $true
+        $btnInput.Enabled = $true
+        $btnOutput.Enabled = $true
+        $btnSourceDir.Enabled = $true
+        $txtOutputDir.Enabled = $true
+        $form.Cursor = [System.Windows.Forms.Cursors]::Default
+
+        if ($script:g_indexWorkerError) {
+            $lblStatus.Text = "索引生成失败：$($script:g_indexWorkerError)"
+            [System.Windows.Forms.MessageBox]::Show(
+                $script:g_indexWorkerError, "索引生成失败")
+        } else {
+            $successes = @($script:g_indexWorkerResults | Where-Object { $_.Ok })
+            $failures = @($script:g_indexWorkerResults | Where-Object { -not $_.Ok })
+
+            if ($script:g_indexWorkerResults.Count -eq 1 -and $successes.Count -eq 1) {
+                $one = $script:g_indexWorkerResults[0]
+                $lblStatus.Text = "V2 索引已生成：$($one.Path)"
+                [System.Windows.Forms.MessageBox]::Show(
+                    "V2 索引已生成`r`n`r`n$($one.Path)`r`n`r`n$($one.Message)",
+                    "索引生成完成")
+            } else {
+                $lblStatus.Text = "索引生成完成：成功 $($successes.Count) / 共 $($script:g_indexWorkerResults.Count)"
+                $summary = "成功 $($successes.Count) 个，失败 $($failures.Count) 个。"
+                if ($failures.Count -gt 0) {
+                    $details = @($failures | ForEach-Object {
+                        "$([System.IO.Path]::GetFileName($_.Path))：$($_.Message)"
+                    })
+                    $summary += "`r`n`r`n失败明细：`r`n" + ($details -join "`r`n")
+                }
+                [System.Windows.Forms.MessageBox]::Show($summary, "批量生成完成")
+            }
+        }
+    }
+}.GetNewClosure())
+
+function Start-SidecarIndexBatch([string[]]$targets, [switch]$Wait, [switch]$Silent) {
+    if ($script:g_indexWorker.IsBusy) {
+        throw "索引生成任务正在运行，请稍候。"
+    }
+
+    $script:g_indexWorkerDone = $false
+    $script:g_indexWorkerResults = @()
+    $script:g_indexWorkerError = ""
+    $script:g_indexWorkerShowDialog = -not $Silent
+
+    $progress.Style = [System.Windows.Forms.ProgressBarStyle]::Blocks
+    $progress.Value = 0
+    $btnSidecar.Enabled = $false
+    if (-not $Silent) {
+        $btnConvert.Enabled = $false
+        $btnInput.Enabled = $false
+        $btnOutput.Enabled = $false
+        $btnSourceDir.Enabled = $false
+        $txtOutputDir.Enabled = $false
+        $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    }
+
+    $script:g_indexWorker.RunWorkerAsync([string[]]$targets)
+
+    if ($Wait) {
+        # 转换流程需要等待索引结果，但继续泵送 WinForms 消息，界面不会冻结。
+        while (-not $script:g_indexWorkerDone) {
+            [System.Windows.Forms.Application]::DoEvents()
+            Start-Sleep -Milliseconds 40
+        }
+        return ,$script:g_indexWorkerResults
+    }
+}
+
+# 输出文件名采用简短规则：源文件名_FP.avi。
+# 单文件和批量文件统一写入用户选择的目标目录。
+function Get-DefaultOutputPath([string]$inputPath, [string]$outputDirectory) {
+    if ([string]::IsNullOrWhiteSpace($outputDirectory)) {
+        $outputDirectory = [System.IO.Path]::GetDirectoryName($inputPath)
+    }
     $name = [System.IO.Path]::GetFileNameWithoutExtension($inputPath)
-    return [System.IO.Path]::Combine($dir, "${name}_460_$([int]$numFps.Value)fps_MJPEG.avi")
+    return [System.IO.Path]::Combine($outputDirectory, "${name}_FP.avi")
+}
+
+# 同一批次中若不同源目录存在同名文件，自动追加序号，避免互相覆盖。
+function Get-UniqueOutputPath(
+    [string]$inputPath,
+    [string]$outputDirectory,
+    [hashtable]$reservedPaths
+) {
+    $path = Get-DefaultOutputPath $inputPath $outputDirectory
+    if (-not $reservedPaths.ContainsKey($path)) {
+        $reservedPaths[$path] = $true
+        return $path
+    }
+
+    $name = [System.IO.Path]::GetFileNameWithoutExtension($inputPath)
+    $index = 2
+    do {
+        $fileName = "{0}_FP ({1}).avi" -f $name, $index
+        $path = [System.IO.Path]::Combine($outputDirectory, $fileName)
+        $index++
+    } while ($reservedPaths.ContainsKey($path))
+
+    $reservedPaths[$path] = $true
+    return $path
+}
+
+# 统一设置目标目录，避免程序自动更新文本框时误判为用户手动选择。
+function Set-OutputDirectory([string]$directory, [bool]$userSelected) {
+    if ([string]::IsNullOrWhiteSpace($directory)) { return }
+    $script:g_updating_output_dir = $true
+    $txtOutputDir.Text = $directory
+    $script:g_updating_output_dir = $false
+    $script:g_output_dir_user_selected = $userSelected
+    Update-CommandPreview
 }
 
 # 视频滤镜链：黑边裁切（可选）→ 方形/等比缩放 → 帧率。
@@ -989,11 +864,12 @@ function Build-FfmpegArguments([string]$inPath, [string]$outPath) {
 }
 
 function Update-CommandPreview {
-    if ([string]::IsNullOrWhiteSpace($txtInput.Text) -or [string]::IsNullOrWhiteSpace($txtOutput.Text)) {
-        $txtCommand.Text = "选择输入视频后，这里会显示实际 FFmpeg 命令。"
+    if ([string]::IsNullOrWhiteSpace($txtInput.Text) -or [string]::IsNullOrWhiteSpace($txtOutputDir.Text)) {
+        $txtCommand.Text = "选择输入视频和输出目录后，这里会显示实际 FFmpeg 命令。"
         return
     }
 
+    $previewOutput = Get-DefaultOutputPath $txtInput.Text $txtOutputDir.Text.Trim()
     $vf = Build-VideoFilterChain
 
     $inv = [System.Globalization.CultureInfo]::InvariantCulture
@@ -1022,11 +898,11 @@ function Update-CommandPreview {
     if ($cmbRate.SelectedItem -ne "保持默认") { $parts += "-ar $($cmbRate.SelectedItem)" }
     if ($cmbChannels.SelectedItem -eq "单声道") { $parts += "-ac 1" }
     if ($cmbChannels.SelectedItem -eq "双声道") { $parts += "-ac 2" }
-    $parts += (Quote-Arg $txtOutput.Text)
+    $parts += (Quote-Arg $previewOutput)
 
     $command = ($parts -join " ")
     if ($script:g_inputs.Count -gt 1) {
-        $command = "批量模式（共 $($script:g_inputs.Count) 个视频，逐个转换，输出到各自源目录；以下为第一个文件的命令）`r`n" + $command
+        $command = "批量模式（共 $($script:g_inputs.Count) 个视频，逐个转换，统一输出到：$($txtOutputDir.Text)；以下为第一个文件的命令）`r`n" + $command
     }
     $txtCommand.Text = $command
 }
@@ -1046,10 +922,12 @@ $btnInput.Add_Click({
         } else {
             $script:g_input_duration = 0
         }
-        $txtOutput.Text = Get-DefaultOutputPath $files[0]
+        if (-not $script:g_output_dir_user_selected) {
+            Set-OutputDirectory ([System.IO.Path]::GetDirectoryName($files[0])) $false
+        }
         $txtCrop.Text = ""
         if ($files.Count -gt 1) {
-            $lblStatus.Text = "已选择 $($files.Count) 个视频：将按当前参数逐个转换，输出到各自源目录。"
+            $lblStatus.Text = "已选择 $($files.Count) 个视频：转换结果将统一保存到输出目录。"
         } else {
             $lblStatus.Text = "已选择视频。需要裁黑边时点击【自动检测黑边】。"
         }
@@ -1058,17 +936,33 @@ $btnInput.Add_Click({
 })
 
 $btnOutput.Add_Click({
-    $dlg = New-Object System.Windows.Forms.SaveFileDialog
-    $dlg.Filter = "AVI 视频|*.avi"
-    $dlg.DefaultExt = "avi"
-    if (-not [string]::IsNullOrWhiteSpace($txtOutput.Text)) {
-        $dlg.FileName = [System.IO.Path]::GetFileName($txtOutput.Text)
-        $dlg.InitialDirectory = [System.IO.Path]::GetDirectoryName($txtOutput.Text)
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = "选择转换后 AVI 和 .fvix 索引的保存目录（单文件、批量均使用此目录）"
+    $dlg.ShowNewFolderButton = $true
+    if (-not [string]::IsNullOrWhiteSpace($txtOutputDir.Text) -and
+        (Test-Path -LiteralPath $txtOutputDir.Text -PathType Container)) {
+        $dlg.SelectedPath = $txtOutputDir.Text
+    } elseif ($script:g_inputs.Count -gt 0) {
+        $dlg.SelectedPath = [System.IO.Path]::GetDirectoryName($script:g_inputs[0])
     }
     if ($dlg.ShowDialog() -eq "OK") {
-        $txtOutput.Text = $dlg.FileName
-        Update-CommandPreview
+        Set-OutputDirectory $dlg.SelectedPath $true
+        $lblStatus.Text = "输出目录已设置：$($dlg.SelectedPath)"
     }
+})
+
+$btnSourceDir.Add_Click({
+    if ($script:g_inputs.Count -gt 0) {
+        $sourceDirectory = [System.IO.Path]::GetDirectoryName($script:g_inputs[0])
+    } elseif (-not [string]::IsNullOrWhiteSpace($txtInput.Text) -and
+        (Test-Path -LiteralPath $txtInput.Text)) {
+        $sourceDirectory = [System.IO.Path]::GetDirectoryName($txtInput.Text)
+    } else {
+        [System.Windows.Forms.MessageBox]::Show("请先选择输入视频。", "提示")
+        return
+    }
+    Set-OutputDirectory $sourceDirectory $false
+    $lblStatus.Text = "输出目录已恢复为第一个源视频所在目录。"
 })
 
 $btnCrop.Add_Click({
@@ -1115,71 +1009,46 @@ $btnPreset.Add_Click({
 })
 
 $btnOpen.Add_Click({
-    if (-not [string]::IsNullOrWhiteSpace($txtOutput.Text)) {
-        $dir = [System.IO.Path]::GetDirectoryName($txtOutput.Text)
-        if (Test-Path -LiteralPath $dir) {
-            Start-Process explorer.exe $dir
-        }
+    $dir = $txtOutputDir.Text.Trim()
+    if (-not [string]::IsNullOrWhiteSpace($dir) -and
+        (Test-Path -LiteralPath $dir -PathType Container)) {
+        Start-Process explorer.exe $dir
+    } else {
+        [System.Windows.Forms.MessageBox]::Show("输出目录尚未创建或路径无效。", "提示")
     }
 })
 
-# 补生成 .fvix V2 索引：弹出文件选择框（支持多选）挑已有视频；
-# 若“输出文件”已是 AVI，则预选它并以其目录作为初始目录。
+# 补生成 .fvix V2 索引：弹出文件选择框（支持多选），优先从目标输出目录打开。
 $btnSidecar.Add_Click({
-    $targets = @()
-    $outPath = $txtOutput.Text
-    $hasOutAvi = -not [string]::IsNullOrWhiteSpace($outPath) -and
-        $outPath.Trim().ToLower().EndsWith(".avi") -and
-        (Test-Path -LiteralPath $outPath)
     $dlg = New-Object System.Windows.Forms.OpenFileDialog
     $dlg.Title = "选择要生成 .fvix V2 索引的 AVI（可多选）"
     $dlg.Filter = "AVI 视频 (*.avi)|*.avi|所有文件 (*.*)|*.*"
     $dlg.Multiselect = $true
-    if ($hasOutAvi) {
-        $dlg.InitialDirectory = [System.IO.Path]::GetDirectoryName($outPath)
-        $dlg.FileName = [System.IO.Path]::GetFileName($outPath)
+    if (-not [string]::IsNullOrWhiteSpace($txtOutputDir.Text) -and
+        (Test-Path -LiteralPath $txtOutputDir.Text -PathType Container)) {
+        $dlg.InitialDirectory = $txtOutputDir.Text
     } elseif (-not [string]::IsNullOrWhiteSpace($txtInput.Text) -and
         (Test-Path -LiteralPath $txtInput.Text)) {
         $dlg.InitialDirectory = [System.IO.Path]::GetDirectoryName($txtInput.Text)
     }
     if ($dlg.ShowDialog() -ne "OK") { return }
+
     $targets = @($dlg.FileNames)
     if ($targets.Count -eq 0) { return }
 
-    $btnSidecar.Enabled = $false
-    $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-    $succeeded = 0
-    $failures = New-Object System.Collections.Generic.List[string]
     try {
-        for ($i = 0; $i -lt $targets.Count; $i++) {
-            $target = $targets[$i]
-            $lblStatus.Text = "正在生成 V2 索引 ($($i + 1)/$($targets.Count))：$([System.IO.Path]::GetFileName($target)) …"
-            [System.Windows.Forms.Application]::DoEvents()
-            $idx = New-SidecarIndex -aviPath $target
-            if ($idx.Ok) {
-                $succeeded++
-            } else {
-                $failures.Add("$([System.IO.Path]::GetFileName($target))：$($idx.Message)")
-            }
-        }
-
-        if ($targets.Count -eq 1 -and $failures.Count -eq 0) {
-            $lblStatus.Text = "V2 索引已生成：$($targets[0]).fvix"
-            [System.Windows.Forms.MessageBox]::Show("V2 索引已生成`r`n`r`n$($targets[0]).fvix", "V2 索引生成完成")
-        } else {
-            $lblStatus.Text = "索引生成完成：成功 $succeeded / 共 $($targets.Count)"
-            $summary = "成功 $succeeded 个，失败 $($failures.Count) 个。"
-            if ($failures.Count -gt 0) {
-                $summary += "`r`n`r`n失败明细：`r`n" + ($failures -join "`r`n")
-            }
-            [System.Windows.Forms.MessageBox]::Show($summary, "批量生成完成")
-        }
+        $lblStatus.Text = "索引任务已启动，正在后台扫描…"
+        Start-SidecarIndexBatch -targets $targets
     } catch {
+        $btnSidecar.Enabled = $true
+        $btnConvert.Enabled = $true
+        $btnInput.Enabled = $true
+        $btnOutput.Enabled = $true
+        $btnSourceDir.Enabled = $true
+        $txtOutputDir.Enabled = $true
+        $form.Cursor = [System.Windows.Forms.Cursors]::Default
         $lblStatus.Text = "索引生成失败：$($_.Exception.Message)"
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "索引生成失败")
-    } finally {
-        $form.Cursor = [System.Windows.Forms.Cursors]::Default
-        $btnSidecar.Enabled = $true
     }
 })
 
@@ -1201,8 +1070,16 @@ $btnConvert.Add_Click({
         [System.Windows.Forms.MessageBox]::Show("输入文件不存在，请重新选择。","错误")
         return
     }
-    if ($inputs.Count -eq 1 -and [string]::IsNullOrWhiteSpace($txtOutput.Text)) {
-        [System.Windows.Forms.MessageBox]::Show("请选择输出文件。","错误")
+    if ([string]::IsNullOrWhiteSpace($txtOutputDir.Text)) {
+        $txtOutputDir.Text = [System.IO.Path]::GetDirectoryName($inputs[0])
+    }
+    $outputDirectory = $txtOutputDir.Text.Trim()
+    try {
+        if (-not (Test-Path -LiteralPath $outputDirectory -PathType Container)) {
+            [System.IO.Directory]::CreateDirectory($outputDirectory) | Out-Null
+        }
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("输出目录无效：$($_.Exception.Message)", "输出目录错误")
         return
     }
 
@@ -1220,12 +1097,15 @@ $btnConvert.Add_Click({
     $succeeded = 0
     $sidecarCount = 0
     $failures = New-Object System.Collections.Generic.List[string]
-    $singleOutput = $txtOutput.Text.Trim()
+    $reservedOutputPaths = @{}
+    $singleOutput = ""
 
     $btnConvert.Enabled = $false
     $btnCrop.Enabled = $false
     $btnInput.Enabled = $false
     $btnOutput.Enabled = $false
+    $btnSourceDir.Enabled = $false
+    $txtOutputDir.Enabled = $false
     $btnSidecar.Enabled = $false
     $progress.Style = "Marquee"
     $progress.MarqueeAnimationSpeed = 30
@@ -1236,14 +1116,12 @@ $btnConvert.Add_Click({
         for ($i = 0; $i -lt $total; $i++) {
             $inPath = $inputs[$i]
             $fileName = [System.IO.Path]::GetFileName($inPath)
-            # 单文件沿用“另存为”路径；批量时逐个输出到各自源目录，默认命名与单文件一致。
-            $outPath = if ($total -eq 1) { $singleOutput } else { Get-DefaultOutputPath $inPath }
-            if ($outPath.ToLower() -eq $inPath.ToLower()) {
-                $outPath = [System.IO.Path]::Combine(
-                    [System.IO.Path]::GetDirectoryName($inPath),
-                    ([System.IO.Path]::GetFileNameWithoutExtension($inPath) + "_out.avi"))
-            }
+            # 单文件和批量统一输出到选定目录；批量遇到同名源文件时自动追加序号。
+            $outPath = Get-UniqueOutputPath $inPath $outputDirectory $reservedOutputPaths
+            if ($i -eq 0) { $singleOutput = $outPath }
 
+            $progress.Style = [System.Windows.Forms.ProgressBarStyle]::Marquee
+            $progress.MarqueeAnimationSpeed = 30
             $lblStatus.Text = if ($total -eq 1) {
                 "正在转换，请勿关闭本窗口…"
             } else {
@@ -1294,10 +1172,15 @@ $btnConvert.Add_Click({
                 $succeeded++
         # 生成侧车索引(.fvix V2)，供设备端 SEEK 使用。失败不影响播放。
                 try {
-                    $lblStatus.Text = "正在生成 .fvix V2 索引 ($($i + 1)/$total)…"
-                    [System.Windows.Forms.Application]::DoEvents()
-                    $idx = New-SidecarIndex -aviPath $outPath
-                    if ($idx.Ok) { $sidecarCount++ } else { Write-Warning "侧车索引生成失败（不影响播放）：$($idx.Message)" }
+                    $lblStatus.Text = "正在后台生成 .fvix V2 索引 ($($i + 1)/$total)…"
+                    $indexResults = Start-SidecarIndexBatch -targets @($outPath) -Wait -Silent
+                    if ($indexResults.Count -gt 0 -and $indexResults[0].Ok) {
+                        $sidecarCount++
+                    } elseif ($indexResults.Count -gt 0) {
+                        Write-Warning "侧车索引生成失败（不影响播放）：$($indexResults[0].Message)"
+                    } elseif ($script:g_indexWorkerError) {
+                        Write-Warning "侧车索引生成失败（不影响播放）：$($script:g_indexWorkerError)"
+                    }
                 } catch {
                     Write-Warning "侧车索引生成失败（不影响播放）：$($_.Exception.Message)"
                 }
@@ -1322,7 +1205,7 @@ $btnConvert.Add_Click({
         } else {
             $lblStatus.Text = "批量转换结束：成功 $succeeded / 共 $total"
             [System.Media.SystemSounds]::Asterisk.Play()
-            $summary = "成功 $succeeded 个，失败 $($failures.Count) 个。`r`n输出已生成在各自源视频所在目录。"
+            $summary = "成功 $succeeded 个，失败 $($failures.Count) 个。`r`n输出目录：$outputDirectory"
             if ($failures.Count -gt 0) {
                 $summary += "`r`n`r`n失败明细：`r`n" + ($failures -join "`r`n")
             }
@@ -1338,12 +1221,21 @@ $btnConvert.Add_Click({
         $btnCrop.Enabled = $true
         $btnInput.Enabled = $true
         $btnOutput.Enabled = $true
+        $btnSourceDir.Enabled = $true
+        $txtOutputDir.Enabled = $true
         $btnSidecar.Enabled = $true
         $form.Cursor = [System.Windows.Forms.Cursors]::Default
     }
 })
 
-foreach ($c in @($txtInput,$txtOutput,$numWidth,$numFps,$numQ,$chkCrop,$txtCrop,$chkYuv420,$cmbBitrate,$cmbRate,$cmbChannels,$numTrimStart,$numTrimEnd)) {
+$txtOutputDir.Add_TextChanged({
+    if (-not $script:g_updating_output_dir) {
+        $script:g_output_dir_user_selected = $true
+    }
+    Update-CommandPreview
+})
+
+foreach ($c in @($txtInput,$numWidth,$numFps,$numQ,$chkCrop,$txtCrop,$chkYuv420,$cmbBitrate,$cmbRate,$cmbChannels,$numTrimStart,$numTrimEnd)) {
     if ($c -is [System.Windows.Forms.TextBox]) {
         $c.Add_TextChanged({ Update-CommandPreview })
     } elseif ($c -is [System.Windows.Forms.NumericUpDown]) {
