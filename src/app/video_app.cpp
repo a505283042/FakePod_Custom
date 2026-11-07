@@ -1487,6 +1487,13 @@ static esp_err_t benchmark_presenter_start()
     return ESP_OK;
 }
 
+// 拖动预览基准需要保留到抬手事件消费；此时 current_drag 已经返回 false。
+static constexpr int32_t kSeekPreviewStartPx = 18;
+static constexpr int64_t kSeekPreviewHoldUs = 250000LL;
+static bool g_seek_preview_active = false;
+static bool g_seek_preview_base_valid = false;
+static uint32_t g_seek_preview_base_ms = 0U;
+
 // 侧车索引 seek：按相对毫秒跳转。依赖 .fvix 索引，无索引时静默忽略。
 static void benchmark_seek_by(int32_t delta_ms)
 {
@@ -1498,7 +1505,10 @@ static void benchmark_seek_by(int32_t delta_ms)
     if (!VideoBenchmark::get_snapshot(&snapshot)) return;
     if (snapshot.state != VideoBenchmark::State::Running) return;
 
-    int64_t target = static_cast<int64_t>(snapshot.last_pts_ms) + delta_ms;
+    // 使用手势开始时记录的同一基准，避免拖动3秒后实际比预览多跳3秒。
+    const uint32_t base_ms = g_seek_preview_base_valid
+        ? g_seek_preview_base_ms : snapshot.last_pts_ms;
+    int64_t target = static_cast<int64_t>(base_ms) + delta_ms;
     if (target < 0) target = 0;
     if (snapshot.duration_ms > 0 && target > static_cast<int64_t>(snapshot.duration_ms)) {
         target = snapshot.duration_ms;
@@ -1539,23 +1549,22 @@ static void benchmark_seek_by_swipe()
 {
     int16_t dx = 0;
     int16_t dy = 0;
-    if (!gesture_router_last_displacement(&dx, &dy)) return;
-    // 与主流播放器一致：右滑（dx>0）快进，左滑（dx<0）后退。
-    benchmark_seek_by(static_cast<int32_t>(dx) * 100);
+    if (gesture_router_last_displacement(&dx, &dy)) {
+        // 与拖动浮层共享起始时间；抬手后才清掉基准。
+        benchmark_seek_by(static_cast<int32_t>(dx) * 100);
+    }
+    g_seek_preview_base_valid = false;
 }
 
 // 拖动中的 seek 实时预览：每 tick 把“当前位移 + 起点时间”换成目标时间，刷新同一个浮层。
 // 只是显示，不执行 seek；抬手后由 benchmark_seek_by_swipe() 真正跳转并显示 2 秒结果浮层。
-static constexpr int32_t kSeekPreviewStartPx = 18;
-static constexpr int64_t kSeekPreviewHoldUs = 250000LL;
-static bool g_seek_preview_active = false;
-static uint32_t g_seek_preview_base_ms = 0U;
 
 static void benchmark_seek_preview_tick()
 {
     if (g_page != VideoPage::Benchmark || g_risk_prompt_active ||
         !VideoBenchmark::can_seek()) {
         g_seek_preview_active = false;
+        g_seek_preview_base_valid = false;
         return;
     }
 
@@ -1576,6 +1585,7 @@ static void benchmark_seek_preview_tick()
         if (!VideoBenchmark::get_snapshot(&snapshot)) return;
         if (snapshot.state != VideoBenchmark::State::Running) return;
         g_seek_preview_active = true;
+        g_seek_preview_base_valid = true;
         g_seek_preview_base_ms = snapshot.last_pts_ms;
     }
 
@@ -2269,17 +2279,23 @@ static void timer_cb(lv_timer_t *timer)
     if (!gesture_router_take_action(&action)) return;
     if (app_launcher_overlay_is_visible()) {
         app_launcher_overlay_hide();
+        g_seek_preview_base_valid = false;
         return;
+    }
+    // 非水平手势不会提交 SEEK，不能把这次拖动基准带到下一次手势。
+    if (action != UiGestureAction::SwipeLeft &&
+        action != UiGestureAction::SwipeRight) {
+        g_seek_preview_base_valid = false;
     }
     switch (action) {
         case UiGestureAction::SwipeLeft:
-            // 视频播放中左滑 = 按距离快进
+            // 视频播放中左滑 = 按距离后退
             if (g_page == VideoPage::Benchmark) {
                 if (!g_risk_prompt_active) benchmark_seek_by_swipe();
             }
             break;
         case UiGestureAction::SwipeRight:
-            // 视频播放中右滑 = 按距离后退；播放页返回列表改由下滑完成
+            // 视频播放中右滑 = 按距离快进；播放页返回列表改由下滑完成
             if (g_page == VideoPage::Benchmark) {
                 if (!g_risk_prompt_active) benchmark_seek_by_swipe();
             } else {

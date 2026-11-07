@@ -119,9 +119,12 @@ esp_err_t open(VideoMediaIo::Context *io, StreamInfo *out_info) {
                                 s_info.fps_x100 = static_cast<uint32_t>(100000000ULL / us_per_frame);
                             }
                             s_info.total_frames = read_u32(avih + 16);
+                            // 先提升到64位再乘，避免30分钟以上视频的时长在32位乘法中回绕。
                             s_info.duration_ms = s_info.total_frames > 0 && s_info.fps_x100 > 0
-                                ? s_info.total_frames * 100000U / s_info.fps_x100
-                                : 0;
+                                ? static_cast<uint32_t>(
+                                      static_cast<uint64_t>(s_info.total_frames) * 100000ULL /
+                                      s_info.fps_x100)
+                                : 0U;
                             found_avih = true;
                         }
                     } else if (match_fcc(sub, "LIST")) {
@@ -304,12 +307,15 @@ esp_err_t seek_to_offset(uint32_t file_offset, uint32_t video_pts_ms, uint32_t a
     // 侧车索引可能记录 chunk 头偏移，也可能记录数据起点（如 ffprobe 的 pkt_pos）。
     // 这里按「chunk 头 + JPEG 起始标记」校验落点，必要时回退 8 字节。
     auto video_chunk_at = [](uint32_t off) -> bool {
-        if (off + 10U > s_movi_data_end) return false;
+        // 先做减法式边界校验，避免坏索引偏移导致加法溢出或越过 movi。
+        if (off < s_movi_data_offset || off >= s_movi_data_end ||
+            s_movi_data_end - off < 10U) return false;
         uint8_t hdr[8];
         if (read_at(off, hdr, 8) != ESP_OK) return false;
         if (!(match_fcc(hdr, "00dc") || match_fcc(hdr, "00db"))) return false;
         const uint32_t size = read_u32(hdr + 4);
-        if (size == 0U || size > (8U * 1024U * 1024U)) return false;
+        if (size < 2U || size > (8U * 1024U * 1024U) ||
+            size > s_movi_data_end - off - 8U) return false;
         uint8_t sig[2];
         if (read_at(off + 8U, sig, 2) != ESP_OK) return false;
         return sig[0] == 0xFFU && sig[1] == 0xD8U;
@@ -323,8 +329,10 @@ esp_err_t seek_to_offset(uint32_t file_offset, uint32_t video_pts_ms, uint32_t a
                 static_cast<unsigned long>(file_offset),
                 static_cast<unsigned long>(aligned));
         } else {
-            ESP_LOGW(TAG, "Seek偏移未落在视频chunk头，保持原偏移: %lu",
+            // 不允许把未经验证的偏移交给解复用器，否则旧索引可能读出随机帧。
+            ESP_LOGE(TAG, "Seek偏移无效，拒绝跳转: %lu",
                 static_cast<unsigned long>(file_offset));
+            return ESP_ERR_INVALID_ARG;
         }
     }
 

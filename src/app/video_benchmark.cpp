@@ -153,6 +153,7 @@ static bool g_paused = false;
 static bool g_extract_pause_ack = false;
 static int64_t g_pause_started_us = 0LL;
 static uint32_t g_seek_epoch = 0U;
+static esp_err_t g_seek_failure = ESP_OK;  // 本轮 SEEK 致命错误，仅随新播放世代清除
 static QueueHandle_t g_free_queue = nullptr;
 static QueueHandle_t g_ready_queue = nullptr;
 static QueueHandle_t g_compressed_free_queue = nullptr;
@@ -286,7 +287,11 @@ static void publish(const Snapshot &snapshot)
     portENTER_CRITICAL(&g_mux);
     if (snapshot.generation == g_generation) {
         g_snapshot = snapshot;
-        g_snapshot.paused = g_paused && snapshot.state == State::Running;
+        if (g_seek_failure != ESP_OK) {
+            g_snapshot.state = State::Failed;
+            g_snapshot.result = g_seek_failure;
+        }
+        g_snapshot.paused = g_paused && g_snapshot.state == State::Running;
         merge_audio_probe_unlocked(&g_snapshot);
     }
     portEXIT_CRITICAL(&g_mux);
@@ -297,6 +302,10 @@ static void publish_task_exit(const Snapshot &snapshot)
     portENTER_CRITICAL(&g_mux);
     if (snapshot.generation == g_generation) {
         g_snapshot = snapshot;
+        if (g_seek_failure != ESP_OK) {
+            g_snapshot.state = State::Failed;
+            g_snapshot.result = g_seek_failure;
+        }
         g_snapshot.paused = false;
         merge_audio_probe_unlocked(&g_snapshot);
     }
@@ -1272,6 +1281,7 @@ esp_err_t start(const char *path, bool allow_fullcanvas_over20, bool music_suspe
     g_snapshot = {};
     g_snapshot.state = State::Starting;
     g_snapshot.generation = g_generation;
+    g_seek_failure = ESP_OK;
     g_stop_generation = 0U;
     g_pause_requested = false;
     g_paused = false;
@@ -1425,6 +1435,26 @@ esp_err_t seek(uint32_t target_ms)
     portEXIT_CRITICAL(&g_mux);
     if (!running) return ESP_ERR_INVALID_STATE;
 
+    // 索引偏移或扫描失败后已清空旧帧，不能简单恢复旧播放位置。
+    // 终止当前世代并取消音频桥，由现有终止页统一停止 AudioTask，避免音画错位。
+    auto abort_seek = [generation](esp_err_t error) -> esp_err_t {
+        portENTER_CRITICAL(&g_mux);
+        if (generation == g_generation) {
+            g_seek_failure = error;
+            g_stop_generation = generation;
+            g_pause_requested = false;
+            g_paused = false;
+            g_extract_pause_ack = false;
+            g_pause_started_us = 0LL;
+            g_snapshot.state = State::Failed;
+            g_snapshot.result = error;
+            g_snapshot.paused = false;
+        }
+        portEXIT_CRITICAL(&g_mux);
+        avi_mp3_bridge_cancel();
+        return error;
+    };
+
     VideoSeekIndex::Entry entry = {};
     esp_err_t ret = VideoSeekIndex::lookup(target_ms, &entry);
     if (ret != ESP_OK) return ret;
@@ -1435,6 +1465,11 @@ esp_err_t seek(uint32_t target_ms)
         static_cast<unsigned>(entry.file_offset));
 
     // 1. 暂停 pipeline，等待 ExtractTask 确认暂停
+    const bool was_paused = is_paused();
+    bool has_audio = false;
+    portENTER_CRITICAL(&g_mux);
+    has_audio = g_snapshot.audio_streams != 0U;
+    portEXIT_CRITICAL(&g_mux);
     if (!set_paused(true)) {
         ESP_LOGE(TAG, "Seek前暂停失败");
         return ESP_FAIL;
@@ -1471,7 +1506,10 @@ esp_err_t seek(uint32_t target_ms)
     // 4. 音频必须先暂停：否则 AudioTask 在桥被清空、Extract 已停的情况下会阻塞在
     //    Source read 的空等循环里，VideoMp3Seek 命令要等到 1.5s 超时才可能执行，
     //    新旧位置音频就会混播一段，听起来就是“咔咔”。
-    (void)audio_service_video_mp3_pause(true);
+    if (has_audio && !audio_service_video_mp3_pause(true)) {
+        ESP_LOGE(TAG, "Seek暂停音频失败，终止当前视频");
+        return abort_seek(ESP_FAIL);
+    }
 
     // 5. 清空音频桥残留数据
     avi_mp3_bridge_clear();
@@ -1489,18 +1527,16 @@ esp_err_t seek(uint32_t target_ms)
     ret = AviDemuxer::seek_to_offset(entry.file_offset, entry.timestamp_ms, audio_bytes_at_seek);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Demuxer seek 失败: offset=%u", entry.file_offset);
-        set_paused(false);
-        return ret;
+        return abort_seek(ret);
     }
 
     // 6.5 索引粒度为 2 秒，索引落点未必等于目标时间；顺序扫描丢弃 PTS 早于目标的视频帧，
     //     精确定位到目标帧。跳过的音频 chunk 只累加字节计数，保持音视频同一时间轴。
     const esp_err_t scan_ret = AviDemuxer::scan_forward_to(target_ms);
-    if (scan_ret != ESP_OK && scan_ret != AviDemuxer::kErrEof) {
+    if (scan_ret != ESP_OK) {
         ESP_LOGE(TAG, "Demuxer精确定位失败: target=%ums ret=%s",
             static_cast<unsigned>(target_ms), esp_err_to_name(scan_ret));
-        set_paused(false);
-        return scan_ret;
+        return abort_seek(scan_ret);
     }
 
     // 7. 用 demuxer 实际恢复的时间轴位置对齐音频时钟。
@@ -1508,8 +1544,10 @@ esp_err_t seek(uint32_t target_ms)
     //     音频时钟只要和视频 PTS 不同轴，Presenter 就会把后续帧全部判为迟到。
     //     该调用在 AudioTask 内执行：静音→排空 DMA 旧 PCM→丢弃解码残留→淡入，避免 seek 爆音。
     const uint32_t base_pts_ms = AviDemuxer::next_video_pts_ms();
-    if (!audio_service_video_mp3_seek(base_pts_ms)) {
-        ESP_LOGW(TAG, "视频音频seek时钟失败：base=%lums", static_cast<unsigned long>(base_pts_ms));
+    if (has_audio && !audio_service_video_mp3_seek(base_pts_ms)) {
+        ESP_LOGE(TAG, "视频音频seek时钟失败，终止当前视频：base=%lums",
+            static_cast<unsigned long>(base_pts_ms));
+        return abort_seek(ESP_FAIL);
     }
 
     // 音频探针的 first_pts 是时钟零点基准，seek 后必须归零；
@@ -1531,8 +1569,17 @@ esp_err_t seek(uint32_t target_ms)
 
     // 9. 恢复播放：音频 seek 已在 AudioTask 内完成时钟对齐与淡入，先恢复音频再放开
     //    视频管线，避免视频先跑、音频后追。
-    (void)audio_service_video_mp3_resume(true);
-    set_paused(false);
+    // 如果 SEEK 前是暂停状态，保持暂停；否则先恢复音频再恢复视频。
+    if (!was_paused) {
+        if (has_audio && !audio_service_video_mp3_resume(true)) {
+            ESP_LOGE(TAG, "Seek恢复音频失败，终止当前视频");
+            return abort_seek(ESP_FAIL);
+        }
+        if (!set_paused(false)) {
+            ESP_LOGE(TAG, "Seek恢复视频失败，终止当前视频");
+            return abort_seek(ESP_FAIL);
+        }
+    }
     return ESP_OK;
 }
 
