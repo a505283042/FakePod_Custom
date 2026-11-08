@@ -3265,7 +3265,9 @@ static void timer_cb(lv_timer_t *timer)
     benchmark_tick();
     benchmark_seek_preview_tick();
     benchmark_controls_tick();
-    gesture_router_tick(static_cast<uint32_t>(lv_tick_get()));
+    // 必须与 TouchInputTask 边沿的 tick_ms 同源（RTOS 毫秒）；用 lv_tick_get 会因
+    // LVGL/RTOS 时钟起点不同产生固定偏移，让双击窗口判断整体失效。
+    gesture_router_tick(static_cast<uint32_t>(xTaskGetTickCount() * portTICK_PERIOD_MS));
 
     UiGestureAction action = UiGestureAction::None;
     if (!gesture_router_take_action(&action)) {

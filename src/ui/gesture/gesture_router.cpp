@@ -23,7 +23,7 @@ constexpr int16_t kVerticalAdjustDominancePercent = 135;
 // 双击：两次触摸都必须近似“原地轻点”，且间隔/落点在容差内，避免与短滑混淆。
 constexpr int16_t kTapMaxMovePx = 14;
 constexpr int16_t kDoubleTapSlopPx = 40;
-constexpr uint32_t kDoubleTapWindowMs = 320U;
+constexpr uint32_t kDoubleTapWindowMs = 480U;
 
 enum class GestureAxis : uint8_t
 {
@@ -226,9 +226,13 @@ void gesture_router_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t ti
 {
     if (pressed) {
         if (!g_state.pressed) {
-            // R44.3：新一轮物理触摸开始后，上一轮尚未被 UI timer 消费的动作已经过期。
-            // 宁可丢弃旧动作，也不能让它在新手指已经按下后跨触摸生命周期执行。
-            g_state.pending = UiGestureAction::None;
+            // 新一轮物理触摸开始后，滑动类未消费动作已经过期，必须丢弃。
+            // 但单击/双击是“已完成判定、只差页面取走”的动作：若在这里无条件清掉，
+            // 窗口边界上恰好被 timer 发布又立刻被下一次按下吞掉的点击就会永久丢失。
+            if (g_state.pending != UiGestureAction::SingleTap &&
+                g_state.pending != UiGestureAction::DoubleTap) {
+                g_state.pending = UiGestureAction::None;
+            }
             g_state.pressed = true;
             g_state.press_origin_valid = true;
             g_state.suppress_click = false;
