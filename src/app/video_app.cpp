@@ -1329,7 +1329,13 @@ static bool benchmark_controls_overlay_snapshot(
     snapshot.brightness_percent = g_video_controls.brightness_percent;
     snapshot.volume_percent = g_video_controls.volume_percent;
     portEXIT_CRITICAL(&g_video_controls_mux);
-    if (!snapshot.active || width < 160U || height < 120U) return false;
+    if (!snapshot.active) return false;
+    if (width < 160U || height < 120U) {
+        portENTER_CRITICAL(&g_video_controls_mux);
+        g_video_controls.layout.valid = false;
+        portEXIT_CRITICAL(&g_video_controls_mux);
+        return false;
+    }
 
     const uint16_t margin = width >= 320U ? 12U : 6U;
     const uint16_t gap = width >= 320U ? 12U : 8U;
@@ -1337,7 +1343,12 @@ static bool benchmark_controls_overlay_snapshot(
         ? static_cast<uint16_t>(width - margin * 2U - gap) : 0U;
     uint16_t pill_width = static_cast<uint16_t>(available / 2U);
     if (pill_width > 148U) pill_width = 148U;
-    if (pill_width < 72U) return false;
+    if (pill_width < 72U) {
+        portENTER_CRITICAL(&g_video_controls_mux);
+        g_video_controls.layout.valid = false;
+        portEXIT_CRITICAL(&g_video_controls_mux);
+        return false;
+    }
 
     VideoControlsLayout layout = {};
     layout.valid = true;
@@ -1500,8 +1511,8 @@ static void benchmark_controls_patch_refresh()
         static_cast<uint16_t>(info.frame_y + info.patch_y),
         info.patch_width,
         info.patch_height,
-        false,
-        false,
+        true,
+        true,
         nullptr);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "暂停状态刷新视频控制浮层失败：%s", esp_err_to_name(ret));
