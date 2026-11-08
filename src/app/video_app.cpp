@@ -90,6 +90,7 @@ static constexpr size_t kInvalidEntryIndex = static_cast<size_t>(-1);
 
 static constexpr int64_t kVideoControlsOverlayHoldUs = 3000000LL;
 static constexpr int32_t kVideoControlsDragFullScalePx = 220;
+static constexpr int64_t kVideoControlsApplyIntervalUs = 50000LL;
 static constexpr uint16_t kVideoControlsPatchMaxWidth = 340U;
 static constexpr uint16_t kVideoControlsPatchMaxHeight = 180U;
 
@@ -129,6 +130,8 @@ struct VideoControlsState
     uint8_t brightness_percent = 60U;
     uint8_t volume_percent = 50U;
     bool brightness_dirty = false;
+    bool brightness_apply_pending = false;
+    bool volume_apply_pending = false;
     bool dragging = false;
     uint32_t drag_sequence = 0U;
     uint8_t drag_start_percent = 0U;
@@ -161,6 +164,8 @@ struct VideoControlsPatchInfo
 static VideoControlsState g_video_controls = {};
 static portMUX_TYPE g_video_controls_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool g_video_controls_refresh_pending = false;
+static int64_t g_video_controls_last_brightness_apply_us = 0LL;
+static int64_t g_video_controls_last_volume_apply_us = 0LL;
 static uint8_t *g_video_controls_patch_buffer = nullptr;
 static VideoControlsPatchInfo g_video_controls_patch_info = {};
 static portMUX_TYPE g_video_controls_patch_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -233,9 +238,13 @@ static void benchmark_controls_reset_for_video()
     g_video_controls.until_us = 0LL;
     g_video_controls.brightness_percent = brightness < 5U ? 5U : brightness;
     g_video_controls.volume_percent = volume > 100U ? 100U : volume;
+    g_video_controls.brightness_apply_pending = false;
+    g_video_controls.volume_apply_pending = false;
     g_video_controls.dragging = false;
     g_video_controls.layout.valid = false;
     portEXIT_CRITICAL(&g_video_controls_mux);
+    g_video_controls_last_brightness_apply_us = 0LL;
+    g_video_controls_last_volume_apply_us = 0LL;
     benchmark_controls_notify_presenter();
     gesture_router_set_vertical_adjust_enabled(false);
     gesture_router_set_vertical_adjust_edges_reserved(false);
@@ -1113,8 +1122,7 @@ static void benchmark_seek_overlay_draw(
 }
 
 
-// Video controls are composited into the Presenter RGB565 stream. LVGL never flushes
-// over the active video frame, so the overlay cannot race BoundedSPI.
+// 视频控制浮层直接合成到 Presenter 输出的 RGB565 帧中，避免 LVGL 与 BoundedSPI 并发刷新。
 static void benchmark_controls_fill_rect(
     uint8_t *dst, uint16_t strip_y, uint16_t rows, uint16_t width,
     int32_t left, int32_t top, int32_t right, int32_t bottom, uint16_t color)
@@ -1449,16 +1457,17 @@ static esp_err_t benchmark_controls_patch_producer(
     void *context,
     uint16_t source_y,
     uint16_t rows,
+    uint16_t width,
     uint8_t *dst_rgb565,
     size_t dst_bytes)
 {
     auto *patch = static_cast<VideoControlsPatchContext *>(context);
     if (patch == nullptr || patch->patch_buffer == nullptr || dst_rgb565 == nullptr ||
-        patch->info.patch_width == 0U || rows == 0U ||
+        patch->info.patch_width == 0U || width != patch->info.patch_width || rows == 0U ||
         static_cast<uint32_t>(source_y) + rows > patch->info.patch_height) {
         return ESP_ERR_INVALID_ARG;
     }
-    const size_t width_bytes = static_cast<size_t>(patch->info.patch_width) * 2U;
+    const size_t width_bytes = static_cast<size_t>(width) * 2U;
     if (dst_bytes < width_bytes * rows) return ESP_ERR_INVALID_SIZE;
 
     const size_t source_stride = static_cast<size_t>(kVideoControlsPatchMaxWidth) * 2U;
@@ -2296,36 +2305,89 @@ static void benchmark_seek_preview_tick()
 }
 
 
-static void benchmark_controls_apply_brightness(uint8_t level)
+static void benchmark_controls_apply_brightness(uint8_t level, bool force)
 {
     if (level < 5U) level = 5U;
     if (level > 100U) level = 100U;
-    const esp_err_t ret = screen_lock_simple_set_normal_brightness(level);
+
+    bool changed = false;
+    bool pending = false;
+    uint8_t target = level;
+    portENTER_CRITICAL(&g_video_controls_mux);
+    if (g_video_controls.brightness_percent != level) {
+        g_video_controls.brightness_percent = level;
+        g_video_controls.brightness_dirty = true;
+        g_video_controls.brightness_apply_pending = true;
+        g_video_controls.until_us = esp_timer_get_time() + kVideoControlsOverlayHoldUs;
+        changed = true;
+    }
+    pending = g_video_controls.brightness_apply_pending;
+    target = g_video_controls.brightness_percent;
+    portEXIT_CRITICAL(&g_video_controls_mux);
+
+    if (changed) benchmark_controls_notify_presenter();
+    if (!pending) return;
+
+    const int64_t now_us = esp_timer_get_time();
+    if (!force && g_video_controls_last_brightness_apply_us != 0LL &&
+        now_us - g_video_controls_last_brightness_apply_us < kVideoControlsApplyIntervalUs) {
+        return;
+    }
+
+    const esp_err_t ret = screen_lock_simple_set_normal_brightness(target);
+    g_video_controls_last_brightness_apply_us = now_us;
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "视频亮度预览失败：%u%% ret=%s",
-            static_cast<unsigned>(level), esp_err_to_name(ret));
+            static_cast<unsigned>(target), esp_err_to_name(ret));
         return;
     }
+
     portENTER_CRITICAL(&g_video_controls_mux);
-    g_video_controls.brightness_percent = level;
-    g_video_controls.brightness_dirty = true;
-    g_video_controls.until_us = esp_timer_get_time() + kVideoControlsOverlayHoldUs;
+    if (g_video_controls.brightness_percent == target) {
+        g_video_controls.brightness_apply_pending = false;
+    }
     portEXIT_CRITICAL(&g_video_controls_mux);
-    benchmark_controls_notify_presenter();
 }
 
-static void benchmark_controls_apply_volume(uint8_t level)
+static void benchmark_controls_apply_volume(uint8_t level, bool force)
 {
     if (level > 100U) level = 100U;
-    if (!audio_service_video_mp3_set_volume(level)) {
-        ESP_LOGW(TAG, "视频音量请求失败：%u%%", static_cast<unsigned>(level));
+
+    bool changed = false;
+    bool pending = false;
+    uint8_t target = level;
+    portENTER_CRITICAL(&g_video_controls_mux);
+    if (g_video_controls.volume_percent != level) {
+        g_video_controls.volume_percent = level;
+        g_video_controls.volume_apply_pending = true;
+        g_video_controls.until_us = esp_timer_get_time() + kVideoControlsOverlayHoldUs;
+        changed = true;
+    }
+    pending = g_video_controls.volume_apply_pending;
+    target = g_video_controls.volume_percent;
+    portEXIT_CRITICAL(&g_video_controls_mux);
+
+    if (changed) benchmark_controls_notify_presenter();
+    if (!pending) return;
+
+    const int64_t now_us = esp_timer_get_time();
+    if (!force && g_video_controls_last_volume_apply_us != 0LL &&
+        now_us - g_video_controls_last_volume_apply_us < kVideoControlsApplyIntervalUs) {
         return;
     }
+
+    const bool ok = audio_service_video_mp3_set_volume(target);
+    g_video_controls_last_volume_apply_us = now_us;
+    if (!ok) {
+        ESP_LOGW(TAG, "视频音量请求失败：%u%%", static_cast<unsigned>(target));
+        return;
+    }
+
     portENTER_CRITICAL(&g_video_controls_mux);
-    g_video_controls.volume_percent = level;
-    g_video_controls.until_us = esp_timer_get_time() + kVideoControlsOverlayHoldUs;
+    if (g_video_controls.volume_percent == target) {
+        g_video_controls.volume_apply_pending = false;
+    }
     portEXIT_CRITICAL(&g_video_controls_mux);
-    benchmark_controls_notify_presenter();
 }
 
 static void benchmark_controls_tick()
@@ -2364,12 +2426,26 @@ static void benchmark_controls_tick()
             if (selected == VideoControlTarget::Brightness) {
                 if (target < 5) target = 5;
                 if (target > 100) target = 100;
-                benchmark_controls_apply_brightness(static_cast<uint8_t>(target));
+                benchmark_controls_apply_brightness(static_cast<uint8_t>(target), adjustment.released);
             } else {
                 if (target < 0) target = 0;
                 if (target > 100) target = 100;
-                benchmark_controls_apply_volume(static_cast<uint8_t>(target));
+                benchmark_controls_apply_volume(static_cast<uint8_t>(target), adjustment.released);
             }
+        } else {
+            // 抬手后若最后一次提交失败，后续定时器继续低频重试。
+            uint8_t retry_brightness = 0U;
+            uint8_t retry_volume = 0U;
+            bool retry_brightness_pending = false;
+            bool retry_volume_pending = false;
+            portENTER_CRITICAL(&g_video_controls_mux);
+            retry_brightness = g_video_controls.brightness_percent;
+            retry_volume = g_video_controls.volume_percent;
+            retry_brightness_pending = g_video_controls.brightness_apply_pending;
+            retry_volume_pending = g_video_controls.volume_apply_pending;
+            portEXIT_CRITICAL(&g_video_controls_mux);
+            if (retry_brightness_pending) benchmark_controls_apply_brightness(retry_brightness, false);
+            if (retry_volume_pending) benchmark_controls_apply_volume(retry_volume, false);
         }
 
         if (adjustment.released) {
