@@ -64,6 +64,7 @@ GestureState g_state = {};
 // 横向手势策略独立于触摸状态，gesture_router_reset() 不会清除页面策略。
 int16_t g_horizontal_trigger_px = kHorizontalTriggerPx;
 uint32_t g_horizontal_min_speed_px_per_sec = kHorizontalMinSpeedPxPerSec;
+bool g_single_tap_enabled = false;
 
 static int32_t gesture_abs(int32_t value)
 {
@@ -108,6 +109,7 @@ static bool gesture_try_activate_vertical_adjust(int32_t dx, int32_t dy)
     g_state.vertical_adjust_released = false;
     g_state.suppress_click = true;
     g_state.pending = UiGestureAction::None;
+    g_state.last_tap_valid = false;
     g_state.axis = GestureAxis::Vertical;
     return true;
 }
@@ -189,6 +191,15 @@ void gesture_router_set_video_seek_mode(bool enabled)
         ? kVideoSeekHorizontalTriggerPx : kHorizontalTriggerPx;
     g_horizontal_min_speed_px_per_sec = enabled
         ? kVideoSeekHorizontalMinSpeedPxPerSec : kHorizontalMinSpeedPxPerSec;
+}
+
+void gesture_router_set_single_tap_enabled(bool enabled)
+{
+    g_single_tap_enabled = enabled;
+    g_state.last_tap_valid = false;
+    if (!enabled && g_state.pending == UiGestureAction::SingleTap) {
+        g_state.pending = UiGestureAction::None;
+    }
 }
 
 void gesture_router_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick_ms)
@@ -282,6 +293,9 @@ void gesture_router_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t ti
                 g_state.last_tap_tick_ms = tick_ms;
                 g_state.last_tap_x = x;
                 g_state.last_tap_y = y;
+                if (g_single_tap_enabled) {
+                    g_state.pending = UiGestureAction::SingleTap;
+                }
             }
         } else {
             g_state.last_tap_valid = false;
@@ -411,6 +425,7 @@ const char *gesture_router_action_name(UiGestureAction action)
         case UiGestureAction::PullDownFromTop: return "顶部下拉";
         case UiGestureAction::PullUpFromBottom: return "底部上滑";
         case UiGestureAction::DoubleTap: return "双击";
+        case UiGestureAction::SingleTap: return "单击";
         default: return "无";
     }
 }

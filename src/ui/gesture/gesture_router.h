@@ -17,12 +17,16 @@ enum class UiGestureAction : uint8_t
     PullUpFromBottom,
     // 原地双击（两次轻点，间隔与落点都在容差内）。播放页用它切换暂停/继续。
     DoubleTap,
+    // 视频播放页的单击：显示/操作亮度与音量浮层；其它页面不启用。
+    SingleTap,
 };
 
 void gesture_router_reset();
 
 // 视频播放页启用短距离、慢速 SEEK；false 时恢复其他页面原有横向手势门槛。
 void gesture_router_set_video_seek_mode(bool enabled);
+// 仅视频播放页启用单击动作，避免改变其它页面的轻点行为。
+void gesture_router_set_single_tap_enabled(bool enabled);
 
 // 由 CST820 -> LVGL 输入桥接层喂入原始指针状态。
 void gesture_router_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick_ms);

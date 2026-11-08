@@ -110,6 +110,9 @@ bool audio_service_video_mp3_release_start(bool wait = true);
 bool audio_service_video_mp3_pause(bool wait = true);
 bool audio_service_video_mp3_resume(bool wait = true);
 bool audio_service_video_mp3_stop(bool wait = true);
+// 视频专属音量：只改变 AVI MP3 输出，不修改 Music 的全局音量；范围 0~100。
+bool audio_service_video_mp3_set_volume(uint8_t percent);
+bool audio_service_video_mp3_get_volume(uint8_t *out_percent);
 
 // R.40.4.2：Video Presenter / PreDecode 只读的 AVI MP3 PCM 主时钟快照。
 // position_us 来自“真实已成功提交到 I2S DMA”的 PCM sample 数；Video 永远只读，

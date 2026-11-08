@@ -305,6 +305,11 @@ static bool g_video_restore_paused_music_hardware = false;
 static uint32_t g_video_mp3_sample_rate_hz = 0U;
 static uint16_t g_video_mp3_channels = 0U;
 static uint16_t g_video_mp3_bits_per_sample = 0U;
+// Video 音量与 g_task_volume_percent 分离；只在 Video MP3 活动期间写入 CS43131。
+static portMUX_TYPE g_video_mp3_volume_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t g_video_mp3_volume_percent = 50U;
+static bool g_video_mp3_volume_initialized = false;
+static bool g_video_mp3_volume_pending = false;
 struct VideoMp3TimingStats
 {
     uint64_t decoder_read_us_total = 0ULL;
@@ -1425,9 +1430,39 @@ static esp_err_t audio_task_apply_volume(bool nsf_mode)
         audio_task_effective_volume_half_db_steps(nsf_mode));
 }
 
+static esp_err_t audio_task_apply_video_mp3_volume()
+{
+    if (!g_pipeline_headphone_enabled) return ESP_OK;
+    uint8_t percent = 50U;
+    portENTER_CRITICAL(&g_video_mp3_volume_mux);
+    percent = g_video_mp3_volume_percent;
+    g_video_mp3_volume_pending = false;
+    portEXIT_CRITICAL(&g_video_mp3_volume_mux);
+    return cs43131_set_pcm_volume_attenuation(audio_volume_percent_to_half_db_steps(percent));
+}
+
 static esp_err_t audio_task_apply_user_volume()
 {
+    // Video 播放时，Music 的全局音量只更新其保存值；硬件当前输出始终使用 Video 专属音量。
+    if (g_video_mp3_active) return audio_task_apply_video_mp3_volume();
     return audio_task_apply_volume(g_nsf_active);
+}
+
+static void audio_task_apply_pending_video_mp3_volume()
+{
+    bool pending = false;
+    portENTER_CRITICAL(&g_video_mp3_volume_mux);
+    pending = g_video_mp3_volume_pending;
+    portEXIT_CRITICAL(&g_video_mp3_volume_mux);
+    if (!pending || !g_video_mp3_active) return;
+
+    const esp_err_t ret = audio_task_apply_video_mp3_volume();
+    if (ret != ESP_OK) {
+        portENTER_CRITICAL(&g_video_mp3_volume_mux);
+        g_video_mp3_volume_pending = true;
+        portEXIT_CRITICAL(&g_video_mp3_volume_mux);
+        ESP_LOGW(TAG, "AVI MP3专属音量应用失败：%s", esp_err_to_name(ret));
+    }
 }
 
 static esp_err_t audio_task_unmute_when_pcm_ready()
@@ -3563,6 +3598,15 @@ static void audio_task_handle_video_mp3_start(AudioRequest *request)
     g_video_restore_paused_music_hardware =
         g_task_state == AudioPlaybackState::Paused && pcm_decoder_is_open(&g_decoder);
 
+    // 首次进入 Video 时沿用当前 Music 音量作为起始值；之后独立记住 Video 音量。
+    portENTER_CRITICAL(&g_video_mp3_volume_mux);
+    if (!g_video_mp3_volume_initialized) {
+        g_video_mp3_volume_percent = g_task_volume_percent;
+        g_video_mp3_volume_initialized = true;
+    }
+    g_video_mp3_volume_pending = true;
+    portEXIT_CRITICAL(&g_video_mp3_volume_mux);
+
     if (g_pipeline_headphone_enabled || g_pipeline_clock_prepared ||
         g_pipeline_i2s_started || i2s_output_is_started()) {
         const uint32_t active_rate = g_task_sample_rate_hz > 0U ? g_task_sample_rate_hz : 48000U;
@@ -3802,6 +3846,9 @@ static void audio_task_handle_video_mp3_stop(AudioRequest *request)
 static void audio_task_service_video_mp3()
 {
     if (!g_video_mp3_active || !mp3_decoder_is_open(&g_video_mp3_decoder)) return;
+
+    // 即使暂停或处于 A/V Start Barrier，也允许立即应用 Video 音量变化。
+    audio_task_apply_pending_video_mp3_volume();
 
     if (!g_video_mp3_start_released || g_video_mp3_paused) {
         // Start Barrier或Video暂停期间只维持稳定的静音I2S时钟，不读取Bridge、不推进decoder/submitted clock。
@@ -7106,6 +7153,26 @@ bool audio_service_video_mp3_stop(bool wait)
 {
     AudioRequest *request = audio_request_create(AudioCommandType::VideoMp3Stop, wait);
     return audio_service_submit(request, wait);
+}
+
+bool audio_service_video_mp3_set_volume(uint8_t percent)
+{
+    if (percent > 100U) percent = 100U;
+    portENTER_CRITICAL(&g_video_mp3_volume_mux);
+    g_video_mp3_volume_percent = percent;
+    g_video_mp3_volume_initialized = true;
+    g_video_mp3_volume_pending = true;
+    portEXIT_CRITICAL(&g_video_mp3_volume_mux);
+    return true;
+}
+
+bool audio_service_video_mp3_get_volume(uint8_t *out_percent)
+{
+    if (out_percent == nullptr) return false;
+    portENTER_CRITICAL(&g_video_mp3_volume_mux);
+    *out_percent = g_video_mp3_volume_percent;
+    portEXIT_CRITICAL(&g_video_mp3_volume_mux);
+    return true;
 }
 
 bool audio_service_video_mp3_get_clock(AudioVideoClockSnapshot *out_snapshot)
