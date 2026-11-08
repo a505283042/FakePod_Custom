@@ -123,6 +123,10 @@ $ffmpeg = Find-Tool "ffmpeg"
 $script:g_input_duration = 0
 # 批量模式：一次可多选输入视频；g_inputs 保存选中的完整列表。
 $script:g_inputs = @()
+# 记录最近一次索引选择，失败后可直接重试，不必重新打开文件选择窗口。
+$script:g_last_index_targets = @()
+$script:g_last_index_failures = @()
+$script:g_last_index_directory = ""
 # 输出目录默认跟随第一个输入文件；用户手动选择后，切换输入列表时保留该目录。
 $script:g_output_dir_user_selected = $false
 $script:g_updating_output_dir = $false
@@ -648,83 +652,169 @@ $lblTools.Size = New-Object System.Drawing.Size(100,28)
 $lblTools.TextAlign = "MiddleRight"
 $form.Controls.Add($lblTools)
 
-# 索引扫描在后台线程执行，UI 线程只接收进度并更新控件。
+# 索引扫描在独立后台线程执行；WinForms Timer 在 UI 线程轮询线程安全的进度和完成标志。
+# 完成检测不依赖 BackgroundWorker 或 SynchronizationContext 回调。
 $script:g_indexWorker = New-Object FakePod.VideoTools.SidecarIndexWorker
-$script:g_indexWorkerDone = $false
-$script:g_indexWorkerShowDialog = $false
-$script:g_indexWorkerResults = @()
-$script:g_indexWorkerError = ""
+$script:g_indexWorkerState = [hashtable]::Synchronized(@{
+    Active = $false
+    Done = $false
+    ShowDialog = $false
+    Results = @()
+    Error = ""
+})
+$script:g_indexWorkerUiTimer = New-Object System.Windows.Forms.Timer
+$script:g_indexWorkerUiTimer.Interval = 120
 
-$script:g_indexWorker.add_ProgressChanged({
+$indexWorker = $script:g_indexWorker
+$indexWorkerState = $script:g_indexWorkerState
+$indexWorkerUiTimer = $script:g_indexWorkerUiTimer
+$indexForm = $form
+$indexProgress = $progress
+$indexStatus = $lblStatus
+$indexBtnSidecar = $btnSidecar
+$indexBtnConvert = $btnConvert
+$indexBtnInput = $btnInput
+$indexBtnOutput = $btnOutput
+$indexBtnSourceDir = $btnSourceDir
+$indexTxtOutputDir = $txtOutputDir
+
+$indexWorkerUiTimer.add_Tick({
     param($sender, $e)
-    if ($progress.Style -ne [System.Windows.Forms.ProgressBarStyle]::Blocks) {
-        $progress.Style = [System.Windows.Forms.ProgressBarStyle]::Blocks
-    }
-    $value = [Math]::Max(0, [Math]::Min(100, [int]$e.ProgressPercentage))
-    $progress.Value = $value
-    if ($e.UserState) { $lblStatus.Text = [string]$e.UserState }
-}.GetNewClosure())
 
-$script:g_indexWorker.add_RunWorkerCompleted({
-    param($sender, $e)
+    if (-not $indexWorkerState.Active) { return }
 
-    $script:g_indexWorkerDone = $true
-    $script:g_indexWorkerError = ""
-    $script:g_indexWorkerResults = @()
+    try {
+        $percentage = [Math]::Max(0, [Math]::Min(100, [int]$indexWorker.ProgressPercentage))
+        if ($indexProgress.Style -ne [System.Windows.Forms.ProgressBarStyle]::Blocks) {
+            $indexProgress.Style = [System.Windows.Forms.ProgressBarStyle]::Blocks
+        }
+        $indexProgress.Value = $percentage
+        if (-not [string]::IsNullOrWhiteSpace($indexWorker.ProgressText)) {
+            $indexStatus.Text = [string]$indexWorker.ProgressText
+        }
 
-    if ($e.Error) {
-        $script:g_indexWorkerError = $e.Error.Exception.Message
-    } elseif ($null -ne $e.Result) {
-        $script:g_indexWorkerResults = @($e.Result)
-    }
+        # 独立工作线程先写入结果/错误，再将 IsCompleted 置为 true；不依赖 WinForms 同步上下文。
+        if (-not $indexWorker.IsCompleted) { return }
 
-    if ($script:g_indexWorkerShowDialog) {
-        $btnSidecar.Enabled = $true
-        $btnConvert.Enabled = $true
-        $btnInput.Enabled = $true
-        $btnOutput.Enabled = $true
-        $btnSourceDir.Enabled = $true
-        $txtOutputDir.Enabled = $true
-        $form.Cursor = [System.Windows.Forms.Cursors]::Default
+        $indexWorkerUiTimer.Stop()
+        $indexWorkerState.Active = $false
+        $indexWorkerState.Done = $true
+        $indexWorkerState.Error = [string]$indexWorker.LastError
+        $indexWorkerState.Results = @($indexWorker.LastResults)
 
-        if ($script:g_indexWorkerError) {
-            $lblStatus.Text = "索引生成失败：$($script:g_indexWorkerError)"
-            [System.Windows.Forms.MessageBox]::Show(
-                $script:g_indexWorkerError, "索引生成失败")
-        } else {
-            $successes = @($script:g_indexWorkerResults | Where-Object { $_.Ok })
-            $failures = @($script:g_indexWorkerResults | Where-Object { -not $_.Ok })
+        if (-not $indexWorkerState.ShowDialog) { return }
 
-            if ($script:g_indexWorkerResults.Count -eq 1 -and $successes.Count -eq 1) {
-                $one = $script:g_indexWorkerResults[0]
-                $lblStatus.Text = "V2 索引已生成：$($one.Path)"
+        # 必须在 UI 线程恢复鼠标和按钮状态；无论成功或失败都执行。
+        try {
+            $indexForm.UseWaitCursor = $false
+            [System.Windows.Forms.Application]::UseWaitCursor = $false
+            $indexForm.Cursor = [System.Windows.Forms.Cursors]::Default
+            [System.Windows.Forms.Cursor]::Current = [System.Windows.Forms.Cursors]::Default
+            $indexBtnSidecar.Enabled = $true
+            $indexBtnConvert.Enabled = $true
+            $indexBtnInput.Enabled = $true
+            $indexBtnOutput.Enabled = $true
+            $indexBtnSourceDir.Enabled = $true
+            $indexTxtOutputDir.Enabled = $true
+
+            if (-not [string]::IsNullOrWhiteSpace($indexWorkerState.Error)) {
+                # 线程级异常无法精确区分失败文件，保留本批次全部源路径供用户重试。
+                $script:g_last_index_failures = @($script:g_last_index_targets)
+                $indexBtnSidecar.Text = "重试索引失败项 ($($script:g_last_index_failures.Count))"
+                $indexStatus.Text = "索引生成失败：$($indexWorkerState.Error)"
                 [System.Windows.Forms.MessageBox]::Show(
-                    "V2 索引已生成`r`n`r`n$($one.Path)`r`n`r`n$($one.Message)",
-                    "索引生成完成")
+                    $indexWorkerState.Error, "索引生成失败")
             } else {
-                $lblStatus.Text = "索引生成完成：成功 $($successes.Count) / 共 $($script:g_indexWorkerResults.Count)"
-                $summary = "成功 $($successes.Count) 个，失败 $($failures.Count) 个。"
-                if ($failures.Count -gt 0) {
-                    $details = @($failures | ForEach-Object {
-                        "$([System.IO.Path]::GetFileName($_.Path))：$($_.Message)"
-                    })
-                    $summary += "`r`n`r`n失败明细：`r`n" + ($details -join "`r`n")
+                $successes = @($indexWorkerState.Results | Where-Object { $_ -and $_.Ok })
+                $failures = @($indexWorkerState.Results | Where-Object { $_ -and -not $_.Ok })
+                # 只保留失败文件的源 AVI 完整路径；下次点击可直接重试这些文件。
+                $script:g_last_index_failures = @($failures | ForEach-Object {
+                    if (-not [string]::IsNullOrWhiteSpace($_.SourcePath)) { $_.SourcePath }
+                } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                if ($script:g_last_index_failures.Count -gt 0) {
+                    $indexBtnSidecar.Text = "重试索引失败项 ($($script:g_last_index_failures.Count))"
+                } else {
+                    $indexBtnSidecar.Text = "生成 .fvix 索引(可多选)"
                 }
-                [System.Windows.Forms.MessageBox]::Show($summary, "批量生成完成")
+
+                if ($indexWorkerState.Results.Count -eq 1) {
+                    $one = $indexWorkerState.Results[0]
+                    if ($one -and $one.Ok) {
+                        $indexStatus.Text = "V2 索引已生成：$($one.Path)"
+                        [System.Media.SystemSounds]::Asterisk.Play()
+                        [System.Windows.Forms.MessageBox]::Show(
+                            "V2 索引已生成`r`n`r`n$($one.Path)`r`n`r`n$($one.Message)",
+                            "索引生成完成")
+                    } else {
+                        $message = if ($one) { $one.Message } else { "扫描器没有返回结果。" }
+                        $indexStatus.Text = "索引生成失败：$message"
+                        [System.Windows.Forms.MessageBox]::Show($message, "索引生成失败")
+                    }
+                } else {
+                    $indexStatus.Text = "索引生成完成：成功 $($successes.Count) / 共 $($indexWorkerState.Results.Count)"
+                    $summary = "成功 $($successes.Count) 个，失败 $($failures.Count) 个。"
+                    if ($failures.Count -gt 0) {
+                        $details = @($failures | ForEach-Object {
+                            $indexName = [System.IO.Path]::GetFileName($_.Path)
+                            "$indexName：`r`n$($_.Message)"
+                        })
+                        $summary += "`r`n`r`n失败明细：`r`n" + ($details -join "`r`n")
+                    }
+                    [System.Media.SystemSounds]::Asterisk.Play()
+                    [System.Windows.Forms.MessageBox]::Show($summary, "批量生成完成")
+                }
             }
+        } finally {
+            $indexForm.UseWaitCursor = $false
+            [System.Windows.Forms.Application]::UseWaitCursor = $false
+            $indexForm.Cursor = [System.Windows.Forms.Cursors]::Default
+            [System.Windows.Forms.Cursor]::Current = [System.Windows.Forms.Cursors]::Default
+        }
+    } catch {
+        $indexWorkerUiTimer.Stop()
+        $indexWorkerState.Active = $false
+        $indexWorkerState.Done = $true
+        $indexWorkerState.Error = $_.Exception.Message
+        # UI 轮询/显示异常时同样保留源路径，避免失败后丢失可重试文件。
+        $script:g_last_index_failures = @($script:g_last_index_targets)
+        if ($script:g_last_index_failures.Count -gt 0) {
+            $indexBtnSidecar.Text = "重试索引失败项 ($($script:g_last_index_failures.Count))"
+        }
+        if ($indexWorkerState.ShowDialog) {
+            $indexForm.UseWaitCursor = $false
+            [System.Windows.Forms.Application]::UseWaitCursor = $false
+            $indexForm.Cursor = [System.Windows.Forms.Cursors]::Default
+            [System.Windows.Forms.Cursor]::Current = [System.Windows.Forms.Cursors]::Default
+            $indexBtnSidecar.Enabled = $true
+            $indexBtnConvert.Enabled = $true
+            $indexBtnInput.Enabled = $true
+            $indexBtnOutput.Enabled = $true
+            $indexBtnSourceDir.Enabled = $true
+            $indexTxtOutputDir.Enabled = $true
+            $indexStatus.Text = "索引任务结束时发生界面错误：$($indexWorkerState.Error)"
+            [System.Windows.Forms.MessageBox]::Show($indexWorkerState.Error, "索引任务错误")
         }
     }
 }.GetNewClosure())
 
-function Start-SidecarIndexBatch([string[]]$targets, [switch]$Wait, [switch]$Silent) {
-    if ($script:g_indexWorker.IsBusy) {
+function Start-SidecarIndexBatch([string[]]$targets, [switch]$Wait, [switch]$Silent, [switch]$Retry) {
+    $state = $script:g_indexWorkerState
+    if (-not $Retry) {
+        $script:g_last_index_targets = @($targets)
+        $script:g_last_index_failures = @()
+        if ($targets.Count -gt 0) {
+            $script:g_last_index_directory = [System.IO.Path]::GetDirectoryName([string]$targets[0])
+        }
+    }
+    if ($script:g_indexWorker.IsRunning -or $state.Active) {
         throw "索引生成任务正在运行，请稍候。"
     }
 
-    $script:g_indexWorkerDone = $false
-    $script:g_indexWorkerResults = @()
-    $script:g_indexWorkerError = ""
-    $script:g_indexWorkerShowDialog = -not $Silent
+    $state.Active = $true
+    $state.Done = $false
+    $state.ShowDialog = -not $Silent
+    $state.Results = @()
+    $state.Error = ""
 
     $progress.Style = [System.Windows.Forms.ProgressBarStyle]::Blocks
     $progress.Value = 0
@@ -735,23 +825,37 @@ function Start-SidecarIndexBatch([string[]]$targets, [switch]$Wait, [switch]$Sil
         $btnOutput.Enabled = $false
         $btnSourceDir.Enabled = $false
         $txtOutputDir.Enabled = $false
+        $form.UseWaitCursor = $true
+        [System.Windows.Forms.Application]::UseWaitCursor = $true
         $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        [System.Windows.Forms.Cursor]::Current = [System.Windows.Forms.Cursors]::WaitCursor
     }
 
-    $script:g_indexWorker.RunWorkerAsync([string[]]$targets)
+    try {
+        $script:g_indexWorker.StartAsync([string[]]$targets)
+        $script:g_indexWorkerUiTimer.Start()
+    } catch {
+        $state.Active = $false
+        $state.Done = $true
+        $state.Error = $_.Exception.Message
+        $script:g_indexWorkerUiTimer.Stop()
+        $form.UseWaitCursor = $false
+        [System.Windows.Forms.Application]::UseWaitCursor = $false
+        $form.Cursor = [System.Windows.Forms.Cursors]::Default
+        [System.Windows.Forms.Cursor]::Current = [System.Windows.Forms.Cursors]::Default
+        throw
+    }
 
     if ($Wait) {
-        # 转换流程需要等待索引结果，但继续泵送 WinForms 消息，界面不会冻结。
-        while (-not $script:g_indexWorkerDone) {
+        # 转换流程等待索引结果时仍泵送 WinForms 消息，由 UI Timer 统一完成收尾。
+        while (-not $state.Done) {
             [System.Windows.Forms.Application]::DoEvents()
-            Start-Sleep -Milliseconds 40
+            Start-Sleep -Milliseconds 30
         }
-        return ,$script:g_indexWorkerResults
+        return ,$state.Results
     }
 }
 
-# 输出文件名采用简短规则：源文件名_FP.avi。
-# 单文件和批量文件统一写入用户选择的目标目录。
 function Get-DefaultOutputPath([string]$inputPath, [string]$outputDirectory) {
     if ([string]::IsNullOrWhiteSpace($outputDirectory)) {
         $outputDirectory = [System.IO.Path]::GetDirectoryName($inputPath)
@@ -1018,27 +1122,65 @@ $btnOpen.Add_Click({
     }
 })
 
-# 补生成 .fvix V2 索引：弹出文件选择框（支持多选），优先从目标输出目录打开。
+# 补生成 .fvix V2 索引。每个 AVI 串行扫描并立即提交自己的 .fvix；失败文件保留以便重试。
 $btnSidecar.Add_Click({
-    $dlg = New-Object System.Windows.Forms.OpenFileDialog
-    $dlg.Title = "选择要生成 .fvix V2 索引的 AVI（可多选）"
-    $dlg.Filter = "AVI 视频 (*.avi)|*.avi|所有文件 (*.*)|*.*"
-    $dlg.Multiselect = $true
-    if (-not [string]::IsNullOrWhiteSpace($txtOutputDir.Text) -and
-        (Test-Path -LiteralPath $txtOutputDir.Text -PathType Container)) {
-        $dlg.InitialDirectory = $txtOutputDir.Text
-    } elseif (-not [string]::IsNullOrWhiteSpace($txtInput.Text) -and
-        (Test-Path -LiteralPath $txtInput.Text)) {
-        $dlg.InitialDirectory = [System.IO.Path]::GetDirectoryName($txtInput.Text)
-    }
-    if ($dlg.ShowDialog() -ne "OK") { return }
+    $targets = @()
+    $retryOnly = $false
 
-    $targets = @($dlg.FileNames)
-    if ($targets.Count -eq 0) { return }
+    # 上一批有失败项时，允许直接重试失败文件，或重新选择一批 AVI。
+    if ($script:g_last_index_failures.Count -gt 0) {
+        $choice = [System.Windows.Forms.MessageBox]::Show(
+            "上一批有 $($script:g_last_index_failures.Count) 个 AVI 未生成索引。`r`n`r`n是：只重试失败文件`r`n否：重新选择 AVI 文件`r`n取消：返回",
+            "索引生成",
+            [System.Windows.Forms.MessageBoxButtons]::YesNoCancel,
+            [System.Windows.Forms.MessageBoxIcon]::Question,
+            [System.Windows.Forms.MessageBoxDefaultButton]::Button1)
+
+        if ($choice -eq [System.Windows.Forms.DialogResult]::Cancel) { return }
+        if ($choice -eq [System.Windows.Forms.DialogResult]::Yes) {
+            $targets = @($script:g_last_index_failures)
+            $retryOnly = $true
+        }
+    }
+
+    if (-not $retryOnly) {
+        $dlg = New-Object System.Windows.Forms.OpenFileDialog
+        $dlg.Title = "选择要生成 .fvix V2 索引的 AVI（可多选）"
+        # 只允许选择 AVI，避免误把 .fvix 索引作为输入文件。
+        $dlg.Filter = "AVI 视频 (*.avi)|*.avi"
+        $dlg.Multiselect = $true
+        # 失败后重新选择时仍回到上次目录，不会丢失文件夹位置。
+        if (-not [string]::IsNullOrWhiteSpace($script:g_last_index_directory) -and
+            (Test-Path -LiteralPath $script:g_last_index_directory -PathType Container)) {
+            $dlg.InitialDirectory = $script:g_last_index_directory
+        } elseif (-not [string]::IsNullOrWhiteSpace($txtOutputDir.Text) -and
+            (Test-Path -LiteralPath $txtOutputDir.Text -PathType Container)) {
+            $dlg.InitialDirectory = $txtOutputDir.Text
+        } elseif (-not [string]::IsNullOrWhiteSpace($txtInput.Text) -and
+            (Test-Path -LiteralPath $txtInput.Text)) {
+            $dlg.InitialDirectory = [System.IO.Path]::GetDirectoryName($txtInput.Text)
+        }
+
+        # Windows 标准文件选择框在点击“打开”后会关闭，这是系统默认行为；
+        # 任务在关闭后才开始。失败路径会保存在主窗口状态中，不会丢失或要求重新定位目录。
+        if ($dlg.ShowDialog() -ne "OK") { return }
+        $targets = @($dlg.FileNames | ForEach-Object {
+            [System.IO.Path]::GetFullPath([string]$_)
+        })
+        if ($targets.Count -eq 0) { return }
+        $script:g_last_index_targets = @($targets)
+        $script:g_last_index_failures = @()
+        $script:g_last_index_directory = [System.IO.Path]::GetDirectoryName([string]$targets[0])
+    }
 
     try {
-        $lblStatus.Text = "索引任务已启动，正在后台扫描…"
-        Start-SidecarIndexBatch -targets $targets
+        if ($retryOnly) {
+            $lblStatus.Text = "正在重试 $($targets.Count) 个失败 AVI；逐个扫描并立即写入索引…"
+            Start-SidecarIndexBatch -targets $targets -Retry
+        } else {
+            $lblStatus.Text = "已选择 $($targets.Count) 个 AVI；将逐个扫描，每个完成后立即写入 .fvix…"
+            Start-SidecarIndexBatch -targets $targets
+        }
     } catch {
         $btnSidecar.Enabled = $true
         $btnConvert.Enabled = $true
@@ -1046,7 +1188,10 @@ $btnSidecar.Add_Click({
         $btnOutput.Enabled = $true
         $btnSourceDir.Enabled = $true
         $txtOutputDir.Enabled = $true
+        $form.UseWaitCursor = $false
+        [System.Windows.Forms.Application]::UseWaitCursor = $false
         $form.Cursor = [System.Windows.Forms.Cursors]::Default
+        [System.Windows.Forms.Cursor]::Current = [System.Windows.Forms.Cursors]::Default
         $lblStatus.Text = "索引生成失败：$($_.Exception.Message)"
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "索引生成失败")
     }
@@ -1143,7 +1288,7 @@ $btnConvert.Add_Click({
             }
 
             # 转码开始前先移除目标文件的旧索引，防止 FFmpeg 中途失败后留下可被误用的旧 V1 索引。
-            $outSidecarPath = $outPath + ".fvix"
+            $outSidecarPath = [System.IO.Path]::ChangeExtension($outPath, ".fvix")
             if (Test-Path -LiteralPath $outSidecarPath) {
                 try {
                     Remove-Item -LiteralPath $outSidecarPath -Force -ErrorAction Stop
@@ -1178,8 +1323,8 @@ $btnConvert.Add_Click({
                         $sidecarCount++
                     } elseif ($indexResults.Count -gt 0) {
                         Write-Warning "侧车索引生成失败（不影响播放）：$($indexResults[0].Message)"
-                    } elseif ($script:g_indexWorkerError) {
-                        Write-Warning "侧车索引生成失败（不影响播放）：$($script:g_indexWorkerError)"
+                    } elseif ($script:g_indexWorkerState.Error) {
+                        Write-Warning "侧车索引生成失败（不影响播放）：$($script:g_indexWorkerState.Error)"
                     }
                 } catch {
                     Write-Warning "侧车索引生成失败（不影响播放）：$($_.Exception.Message)"
@@ -1224,7 +1369,10 @@ $btnConvert.Add_Click({
         $btnSourceDir.Enabled = $true
         $txtOutputDir.Enabled = $true
         $btnSidecar.Enabled = $true
+        $form.UseWaitCursor = $false
+        [System.Windows.Forms.Application]::UseWaitCursor = $false
         $form.Cursor = [System.Windows.Forms.Cursors]::Default
+        [System.Windows.Forms.Cursor]::Current = [System.Windows.Forms.Cursors]::Default
     }
 })
 

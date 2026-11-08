@@ -20,7 +20,7 @@ struct Entry {
     uint32_t audio_bytes_before;
 };
 
-// 加载侧车索引文件。sidecar_path 通常为 video_path + ".fvix"。
+// 加载侧车索引文件。sidecar_path 由 AVI 文件名替换扩展名为 .fvix 得到。
 // V2 会校验 AVI 文件长度和抽样 CRC32；同时用源视频总帧数检查索引是否覆盖全片。
 // V1 仍可读取，但不具备来源指纹和累计音频字节锚点；不完整索引会被拒绝。
 esp_err_t load(const char *sidecar_path, VideoMediaIo::Context *source_io,

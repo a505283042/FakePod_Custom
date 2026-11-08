@@ -1,6 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.ComponentModel;
+using System.Threading;
 using System.IO;
 
 namespace FakePod.VideoTools
@@ -9,22 +9,131 @@ namespace FakePod.VideoTools
     {
         public bool Ok { get; set; }
         public string Path { get; set; }
+        public string SourcePath { get; set; }
         public int Count { get; set; }
         public string Message { get; set; }
     }
 
-    // DoWork 直接在 .NET 工作线程中运行 C# 扫描器，避免从后台线程回调 PowerShell 脚本块。
-    public sealed class SidecarIndexWorker : BackgroundWorker
+    // 使用独立后台线程扫描 AVI；完成状态由本类直接发布，不依赖界面同步上下文回调。
+    public sealed class SidecarIndexWorker
     {
-        public SidecarIndexWorker()
+        private readonly object _stateLock = new object();
+        private int _progressPercentage;
+        private string _progressText = "";
+        private SidecarIndexResult[] _lastResults = new SidecarIndexResult[0];
+        private string _lastError = "";
+        private bool _isRunning;
+        private bool _isCompleted;
+
+        public int ProgressPercentage
         {
-            WorkerReportsProgress = true;
-            WorkerSupportsCancellation = false;
+            get { lock (_stateLock) return _progressPercentage; }
         }
 
-        protected override void OnDoWork(DoWorkEventArgs e)
+        public string ProgressText
         {
-            e.Result = SidecarIndexGenerator.GenerateBatch((string[])e.Argument, this);
+            get { lock (_stateLock) return _progressText; }
+        }
+
+        public SidecarIndexResult[] LastResults
+        {
+            get
+            {
+                lock (_stateLock)
+                    return (SidecarIndexResult[])_lastResults.Clone();
+            }
+        }
+
+        public string LastError
+        {
+            get { lock (_stateLock) return _lastError; }
+        }
+
+        public bool IsRunning
+        {
+            get { lock (_stateLock) return _isRunning; }
+        }
+
+        public bool IsCompleted
+        {
+            get { lock (_stateLock) return _isCompleted; }
+        }
+
+        public void SetProgress(int percentage, string text)
+        {
+            lock (_stateLock)
+            {
+                _progressPercentage = Math.Max(0, Math.Min(100, percentage));
+                _progressText = text ?? "";
+            }
+        }
+
+        public void StartAsync(string[] aviPaths)
+        {
+            if (aviPaths == null || aviPaths.Length == 0)
+                throw new ArgumentException("没有选择需要生成索引的 AVI 文件。", "aviPaths");
+
+            Thread thread = new Thread(new ThreadStart(delegate()
+            {
+                try
+                {
+                    SidecarIndexResult[] results = SidecarIndexGenerator.GenerateBatch(aviPaths, this);
+                    lock (_stateLock)
+                    {
+                        _lastResults = results ?? new SidecarIndexResult[0];
+                        _progressPercentage = 100;
+                        if (_lastResults.Length == 0 && String.IsNullOrEmpty(_lastError))
+                            _lastError = "索引扫描结束，但没有返回任何文件结果。";
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lock (_stateLock)
+                    {
+                        _lastError = ex.Message;
+                    }
+                }
+                finally
+                {
+                    // 先写入结果/错误，再发布完成标志；UI Timer 读取时通过同一把锁获得完整状态。
+                    lock (_stateLock)
+                    {
+                        _isRunning = false;
+                        _isCompleted = true;
+                    }
+                }
+            }));
+
+            thread.IsBackground = true;
+            thread.Name = "FakePod FVIX Index Generator";
+
+            // 线程对象创建成功后再标记 Running，避免线程创建失败时界面永远等待。
+            lock (_stateLock)
+            {
+                if (_isRunning)
+                    throw new InvalidOperationException("索引生成任务正在运行，请稍候。");
+                _progressPercentage = 0;
+                _progressText = "准备启动索引扫描…";
+                _lastResults = new SidecarIndexResult[0];
+                _lastError = "";
+                _isRunning = true;
+                _isCompleted = false;
+            }
+
+            try
+            {
+                thread.Start();
+            }
+            catch (Exception ex)
+            {
+                lock (_stateLock)
+                {
+                    _lastError = ex.Message;
+                    _isRunning = false;
+                    _isCompleted = true;
+                }
+                throw;
+            }
         }
     }
 
@@ -146,10 +255,10 @@ namespace FakePod.VideoTools
             return new string(chars);
         }
 
-        private static void Report(BackgroundWorker worker, int fileIndex, int fileCount,
+        private static void Report(SidecarIndexWorker worker, int fileIndex, int fileCount,
             int localPercent, string fileName, string message)
         {
-            if (worker == null || !worker.WorkerReportsProgress)
+            if (worker == null)
                 return;
 
             int total = Math.Max(1, fileCount);
@@ -157,10 +266,10 @@ namespace FakePod.VideoTools
             int overall = (fileIndex * 100 + local) / total;
             string text = String.Format("{0} ({1}/{2})：{3}",
                 fileName, fileIndex + 1, total, message);
-            worker.ReportProgress(Math.Max(0, Math.Min(100, overall)), text);
+            worker.SetProgress(Math.Max(0, Math.Min(100, overall)), text);
         }
 
-        public static SidecarIndexResult[] GenerateBatch(string[] aviPaths, BackgroundWorker worker)
+        public static SidecarIndexResult[] GenerateBatch(string[] aviPaths, SidecarIndexWorker worker)
         {
             if (aviPaths == null)
                 return new SidecarIndexResult[0];
@@ -168,42 +277,61 @@ namespace FakePod.VideoTools
             SidecarIndexResult[] results = new SidecarIndexResult[aviPaths.Length];
             for (int i = 0; i < aviPaths.Length; i++)
             {
+                // 严格逐文件处理：当前 AVI 完整扫描、写入临时 FVIX 并提交正式 .fvix 后，
+                // Generate 才会返回；此时才打开下一个 AVI。单文件异常由 Generate 捕获为失败结果，
+                // 不会中断后续文件，也不会撤销此前已经成功生成的索引。
                 results[i] = Generate(aviPaths[i], worker, i, aviPaths.Length);
             }
             return results;
         }
 
-        public static SidecarIndexResult Generate(string aviPath, BackgroundWorker worker,
+        public static SidecarIndexResult Generate(string aviPath, SidecarIndexWorker worker,
             int fileIndex, int fileCount)
         {
-            string outputPath = String.IsNullOrWhiteSpace(aviPath) ? "" : aviPath + ".fvix";
-            string tempPath = outputPath + ".tmp";
-            string fileName = String.IsNullOrWhiteSpace(aviPath)
-                ? "AVI" : System.IO.Path.GetFileName(aviPath);
-
+            string fullAviPath = "";
+            string outputPath = "";
+            string tempPath = "";
+            string fileName = "AVI";
+            string stage = "准备源文件路径";
             SidecarIndexResult result = new SidecarIndexResult();
             int generatedCount = 0;
             result.Ok = false;
-            result.Path = outputPath;
+            result.Path = "";
+            result.SourcePath = aviPath ?? "";
             result.Count = 0;
             result.Message = "";
 
             try
             {
-                if (String.IsNullOrWhiteSpace(aviPath) || !File.Exists(aviPath))
-                    throw new FileNotFoundException("AVI 文件不存在");
+                if (String.IsNullOrWhiteSpace(aviPath))
+                    throw new ArgumentException("没有提供 AVI 源文件路径。");
+
+                // 统一为绝对路径，避免批量选择后相对路径或当前目录变化影响后台线程。
+                fullAviPath = Path.GetFullPath(aviPath.Trim());
+                result.SourcePath = fullAviPath;
+                fileName = Path.GetFileName(fullAviPath);
+
+                // 只允许以 AVI 为输入；避免误选 .fvix 时把输入索引当作输出文件删除。
+                if (!String.Equals(Path.GetExtension(fullAviPath), ".avi", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("选中的文件不是 AVI（仅接受 .avi）：" + fullAviPath);
+
+                outputPath = Path.ChangeExtension(fullAviPath, ".fvix");
+                tempPath = outputPath + ".tmp";
+                result.Path = outputPath;
 
                 Report(worker, fileIndex, fileCount, 0, fileName, "正在打开 AVI…");
 
-                // 先移除旧索引；生成失败时不会留下可能不匹配当前 AVI 的旧索引。
-                if (File.Exists(outputPath))
-                    File.Delete(outputPath);
-                if (File.Exists(tempPath))
-                    File.Delete(tempPath);
-
-                using (FileStream stream = new FileStream(aviPath, FileMode.Open, FileAccess.Read,
+                // 直接打开源文件，不用 File.Exists 预判；后者会把设备离线、权限不足等情况误报为文件不存在。
+                // 先成功打开 AVI，再处理临时索引，避免路径异常时误删已有索引。
+                stage = "打开 AVI 源文件";
+                using (FileStream stream = new FileStream(fullAviPath, FileMode.Open, FileAccess.Read,
                     FileShare.Read, 64 * 1024, FileOptions.SequentialScan))
                 {
+                    stage = "检查索引临时文件";
+                    if (File.Exists(tempPath))
+                        File.Delete(tempPath);
+
+                    stage = "扫描 AVI 结构并生成索引";
                     long fileLength = stream.Length;
                     if (fileLength < 12 || fileLength > MaxFileLength)
                         throw new InvalidDataException("AVI 文件长度超出 FVIX V2 的 32 位偏移范围");
@@ -469,9 +597,11 @@ namespace FakePod.VideoTools
                         throw new InvalidDataException("索引条目超过设备端上限 100000，无法安全加载到 PSRAM");
                     generatedCount = entries.Count;
 
+                    stage = "计算 AVI 来源指纹";
                     Report(worker, fileIndex, fileCount, 94, fileName, "正在计算 AVI 来源指纹…");
                     uint sourceCrc32 = ComputeSampleCrc32(reader, fileLength);
 
+                    stage = "写入 FVIX 临时索引";
                     Report(worker, fileIndex, fileCount, 97, fileName, "正在写入 FVIX V2 索引…");
                     using (FileStream output = new FileStream(tempPath, FileMode.Create, FileAccess.Write,
                         FileShare.None, 64 * 1024, FileOptions.SequentialScan))
@@ -495,15 +625,41 @@ namespace FakePod.VideoTools
                     }
                 }
 
+                // 新索引完整写入临时文件后才替换旧索引；扫描失败不会破坏原有可用索引。
+                stage = "提交 FVIX 索引文件";
                 if (File.Exists(outputPath))
-                    File.Delete(outputPath);
-                File.Move(tempPath, outputPath);
+                {
+                    // 不依赖 File.Replace，兼容 FAT32 等外置盘文件系统。
+                    string backupPath = outputPath + ".bak";
+                    if (File.Exists(backupPath))
+                        File.Delete(backupPath);
+                    File.Move(outputPath, backupPath);
+                    try
+                    {
+                        File.Move(tempPath, outputPath);
+                        if (File.Exists(backupPath))
+                        {
+                            try { File.Delete(backupPath); }
+                            catch { /* 新索引已提交；备份清理失败不应误报索引生成失败。 */ }
+                        }
+                    }
+                    catch
+                    {
+                        if (!File.Exists(outputPath) && File.Exists(backupPath))
+                            File.Move(backupPath, outputPath);
+                        throw;
+                    }
+                }
+                else
+                {
+                    File.Move(tempPath, outputPath);
+                }
 
                 result.Ok = true;
                 result.Count = generatedCount;
                 result.Message = String.Format(
                     "V2 索引已生成：{0:N0} 条，文件长度 {1:N0} 字节；支持全部 OpenDML movi 段",
-                    result.Count, new FileInfo(aviPath).Length);
+                    result.Count, new FileInfo(fullAviPath).Length);
                 Report(worker, fileIndex, fileCount, 100, fileName, "索引生成完成：" + result.Count + " 条");
                 return result;
             }
@@ -517,7 +673,9 @@ namespace FakePod.VideoTools
                 catch { }
 
                 result.Ok = false;
-                result.Message = ex.Message;
+                string sourceDescription = String.IsNullOrWhiteSpace(fullAviPath) ? (aviPath ?? "（空路径）") : fullAviPath;
+                result.Message = String.Format("阶段：{0}\r\n源 AVI：{1}\r\n错误：{2}（HRESULT=0x{3:X8}）",
+                    stage, sourceDescription, ex.Message, ex.HResult);
                 Report(worker, fileIndex, fileCount, 100, fileName, "索引生成失败：" + ex.Message);
                 return result;
             }

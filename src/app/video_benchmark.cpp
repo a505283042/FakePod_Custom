@@ -25,6 +25,29 @@ namespace VideoBenchmark
 namespace
 {
 
+// 将 AVI 文件扩展名替换为 .fvix；不再尝试旧的 .avi.fvix 命名。
+static bool build_sidecar_path(const char *avi_path, char *out_path, size_t out_size)
+{
+    if (avi_path == nullptr || out_path == nullptr || out_size == 0U) return false;
+
+    const char *dot = strrchr(avi_path, '.');
+    const char *slash = strrchr(avi_path, '/');
+    if (dot == nullptr || (slash != nullptr && dot < slash) || strlen(dot) != 4U) return false;
+
+    const bool is_avi =
+        (dot[1] == 'a' || dot[1] == 'A') &&
+        (dot[2] == 'v' || dot[2] == 'V') &&
+        (dot[3] == 'i' || dot[3] == 'I');
+    if (!is_avi) return false;
+
+    const size_t stem_length = static_cast<size_t>(dot - avi_path);
+    if (stem_length + sizeof(".fvix") > out_size) return false;
+
+    memcpy(out_path, avi_path, stem_length);
+    memcpy(out_path + stem_length, ".fvix", sizeof(".fvix"));
+    return true;
+}
+
 static constexpr size_t kFrameSlotCount = 3U;
 // 24 个 PSRAM 压缩槽中，23 个供视频队列使用（约 1.5 秒@15fps），最后一个 128KB 专供 MP3 chunk。
 static constexpr size_t kCompressedSlotCount = 24U;
@@ -953,21 +976,24 @@ static void benchmark_task(void *arg)
         }
     }
 
-    // 加载侧车索引（用于 seek）。不存在则跳过，seek 不可用但不影响播放。
+    // 加载侧车索引（用于 seek）：仅将 .avi 扩展名替换为 .fvix，不兼容旧的 .avi.fvix。
     if (ret == ESP_OK && generation_current(args->generation)) {
-        char sidecar_path[512];
-        snprintf(sidecar_path, sizeof(sidecar_path), "%s.fvix", args->path);
-        const esp_err_t idx_ret = VideoSeekIndex::load(
-            sidecar_path, &io, source_fps_x100,
-            avi_info.total_frames, avi_info.duration_ms);
-        if (idx_ret == ESP_OK) {
-            ESP_LOGI(TAG, "侧车索引已加载，%u 条目，来源抽样校验=%s，音频字节锚点=%s",
-                VideoSeekIndex::count(),
-                VideoSeekIndex::has_source_fingerprint() ? "通过" : "旧版未验证",
-                VideoSeekIndex::has_audio_byte_anchor() ? "是" : "否");
+        char sidecar_path[512] = {};
+        if (build_sidecar_path(args->path, sidecar_path, sizeof(sidecar_path))) {
+            const esp_err_t idx_ret = VideoSeekIndex::load(
+                sidecar_path, &io, source_fps_x100,
+                avi_info.total_frames, avi_info.duration_ms);
+            if (idx_ret == ESP_OK) {
+                ESP_LOGI(TAG, "侧车索引已加载，%u 条目，来源抽样校验=%s，音频字节锚点=%s",
+                    VideoSeekIndex::count(),
+                    VideoSeekIndex::has_source_fingerprint() ? "通过" : "旧版未验证",
+                    VideoSeekIndex::has_audio_byte_anchor() ? "是" : "否");
+            } else {
+                ESP_LOGW(TAG, "侧车索引不可用（缺失、版本不支持或来源校验失败），seek 不可用: %s",
+                    sidecar_path);
+            }
         } else {
-            ESP_LOGW(TAG, "侧车索引不可用（缺失、版本不支持或来源校验失败），seek 不可用: %s",
-                sidecar_path);
+            ESP_LOGW(TAG, "无法根据 AVI 路径生成 .fvix 索引路径: %s", args->path);
         }
     }
 
