@@ -174,6 +174,15 @@ static void benchmark_controls_notify_presenter();
 static void benchmark_controls_patch_ensure_alloc();
 static void benchmark_controls_patch_free();
 
+static bool benchmark_controls_is_active()
+{
+    bool active = false;
+    portENTER_CRITICAL(&g_video_controls_mux);
+    active = g_video_controls.active;
+    portEXIT_CRITICAL(&g_video_controls_mux);
+    return active;
+}
+
 static void benchmark_controls_hide()
 {
     portENTER_CRITICAL(&g_video_controls_mux);
@@ -187,6 +196,7 @@ static void benchmark_controls_hide()
     gesture_router_set_vertical_adjust_enabled(false);
     gesture_router_set_vertical_adjust_edges_reserved(false);
     gesture_router_set_control_capture(false);
+    gesture_router_set_horizontal_swipe_enabled(true);
 }
 
 static void benchmark_controls_show()
@@ -199,6 +209,8 @@ static void benchmark_controls_show()
     g_video_controls.layout.valid = false;
     portEXIT_CRITICAL(&g_video_controls_mux);
     benchmark_controls_notify_presenter();
+    // 胶囊一显示就屏蔽左右滑动 SEEK，直到浮层关闭。
+    gesture_router_set_horizontal_swipe_enabled(false);
     gesture_router_set_vertical_adjust_enabled(false);
     gesture_router_set_vertical_adjust_edges_reserved(false);
 }
@@ -213,6 +225,8 @@ static void benchmark_controls_select(VideoControlTarget target)
     g_video_controls.layout.valid = false;
     portEXIT_CRITICAL(&g_video_controls_mux);
     benchmark_controls_notify_presenter();
+    // 选中亮度或音量后继续保持 SEEK 屏蔽，只允许纵向调节。
+    gesture_router_set_horizontal_swipe_enabled(false);
     const bool adjust_enabled = target != VideoControlTarget::None;
     gesture_router_set_vertical_adjust_enabled(adjust_enabled);
     gesture_router_set_vertical_adjust_edges_reserved(adjust_enabled);
@@ -248,6 +262,7 @@ static void benchmark_controls_reset_for_video()
     benchmark_controls_notify_presenter();
     gesture_router_set_vertical_adjust_enabled(false);
     gesture_router_set_vertical_adjust_edges_reserved(false);
+    gesture_router_set_horizontal_swipe_enabled(true);
     benchmark_controls_patch_ensure_alloc();
     gesture_router_set_single_tap_enabled(true);
 }
@@ -2255,7 +2270,8 @@ static void benchmark_seek_by_swipe()
 static void benchmark_seek_preview_tick()
 {
     if (g_page != VideoPage::Benchmark || g_risk_prompt_active ||
-        !VideoBenchmark::can_seek()) {
+        !VideoBenchmark::can_seek() || benchmark_controls_is_active()) {
+        // 控制胶囊显示期间不生成 SEEK 预览，也不保留旧的拖动基准。
         g_seek_preview_active = false;
         g_seek_preview_base_valid = false;
         return;

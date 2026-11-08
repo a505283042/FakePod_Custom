@@ -65,6 +65,8 @@ GestureState g_state = {};
 int16_t g_horizontal_trigger_px = kHorizontalTriggerPx;
 uint32_t g_horizontal_min_speed_px_per_sec = kHorizontalMinSpeedPxPerSec;
 bool g_single_tap_enabled = false;
+// 视频控制浮层显示期间临时屏蔽横向手势，避免误触发 SEEK。
+bool g_horizontal_swipe_enabled = true;
 
 static int32_t gesture_abs(int32_t value)
 {
@@ -128,7 +130,9 @@ static void gesture_update_axis_lock(int32_t dx, int32_t dy)
 
     // 一旦某方向明显占优就锁定，之后不会从横向切换成纵向或反过来。
     if (ax * 100 >= ay * 120) {
-        g_state.axis = GestureAxis::Horizontal;
+        if (g_horizontal_swipe_enabled) {
+            g_state.axis = GestureAxis::Horizontal;
+        }
     } else if (ay * 100 >= ax * 120) {
         g_state.axis = GestureAxis::Vertical;
     }
@@ -169,7 +173,8 @@ static UiGestureAction gesture_classify(uint32_t tick_ms)
         return UiGestureAction::None;
     }
 
-    if (g_state.axis == GestureAxis::Horizontal && ax >= g_horizontal_trigger_px &&
+    if (g_horizontal_swipe_enabled && g_state.axis == GestureAxis::Horizontal &&
+        ax >= g_horizontal_trigger_px &&
         ax * 100 >= ay * 135 &&
         gesture_speed_ok(ax, elapsed_ms, g_horizontal_min_speed_px_per_sec)) {
         return dx < 0 ? UiGestureAction::SwipeLeft : UiGestureAction::SwipeRight;
@@ -191,6 +196,21 @@ void gesture_router_set_video_seek_mode(bool enabled)
         ? kVideoSeekHorizontalTriggerPx : kHorizontalTriggerPx;
     g_horizontal_min_speed_px_per_sec = enabled
         ? kVideoSeekHorizontalMinSpeedPxPerSec : kHorizontalMinSpeedPxPerSec;
+}
+
+void gesture_router_set_horizontal_swipe_enabled(bool enabled)
+{
+    g_horizontal_swipe_enabled = enabled;
+    if (!enabled) {
+        // 关闭横向手势时，丢弃尚未消费的左右滑动作和当前横向方向锁。
+        if (g_state.pending == UiGestureAction::SwipeLeft ||
+            g_state.pending == UiGestureAction::SwipeRight) {
+            g_state.pending = UiGestureAction::None;
+        }
+        if (g_state.axis == GestureAxis::Horizontal) {
+            g_state.axis = GestureAxis::None;
+        }
+    }
 }
 
 void gesture_router_set_single_tap_enabled(bool enabled)
