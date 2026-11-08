@@ -92,7 +92,6 @@ static constexpr int64_t kVideoControlsOverlayHoldUs = 3000000LL;
 static constexpr int32_t kVideoControlsDragFullScalePx = 220;
 static constexpr uint16_t kVideoControlsPatchMaxWidth = 340U;
 static constexpr uint16_t kVideoControlsPatchMaxHeight = 180U;
-static constexpr uint32_t kVideoControlsNotifyBit = 1UL << 0U;
 
 enum class VideoControlTarget : uint8_t { None = 0, Brightness, Volume };
 
@@ -161,6 +160,7 @@ struct VideoControlsPatchInfo
 
 static VideoControlsState g_video_controls = {};
 static portMUX_TYPE g_video_controls_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool g_video_controls_refresh_pending = false;
 static uint8_t *g_video_controls_patch_buffer = nullptr;
 static VideoControlsPatchInfo g_video_controls_patch_info = {};
 static portMUX_TYPE g_video_controls_patch_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -372,11 +372,9 @@ static bool g_present_stop_requested = false;
 
 static void benchmark_controls_notify_presenter()
 {
-    portENTER_CRITICAL(&g_benchmark_ui_mux);
-    if (g_present_running && g_present_task != nullptr) {
-        (void)xTaskNotify(g_present_task, kVideoControlsNotifyBit, eSetBits);
-    }
-    portEXIT_CRITICAL(&g_benchmark_ui_mux);
+    portENTER_CRITICAL(&g_video_controls_mux);
+    g_video_controls_refresh_pending = true;
+    portEXIT_CRITICAL(&g_video_controls_mux);
 }
 
 static void benchmark_controls_patch_ensure_alloc()
@@ -1676,12 +1674,13 @@ static bool benchmark_presenter_wait_if_paused(bool clock_started, int64_t *cloc
 
     const int64_t paused_at_us = esp_timer_get_time();
     while (VideoBenchmark::is_paused() && !benchmark_presenter_should_stop()) {
-        uint32_t notification_value = 0U;
-        const BaseType_t notified = xTaskNotifyWait(
-            0U, kVideoControlsNotifyBit, &notification_value, pdMS_TO_TICKS(1U));
-        if (notified == pdTRUE && (notification_value & kVideoControlsNotifyBit) != 0U) {
-            benchmark_controls_patch_refresh();
-        }
+        bool refresh_controls = false;
+        portENTER_CRITICAL(&g_video_controls_mux);
+        refresh_controls = g_video_controls_refresh_pending;
+        g_video_controls_refresh_pending = false;
+        portEXIT_CRITICAL(&g_video_controls_mux);
+        if (refresh_controls) benchmark_controls_patch_refresh();
+        vTaskDelay(1);
     }
     if (benchmark_presenter_should_stop()) return false;
 
