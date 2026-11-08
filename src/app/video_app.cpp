@@ -2034,6 +2034,9 @@ static void benchmark_presenter_task(void *arg)
             continue;
         }
 
+        // 暂停态 SEEK 的预览帧：只上屏一次，不上音频、不解除 A/V 启动屏障。
+        const bool paused_preview_frame = VideoBenchmark::paused_seek_preview_active();
+
         if (!clock_started) {
             clock_started = true;
             first_pts_ms = frame.pts_ms;
@@ -2237,7 +2240,7 @@ static void benchmark_presenter_task(void *arg)
                 static_cast<unsigned>(frame_width), static_cast<unsigned>(frame_height));
         }
 
-        if (audio_master_expected && !audio_start_barrier_released) {
+        if (audio_master_expected && !audio_start_barrier_released && !paused_preview_frame) {
             // 首张RGB已经ready，BoundedSPI session/黑场也准备完毕；到这里才允许AudioTask
             // 消费Bridge并提交第一块真实PCM。Presenter 与 AudioTask 同在 Core0，AudioTask/P5 优先；
             // JPEG Decode 独占 Core1，从同一边界并行启动。
@@ -2362,8 +2365,16 @@ static void benchmark_presenter_task(void *arg)
             break;
         }
 
+        // 暂停态 SEEK 的预览帧：整帧已写入 LCD，立即回到暂停，并让暂停循环重绘底部浮层。
+        if (paused_preview_frame) {
+            VideoBenchmark::finish_paused_seek_preview();
+            g_pause_seek_patched_active = false;
+            g_pause_seek_patch_last_us = 0LL;
+        }
+
         // SEEK 后音频保持暂停；新位置首帧已真正写入 LCD 后才恢复音频时钟。
-        if (frame.seek_epoch == VideoBenchmark::seek_epoch() &&
+        if (!paused_preview_frame &&
+            frame.seek_epoch == VideoBenchmark::seek_epoch() &&
             VideoBenchmark::seek_audio_resume_pending() &&
             !VideoBenchmark::resume_audio_after_seek()) {
             benchmark_presenter_set_error(ESP_FAIL);

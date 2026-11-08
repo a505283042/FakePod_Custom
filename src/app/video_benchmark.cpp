@@ -182,6 +182,8 @@ static bool g_extract_pause_ack = false;
 static int64_t g_pause_started_us = 0LL;
 static uint32_t g_seek_epoch = 0U;
 static bool g_seek_audio_resume_pending = false;  // SEEK 后首帧显示前保持音频暂停
+// 暂停态 SEEK 后短暂解除冻结，只为把目标位置首帧推上屏，Present 完成后立即回到暂停。
+static bool g_paused_seek_preview = false;
 static esp_err_t g_seek_failure = ESP_OK;  // 本轮 SEEK 致命错误，仅随新播放世代清除
 static QueueHandle_t g_free_queue = nullptr;
 static QueueHandle_t g_ready_queue = nullptr;
@@ -342,6 +344,7 @@ static void publish_task_exit(const Snapshot &snapshot)
     g_paused = false;
     g_extract_pause_ack = false;
     g_pause_started_us = 0LL;
+    g_paused_seek_preview = false;
     g_seek_audio_resume_pending = false;
     g_task = nullptr;
     portEXIT_CRITICAL(&g_mux);
@@ -457,6 +460,7 @@ static void stop_generation(uint32_t generation)
         g_paused = false;
         g_extract_pause_ack = false;
         g_pause_started_us = 0LL;
+        g_paused_seek_preview = false;
         g_seek_audio_resume_pending = false;
     }
     portEXIT_CRITICAL(&g_mux);
@@ -1463,6 +1467,7 @@ esp_err_t start(const char *path, bool allow_fullcanvas_over20, bool music_suspe
     g_paused = false;
     g_extract_pause_ack = false;
     g_pause_started_us = 0LL;
+    g_paused_seek_preview = false;
     g_seek_audio_resume_pending = false;
     g_extract_task = nullptr;
     g_leased_mask = 0U;
@@ -1503,6 +1508,7 @@ void stop()
         g_paused = false;
         g_extract_pause_ack = false;
         g_pause_started_us = 0LL;
+        g_paused_seek_preview = false;
         g_seek_audio_resume_pending = false;
         g_snapshot.state = State::Stopped;
         g_snapshot.paused = false;
@@ -1584,6 +1590,27 @@ bool is_paused()
     paused = g_task != nullptr && g_stop_generation != g_generation && g_paused;
     portEXIT_CRITICAL(&g_mux);
     return paused;
+}
+
+bool paused_seek_preview_active()
+{
+    bool active = false;
+    portENTER_CRITICAL(&g_mux);
+    active = g_paused_seek_preview &&
+        g_task != nullptr && g_stop_generation != g_generation;
+    portEXIT_CRITICAL(&g_mux);
+    return active;
+}
+
+bool finish_paused_seek_preview()
+{
+    portENTER_CRITICAL(&g_mux);
+    const bool was_expected = g_paused_seek_preview;
+    g_paused_seek_preview = false;
+    portEXIT_CRITICAL(&g_mux);
+    if (!was_expected) return true;
+    // 首帧已上屏，立即回到暂停；音频保持暂停，等待用户手动恢复。
+    return set_paused(true);
 }
 
 bool can_seek()
@@ -1673,6 +1700,7 @@ esp_err_t seek(uint32_t target_ms)
             g_paused = false;
             g_extract_pause_ack = false;
             g_pause_started_us = 0LL;
+            g_paused_seek_preview = false;
             g_seek_audio_resume_pending = false;
             g_snapshot.state = State::Failed;
             g_snapshot.result = error;
@@ -1812,9 +1840,23 @@ esp_err_t seek(uint32_t target_ms)
         has_audio ? "等待首帧显示" : "无音轨");
 
     // SEEK 前正在播放时只恢复视频提取/解码；音频保持暂停，直到新位置首帧真正显示。
-    // SEEK 前已经暂停则继续保持暂停，用户手动恢复后仍由首帧显示逻辑释放音频。
-    if (!was_paused && !set_paused(false)) {
-        ESP_LOGE(TAG, "Seek恢复视频失败，终止当前视频");
+    // SEEK 前已经暂停时：短暂恢复提取/解码，仅让目标位置首帧上屏，
+    // Presenter 展示完成后调用 finish_paused_seek_preview() 立即回到暂停。
+    if (!was_paused) {
+        if (!set_paused(false)) {
+            ESP_LOGE(TAG, "Seek恢复视频失败，终止当前视频");
+            return abort_seek(ESP_FAIL);
+        }
+        return ESP_OK;
+    }
+    portENTER_CRITICAL(&g_mux);
+    if (generation == g_generation) g_paused_seek_preview = true;
+    portEXIT_CRITICAL(&g_mux);
+    if (!set_paused(false)) {
+        portENTER_CRITICAL(&g_mux);
+        if (generation == g_generation) g_paused_seek_preview = false;
+        portEXIT_CRITICAL(&g_mux);
+        ESP_LOGE(TAG, "暂停态Seek展示首帧失败，终止当前视频");
         return abort_seek(ESP_FAIL);
     }
     return ESP_OK;
