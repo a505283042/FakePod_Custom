@@ -204,6 +204,7 @@ static void benchmark_controls_patch_ensure_alloc();
 static void benchmark_controls_patch_free();
 static void benchmark_seek_patch_ensure_alloc();
 static void benchmark_seek_patch_free();
+static uint32_t benchmark_seek_base_from_last_pts(uint32_t last_pts_ms);
 
 static bool benchmark_controls_is_active()
 {
@@ -1014,6 +1015,8 @@ static bool benchmark_presenter_wait_stopped(uint32_t timeout_ms)
 // SEEK 完成后的短暂浮层：底部进度条 + “当前时间 / 总时长”，显示 2 秒后自动消失。
 // 浮层直接叠加在 Presenter 合成的 RGB565 帧上，不暂停推流、不影响音频管线。
 static constexpr int64_t kSeekOverlayHoldUs = 2000000LL;
+// 暂停期间进度/时间常驻：给一个很长的有效期，暂停循环退出时再显式关闭。
+static constexpr int64_t kPausedSeekOverlayHoldUs = 86400000000LL;
 static constexpr uint16_t kSeekOverlayMarginX = 40U;
 static constexpr uint16_t kSeekOverlayPanelHeight = 48U;
 static constexpr uint16_t kSeekOverlayBottomGap = 18U;
@@ -1040,6 +1043,14 @@ static void benchmark_seek_overlay_show(
     g_seek_overlay.until_us = esp_timer_get_time() + hold_us;
     g_seek_overlay.target_ms = target_ms;
     g_seek_overlay.duration_ms = duration_ms;
+    portEXIT_CRITICAL(&g_seek_overlay_mux);
+}
+
+static void benchmark_seek_overlay_hide()
+{
+    portENTER_CRITICAL(&g_seek_overlay_mux);
+    g_seek_overlay.active = false;
+    g_seek_overlay.until_us = 0LL;
     portEXIT_CRITICAL(&g_seek_overlay_mux);
 }
 
@@ -1913,8 +1924,21 @@ static bool benchmark_presenter_wait_if_paused(bool clock_started, int64_t *cloc
         // 目标时间变化或浮层到期时刷新一次，避免每 5ms 预览都整屏推送。
         uint32_t seek_target_ms = 0U;
         uint32_t seek_duration_ms = 0U;
-        const bool seek_overlay_active =
+        bool seek_overlay_active =
             benchmark_seek_overlay_snapshot(&seek_target_ms, &seek_duration_ms);
+        if (!seek_overlay_active) {
+            // 暂停时进度/时间常驻：浮层到期后立即按当前暂停位置重新点亮。
+            VideoBenchmark::Snapshot pause_snapshot = {};
+            if (VideoBenchmark::get_snapshot(&pause_snapshot)) {
+                seek_target_ms = benchmark_seek_base_from_last_pts(pause_snapshot.last_pts_ms);
+                seek_duration_ms = pause_snapshot.duration_ms;
+                benchmark_seek_overlay_show(
+                    seek_target_ms, seek_duration_ms, kPausedSeekOverlayHoldUs);
+                seek_overlay_active = true;
+                // 上一次到期时已擦除浮层，强制下一次刷新重绘。
+                g_pause_seek_patched_active = false;
+            }
+        }
         const bool seek_patch_needed =
             seek_overlay_active != g_pause_seek_patched_active ||
             (seek_overlay_active && seek_target_ms != g_pause_seek_patched_target_ms);
@@ -1933,7 +1957,8 @@ static bool benchmark_presenter_wait_if_paused(bool clock_started, int64_t *cloc
         }
         vTaskDelay(1);
     }
-    // 恢复播放后由正常帧路径叠加浮层，这里的局部重绘状态作废。
+    // 恢复播放后关闭暂停常驻浮层，由正常帧路径接管。
+    benchmark_seek_overlay_hide();
     g_pause_seek_patched_active = false;
     g_pause_seek_patch_last_us = 0LL;
     if (benchmark_presenter_should_stop()) return false;
