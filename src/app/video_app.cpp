@@ -1108,6 +1108,26 @@ static inline uint16_t benchmark_seek_dim(uint16_t rgb565)
     return static_cast<uint16_t>((r << 11) | (g << 5) | b);
 }
 
+// 播放位置格式化：不足 1 小时显示 mm:ss，超过则显示 h:mm:ss。
+static void benchmark_seek_format_ms(uint32_t ms, char *out, size_t out_size)
+{
+    if (out == nullptr || out_size == 0U) return;
+    const uint32_t total_s = ms / 1000U;
+    const uint32_t hours = total_s / 3600U;
+    const uint32_t minutes = (total_s / 60U) % 60U;
+    const uint32_t seconds = total_s % 60U;
+    if (hours > 0U) {
+        snprintf(out, out_size, "%lu:%02lu:%02lu",
+            static_cast<unsigned long>(hours),
+            static_cast<unsigned long>(minutes),
+            static_cast<unsigned long>(seconds));
+    } else {
+        snprintf(out, out_size, "%02lu:%02lu",
+            static_cast<unsigned long>(minutes),
+            static_cast<unsigned long>(seconds));
+    }
+}
+
 static void benchmark_seek_overlay_draw(
     uint8_t *dst,
     uint16_t strip_y,
@@ -1128,15 +1148,14 @@ static void benchmark_seek_overlay_draw(
     if (strip_y + rows <= panel_top || strip_y >= panel_bottom) return;
 
     char text[32] = {};
-    const uint32_t target_s = target_ms / 1000U;
+    char target_text[16] = {};
+    benchmark_seek_format_ms(target_ms, target_text, sizeof(target_text));
     if (duration_ms > 0U) {
-        const uint32_t duration_s = duration_ms / 1000U;
-        snprintf(text, sizeof(text), "%u:%02u / %u:%02u",
-            static_cast<unsigned>(target_s / 60U), static_cast<unsigned>(target_s % 60U),
-            static_cast<unsigned>(duration_s / 60U), static_cast<unsigned>(duration_s % 60U));
+        char duration_text[16] = {};
+        benchmark_seek_format_ms(duration_ms, duration_text, sizeof(duration_text));
+        snprintf(text, sizeof(text), "%s / %s", target_text, duration_text);
     } else {
-        snprintf(text, sizeof(text), "%u:%02u",
-            static_cast<unsigned>(target_s / 60U), static_cast<unsigned>(target_s % 60U));
+        snprintf(text, sizeof(text), "%s", target_text);
     }
 
     const uint16_t glyph_width = 3U * kSeekOverlayGlyphScale;
