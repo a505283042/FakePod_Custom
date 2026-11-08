@@ -1082,6 +1082,13 @@ void screen_lock_simple_set_power(ScreenPowerState power)
         return;
     }
 
+    // 获取 LVGL 锁后必须再确认一次视频所有权，防止等待锁期间 Presenter 已接管 SPI。
+    if (g_video_brightness_mode.load(std::memory_order_acquire)) {
+        lvgl_port_unlock();
+        ESP_LOGW(TAG, "视频已接管SPI，取消本次屏态切换");
+        return;
+    }
+
     const ScreenPowerState prev = g_power;
     if (prev == power) {
         lvgl_port_unlock();
@@ -1331,6 +1338,12 @@ static bool screen_lock_simple_set_normal_with_lock(ScreenLockState target_lock)
     constexpr int kWakeMaxRetry = 1;
     for (int attempt = 0; attempt <= kWakeMaxRetry; ++attempt) {
         if (lvgl_port_lock(kWakeLockTimeoutMs)) {
+            // 锁外检查并不能排除排队等待期间的视频接管，必须锁内再次确认。
+            if (g_video_brightness_mode.load(std::memory_order_acquire)) {
+                lvgl_port_unlock();
+                ESP_LOGW(TAG, "视频已接管SPI，取消复合屏态切换");
+                return false;
+            }
             const ScreenPowerState prev_power = g_power;
             const ScreenLockState prev_lock = g_lock;
             g_power = ScreenPowerNormal;
