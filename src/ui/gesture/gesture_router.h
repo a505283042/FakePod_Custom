@@ -32,6 +32,8 @@ void gesture_router_set_horizontal_swipe_enabled(bool enabled);
 
 // 由 CST820 -> LVGL 输入桥接层喂入原始指针状态。
 void gesture_router_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick_ms);
+// 在没有新触摸事件时推进单击判定，等待双击窗口结束后再发布 SingleTap。
+void gesture_router_tick(uint32_t tick_ms);
 
 // 控件优先：Slider / Button 在 PRESSED~RELEASED 生命周期内占有本次触摸，
 // GestureRouter 不会把拖动控件误判为页面手势。
