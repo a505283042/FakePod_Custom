@@ -229,6 +229,8 @@ static void benchmark_controls_hide()
     gesture_router_set_vertical_adjust_edges_reserved(false);
     gesture_router_set_control_capture(false);
     gesture_router_set_horizontal_swipe_enabled(true);
+    // 胶囊关闭后恢复双击（暂停/继续）。
+    gesture_router_set_double_tap_enabled(true);
 }
 
 static void benchmark_controls_show()
@@ -245,6 +247,8 @@ static void benchmark_controls_show()
     gesture_router_set_horizontal_swipe_enabled(false);
     gesture_router_set_vertical_adjust_enabled(false);
     gesture_router_set_vertical_adjust_edges_reserved(false);
+    // 胶囊显示期间关闭双击，轻点只用于选择/关闭胶囊，避免误触暂停。
+    gesture_router_set_double_tap_enabled(false);
 }
 
 static void benchmark_controls_select(VideoControlTarget target)
@@ -298,6 +302,7 @@ static void benchmark_controls_reset_for_video()
     benchmark_controls_patch_ensure_alloc();
     benchmark_seek_patch_ensure_alloc();
     gesture_router_set_single_tap_enabled(true);
+    gesture_router_set_double_tap_enabled(true);
 }
 
 static void benchmark_controls_commit_brightness()
@@ -2771,6 +2776,17 @@ static void benchmark_controls_tick()
     if (expired) benchmark_controls_hide();
 }
 
+// 胶囊本身只有 42px 高、左右间距 12px：向上下各扩 14px、左右各扩 6px，
+// 横向上刚好不侵占相邻胶囊，纵向明显更好按。
+static bool benchmark_controls_hit_pill(int16_t left, int16_t top, int16_t right, int16_t bottom)
+{
+    constexpr int16_t kPadX = 6;
+    constexpr int16_t kPadY = 14;
+    return gesture_router_press_started_in_rect(
+        static_cast<int16_t>(left - kPadX), static_cast<int16_t>(top - kPadY),
+        static_cast<int16_t>(right + kPadX), static_cast<int16_t>(bottom + kPadY));
+}
+
 static void benchmark_controls_handle_single_tap()
 {
     bool active = false;
@@ -2786,13 +2802,13 @@ static void benchmark_controls_handle_single_tap()
         benchmark_controls_show();
         return;
     }
-    if (layout.valid && gesture_router_press_started_in_rect(
+    if (layout.valid && benchmark_controls_hit_pill(
             layout.brightness_left_screen, layout.brightness_top_screen,
             layout.brightness_right_screen, layout.brightness_bottom_screen)) {
         benchmark_controls_select(VideoControlTarget::Brightness);
         return;
     }
-    if (layout.valid && gesture_router_press_started_in_rect(
+    if (layout.valid && benchmark_controls_hit_pill(
             layout.volume_left_screen, layout.volume_top_screen,
             layout.volume_right_screen, layout.volume_bottom_screen)) {
         benchmark_controls_select(VideoControlTarget::Volume);
@@ -2818,13 +2834,13 @@ static bool benchmark_controls_consume_double_tap()
     portEXIT_CRITICAL(&g_video_controls_mux);
     if (!active || !layout.valid) return false;
 
-    if (gesture_router_press_started_in_rect(
+    if (benchmark_controls_hit_pill(
             layout.brightness_left_screen, layout.brightness_top_screen,
             layout.brightness_right_screen, layout.brightness_bottom_screen)) {
         benchmark_controls_select(VideoControlTarget::Brightness);
         return true;
     }
-    if (gesture_router_press_started_in_rect(
+    if (benchmark_controls_hit_pill(
             layout.volume_left_screen, layout.volume_top_screen,
             layout.volume_right_screen, layout.volume_bottom_screen)) {
         benchmark_controls_select(VideoControlTarget::Volume);

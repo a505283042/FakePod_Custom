@@ -29,6 +29,8 @@ void gesture_router_set_video_seek_mode(bool enabled);
 void gesture_router_set_single_tap_enabled(bool enabled);
 // 视频控制胶囊显示期间临时禁止横向手势；胶囊隐藏后恢复。
 void gesture_router_set_horizontal_swipe_enabled(bool enabled);
+// 胶囊显示/调节期间禁止双击：每个轻点都按单击即时处理，避免误触暂停。
+void gesture_router_set_double_tap_enabled(bool enabled);
 
 // 由 CST820 -> LVGL 输入桥接层喂入原始指针状态。
 void gesture_router_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick_ms);

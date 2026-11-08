@@ -67,6 +67,8 @@ uint32_t g_horizontal_min_speed_px_per_sec = kHorizontalMinSpeedPxPerSec;
 bool g_single_tap_enabled = false;
 // 视频控制浮层显示期间临时屏蔽横向手势，避免误触发 SEEK。
 bool g_horizontal_swipe_enabled = true;
+// 胶囊显示/调节期间禁止双击：轻点全部按单击即时发布，不做双击合流。
+bool g_double_tap_enabled = true;
 
 static int32_t gesture_abs(int32_t value)
 {
@@ -222,6 +224,13 @@ void gesture_router_set_single_tap_enabled(bool enabled)
     }
 }
 
+void gesture_router_set_double_tap_enabled(bool enabled)
+{
+    g_double_tap_enabled = enabled;
+    // 无论开关，都断开与上一轻点的配对，避免残留状态误合成双击。
+    g_state.last_tap_valid = false;
+}
+
 void gesture_router_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick_ms)
 {
     if (pressed) {
@@ -304,7 +313,8 @@ void gesture_router_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t ti
             g_state.last_tap_valid = false;
         } else if (ax <= kTapMaxMovePx && ay <= kTapMaxMovePx) {
             // 原地轻点：与上一次轻点在时间/落点容差内即判为双击，并丢弃这次 LVGL CLICKED。
-            const bool double_tap = g_state.last_tap_valid &&
+            const bool double_tap = g_double_tap_enabled &&
+                g_state.last_tap_valid &&
                 tick_ms - g_state.last_tap_tick_ms <= kDoubleTapWindowMs &&
                 gesture_abs(static_cast<int32_t>(x) - g_state.last_tap_x) <= kDoubleTapSlopPx &&
                 gesture_abs(static_cast<int32_t>(y) - g_state.last_tap_y) <= kDoubleTapSlopPx;
@@ -333,7 +343,7 @@ void gesture_router_tick(uint32_t tick_ms)
         !g_single_tap_enabled || !g_state.last_tap_valid) {
         return;
     }
-    if (tick_ms - g_state.last_tap_tick_ms <= kDoubleTapWindowMs) {
+    if (g_double_tap_enabled && tick_ms - g_state.last_tap_tick_ms <= kDoubleTapWindowMs) {
         return;
     }
     // 双击窗口已结束，此时才把第一次轻点交给页面层，避免双击时胶囊先闪现。
