@@ -2233,6 +2233,31 @@ static void benchmark_controls_handle_single_tap()
     benchmark_controls_hide();
 }
 
+static bool benchmark_controls_consume_double_tap()
+{
+    bool active = false;
+    VideoControlsLayout layout = {};
+    portENTER_CRITICAL(&g_video_controls_mux);
+    active = g_video_controls.active;
+    layout = g_video_controls.layout;
+    portEXIT_CRITICAL(&g_video_controls_mux);
+    if (!active || !layout.valid) return false;
+
+    if (gesture_router_press_started_in_rect(
+            layout.brightness_left_screen, layout.brightness_top_screen,
+            layout.brightness_right_screen, layout.brightness_bottom_screen)) {
+        benchmark_controls_select(VideoControlTarget::Brightness);
+        return true;
+    }
+    if (gesture_router_press_started_in_rect(
+            layout.volume_left_screen, layout.volume_top_screen,
+            layout.volume_right_screen, layout.volume_bottom_screen)) {
+        benchmark_controls_select(VideoControlTarget::Volume);
+        return true;
+    }
+    return false;
+}
+
 static bool benchmark_request_stop(const char *reason)
 {
     benchmark_controls_hide();
@@ -2980,11 +3005,13 @@ static void timer_cb(lv_timer_t *timer)
             if (g_page == VideoPage::Browser) show_launcher();
             break;
         case UiGestureAction::DoubleTap:
-            // 播放页原地双击 = 暂停/继续；列表页与风险确认浮层不响应。
+            // 浮层打开时，双击胶囊优先选中；双击视频其它位置仍切换暂停/继续。
             if (g_page == VideoPage::Benchmark && !g_risk_prompt_active &&
                 !g_benchmark_ui.terminal_shown) {
-                benchmark_controls_hide();
-                benchmark_toggle_pause();
+                if (!benchmark_controls_consume_double_tap()) {
+                    benchmark_controls_hide();
+                    benchmark_toggle_pause();
+                }
             }
             break;
         case UiGestureAction::SingleTap:
