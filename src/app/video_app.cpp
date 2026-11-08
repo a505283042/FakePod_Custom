@@ -90,6 +90,9 @@ static constexpr size_t kInvalidEntryIndex = static_cast<size_t>(-1);
 
 static constexpr int64_t kVideoControlsOverlayHoldUs = 3000000LL;
 static constexpr int32_t kVideoControlsDragFullScalePx = 220;
+static constexpr uint16_t kVideoControlsPatchMaxWidth = 340U;
+static constexpr uint16_t kVideoControlsPatchMaxHeight = 180U;
+static constexpr uint32_t kVideoControlsNotifyBit = 1UL << 0U;
 
 enum class VideoControlTarget : uint8_t { None = 0, Brightness, Volume };
 
@@ -143,8 +146,28 @@ struct VideoControlsDrawSnapshot
     VideoControlsLayout layout = {};
 };
 
+struct VideoControlsPatchInfo
+{
+    bool valid = false;
+    uint16_t frame_x = 0U;
+    uint16_t frame_y = 0U;
+    uint16_t frame_width = 0U;
+    uint16_t frame_height = 0U;
+    uint16_t patch_x = 0U;
+    uint16_t patch_y = 0U;
+    uint16_t patch_width = 0U;
+    uint16_t patch_height = 0U;
+};
+
 static VideoControlsState g_video_controls = {};
 static portMUX_TYPE g_video_controls_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t *g_video_controls_patch_buffer = nullptr;
+static VideoControlsPatchInfo g_video_controls_patch_info = {};
+static portMUX_TYPE g_video_controls_patch_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void benchmark_controls_notify_presenter();
+static void benchmark_controls_patch_ensure_alloc();
+static void benchmark_controls_patch_free();
 
 static void benchmark_controls_hide()
 {
@@ -155,6 +178,7 @@ static void benchmark_controls_hide()
     g_video_controls.dragging = false;
     g_video_controls.layout.valid = false;
     portEXIT_CRITICAL(&g_video_controls_mux);
+    benchmark_controls_notify_presenter();
     gesture_router_set_vertical_adjust_enabled(false);
     gesture_router_set_vertical_adjust_edges_reserved(false);
     gesture_router_set_control_capture(false);
@@ -169,6 +193,7 @@ static void benchmark_controls_show()
     g_video_controls.dragging = false;
     g_video_controls.layout.valid = false;
     portEXIT_CRITICAL(&g_video_controls_mux);
+    benchmark_controls_notify_presenter();
     gesture_router_set_vertical_adjust_enabled(false);
     gesture_router_set_vertical_adjust_edges_reserved(false);
 }
@@ -182,6 +207,7 @@ static void benchmark_controls_select(VideoControlTarget target)
     g_video_controls.dragging = false;
     g_video_controls.layout.valid = false;
     portEXIT_CRITICAL(&g_video_controls_mux);
+    benchmark_controls_notify_presenter();
     const bool adjust_enabled = target != VideoControlTarget::None;
     gesture_router_set_vertical_adjust_enabled(adjust_enabled);
     gesture_router_set_vertical_adjust_edges_reserved(adjust_enabled);
@@ -210,8 +236,10 @@ static void benchmark_controls_reset_for_video()
     g_video_controls.dragging = false;
     g_video_controls.layout.valid = false;
     portEXIT_CRITICAL(&g_video_controls_mux);
+    benchmark_controls_notify_presenter();
     gesture_router_set_vertical_adjust_enabled(false);
     gesture_router_set_vertical_adjust_edges_reserved(false);
+    benchmark_controls_patch_ensure_alloc();
     gesture_router_set_single_tap_enabled(true);
 }
 
@@ -341,6 +369,38 @@ static portMUX_TYPE g_benchmark_ui_mux = portMUX_INITIALIZER_UNLOCKED;
 static TaskHandle_t g_present_task = nullptr;
 static bool g_present_running = false;
 static bool g_present_stop_requested = false;
+
+static void benchmark_controls_notify_presenter()
+{
+    portENTER_CRITICAL(&g_benchmark_ui_mux);
+    if (g_present_running && g_present_task != nullptr) {
+        (void)xTaskNotify(g_present_task, kVideoControlsNotifyBit, eSetBits);
+    }
+    portEXIT_CRITICAL(&g_benchmark_ui_mux);
+}
+
+static void benchmark_controls_patch_ensure_alloc()
+{
+    if (g_video_controls_patch_buffer != nullptr) return;
+    const size_t bytes = static_cast<size_t>(kVideoControlsPatchMaxWidth) *
+        kVideoControlsPatchMaxHeight * 2U;
+    g_video_controls_patch_buffer = static_cast<uint8_t *>(heap_caps_malloc(
+        bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (g_video_controls_patch_buffer == nullptr) {
+        ESP_LOGW(TAG, "视频暂停控制浮层背景缓存分配失败；播放时控制仍可用，暂停时不刷新浮层");
+    }
+}
+
+static void benchmark_controls_patch_free()
+{
+    uint8_t *buffer = nullptr;
+    portENTER_CRITICAL(&g_video_controls_patch_mux);
+    buffer = g_video_controls_patch_buffer;
+    g_video_controls_patch_buffer = nullptr;
+    g_video_controls_patch_info = {};
+    portEXIT_CRITICAL(&g_video_controls_patch_mux);
+    if (buffer != nullptr) heap_caps_free(buffer);
+}
 static bool g_music_paused_for_benchmark = false;
 static bool g_music_deep_suspended_for_benchmark = false;
 static bool g_fullcanvas_risk_authorized = false;
@@ -1332,6 +1392,124 @@ static bool benchmark_controls_overlay_snapshot(
     return true;
 }
 
+
+struct VideoControlsPatchContext
+{
+    const uint8_t *patch_buffer = nullptr;
+    VideoControlsPatchInfo info = {};
+    VideoControlsDrawSnapshot snapshot = {};
+};
+
+static void benchmark_controls_patch_capture(
+    const uint8_t *frame_rgb565_be,
+    uint16_t frame_x, uint16_t frame_y,
+    uint16_t frame_width, uint16_t frame_height)
+{
+    if (frame_rgb565_be == nullptr || g_video_controls_patch_buffer == nullptr ||
+        frame_width == 0U || frame_height == 0U) return;
+
+    VideoControlsPatchInfo info = {};
+    info.frame_x = frame_x;
+    info.frame_y = frame_y;
+    info.frame_width = frame_width;
+    info.frame_height = frame_height;
+    info.patch_width = frame_width < kVideoControlsPatchMaxWidth
+        ? frame_width : kVideoControlsPatchMaxWidth;
+    info.patch_height = frame_height < kVideoControlsPatchMaxHeight
+        ? frame_height : kVideoControlsPatchMaxHeight;
+    info.patch_x = static_cast<uint16_t>((frame_width - info.patch_width) / 2U);
+    info.patch_y = 0U;
+
+    const size_t source_stride = static_cast<size_t>(frame_width) * 2U;
+    const size_t target_stride = static_cast<size_t>(kVideoControlsPatchMaxWidth) * 2U;
+    const size_t copy_bytes = static_cast<size_t>(info.patch_width) * 2U;
+    for (uint16_t row = 0U; row < info.patch_height; ++row) {
+        const uint8_t *src = frame_rgb565_be +
+            static_cast<size_t>(info.patch_y + row) * source_stride +
+            static_cast<size_t>(info.patch_x) * 2U;
+        uint8_t *dst = g_video_controls_patch_buffer + static_cast<size_t>(row) * target_stride;
+        memcpy(dst, src, copy_bytes);
+    }
+    info.valid = true;
+    portENTER_CRITICAL(&g_video_controls_patch_mux);
+    g_video_controls_patch_info = info;
+    portEXIT_CRITICAL(&g_video_controls_patch_mux);
+}
+
+static esp_err_t benchmark_controls_patch_producer(
+    void *context,
+    uint16_t source_y,
+    uint16_t rows,
+    uint8_t *dst_rgb565,
+    size_t dst_bytes)
+{
+    auto *patch = static_cast<VideoControlsPatchContext *>(context);
+    if (patch == nullptr || patch->patch_buffer == nullptr || dst_rgb565 == nullptr ||
+        patch->info.patch_width == 0U || rows == 0U ||
+        static_cast<uint32_t>(source_y) + rows > patch->info.patch_height) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const size_t width_bytes = static_cast<size_t>(patch->info.patch_width) * 2U;
+    if (dst_bytes < width_bytes * rows) return ESP_ERR_INVALID_SIZE;
+
+    const size_t source_stride = static_cast<size_t>(kVideoControlsPatchMaxWidth) * 2U;
+    for (uint16_t row = 0U; row < rows; ++row) {
+        const uint8_t *src = patch->patch_buffer +
+            static_cast<size_t>(source_y + row) * source_stride;
+        memcpy(dst_rgb565 + static_cast<size_t>(row) * width_bytes, src, width_bytes);
+    }
+
+    if (patch->snapshot.active && patch->snapshot.layout.valid) {
+        VideoControlsDrawSnapshot local = patch->snapshot;
+        local.layout.brightness_left_local = static_cast<uint16_t>(
+            local.layout.brightness_left_local - patch->info.patch_x);
+        local.layout.volume_left_local = static_cast<uint16_t>(
+            local.layout.volume_left_local - patch->info.patch_x);
+        local.layout.pill_top_local = static_cast<uint16_t>(
+            local.layout.pill_top_local - patch->info.patch_y);
+        if (local.layout.panel_height > 0U) {
+            local.layout.panel_left_local = static_cast<uint16_t>(
+                local.layout.panel_left_local - patch->info.patch_x);
+            local.layout.panel_top_local = static_cast<uint16_t>(
+                local.layout.panel_top_local - patch->info.patch_y);
+        }
+        benchmark_controls_overlay_draw(
+            dst_rgb565, source_y, rows, patch->info.patch_width, local);
+    }
+    return ESP_OK;
+}
+
+static void benchmark_controls_patch_refresh()
+{
+    VideoControlsPatchInfo info = {};
+    uint8_t *buffer = nullptr;
+    portENTER_CRITICAL(&g_video_controls_patch_mux);
+    info = g_video_controls_patch_info;
+    buffer = g_video_controls_patch_buffer;
+    portEXIT_CRITICAL(&g_video_controls_patch_mux);
+    if (!info.valid || buffer == nullptr || info.patch_width == 0U || info.patch_height == 0U) return;
+
+    VideoControlsPatchContext context = {};
+    context.patch_buffer = buffer;
+    context.info = info;
+    (void)benchmark_controls_overlay_snapshot(
+        info.frame_x, info.frame_y, info.frame_width, info.frame_height, &context.snapshot);
+
+    const esp_err_t ret = display_launcher_bounded_spi_present_stream(
+        benchmark_controls_patch_producer,
+        &context,
+        static_cast<uint16_t>(info.frame_x + info.patch_x),
+        static_cast<uint16_t>(info.frame_y + info.patch_y),
+        info.patch_width,
+        info.patch_height,
+        false,
+        false,
+        nullptr);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "暂停状态刷新视频控制浮层失败：%s", esp_err_to_name(ret));
+    }
+}
+
 static esp_err_t benchmark_black_strip_producer(
     void *context,
     uint16_t source_y,
@@ -1498,7 +1676,12 @@ static bool benchmark_presenter_wait_if_paused(bool clock_started, int64_t *cloc
 
     const int64_t paused_at_us = esp_timer_get_time();
     while (VideoBenchmark::is_paused() && !benchmark_presenter_should_stop()) {
-        vTaskDelay(1);
+        uint32_t notification_value = 0U;
+        const BaseType_t notified = xTaskNotifyWait(
+            0U, kVideoControlsNotifyBit, &notification_value, pdMS_TO_TICKS(1U));
+        if (notified == pdTRUE && (notification_value & kVideoControlsNotifyBit) != 0U) {
+            benchmark_controls_patch_refresh();
+        }
     }
     if (benchmark_presenter_should_stop()) return false;
 
@@ -1760,6 +1943,7 @@ static void benchmark_presenter_task(void *arg)
 
         const uint16_t frame_x = static_cast<uint16_t>((VideoBenchmark::kWidth - frame_width) / 2U);
         const uint16_t frame_y = static_cast<uint16_t>((VideoBenchmark::kHeight - frame_height) / 2U);
+        benchmark_controls_patch_capture(frame.rgb565_be, frame_x, frame_y, frame_width, frame_height);
         const uint32_t scan_phase_delay_us = benchmark_scan_phase_delay_us(frame_y);
 
         if (!bounded_session) {
@@ -2117,6 +2301,7 @@ static void benchmark_controls_apply_brightness(uint8_t level)
     g_video_controls.brightness_dirty = true;
     g_video_controls.until_us = esp_timer_get_time() + kVideoControlsOverlayHoldUs;
     portEXIT_CRITICAL(&g_video_controls_mux);
+    benchmark_controls_notify_presenter();
 }
 
 static void benchmark_controls_apply_volume(uint8_t level)
@@ -2130,6 +2315,7 @@ static void benchmark_controls_apply_volume(uint8_t level)
     g_video_controls.volume_percent = level;
     g_video_controls.until_us = esp_timer_get_time() + kVideoControlsOverlayHoldUs;
     portEXIT_CRITICAL(&g_video_controls_mux);
+    benchmark_controls_notify_presenter();
 }
 
 static void benchmark_controls_tick()
@@ -3300,6 +3486,7 @@ static void video_destroy()
     g_risk_prompt_active = false;
     if (!benchmark_presenter_is_running()) benchmark_restore_music_after_exclusive("destroy");
     benchmark_controls_commit_brightness();
+    if (!benchmark_presenter_is_running()) benchmark_controls_patch_free();
     g_benchmark_ui = {};
     ESP_LOGI(TAG, "Video destroy完成：LVGL/目录索引/路径PSRAM已释放；Benchmark已请求回收，Exclusive Music状态已处理");
 }
