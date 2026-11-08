@@ -653,6 +653,93 @@ static void extract_task(void *arg)
     uint64_t video_slot_wait_us_total = 0ULL;
     uint32_t video_slot_wait_us_max = 0U;
 
+    // 水位观测：音频桥剩余毫秒数 + 视频压缩队列剩余槽位。
+    // 用于判断是否真的存在音频饿死，再决定是否需要"紧急越过视频 Chunk 补音频"。
+    constexpr int64_t kWatermarkWindowUs = 10 * 1000000LL;
+    int64_t watermark_window_started_us = esp_timer_get_time();
+    uint32_t watermark_samples = 0U;
+    uint32_t watermark_bridge_ms_min = UINT32_MAX;
+    uint64_t watermark_bridge_ms_sum = 0ULL;
+    uint32_t watermark_bridge_under_600 = 0U;
+    uint32_t watermark_bridge_under_300 = 0U;
+    uint8_t watermark_slot_free_min = 0xFFU;
+    uint32_t run_bridge_ms_min = UINT32_MAX;
+    uint64_t run_bridge_ms_sum = 0ULL;
+    uint32_t run_watermark_samples = 0U;
+
+    const auto sample_pipeline_watermarks = [&]() {
+        const uint8_t free_slots = g_compressed_free_queue != nullptr
+            ? static_cast<uint8_t>(uxQueueMessagesWaiting(g_compressed_free_queue))
+            : 0U;
+        if (free_slots < watermark_slot_free_min) watermark_slot_free_min = free_slots;
+
+        const int64_t now_us = esp_timer_get_time();
+        const bool window_due = now_us - watermark_window_started_us >= kWatermarkWindowUs;
+
+        AviMp3BridgeSnapshot bridge = {};
+        if (!avi_mp3_bridge_get_snapshot(&bridge) || bridge.capacity_bytes == 0U) {
+            if (window_due) {
+                ESP_LOGI(TAG,
+                    "AVI水位观测(%ds)：无音频桥 capacity=0 slots_free_min=%u",
+                    10, static_cast<unsigned>(watermark_slot_free_min));
+                watermark_window_started_us = now_us;
+                watermark_slot_free_min = 0xFFU;
+            }
+            return;
+        }
+
+        uint32_t audio_bitrate = 0U;
+        portENTER_CRITICAL(&g_mux);
+        audio_bitrate = g_snapshot.audio_bitrate;
+        portEXIT_CRITICAL(&g_mux);
+        const uint32_t audio_avg_bps = audio_bitrate / 8U;
+        if (audio_avg_bps == 0U) {
+            if (window_due) {
+                ESP_LOGI(TAG,
+                    "AVI水位观测(%ds)：码率未知 audio_bitrate=0 slots_free_min=%u",
+                    10, static_cast<unsigned>(watermark_slot_free_min));
+                watermark_window_started_us = now_us;
+                watermark_slot_free_min = 0xFFU;
+            }
+            return;
+        }
+
+        const uint32_t buffered_ms = static_cast<uint32_t>(
+            static_cast<uint64_t>(bridge.buffered_bytes) * 1000ULL / audio_avg_bps);
+        ++watermark_samples;
+        watermark_bridge_ms_sum += buffered_ms;
+        if (buffered_ms < watermark_bridge_ms_min) watermark_bridge_ms_min = buffered_ms;
+        if (buffered_ms < run_bridge_ms_min) run_bridge_ms_min = buffered_ms;
+        run_bridge_ms_sum += buffered_ms;
+        ++run_watermark_samples;
+        if (buffered_ms < 600U) ++watermark_bridge_under_600;
+        if (buffered_ms < 300U) ++watermark_bridge_under_300;
+
+        if (!window_due) return;
+
+        ESP_LOGI(TAG,
+            "AVI水位观测(%ds)：bridge_min=%lums bridge_avg=%lums <600ms=%lu <300ms=%lu "
+            "bridge_push_wait=%lu slots_free_min=%u samples=%lu",
+            10,
+            static_cast<unsigned long>(
+                watermark_bridge_ms_min != UINT32_MAX ? watermark_bridge_ms_min : 0U),
+            static_cast<unsigned long>(watermark_samples != 0U
+                ? watermark_bridge_ms_sum / watermark_samples : 0ULL),
+            static_cast<unsigned long>(watermark_bridge_under_600),
+            static_cast<unsigned long>(watermark_bridge_under_300),
+            static_cast<unsigned long>(bridge.push_wait_count),
+            static_cast<unsigned>(watermark_slot_free_min),
+            static_cast<unsigned long>(watermark_samples));
+
+        watermark_window_started_us = now_us;
+        watermark_samples = 0U;
+        watermark_bridge_ms_min = UINT32_MAX;
+        watermark_bridge_ms_sum = 0ULL;
+        watermark_bridge_under_600 = 0U;
+        watermark_bridge_under_300 = 0U;
+        watermark_slot_free_min = 0xFFU;
+    };
+
     uint8_t compressed_slot_index = 0xFFU;
     bool have_video_slot = false;
 
@@ -785,6 +872,7 @@ static void extract_task(void *arg)
                 (void)send_pipeline_message(message, args->generation);
                 break;
             }
+            sample_pipeline_watermarks();
             continue;
         }
 
@@ -817,12 +905,14 @@ static void extract_task(void *arg)
         }
         // 成功发送后槽位所有权转交给 DecodeTask；暂停期间的发送路径也会自行归还槽位。
         have_video_slot = false;
+        sample_pipeline_watermarks();
     }
 
     if (have_video_slot) return_compressed_to_free(compressed_slot_index);
 
     ESP_LOGI(TAG,
-        "Extractor供数汇总：audio_chunks=%lu audio_bytes=%llu push_avg=%luus push_max=%luus video_slot_waits=%lu wait_avg=%lluus wait_max=%luus",
+        "Extractor供数汇总：audio_chunks=%lu audio_bytes=%llu push_avg=%luus push_max=%luus video_slot_waits=%lu wait_avg=%lluus wait_max=%luus "
+        "bridge_ms_min=%lums bridge_ms_avg=%lums",
         static_cast<unsigned long>(audio_chunks_pushed),
         static_cast<unsigned long long>(audio_bytes_pushed),
         static_cast<unsigned long>(audio_chunks_pushed != 0U
@@ -831,7 +921,10 @@ static void extract_task(void *arg)
         static_cast<unsigned long>(video_slot_wait_count),
         static_cast<unsigned long long>(video_slot_wait_count != 0U
             ? video_slot_wait_us_total / video_slot_wait_count : 0ULL),
-        static_cast<unsigned long>(video_slot_wait_us_max));
+        static_cast<unsigned long>(video_slot_wait_us_max),
+        static_cast<unsigned long>(run_bridge_ms_min != UINT32_MAX ? run_bridge_ms_min : 0U),
+        static_cast<unsigned long>(run_watermark_samples != 0U
+            ? run_bridge_ms_sum / run_watermark_samples : 0ULL));
 
     heap_caps_free(args);
     portENTER_CRITICAL(&g_mux);
