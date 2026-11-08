@@ -87,6 +87,16 @@ static constexpr size_t kAudioPrebufferBytes = 4U * 1024U;
 static constexpr uint32_t kAudioPrebufferTimeoutMs = 1500U;
 // Bridge 满是正常的生产者反压：等待 AudioTask 消费；仅在取消或 Source 关闭时退出。
 static constexpr uint32_t kAudioBridgePushWaitForever = UINT32_MAX;
+// 紧急音频模式：音频桥剩余可播放时间低于低水位时，按物理 chunk 顺序越过视频 payload
+// 优先补充 MP3；恢复到高水位后按记录偏移回读。阈值按实际码率动态换算成毫秒。
+static constexpr uint32_t kAudioEmergencyLowMs = 128U;
+static constexpr uint32_t kAudioEmergencyHighMs = 300U;
+// 回读只在音频桥有富余时进行：低于该水位暂停回读，
+// 避免“回读把桥抽干 → 再次进入紧急 → 又回读”的自激震荡。
+static constexpr uint32_t kAudioReplayAboveMs = 600U;
+// 回读帧若已落后播放时钟过多，回读后也会被 Presenter 丢弃，直接跳过记录。
+static constexpr uint32_t kAudioReplayStaleMs = 500U;
+static constexpr size_t kMaxSkippedVideoChunks = 24U;
 
 struct FrameSlot
 {
@@ -663,9 +673,14 @@ static void extract_task(void *arg)
     uint32_t watermark_bridge_under_600 = 0U;
     uint32_t watermark_bridge_under_300 = 0U;
     uint8_t watermark_slot_free_min = 0xFFU;
+    // 音频输出侧时钟：用于区分“桥被抽干是因为输出跑得比实时快”还是“抽取供不上”。
+    uint32_t watermark_submitted_ms_last = 0U;
+    bool watermark_submitted_valid = false;
     uint32_t run_bridge_ms_min = UINT32_MAX;
     uint64_t run_bridge_ms_sum = 0ULL;
     uint32_t run_watermark_samples = 0U;
+    uint32_t watermark_window_audio_chunks = 0U;
+    uint32_t watermark_window_video_frames = 0U;
 
     const auto sample_pipeline_watermarks = [&]() {
         const uint8_t free_slots = g_compressed_free_queue != nullptr
@@ -677,50 +692,49 @@ static void extract_task(void *arg)
         const bool window_due = now_us - watermark_window_started_us >= kWatermarkWindowUs;
 
         AviMp3BridgeSnapshot bridge = {};
-        if (!avi_mp3_bridge_get_snapshot(&bridge) || bridge.capacity_bytes == 0U) {
-            if (window_due) {
-                ESP_LOGI(TAG,
-                    "AVI水位观测(%ds)：无音频桥 capacity=0 slots_free_min=%u",
-                    10, static_cast<unsigned>(watermark_slot_free_min));
-                watermark_window_started_us = now_us;
-                watermark_slot_free_min = 0xFFU;
-            }
-            return;
-        }
+        const bool bridge_ok = avi_mp3_bridge_get_snapshot(&bridge) && bridge.capacity_bytes != 0U;
 
         uint32_t audio_bitrate = 0U;
         portENTER_CRITICAL(&g_mux);
         audio_bitrate = g_snapshot.audio_bitrate;
         portEXIT_CRITICAL(&g_mux);
         const uint32_t audio_avg_bps = audio_bitrate / 8U;
-        if (audio_avg_bps == 0U) {
-            if (window_due) {
-                ESP_LOGI(TAG,
-                    "AVI水位观测(%ds)：码率未知 audio_bitrate=0 slots_free_min=%u",
-                    10, static_cast<unsigned>(watermark_slot_free_min));
-                watermark_window_started_us = now_us;
-                watermark_slot_free_min = 0xFFU;
-            }
-            return;
-        }
+        const bool have_ms = bridge_ok && audio_avg_bps != 0U;
+        if (have_ms) {
 
-        const uint32_t buffered_ms = static_cast<uint32_t>(
-            static_cast<uint64_t>(bridge.buffered_bytes) * 1000ULL / audio_avg_bps);
-        ++watermark_samples;
-        watermark_bridge_ms_sum += buffered_ms;
-        if (buffered_ms < watermark_bridge_ms_min) watermark_bridge_ms_min = buffered_ms;
-        if (buffered_ms < run_bridge_ms_min) run_bridge_ms_min = buffered_ms;
-        run_bridge_ms_sum += buffered_ms;
-        ++run_watermark_samples;
-        if (buffered_ms < 600U) ++watermark_bridge_under_600;
-        if (buffered_ms < 300U) ++watermark_bridge_under_300;
+            const uint32_t buffered_ms = static_cast<uint32_t>(
+                static_cast<uint64_t>(bridge.buffered_bytes) * 1000ULL / audio_avg_bps);
+            ++watermark_samples;
+            watermark_bridge_ms_sum += buffered_ms;
+            if (buffered_ms < watermark_bridge_ms_min) watermark_bridge_ms_min = buffered_ms;
+            if (buffered_ms < run_bridge_ms_min) run_bridge_ms_min = buffered_ms;
+            run_bridge_ms_sum += buffered_ms;
+            ++run_watermark_samples;
+            if (buffered_ms < 600U) ++watermark_bridge_under_600;
+            if (buffered_ms < 300U) ++watermark_bridge_under_300;
+        }
 
         if (!window_due) return;
 
+        AudioVideoClockSnapshot audio_clock = {};
+        uint32_t audio_submitted_ms = 0U;
+        const bool audio_clock_valid =
+            audio_service_video_mp3_get_clock(&audio_clock) &&
+            audio_clock.sample_rate_hz > 0U;
+        if (audio_clock_valid) {
+            audio_submitted_ms = static_cast<uint32_t>(
+                audio_clock.submitted_frames * 1000ULL / audio_clock.sample_rate_hz);
+        }
+        const long audio_submitted_delta_ms = watermark_submitted_valid
+            ? static_cast<long>(static_cast<int32_t>(audio_submitted_ms) -
+                static_cast<int32_t>(watermark_submitted_ms_last))
+            : 0L;
+
         ESP_LOGI(TAG,
-            "AVI水位观测(%ds)：bridge_min=%lums bridge_avg=%lums <600ms=%lu <300ms=%lu "
-            "bridge_push_wait=%lu slots_free_min=%u samples=%lu",
-            10,
+            "AVI水位观测(10s)：bridge_min=%lums bridge_avg=%lums <600ms=%lu <300ms=%lu "
+            "push_wait=%lu slots_free_min=%u samples=%lu audio_chunks=%lu video_frames=%lu "
+            "bridge=%s buf=%u/%u bps=%lu active=%d eof=%d cancel=%d "
+            "audio_pace=%ldms audio_paused=%d start_released=%d rate=%lu dec_frames=%llu",
             static_cast<unsigned long>(
                 watermark_bridge_ms_min != UINT32_MAX ? watermark_bridge_ms_min : 0U),
             static_cast<unsigned long>(watermark_samples != 0U
@@ -729,8 +743,26 @@ static void extract_task(void *arg)
             static_cast<unsigned long>(watermark_bridge_under_300),
             static_cast<unsigned long>(bridge.push_wait_count),
             static_cast<unsigned>(watermark_slot_free_min),
-            static_cast<unsigned long>(watermark_samples));
+            static_cast<unsigned long>(watermark_samples),
+            static_cast<unsigned long>(watermark_window_audio_chunks),
+            static_cast<unsigned long>(watermark_window_video_frames),
+            have_ms ? "ok" : (bridge_ok ? "no-bps" : "none"),
+            static_cast<unsigned>(bridge.buffered_bytes),
+            static_cast<unsigned>(bridge.capacity_bytes),
+            static_cast<unsigned long>(audio_bitrate),
+            bridge.active ? 1 : 0,
+            bridge.eof ? 1 : 0,
+            bridge.cancelled ? 1 : 0,
+            audio_submitted_delta_ms,
+            audio_clock.paused ? 1 : 0,
+            audio_clock.start_released ? 1 : 0,
+            static_cast<unsigned long>(audio_clock.sample_rate_hz),
+            static_cast<unsigned long long>(audio_clock.decoder_frames));
 
+        if (audio_clock_valid) {
+            watermark_submitted_ms_last = audio_submitted_ms;
+            watermark_submitted_valid = true;
+        }
         watermark_window_started_us = now_us;
         watermark_samples = 0U;
         watermark_bridge_ms_min = UINT32_MAX;
@@ -738,17 +770,156 @@ static void extract_task(void *arg)
         watermark_bridge_under_600 = 0U;
         watermark_bridge_under_300 = 0U;
         watermark_slot_free_min = 0xFFU;
+        watermark_window_audio_chunks = 0U;
+        watermark_window_video_frames = 0U;
     };
 
     uint8_t compressed_slot_index = 0xFFU;
     bool have_video_slot = false;
 
+    // 紧急音频模式状态：记录被越过的视频 chunk，音频恢复后按原顺序回读。
+    AviDemuxer::SkippedVideoChunk skipped_video_chunks[kMaxSkippedVideoChunks] = {};
+    size_t skipped_video_count = 0U;
+    bool audio_emergency = false;
+    bool audio_emergency_primed = false;
+    uint32_t emergency_epoch_seen = seek_epoch();
+    uint32_t emergency_entry_count = 0U;
+    uint32_t emergency_skip_count = 0U;
+    uint32_t emergency_replay_count = 0U;
+    uint32_t emergency_stale_count = 0U;
+
+    // 音频桥剩余可播放毫秒数；无音轨或码率未知时返回 -1。
+    const auto bridge_buffered_ms = [&]() -> int32_t {
+        AviMp3BridgeSnapshot bridge = {};
+        if (!avi_mp3_bridge_get_snapshot(&bridge) || bridge.capacity_bytes == 0U) return -1;
+        uint32_t audio_bitrate = 0U;
+        portENTER_CRITICAL(&g_mux);
+        audio_bitrate = g_snapshot.audio_bitrate;
+        portEXIT_CRITICAL(&g_mux);
+        const uint32_t audio_avg_bps = audio_bitrate / 8U;
+        if (audio_avg_bps == 0U) return -1;
+        return static_cast<int32_t>(
+            static_cast<uint64_t>(bridge.buffered_bytes) * 1000ULL / audio_avg_bps);
+    };
+
+    // 音频恢复后回读被越过的视频帧；音频再次吃紧时中止，剩余记录留到下一次。
+    const auto replay_skipped_videos = [&]() {
+        if (skipped_video_count == 0U) return;
+        const uint32_t resume_offset = AviDemuxer::current_offset();
+        bool random_read_done = false;
+        // 回读目标若已落后播放时钟过多，Presenter 也会按迟到丢弃；直接跳过记录，避免无效解码。
+        uint32_t playback_now_ms = 0U;
+        portENTER_CRITICAL(&g_mux);
+        if (g_presentation_clock.started && g_presentation_clock.generation == args->generation) {
+            const int64_t elapsed_us = esp_timer_get_time() - g_presentation_clock.base_us;
+            if (elapsed_us > 0) {
+                playback_now_ms = g_presentation_clock.first_pts_ms +
+                    static_cast<uint32_t>(elapsed_us / 1000LL);
+            }
+        }
+        portEXIT_CRITICAL(&g_mux);
+        while (skipped_video_count > 0U) {
+            if (!generation_current(args->generation)) break;
+            const int32_t audio_ms = bridge_buffered_ms();
+            if (audio_ms >= 0 && audio_ms < static_cast<int32_t>(kAudioReplayAboveMs)) break;
+
+            uint8_t slot_index = 0xFFU;
+            // 非阻塞取槽位：拿不到就让音频继续流动，回读留到下次，绝不阻塞抽取。
+            if (!try_take_compressed_free(&slot_index)) break;
+
+            const AviDemuxer::SkippedVideoChunk chunk = skipped_video_chunks[0];
+            if (playback_now_ms != 0U && playback_now_ms > chunk.pts_ms &&
+                playback_now_ms - chunk.pts_ms > kAudioReplayStaleMs) {
+                ++emergency_stale_count;
+                return_compressed_to_free(slot_index);
+                for (size_t i = 1U; i < skipped_video_count; ++i) {
+                    skipped_video_chunks[i - 1U] = skipped_video_chunks[i];
+                }
+                --skipped_video_count;
+                continue;
+            }
+            uint32_t chunk_bytes = 0U;
+            const esp_err_t read_ret = AviDemuxer::read_video_chunk_at(
+                chunk.file_offset, g_compressed_slots[slot_index].data,
+                kCompressedSlotBytes, &chunk_bytes);
+            if (read_ret != ESP_OK) {
+                ESP_LOGW(TAG, "紧急音频回读失败：offset=%lu ret=%s，放弃剩余记录",
+                    static_cast<unsigned long>(chunk.file_offset),
+                    esp_err_to_name(read_ret));
+                return_compressed_to_free(slot_index);
+                skipped_video_count = 0U;
+                break;
+            }
+            random_read_done = true;
+            CompressedSlot &slot = g_compressed_slots[slot_index];
+            slot.bytes = chunk_bytes;
+            slot.pts_ms = chunk.pts_ms;
+            slot.seek_epoch = seek_epoch();
+            slot.extract_us = 0U;
+            slot.storage_us = 0U;
+            slot.copy_us = 0U;
+
+            PipelineMessage message = {};
+            message.type = PipelineMessageType::Frame;
+            message.slot = slot_index;
+            message.result = ESP_OK;
+            if (!send_pipeline_message(message, args->generation)) {
+                return_compressed_to_free(slot_index);
+                break;
+            }
+            ++emergency_replay_count;
+            for (size_t i = 1U; i < skipped_video_count; ++i) {
+                skipped_video_chunks[i - 1U] = skipped_video_chunks[i];
+            }
+            --skipped_video_count;
+            // 每次音频推进只回读一帧，保证音频抽取不被回读抢占。
+            break;
+        }
+        // 回读使用随机定位，结束后把顺序读游标还原，避免破坏后续时间轴。
+        if (random_read_done) (void)AviDemuxer::restore_sequential_offset(resume_offset);
+    };
+
     while (generation_current(args->generation)) {
         if (!extract_pause_gate(args->generation)) break;
 
+        // SEEK 换代后清空紧急音频状态：SEEK 会主动清空音频桥，
+        // 不能把“清空后的低谷”误判成饿死。
+        const uint32_t epoch_now = seek_epoch();
+        if (epoch_now != emergency_epoch_seen) {
+            emergency_epoch_seen = epoch_now;
+            skipped_video_count = 0U;
+            audio_emergency = false;
+            audio_emergency_primed = false;
+        }
+
+        // 水位状态机：桥先到 300ms 才算预热完成；低于 128ms 才进入紧急模式。
+        const int32_t loop_audio_ms = bridge_buffered_ms();
+        if (loop_audio_ms >= 0) {
+            if (loop_audio_ms >= static_cast<int32_t>(kAudioEmergencyHighMs)) {
+                audio_emergency_primed = true;
+                if (audio_emergency) {
+                    audio_emergency = false;
+                    ESP_LOGW(TAG, "紧急音频模式退出：bridge=%ldms 已回读=%lu 待回读=%u",
+                        static_cast<long>(loop_audio_ms),
+                        static_cast<unsigned long>(emergency_replay_count),
+                        static_cast<unsigned>(skipped_video_count));
+                }
+            }
+            if (!audio_emergency && audio_emergency_primed &&
+                loop_audio_ms < static_cast<int32_t>(kAudioEmergencyLowMs) &&
+                skipped_video_count < kMaxSkippedVideoChunks) {
+                audio_emergency = true;
+                ++emergency_entry_count;
+                ESP_LOGW(TAG, "紧急音频模式进入：bridge=%ldms 待回读=%u",
+                    static_cast<long>(loop_audio_ms),
+                    static_cast<unsigned>(skipped_video_count));
+            }
+        }
+
         // 有空闲槽位时先非阻塞借用；若池已满，仍允许 Demuxer 直接读取音频 chunk。
         // 只有确认当前 chunk 是视频帧且无槽位时，才等待并重试同一帧，绝不主动丢帧。
-        if (!have_video_slot) {
+        // 紧急模式下不占用视频槽位，按物理 chunk 顺序先找音频数据。
+        if (!have_video_slot && !audio_emergency) {
             have_video_slot = try_take_compressed_free(&compressed_slot_index);
         }
         uint8_t *video_buffer = have_video_slot
@@ -776,6 +947,22 @@ static void extract_task(void *arg)
                 message.result = ESP_ERR_INVALID_STATE;
                 (void)send_pipeline_message(message, args->generation);
                 break;
+            }
+
+            // 紧急音频模式：越过当前视频 payload，继续向后找音频 chunk。
+            // 只记录偏移/大小/PTS，不丢帧；音频恢复到高水位后按原顺序回读解码。
+            if (audio_emergency && skipped_video_count < kMaxSkippedVideoChunks) {
+                AviDemuxer::SkippedVideoChunk skipped = {};
+                if (AviDemuxer::skip_pending_video_chunk(
+                        &skipped, audio_buffer, kCompressedSlotBytes) == ESP_OK) {
+                    skipped_video_chunks[skipped_video_count++] = skipped;
+                    ++emergency_skip_count;
+                    continue;
+                }
+                ESP_LOGW(TAG, "紧急音频越过视频失败：offset=%lu size=%lu，退回等待槽位",
+                    static_cast<unsigned long>(skipped.file_offset),
+                    static_cast<unsigned long>(skipped.size));
+                audio_emergency = false;
             }
 
             const int64_t wait_started_us = esp_timer_get_time();
@@ -872,6 +1059,8 @@ static void extract_task(void *arg)
                 (void)send_pipeline_message(message, args->generation);
                 break;
             }
+            ++watermark_window_audio_chunks;
+            if (!audio_emergency) replay_skipped_videos();
             sample_pipeline_watermarks();
             continue;
         }
@@ -905,6 +1094,7 @@ static void extract_task(void *arg)
         }
         // 成功发送后槽位所有权转交给 DecodeTask；暂停期间的发送路径也会自行归还槽位。
         have_video_slot = false;
+        ++watermark_window_video_frames;
         sample_pipeline_watermarks();
     }
 
@@ -912,7 +1102,8 @@ static void extract_task(void *arg)
 
     ESP_LOGI(TAG,
         "Extractor供数汇总：audio_chunks=%lu audio_bytes=%llu push_avg=%luus push_max=%luus video_slot_waits=%lu wait_avg=%lluus wait_max=%luus "
-        "bridge_ms_min=%lums bridge_ms_avg=%lums",
+        "bridge_ms_min=%lums bridge_ms_avg=%lums emergency_entries=%lu emergency_skipped=%lu "
+        "emergency_replayed=%lu emergency_stale=%lu emergency_pending=%u",
         static_cast<unsigned long>(audio_chunks_pushed),
         static_cast<unsigned long long>(audio_bytes_pushed),
         static_cast<unsigned long>(audio_chunks_pushed != 0U
@@ -924,7 +1115,12 @@ static void extract_task(void *arg)
         static_cast<unsigned long>(video_slot_wait_us_max),
         static_cast<unsigned long>(run_bridge_ms_min != UINT32_MAX ? run_bridge_ms_min : 0U),
         static_cast<unsigned long>(run_watermark_samples != 0U
-            ? run_bridge_ms_sum / run_watermark_samples : 0ULL));
+            ? run_bridge_ms_sum / run_watermark_samples : 0ULL),
+        static_cast<unsigned long>(emergency_entry_count),
+        static_cast<unsigned long>(emergency_skip_count),
+        static_cast<unsigned long>(emergency_replay_count),
+        static_cast<unsigned long>(emergency_stale_count),
+        static_cast<unsigned>(skipped_video_count));
 
     heap_caps_free(args);
     portENTER_CRITICAL(&g_mux);

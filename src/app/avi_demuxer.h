@@ -69,6 +69,28 @@ esp_err_t read_frame(
     uint8_t *audio_data, uint32_t audio_capacity);
 void get_io_stats(IoStats *out_stats);
 
+// 紧急音频模式下被越过（未进入解码队列）的视频 chunk 记录。
+struct SkippedVideoChunk {
+    uint32_t file_offset = 0U;
+    uint32_t size = 0U;
+    uint32_t pts_ms = 0U;
+};
+
+// 紧急音频模式：顺序消费当前已缓存的视频 chunk payload（不进入解码队列），
+// 返回其偏移/大小/PTS，供音频恢复后回读。scratch 用于顺序跳过 payload。
+esp_err_t skip_pending_video_chunk(
+    SkippedVideoChunk *out_chunk, uint8_t *scratch, uint32_t scratch_capacity);
+
+// 音频恢复后按记录偏移回读一个视频 chunk payload；不推进连续时间轴计数器。
+esp_err_t read_video_chunk_at(
+    uint32_t file_offset, uint8_t *dst, uint32_t capacity, uint32_t *out_size);
+
+// 回读结束后把顺序读游标恢复到指定偏移；不改变帧序号/音频字节计数。
+esp_err_t restore_sequential_offset(uint32_t file_offset);
+
+// 当前顺序读偏移，用于记录回读结束后的恢复点。
+uint32_t current_offset();
+
 // seek 到任一 RIFF/AVIX 段的 movi 文件偏移，并重置连续时间轴计数器。
 // 用于侧车索引定位后的跳转。
 esp_err_t seek_to_offset(uint32_t file_offset, uint32_t video_pts_ms,
