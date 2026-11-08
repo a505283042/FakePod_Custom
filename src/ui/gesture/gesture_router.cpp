@@ -313,9 +313,6 @@ void gesture_router_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t ti
                 g_state.last_tap_tick_ms = tick_ms;
                 g_state.last_tap_x = x;
                 g_state.last_tap_y = y;
-                if (g_single_tap_enabled) {
-                    g_state.pending = UiGestureAction::SingleTap;
-                }
             }
         } else {
             g_state.last_tap_valid = false;
@@ -324,6 +321,20 @@ void gesture_router_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t ti
 
     g_state.pressed = false;
     g_state.axis = GestureAxis::None;
+}
+
+void gesture_router_tick(uint32_t tick_ms)
+{
+    if (g_state.pressed || g_state.pending != UiGestureAction::None ||
+        !g_single_tap_enabled || !g_state.last_tap_valid) {
+        return;
+    }
+    if (tick_ms - g_state.last_tap_tick_ms <= kDoubleTapWindowMs) {
+        return;
+    }
+    // 双击窗口已结束，此时才把第一次轻点交给页面层，避免双击时胶囊先闪现。
+    g_state.pending = UiGestureAction::SingleTap;
+    g_state.last_tap_valid = false;
 }
 
 void gesture_router_set_control_capture(bool captured)
