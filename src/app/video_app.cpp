@@ -3265,6 +3265,7 @@ static void timer_cb(lv_timer_t *timer)
     benchmark_tick();
     benchmark_seek_preview_tick();
     benchmark_controls_tick();
+    gesture_router_tick(static_cast<uint32_t>(lv_tick_get()));
 
     UiGestureAction action = UiGestureAction::None;
     if (!gesture_router_take_action(&action)) {
