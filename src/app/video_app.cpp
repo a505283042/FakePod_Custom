@@ -21,6 +21,8 @@
 #include "media_library.h"
 #include "player_state.h"
 #include "player_transport.h"
+#include "device_settings.h"
+#include "screen_lock_simple.h"
 #include "ui_common.h"
 #include "video_benchmark.h"
 #include "video_browser_model.h"
@@ -85,6 +87,154 @@ static constexpr uint32_t kPresenterStopWaitMs = 250U;
 // 下一阶段由“自动播放下一个视频”设置项接管，不在视频画面增加浮动UI。
 static constexpr bool kAutoPlayNextBringUpEnabled = true;
 static constexpr size_t kInvalidEntryIndex = static_cast<size_t>(-1);
+
+static constexpr int64_t kVideoControlsOverlayHoldUs = 3000000LL;
+static constexpr int32_t kVideoControlsDragFullScalePx = 220;
+
+enum class VideoControlTarget : uint8_t { None = 0, Brightness, Volume };
+
+struct VideoControlsLayout
+{
+    bool valid = false;
+    uint16_t brightness_left_local = 0U;
+    uint16_t volume_left_local = 0U;
+    uint16_t pill_top_local = 0U;
+    uint16_t pill_width = 0U;
+    uint16_t pill_height = 0U;
+    uint16_t panel_left_local = 0U;
+    uint16_t panel_top_local = 0U;
+    uint16_t panel_width = 0U;
+    uint16_t panel_height = 0U;
+    int16_t brightness_left_screen = 0;
+    int16_t brightness_top_screen = 0;
+    int16_t brightness_right_screen = 0;
+    int16_t brightness_bottom_screen = 0;
+    int16_t volume_left_screen = 0;
+    int16_t volume_top_screen = 0;
+    int16_t volume_right_screen = 0;
+    int16_t volume_bottom_screen = 0;
+    int16_t panel_left_screen = 0;
+    int16_t panel_top_screen = 0;
+    int16_t panel_right_screen = 0;
+    int16_t panel_bottom_screen = 0;
+};
+
+struct VideoControlsState
+{
+    bool active = false;
+    VideoControlTarget selected = VideoControlTarget::None;
+    int64_t until_us = 0LL;
+    uint8_t brightness_percent = 60U;
+    uint8_t volume_percent = 50U;
+    bool brightness_dirty = false;
+    bool dragging = false;
+    uint32_t drag_sequence = 0U;
+    uint8_t drag_start_percent = 0U;
+    VideoControlsLayout layout = {};
+};
+
+struct VideoControlsDrawSnapshot
+{
+    bool active = false;
+    VideoControlTarget selected = VideoControlTarget::None;
+    uint8_t brightness_percent = 60U;
+    uint8_t volume_percent = 50U;
+    uint8_t slider_percent = 0U;
+    VideoControlsLayout layout = {};
+};
+
+static VideoControlsState g_video_controls = {};
+static portMUX_TYPE g_video_controls_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void benchmark_controls_hide()
+{
+    portENTER_CRITICAL(&g_video_controls_mux);
+    g_video_controls.active = false;
+    g_video_controls.selected = VideoControlTarget::None;
+    g_video_controls.until_us = 0LL;
+    g_video_controls.dragging = false;
+    g_video_controls.layout.valid = false;
+    portEXIT_CRITICAL(&g_video_controls_mux);
+    gesture_router_set_vertical_adjust_enabled(false);
+    gesture_router_set_vertical_adjust_edges_reserved(false);
+    gesture_router_set_control_capture(false);
+}
+
+static void benchmark_controls_show()
+{
+    portENTER_CRITICAL(&g_video_controls_mux);
+    g_video_controls.active = true;
+    g_video_controls.selected = VideoControlTarget::None;
+    g_video_controls.until_us = esp_timer_get_time() + kVideoControlsOverlayHoldUs;
+    g_video_controls.dragging = false;
+    g_video_controls.layout.valid = false;
+    portEXIT_CRITICAL(&g_video_controls_mux);
+    gesture_router_set_vertical_adjust_enabled(false);
+    gesture_router_set_vertical_adjust_edges_reserved(false);
+}
+
+static void benchmark_controls_select(VideoControlTarget target)
+{
+    portENTER_CRITICAL(&g_video_controls_mux);
+    g_video_controls.active = true;
+    g_video_controls.selected = target;
+    g_video_controls.until_us = esp_timer_get_time() + kVideoControlsOverlayHoldUs;
+    g_video_controls.dragging = false;
+    g_video_controls.layout.valid = false;
+    portEXIT_CRITICAL(&g_video_controls_mux);
+    const bool adjust_enabled = target != VideoControlTarget::None;
+    gesture_router_set_vertical_adjust_enabled(adjust_enabled);
+    gesture_router_set_vertical_adjust_edges_reserved(adjust_enabled);
+}
+
+static void benchmark_controls_extend()
+{
+    portENTER_CRITICAL(&g_video_controls_mux);
+    if (g_video_controls.active) {
+        g_video_controls.until_us = esp_timer_get_time() + kVideoControlsOverlayHoldUs;
+    }
+    portEXIT_CRITICAL(&g_video_controls_mux);
+}
+
+static void benchmark_controls_reset_for_video()
+{
+    uint8_t volume = 50U;
+    (void)audio_service_video_mp3_get_volume(&volume);
+    const uint8_t brightness = screen_lock_simple_get_normal_brightness();
+    portENTER_CRITICAL(&g_video_controls_mux);
+    g_video_controls.active = false;
+    g_video_controls.selected = VideoControlTarget::None;
+    g_video_controls.until_us = 0LL;
+    g_video_controls.brightness_percent = brightness < 5U ? 5U : brightness;
+    g_video_controls.volume_percent = volume > 100U ? 100U : volume;
+    g_video_controls.dragging = false;
+    g_video_controls.layout.valid = false;
+    portEXIT_CRITICAL(&g_video_controls_mux);
+    gesture_router_set_vertical_adjust_enabled(false);
+    gesture_router_set_vertical_adjust_edges_reserved(false);
+    gesture_router_set_single_tap_enabled(true);
+}
+
+static void benchmark_controls_commit_brightness()
+{
+    uint8_t level = 60U;
+    bool dirty = false;
+    portENTER_CRITICAL(&g_video_controls_mux);
+    level = g_video_controls.brightness_percent;
+    dirty = g_video_controls.brightness_dirty;
+    portEXIT_CRITICAL(&g_video_controls_mux);
+    if (!dirty) return;
+    const esp_err_t ret = device_settings_set_brightness_level(level);
+    if (ret == ESP_OK) {
+        portENTER_CRITICAL(&g_video_controls_mux);
+        if (g_video_controls.brightness_percent == level) g_video_controls.brightness_dirty = false;
+        portEXIT_CRITICAL(&g_video_controls_mux);
+        ESP_LOGI(TAG, "视频亮度已保存：%u%%", static_cast<unsigned>(level));
+    } else {
+        ESP_LOGW(TAG, "视频亮度保存失败：level=%u ret=%s",
+            static_cast<unsigned>(level), esp_err_to_name(ret));
+    }
+}
 
 struct RowUi
 {
@@ -654,6 +804,8 @@ static void browser_load_tick()
 
 static void show_browser()
 {
+    benchmark_controls_hide();
+    gesture_router_set_single_tap_enabled(false);
     remote_context_end();
     g_page = VideoPage::Browser;
     g_fullcanvas_risk_authorized = false;
@@ -902,6 +1054,284 @@ static void benchmark_seek_overlay_draw(
     }
 }
 
+
+// Video controls are composited into the Presenter RGB565 stream. LVGL never flushes
+// over the active video frame, so the overlay cannot race BoundedSPI.
+static void benchmark_controls_fill_rect(
+    uint8_t *dst, uint16_t strip_y, uint16_t rows, uint16_t width,
+    int32_t left, int32_t top, int32_t right, int32_t bottom, uint16_t color)
+{
+    if (dst == nullptr || rows == 0U || width == 0U || right <= left || bottom <= top) return;
+    if (left < 0) left = 0;
+    if (right > width) right = width;
+    const int32_t strip_bottom = static_cast<int32_t>(strip_y) + rows;
+    if (top < strip_y) top = strip_y;
+    if (bottom > strip_bottom) bottom = strip_bottom;
+    if (right <= left || bottom <= top) return;
+    for (int32_t y = top; y < bottom; ++y) {
+        uint8_t *row = dst + static_cast<size_t>(y - strip_y) * width * 2U;
+        for (int32_t x = left; x < right; ++x) {
+            benchmark_seek_put_be(row, static_cast<uint16_t>(x), color);
+        }
+    }
+}
+
+static void benchmark_controls_fill_round_rect(
+    uint8_t *dst, uint16_t strip_y, uint16_t rows, uint16_t width,
+    int32_t left, int32_t top, int32_t right, int32_t bottom,
+    int32_t radius, uint16_t color)
+{
+    if (right <= left || bottom <= top) return;
+    const int32_t strip_bottom = static_cast<int32_t>(strip_y) + rows;
+    const int32_t y_begin = top > strip_y ? top : strip_y;
+    const int32_t y_end = bottom < strip_bottom ? bottom : strip_bottom;
+    for (int32_t y = y_begin; y < y_end; ++y) {
+        const int32_t from_top = y - top;
+        const int32_t from_bottom = bottom - 1 - y;
+        int32_t inset = 0;
+        if (from_top < radius) inset = radius - from_top;
+        if (from_bottom < radius && radius - from_bottom > inset) inset = radius - from_bottom;
+        benchmark_controls_fill_rect(
+            dst, strip_y, rows, width, left + inset, y, right - inset, y + 1, color);
+    }
+}
+
+static const uint8_t kVideoGlyphB[5] = {0x6, 0x5, 0x6, 0x5, 0x6};
+static const uint8_t kVideoGlyphR[5] = {0x6, 0x5, 0x6, 0x5, 0x5};
+static const uint8_t kVideoGlyphI[5] = {0x7, 0x2, 0x2, 0x2, 0x7};
+static const uint8_t kVideoGlyphV[5] = {0x5, 0x5, 0x5, 0x5, 0x2};
+static const uint8_t kVideoGlyphO[5] = {0x7, 0x5, 0x5, 0x5, 0x7};
+static const uint8_t kVideoGlyphL[5] = {0x4, 0x4, 0x4, 0x4, 0x7};
+static const uint8_t kVideoGlyphPercent[5] = {0x5, 0x1, 0x2, 0x4, 0x5};
+
+static const uint8_t *benchmark_controls_glyph(char c)
+{
+    if (c >= '0' && c <= '9') return kSeekGlyphDigits[c - '0'];
+    switch (c) {
+        case 'B': return kVideoGlyphB;
+        case 'R': return kVideoGlyphR;
+        case 'I': return kVideoGlyphI;
+        case 'V': return kVideoGlyphV;
+        case 'O': return kVideoGlyphO;
+        case 'L': return kVideoGlyphL;
+        case '%': return kVideoGlyphPercent;
+        default: return nullptr;
+    }
+}
+
+static uint16_t benchmark_controls_text_width(const char *text, uint16_t scale)
+{
+    if (text == nullptr || text[0] == '\0') return 0U;
+    const size_t count = strlen(text);
+    const size_t width = count * static_cast<size_t>(4U * scale) - scale;
+    return width > UINT16_MAX ? UINT16_MAX : static_cast<uint16_t>(width);
+}
+
+static void benchmark_controls_draw_text(
+    uint8_t *dst, uint16_t strip_y, uint16_t rows, uint16_t width,
+    uint16_t left, uint16_t top, const char *text, uint16_t scale, uint16_t color)
+{
+    if (text == nullptr || scale == 0U) return;
+    uint32_t cursor_x = left;
+    for (size_t i = 0U; text[i] != '\0'; ++i) {
+        const uint8_t *glyph = benchmark_controls_glyph(text[i]);
+        if (glyph != nullptr) {
+            for (uint16_t row = 0U; row < 5U; ++row) {
+                for (uint16_t col = 0U; col < 3U; ++col) {
+                    if ((glyph[row] & (0x04U >> col)) == 0U) continue;
+                    const int32_t x = static_cast<int32_t>(cursor_x + col * scale);
+                    const int32_t y = static_cast<int32_t>(top + row * scale);
+                    benchmark_controls_fill_rect(
+                        dst, strip_y, rows, width, x, y, x + scale, y + scale, color);
+                }
+            }
+        }
+        cursor_x += 4U * scale;
+    }
+}
+
+static void benchmark_controls_draw_sun(
+    uint8_t *dst, uint16_t strip_y, uint16_t rows, uint16_t width, uint16_t x, uint16_t y)
+{
+    constexpr uint16_t yellow = 0xFFE0U;
+    benchmark_controls_fill_rect(dst, strip_y, rows, width, x + 5, y + 5, x + 10, y + 10, yellow);
+    benchmark_controls_fill_rect(dst, strip_y, rows, width, x + 7, y, x + 8, y + 4, yellow);
+    benchmark_controls_fill_rect(dst, strip_y, rows, width, x + 7, y + 11, x + 8, y + 15, yellow);
+    benchmark_controls_fill_rect(dst, strip_y, rows, width, x, y + 7, x + 4, y + 8, yellow);
+    benchmark_controls_fill_rect(dst, strip_y, rows, width, x + 11, y + 7, x + 15, y + 8, yellow);
+    benchmark_controls_fill_rect(dst, strip_y, rows, width, x + 2, y + 2, x + 4, y + 4, yellow);
+    benchmark_controls_fill_rect(dst, strip_y, rows, width, x + 11, y + 2, x + 13, y + 4, yellow);
+    benchmark_controls_fill_rect(dst, strip_y, rows, width, x + 2, y + 11, x + 4, y + 13, yellow);
+    benchmark_controls_fill_rect(dst, strip_y, rows, width, x + 11, y + 11, x + 13, y + 13, yellow);
+}
+
+static void benchmark_controls_draw_speaker(
+    uint8_t *dst, uint16_t strip_y, uint16_t rows, uint16_t width, uint16_t x, uint16_t y)
+{
+    constexpr uint16_t white = 0xFFFFU;
+    benchmark_controls_fill_rect(dst, strip_y, rows, width, x, y + 5, x + 4, y + 11, white);
+    benchmark_controls_fill_rect(dst, strip_y, rows, width, x + 4, y + 3, x + 7, y + 13, white);
+    benchmark_controls_fill_rect(dst, strip_y, rows, width, x + 7, y + 4, x + 9, y + 12, white);
+    benchmark_controls_fill_rect(dst, strip_y, rows, width, x + 11, y + 5, x + 12, y + 11, white);
+    benchmark_controls_fill_rect(dst, strip_y, rows, width, x + 14, y + 3, x + 15, y + 13, white);
+}
+
+static void benchmark_controls_draw_pill(
+    uint8_t *dst, uint16_t strip_y, uint16_t rows, uint16_t width,
+    uint16_t left, uint16_t top, uint16_t pill_width, uint16_t pill_height,
+    bool selected, bool brightness, uint8_t percent)
+{
+    const uint16_t border = selected ? 0x07FFU : 0x6B4DU;
+    benchmark_controls_fill_round_rect(
+        dst, strip_y, rows, width, left, top, left + pill_width, top + pill_height, 9, border);
+    benchmark_controls_fill_round_rect(
+        dst, strip_y, rows, width, left + 2U, top + 2U,
+        left + pill_width - 2U, top + pill_height - 2U, 7, 0x1082U);
+    if (brightness) {
+        benchmark_controls_draw_sun(dst, strip_y, rows, width, left + 8U, top + 12U);
+    } else {
+        benchmark_controls_draw_speaker(dst, strip_y, rows, width, left + 8U, top + 12U);
+    }
+    benchmark_controls_draw_text(
+        dst, strip_y, rows, width, left + 30U, top + 16U,
+        brightness ? "BRI" : "VOL", 2U, 0xFFFFU);
+    char value[8] = {};
+    snprintf(value, sizeof(value), "%u%%", static_cast<unsigned>(percent));
+    const uint16_t value_width = benchmark_controls_text_width(value, 2U);
+    const uint16_t value_left = static_cast<uint16_t>(
+        left + pill_width > value_width + 8U ? left + pill_width - value_width - 8U : left + 8U);
+    benchmark_controls_draw_text(
+        dst, strip_y, rows, width, value_left, top + 16U, value, 2U, 0xFFFFU);
+}
+
+static void benchmark_controls_overlay_draw(
+    uint8_t *dst, uint16_t strip_y, uint16_t rows, uint16_t width,
+    const VideoControlsDrawSnapshot &snapshot)
+{
+    const VideoControlsLayout &layout = snapshot.layout;
+    if (dst == nullptr || !snapshot.active || !layout.valid) return;
+    benchmark_controls_draw_pill(
+        dst, strip_y, rows, width, layout.brightness_left_local, layout.pill_top_local,
+        layout.pill_width, layout.pill_height,
+        snapshot.selected == VideoControlTarget::Brightness, true, snapshot.brightness_percent);
+    benchmark_controls_draw_pill(
+        dst, strip_y, rows, width, layout.volume_left_local, layout.pill_top_local,
+        layout.pill_width, layout.pill_height,
+        snapshot.selected == VideoControlTarget::Volume, false, snapshot.volume_percent);
+
+    if (snapshot.selected == VideoControlTarget::None || layout.panel_height < 64U) return;
+    benchmark_controls_fill_round_rect(
+        dst, strip_y, rows, width, layout.panel_left_local, layout.panel_top_local,
+        layout.panel_left_local + layout.panel_width,
+        layout.panel_top_local + layout.panel_height, 9, 0x07FFU);
+    benchmark_controls_fill_round_rect(
+        dst, strip_y, rows, width, layout.panel_left_local + 2U, layout.panel_top_local + 2U,
+        layout.panel_left_local + layout.panel_width - 2U,
+        layout.panel_top_local + layout.panel_height - 2U, 7, 0x1082U);
+
+    const uint8_t value = snapshot.selected == VideoControlTarget::Brightness
+        ? snapshot.brightness_percent : snapshot.volume_percent;
+    char value_text[8] = {};
+    snprintf(value_text, sizeof(value_text), "%u%%", static_cast<unsigned>(value));
+    const uint16_t text_width = benchmark_controls_text_width(value_text, 3U);
+    const uint16_t text_left = static_cast<uint16_t>(
+        layout.panel_left_local + (layout.panel_width > text_width
+            ? (layout.panel_width - text_width) / 2U : 4U));
+    benchmark_controls_draw_text(
+        dst, strip_y, rows, width, text_left, layout.panel_top_local + 9U,
+        value_text, 3U, 0xFFFFU);
+
+    const uint16_t track_x = static_cast<uint16_t>(layout.panel_left_local + layout.panel_width / 2U - 4U);
+    const uint16_t track_top = static_cast<uint16_t>(layout.panel_top_local + 34U);
+    const uint16_t track_bottom = static_cast<uint16_t>(layout.panel_top_local + layout.panel_height - 12U);
+    if (track_bottom <= track_top + 4U) return;
+    benchmark_controls_fill_round_rect(
+        dst, strip_y, rows, width, track_x, track_top, track_x + 8U, track_bottom, 4, 0x4208U);
+    const uint16_t track_height = static_cast<uint16_t>(track_bottom - track_top);
+    const uint16_t fill_height = static_cast<uint16_t>(
+        static_cast<uint32_t>(track_height) * snapshot.slider_percent / 100U);
+    const uint16_t thumb_y = static_cast<uint16_t>(track_bottom - fill_height);
+    if (fill_height > 0U) {
+        benchmark_controls_fill_round_rect(
+            dst, strip_y, rows, width, track_x, thumb_y, track_x + 8U, track_bottom, 4, 0x07FFU);
+    }
+    benchmark_controls_fill_round_rect(
+        dst, strip_y, rows, width, track_x - 8U, thumb_y - 3U, track_x + 16U, thumb_y + 4U, 3, 0xFFFFU);
+}
+
+static bool benchmark_controls_overlay_snapshot(
+    uint16_t frame_x, uint16_t frame_y, uint16_t width, uint16_t height,
+    VideoControlsDrawSnapshot *out_snapshot)
+{
+    if (out_snapshot == nullptr) return false;
+    VideoControlsDrawSnapshot snapshot = {};
+    portENTER_CRITICAL(&g_video_controls_mux);
+    snapshot.active = g_video_controls.active;
+    snapshot.selected = g_video_controls.selected;
+    snapshot.brightness_percent = g_video_controls.brightness_percent;
+    snapshot.volume_percent = g_video_controls.volume_percent;
+    portEXIT_CRITICAL(&g_video_controls_mux);
+    if (!snapshot.active || width < 160U || height < 120U) return false;
+
+    const uint16_t margin = width >= 320U ? 12U : 6U;
+    const uint16_t gap = width >= 320U ? 12U : 8U;
+    const uint16_t available = width > (margin * 2U + gap)
+        ? static_cast<uint16_t>(width - margin * 2U - gap) : 0U;
+    uint16_t pill_width = static_cast<uint16_t>(available / 2U);
+    if (pill_width > 148U) pill_width = 148U;
+    if (pill_width < 72U) return false;
+
+    VideoControlsLayout layout = {};
+    layout.valid = true;
+    layout.pill_width = pill_width;
+    layout.pill_height = 42U;
+    layout.pill_top_local = 8U;
+    layout.brightness_left_local = static_cast<uint16_t>((width - (pill_width * 2U + gap)) / 2U);
+    layout.volume_left_local = static_cast<uint16_t>(layout.brightness_left_local + pill_width + gap);
+
+    const uint16_t panel_top = static_cast<uint16_t>(layout.pill_top_local + layout.pill_height + 8U);
+    const uint16_t panel_width = pill_width > 20U
+        ? static_cast<uint16_t>(pill_width - 12U) : pill_width;
+    uint16_t panel_height = height > panel_top + 8U
+        ? static_cast<uint16_t>(height - panel_top - 8U) : 0U;
+    if (panel_height > 116U) panel_height = 116U;
+    if (panel_height < 64U || snapshot.selected == VideoControlTarget::None) panel_height = 0U;
+    if (panel_height > 0U) {
+        const uint16_t selected_left = snapshot.selected == VideoControlTarget::Brightness
+            ? layout.brightness_left_local : layout.volume_left_local;
+        layout.panel_width = panel_width;
+        layout.panel_height = panel_height;
+        layout.panel_left_local = static_cast<uint16_t>(selected_left + (pill_width - panel_width) / 2U);
+        layout.panel_top_local = panel_top;
+        layout.panel_left_screen = static_cast<int16_t>(frame_x + layout.panel_left_local);
+        layout.panel_top_screen = static_cast<int16_t>(frame_y + layout.panel_top_local);
+        layout.panel_right_screen = static_cast<int16_t>(layout.panel_left_screen + layout.panel_width - 1U);
+        layout.panel_bottom_screen = static_cast<int16_t>(layout.panel_top_screen + layout.panel_height - 1U);
+    }
+    layout.brightness_left_screen = static_cast<int16_t>(frame_x + layout.brightness_left_local);
+    layout.brightness_top_screen = static_cast<int16_t>(frame_y + layout.pill_top_local);
+    layout.brightness_right_screen = static_cast<int16_t>(layout.brightness_left_screen + layout.pill_width - 1U);
+    layout.brightness_bottom_screen = static_cast<int16_t>(layout.brightness_top_screen + layout.pill_height - 1U);
+    layout.volume_left_screen = static_cast<int16_t>(frame_x + layout.volume_left_local);
+    layout.volume_top_screen = layout.brightness_top_screen;
+    layout.volume_right_screen = static_cast<int16_t>(layout.volume_left_screen + layout.pill_width - 1U);
+    layout.volume_bottom_screen = layout.brightness_bottom_screen;
+
+    snapshot.slider_percent = snapshot.selected == VideoControlTarget::Brightness
+        ? static_cast<uint8_t>((static_cast<uint16_t>(
+            snapshot.brightness_percent > 5U ? snapshot.brightness_percent - 5U : 0U) * 100U) / 95U)
+        : snapshot.volume_percent;
+
+    portENTER_CRITICAL(&g_video_controls_mux);
+    if (g_video_controls.active) g_video_controls.layout = layout;
+    else layout.valid = false;
+    portEXIT_CRITICAL(&g_video_controls_mux);
+    snapshot.layout = layout;
+    if (!layout.valid) return false;
+    *out_snapshot = snapshot;
+    return true;
+}
+
 static esp_err_t benchmark_black_strip_producer(
     void *context,
     uint16_t source_y,
@@ -931,6 +1361,7 @@ struct BenchmarkFrameStripContext
     bool overlay_active = false;
     uint32_t overlay_target_ms = 0U;
     uint32_t overlay_duration_ms = 0U;
+    VideoControlsDrawSnapshot controls = {};
 };
 
 static uint32_t benchmark_scan_phase_delay_us(uint16_t frame_y)
@@ -975,6 +1406,9 @@ static esp_err_t benchmark_frame_strip_producer(
         benchmark_seek_overlay_draw(
             dst_rgb565, source_y, rows, frame->width, frame->height,
             frame->overlay_target_ms, frame->overlay_duration_ms);
+    }
+    if (frame->controls.active) {
+        benchmark_controls_overlay_draw(dst_rgb565, source_y, rows, frame->width, frame->controls);
     }
     return ESP_OK;
 }
@@ -1386,6 +1820,8 @@ static void benchmark_presenter_task(void *arg)
         // seek 浮层只在完成后显示 2 秒；每帧取一次快照，过期自动失效。
         strip_context.overlay_active =
             benchmark_seek_overlay_snapshot(&strip_context.overlay_target_ms, &strip_context.overlay_duration_ms);
+        (void)benchmark_controls_overlay_snapshot(
+            frame_x, frame_y, frame_width, frame_height, &strip_context.controls);
 
         int64_t present_start_master_late_us = 0LL;
         bool present_start_master_valid = false;
@@ -1665,8 +2101,142 @@ static void benchmark_seek_preview_tick()
         static_cast<uint32_t>(target), snapshot.duration_ms, kSeekPreviewHoldUs);
 }
 
+
+static void benchmark_controls_apply_brightness(uint8_t level)
+{
+    if (level < 5U) level = 5U;
+    if (level > 100U) level = 100U;
+    const esp_err_t ret = screen_lock_simple_set_normal_brightness(level);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "视频亮度预览失败：%u%% ret=%s",
+            static_cast<unsigned>(level), esp_err_to_name(ret));
+        return;
+    }
+    portENTER_CRITICAL(&g_video_controls_mux);
+    g_video_controls.brightness_percent = level;
+    g_video_controls.brightness_dirty = true;
+    g_video_controls.until_us = esp_timer_get_time() + kVideoControlsOverlayHoldUs;
+    portEXIT_CRITICAL(&g_video_controls_mux);
+}
+
+static void benchmark_controls_apply_volume(uint8_t level)
+{
+    if (level > 100U) level = 100U;
+    if (!audio_service_video_mp3_set_volume(level)) {
+        ESP_LOGW(TAG, "视频音量请求失败：%u%%", static_cast<unsigned>(level));
+        return;
+    }
+    portENTER_CRITICAL(&g_video_controls_mux);
+    g_video_controls.volume_percent = level;
+    g_video_controls.until_us = esp_timer_get_time() + kVideoControlsOverlayHoldUs;
+    portEXIT_CRITICAL(&g_video_controls_mux);
+}
+
+static void benchmark_controls_tick()
+{
+    if (g_page != VideoPage::Benchmark || g_risk_prompt_active ||
+        g_benchmark_ui.terminal_shown) return;
+
+    UiVerticalAdjustSnapshot adjustment = {};
+    if (gesture_router_get_vertical_adjust(&adjustment)) {
+        VideoControlTarget selected = VideoControlTarget::None;
+        uint8_t start_percent = 0U;
+        bool can_adjust = false;
+        portENTER_CRITICAL(&g_video_controls_mux);
+        selected = g_video_controls.selected;
+        if (g_video_controls.active && selected != VideoControlTarget::None &&
+            (adjustment.active || adjustment.released)) {
+            if (!g_video_controls.dragging ||
+                g_video_controls.drag_sequence != adjustment.sequence) {
+                g_video_controls.drag_sequence = adjustment.sequence;
+                g_video_controls.drag_start_percent =
+                    selected == VideoControlTarget::Brightness
+                        ? g_video_controls.brightness_percent
+                        : g_video_controls.volume_percent;
+            }
+            g_video_controls.dragging = adjustment.active;
+            g_video_controls.until_us = esp_timer_get_time() + kVideoControlsOverlayHoldUs;
+            start_percent = g_video_controls.drag_start_percent;
+            can_adjust = true;
+        }
+        portEXIT_CRITICAL(&g_video_controls_mux);
+
+        if (can_adjust) {
+            const int32_t range = selected == VideoControlTarget::Brightness ? 95 : 100;
+            int32_t target = static_cast<int32_t>(start_percent) -
+                static_cast<int32_t>(adjustment.delta_y) * range / kVideoControlsDragFullScalePx;
+            if (selected == VideoControlTarget::Brightness) {
+                if (target < 5) target = 5;
+                if (target > 100) target = 100;
+                benchmark_controls_apply_brightness(static_cast<uint8_t>(target));
+            } else {
+                if (target < 0) target = 0;
+                if (target > 100) target = 100;
+                benchmark_controls_apply_volume(static_cast<uint8_t>(target));
+            }
+        }
+
+        if (adjustment.released) {
+            portENTER_CRITICAL(&g_video_controls_mux);
+            if (g_video_controls.drag_sequence == adjustment.sequence) {
+                g_video_controls.dragging = false;
+                g_video_controls.until_us = esp_timer_get_time() + kVideoControlsOverlayHoldUs;
+            }
+            portEXIT_CRITICAL(&g_video_controls_mux);
+            gesture_router_ack_vertical_adjust_release(adjustment.sequence);
+        }
+    }
+
+    const bool pointer_down = gesture_router_current_drag(nullptr, nullptr);
+    bool expired = false;
+    portENTER_CRITICAL(&g_video_controls_mux);
+    expired = g_video_controls.active && !g_video_controls.dragging &&
+        !pointer_down && esp_timer_get_time() >= g_video_controls.until_us;
+    portEXIT_CRITICAL(&g_video_controls_mux);
+    if (expired) benchmark_controls_hide();
+}
+
+static void benchmark_controls_handle_single_tap()
+{
+    bool active = false;
+    VideoControlTarget selected = VideoControlTarget::None;
+    VideoControlsLayout layout = {};
+    portENTER_CRITICAL(&g_video_controls_mux);
+    active = g_video_controls.active;
+    selected = g_video_controls.selected;
+    layout = g_video_controls.layout;
+    portEXIT_CRITICAL(&g_video_controls_mux);
+
+    if (!active) {
+        benchmark_controls_show();
+        return;
+    }
+    if (layout.valid && gesture_router_press_started_in_rect(
+            layout.brightness_left_screen, layout.brightness_top_screen,
+            layout.brightness_right_screen, layout.brightness_bottom_screen)) {
+        benchmark_controls_select(VideoControlTarget::Brightness);
+        return;
+    }
+    if (layout.valid && gesture_router_press_started_in_rect(
+            layout.volume_left_screen, layout.volume_top_screen,
+            layout.volume_right_screen, layout.volume_bottom_screen)) {
+        benchmark_controls_select(VideoControlTarget::Volume);
+        return;
+    }
+    if (layout.valid && selected != VideoControlTarget::None && layout.panel_height >= 64U &&
+        gesture_router_press_started_in_rect(
+            layout.panel_left_screen, layout.panel_top_screen,
+            layout.panel_right_screen, layout.panel_bottom_screen)) {
+        benchmark_controls_extend();
+        return;
+    }
+    benchmark_controls_hide();
+}
+
 static bool benchmark_request_stop(const char *reason)
 {
+    benchmark_controls_hide();
+    gesture_router_set_single_tap_enabled(false);
     benchmark_presenter_request_stop();
     VideoBenchmark::stop();
     const bool audio_stopped = benchmark_stop_avi_audio(reason);
@@ -1808,6 +2378,8 @@ static void eof_transition_tick()
     // 下一条先走与手动点击完全相同的规格预检。Music播放状态始终保持暂停，
     // 因此不会出现“视频A结束 -> Music短暂出声 -> 视频B再暂停”的听感断点。
     g_page = VideoPage::Browser;
+    benchmark_controls_hide();
+    gesture_router_set_single_tap_enabled(false);
     gesture_router_set_video_seek_mode(false);
     if (g_timer != nullptr) lv_timer_set_period(g_timer, kBrowserTimerPeriodMs);
     set_visible(g_root, false);
@@ -1832,6 +2404,8 @@ static uint32_t benchmark_fps_milli(const BenchmarkUiState &ui)
 static void benchmark_show_terminal(const VideoBenchmark::Snapshot &snapshot)
 {
     if (g_benchmark_ui.terminal_shown || g_page != VideoPage::Benchmark || benchmark_presenter_is_running()) return;
+    benchmark_controls_hide();
+    gesture_router_set_single_tap_enabled(false);
     if (g_timer != nullptr) lv_timer_set_period(g_timer, kBrowserTimerPeriodMs);
     set_visible(g_root, true);
     g_benchmark_ui.terminal_shown = true;
@@ -1953,6 +2527,8 @@ static bool remote_switch_video(int direction)
     }
 
     g_page = VideoPage::Browser;
+    benchmark_controls_hide();
+    gesture_router_set_single_tap_enabled(false);
     gesture_router_set_video_seek_mode(false);
     if (g_timer != nullptr) lv_timer_set_period(g_timer, kBrowserTimerPeriodMs);
     set_visible(g_root, false);
@@ -2090,6 +2666,8 @@ static bool benchmark_start_selected(bool allow_fullcanvas_over20)
     }
 
     remote_context_begin();
+    benchmark_controls_hide();
+    gesture_router_set_single_tap_enabled(false);
     g_page = VideoPage::Benchmark;
     gesture_router_set_video_seek_mode(true);
     if (g_timer != nullptr) lv_timer_set_period(g_timer, kBenchmarkTimerPeriodMs);
@@ -2122,12 +2700,15 @@ static bool benchmark_start_selected(bool allow_fullcanvas_over20)
         return false;
     }
 
+    benchmark_controls_reset_for_video();
     const esp_err_t presenter_ret = benchmark_presenter_start();
     if (presenter_ret != ESP_OK) {
         VideoBenchmark::stop();
         g_benchmark_ui.display_error = presenter_ret;
         g_benchmark_ui.cleanup_pending = true;
         gesture_router_set_video_seek_mode(false);
+        gesture_router_set_single_tap_enabled(false);
+        benchmark_controls_hide();
         if (benchmark_stop_avi_audio("presenter_start_failed")) {
             benchmark_restore_music_after_exclusive("presenter_start_failed");
         }
@@ -2145,6 +2726,8 @@ static bool benchmark_start_selected(bool allow_fullcanvas_over20)
 
 static void show_fullcanvas_risk_prompt(const VideoProbe::Snapshot &snapshot)
 {
+    benchmark_controls_hide();
+    gesture_router_set_single_tap_enabled(false);
     g_profile_probe_pending = false;
     g_fullcanvas_risk_authorized = false;
     g_risk_prompt_active = true;
@@ -2343,6 +2926,7 @@ static void timer_cb(lv_timer_t *timer)
     profile_probe_tick();
     benchmark_tick();
     benchmark_seek_preview_tick();
+    benchmark_controls_tick();
 
     UiGestureAction action = UiGestureAction::None;
     if (!gesture_router_take_action(&action)) {
@@ -2396,10 +2980,18 @@ static void timer_cb(lv_timer_t *timer)
             if (g_page == VideoPage::Browser) show_launcher();
             break;
         case UiGestureAction::DoubleTap:
-            // 播放页原地双击 = 暂停/继续；列表页与风险确认浮层不响应
+            // 播放页原地双击 = 暂停/继续；列表页与风险确认浮层不响应。
             if (g_page == VideoPage::Benchmark && !g_risk_prompt_active &&
                 !g_benchmark_ui.terminal_shown) {
+                benchmark_controls_hide();
                 benchmark_toggle_pause();
+            }
+            break;
+        case UiGestureAction::SingleTap:
+            // 单击显示亮度/音量胶囊；再次点击胶囊选中后，上下滑动调节。
+            if (g_page == VideoPage::Benchmark && !g_risk_prompt_active &&
+                !g_benchmark_ui.terminal_shown) {
+                benchmark_controls_handle_single_tap();
             }
             break;
         default:
@@ -2570,6 +3162,8 @@ static esp_err_t video_enter()
 {
     if (g_root == nullptr) return ESP_ERR_INVALID_STATE;
     g_page = VideoPage::Browser;
+    benchmark_controls_hide();
+    gesture_router_set_single_tap_enabled(false);
     gesture_router_set_video_seek_mode(false);
     snprintf(g_current_dir, VideoBrowser::kPathBytes, "%s", VideoBrowser::kRootDirectory);
     set_visible(g_root, true);
@@ -2589,6 +3183,8 @@ static esp_err_t video_enter()
 static esp_err_t video_leave(AppRunState next_state)
 {
     (void)next_state;
+    benchmark_controls_hide();
+    gesture_router_set_single_tap_enabled(false);
     remote_context_end();
     if (g_profile_probe_pending) {
         VideoProbe::cancel();
@@ -2624,12 +3220,15 @@ static esp_err_t video_leave(AppRunState next_state)
     gesture_router_reset();
     app_launcher_overlay_hide();
     set_visible(g_root, false);
+    benchmark_controls_commit_brightness();
     ESP_LOGI(TAG, "Video离开Foreground：MJPEG Benchmark/目录协作任务已停止，Video Exclusive Music状态已恢复");
     return ESP_OK;
 }
 
 static void video_destroy()
 {
+    benchmark_controls_hide();
+    gesture_router_set_single_tap_enabled(false);
     gesture_router_set_video_seek_mode(false);
     remote_context_end();
     VideoProbe::cancel();
@@ -2673,6 +3272,7 @@ static void video_destroy()
     g_page = VideoPage::Browser;
     g_risk_prompt_active = false;
     if (!benchmark_presenter_is_running()) benchmark_restore_music_after_exclusive("destroy");
+    benchmark_controls_commit_brightness();
     g_benchmark_ui = {};
     ESP_LOGI(TAG, "Video destroy完成：LVGL/目录索引/路径PSRAM已释放；Benchmark已请求回收，Exclusive Music状态已处理");
 }
