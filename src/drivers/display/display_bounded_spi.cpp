@@ -304,6 +304,35 @@ static esp_err_t display_bounded_spi_send_window_param(
     return display_bounded_spi_queue_wait_single(io, &tx, queue_wait_us);
 }
 
+static void display_bounded_spi_poison(const char *reason);
+
+// 按 CO5300 官方驱动的百分比映射，将 0x51 一字节亮度命令交给同一个 raw SPI 队列。
+// 必须由 Presenter 串行调用，不允许与正在执行的 present_stream 并发。
+esp_err_t display_launcher_bounded_spi_set_brightness(uint8_t percent)
+{
+    if (percent > 100U) return ESP_ERR_INVALID_ARG;
+    if (!g_bounded_spi.active || g_bounded_spi.faulted) return ESP_ERR_INVALID_STATE;
+
+    DisplayPanelIoSpiV553Prefix *io = display_panel_io_spi_v553_prefix();
+    if (!display_bounded_spi_abi_valid(io)) return ESP_ERR_NOT_SUPPORTED;
+
+    // 防止与前一帧/旧 Panel IO 尚未回收的事务交叉。
+    const esp_err_t drain_ret = display_bounded_spi_drain_panel(io, nullptr);
+    if (drain_ret != ESP_OK) return drain_ret;
+
+    DisplayBoundedRawSpiTransaction &tx = g_bounded_spi.control_tx[0];
+    display_bounded_spi_prepare_transaction(
+        &tx, io, display_bounded_qspi_header(CO5300_QSPI_OPCODE_WRITE_CMD, LCD_CMD_WRDISBV), false);
+    tx.base.flags |= SPI_TRANS_USE_TXDATA;
+    tx.base.length = 8U;
+    tx.base.tx_data[0] = static_cast<uint8_t>((static_cast<uint32_t>(percent) * 255U) / 100U);
+    const esp_err_t ret = display_bounded_spi_queue_wait_single(io, &tx, nullptr);
+    if (ret != ESP_OK) {
+        display_bounded_spi_poison("视频亮度命令有界事务失败");
+    }
+    return ret;
+}
+
 static void display_bounded_spi_poison(const char *reason)
 {
     if (!g_bounded_spi.faulted) {

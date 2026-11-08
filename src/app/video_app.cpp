@@ -1715,6 +1715,10 @@ static bool benchmark_presenter_wait_if_paused(bool clock_started, int64_t *cloc
         g_video_controls_refresh_pending = false;
         portEXIT_CRITICAL(&g_video_controls_mux);
         if (refresh_controls) benchmark_controls_patch_refresh();
+        // 暂停时没有新视频帧，仍由 Presenter 独占提交亮度命令。
+        if (display_launcher_bounded_spi_session_active()) {
+            (void)screen_lock_simple_apply_video_brightness_pending();
+        }
         vTaskDelay(1);
     }
     if (benchmark_presenter_should_stop()) return false;
@@ -1989,6 +1993,14 @@ static void benchmark_presenter_task(void *arg)
                 break;
             }
             bounded_session = true;
+            // Presenter 接管 Panel IO 后，在首帧之前提交一次当前亮度。
+            const esp_err_t initial_brightness_ret = screen_lock_simple_apply_video_brightness_pending();
+            if (initial_brightness_ret != ESP_OK) {
+                benchmark_presenter_set_error(initial_brightness_ret);
+                VideoBenchmark::release_frame(frame.slot);
+                VideoBenchmark::stop();
+                break;
+            }
 
             const esp_err_t clear_ret = display_launcher_bounded_spi_present_stream(
                 benchmark_black_strip_producer,
@@ -2126,6 +2138,14 @@ static void benchmark_presenter_task(void *arg)
 
         VideoBenchmark::release_frame(frame.slot);
 
+        // 每次视频帧提交完成且 raw SPI 队列已排空，才允许提交最新亮度值。
+        const esp_err_t brightness_ret = screen_lock_simple_apply_video_brightness_pending();
+        if (brightness_ret != ESP_OK) {
+            benchmark_presenter_set_error(brightness_ret);
+            VideoBenchmark::stop();
+            break;
+        }
+
         // SEEK 后音频保持暂停；新位置首帧已真正写入 LCD 后才恢复音频时钟。
         if (frame.seek_epoch == VideoBenchmark::seek_epoch() &&
             VideoBenchmark::seek_audio_resume_pending() &&
@@ -2137,6 +2157,8 @@ static void benchmark_presenter_task(void *arg)
     }
 
     if (bounded_session) display_launcher_bounded_spi_session_end();
+    // 直到 SPI session 真正结束，才允许 system_loop 恢复普通 CO5300 亮度写入。
+    screen_lock_simple_set_video_brightness_mode(false);
     const BenchmarkUiState ui = benchmark_ui_snapshot();
     ESP_LOGI(TAG, "视频显示结束：显示=%lu 丢帧=%lu 显示错误=%lu",
         static_cast<unsigned long>(ui.presented),
@@ -3014,8 +3036,11 @@ static bool benchmark_start_selected(bool allow_fullcanvas_over20)
     }
 
     benchmark_controls_reset_for_video();
+    // 当前在 Video LVGL 上下文中；在启动独立 Presenter 前封闭普通亮度 SPI 入口。
+    screen_lock_simple_set_video_brightness_mode(true);
     const esp_err_t presenter_ret = benchmark_presenter_start();
     if (presenter_ret != ESP_OK) {
+        screen_lock_simple_set_video_brightness_mode(false);
         VideoBenchmark::stop();
         g_benchmark_ui.display_error = presenter_ret;
         g_benchmark_ui.cleanup_pending = true;

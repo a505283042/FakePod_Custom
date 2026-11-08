@@ -16,6 +16,7 @@
 #include "audio_service.h"          // AudioStateSnapshot（进度/曲目索引）
 #include "board_pins.h"
 #include "display.h"
+#include "drivers/display/display_bounded_spi.h"
 #include "font/font_manager.h"
 #include "lyrics/lyrics_service.h"  // LyricsWindowSnapshot（当前一句歌词）
 #include "media/library/media_catalog_v2.h"  // 歌曲标题/歌手 (catalog)
@@ -71,6 +72,10 @@ static uint8_t           g_normal_brightness = kBrightnessNormalDefault;
 // 这里只记录目标值，由 system_loop 的 idle_update 在取得 LVGL 锁后安全提交。
 static bool              g_normal_brightness_apply_pending = false;
 static TickType_t        g_normal_brightness_last_attempt_tick = 0;
+// 视频运行时由 Presenter 独占屏幕 SPI；系统任务只保存亮度目标，不允许直接写 Panel IO。
+static std::atomic<bool> g_video_brightness_mode{false};
+// -1 表示无更新；新值覆盖旧值，避免连续拖动时积压寄存器写命令。
+static std::atomic<int16_t> g_video_brightness_pending{-1};
 static ScreenLockState   g_lock          = ScreenLockUnlocked;
 static uint16_t          g_auto_screen_off_seconds = 0U;
 static bool              g_auto_screen_off_to_aod = true;
@@ -1064,6 +1069,11 @@ bool screen_lock_should_block_touch(void)
 void screen_lock_simple_set_power(ScreenPowerState power)
 {
     if (!g_ready) return;
+    if (g_video_brightness_mode.load(std::memory_order_acquire)) {
+        // 视频 Presenter 独占 SPI 时不能并发执行 AOD/熄屏相关 Panel 参数命令。
+        ESP_LOGW(TAG, "视频播放期间暂不切换屏态，请先退出视频");
+        return;
+    }
 
     // R44.3：panel 参数命令与 LVGL flush 共用同一把锁；拿锁失败则整次切换不提交，
     // 避免 C++ 状态已改变、UI 未改变，或 brightness/disp_on_off 与 flush 抢 SPI。
@@ -1134,6 +1144,9 @@ esp_err_t screen_lock_simple_set_normal_brightness(uint8_t level)
     }
 
     g_normal_brightness = level;
+    if (g_video_brightness_mode.load(std::memory_order_acquire)) {
+        g_video_brightness_pending.store(level, std::memory_order_release);
+    }
 
     // 这里只发布目标值，不在调用者线程直接发送 panel 参数命令。
     // system_runtime_update() 与 taskLVGL 并发时，直接 set_brightness 会与
@@ -1149,6 +1162,46 @@ esp_err_t screen_lock_simple_set_normal_brightness(uint8_t level)
 uint8_t screen_lock_simple_get_normal_brightness(void)
 {
     return g_normal_brightness;
+}
+
+void screen_lock_simple_set_video_brightness_mode(bool enabled)
+{
+    if (enabled) {
+        // 必须在 LVGL 视频启动上下文、Presenter 尚未开始传输前调用。
+        // idle_update 同样通过 LVGL 锁进入寄存器提交阶段，避免切换时存在旧的在途命令。
+        g_video_brightness_mode.store(true, std::memory_order_release);
+        g_video_brightness_pending.store(g_normal_brightness, std::memory_order_release);
+    } else {
+        // Presenter 已先结束并释放 BoundedSPI session，普通亮度链路才重新开放。
+        g_video_brightness_mode.store(false, std::memory_order_release);
+        g_video_brightness_pending.store(-1, std::memory_order_release);
+        if (g_power == ScreenPowerNormal) {
+            g_normal_brightness_apply_pending = true;
+            g_normal_brightness_last_attempt_tick = 0;
+        }
+    }
+}
+
+esp_err_t screen_lock_simple_apply_video_brightness_pending()
+{
+    if (!g_video_brightness_mode.load(std::memory_order_acquire)) return ESP_ERR_INVALID_STATE;
+    if (!display_launcher_bounded_spi_session_active()) return ESP_ERR_INVALID_STATE;
+
+    const int16_t requested = g_video_brightness_pending.exchange(-1, std::memory_order_acq_rel);
+    if (requested < 0) return ESP_OK;
+
+    const esp_err_t ret = display_launcher_bounded_spi_set_brightness(static_cast<uint8_t>(requested));
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "视频亮度经Presenter安全应用：%u%%", static_cast<unsigned>(requested));
+    } else {
+        // 出错时仅在没有新请求覆盖的情况下恢复旧请求，保留 latest-wins。
+        int16_t empty = -1;
+        (void)g_video_brightness_pending.compare_exchange_strong(
+            empty, requested, std::memory_order_acq_rel, std::memory_order_acquire);
+        ESP_LOGW(TAG, "视频亮度SPI提交失败：%u%% %s",
+            static_cast<unsigned>(requested), esp_err_to_name(ret));
+    }
+    return ret;
 }
 
 void screen_lock_simple_configure_auto_off(uint16_t seconds, bool aod_enabled)
@@ -1170,15 +1223,22 @@ void screen_lock_simple_notify_user_activity(void)
 void screen_lock_simple_idle_update(void)
 {
     // 正常亮度采用延迟提交：只有拿到 LVGL 互斥锁时才发送 CO5300 参数命令。
+    // 注意视频 Presenter 的 BoundedSPI 不受 LVGL 锁保护，视频模式必须跳过该发送链路。
     // esp_lvgl_port 在 lv_timer_handler/flush 期间持有该锁，因此这里成功取得锁时，
     // 不会与 LVGL 的 CASET/RASET/RAMWR polling transaction 并发抢 SPI 总线。
-    if (g_ready && g_power == ScreenPowerNormal && g_normal_brightness_apply_pending) {
+    if (g_ready && g_power == ScreenPowerNormal && g_normal_brightness_apply_pending &&
+        !g_video_brightness_mode.load(std::memory_order_acquire)) {
         const TickType_t now = xTaskGetTickCount();
         constexpr TickType_t kBrightnessRetryInterval = pdMS_TO_TICKS(50);
         if (g_normal_brightness_last_attempt_tick == 0 ||
             now - g_normal_brightness_last_attempt_tick >= kBrightnessRetryInterval) {
             g_normal_brightness_last_attempt_tick = now;
             if (lvgl_port_lock(0)) {
+                // 必须在取得 LVGL 锁后复查；视频页可能恰好在等待期间接管 SPI。
+                if (g_video_brightness_mode.load(std::memory_order_acquire)) {
+                    lvgl_port_unlock();
+                    return;
+                }
                 esp_lcd_panel_handle_t panel = display_get_panel_handle();
                 const esp_err_t ret = panel != nullptr
                     ? esp_lcd_panel_co5300_set_brightness(panel, g_normal_brightness)
@@ -1198,6 +1258,8 @@ void screen_lock_simple_idle_update(void)
         }
     }
 
+    // 视频正在独占屏幕传输时不执行自动 AOD/熄屏，避免其它 Panel 命令抢同一 SPI device。
+    if (g_video_brightness_mode.load(std::memory_order_acquire)) return;
     if (!g_ready || g_power != ScreenPowerNormal || g_auto_screen_off_seconds == 0U) return;
     if (g_menu_open) return;
 
@@ -1256,6 +1318,10 @@ static bool screen_lock_simple_set_normal_with_lock(ScreenLockState target_lock)
 
     // 远程“锁屏”= 正常显示 + 锁定；“唤醒”= 正常显示 + 解锁。
     // 两者都一次提交，不允许从 AOD/Off 切换时留下半套状态。
+    if (g_video_brightness_mode.load(std::memory_order_acquire)) {
+        ESP_LOGW(TAG, "视频播放期间暂不执行复合屏态切换，请先退出视频");
+        return false;
+    }
     if (g_power == ScreenPowerNormal && g_lock == target_lock) {
         g_last_user_activity_tick = xTaskGetTickCount();
         return true;

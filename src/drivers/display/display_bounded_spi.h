@@ -40,6 +40,8 @@ bool display_launcher_bounded_spi_available();
 esp_err_t display_launcher_bounded_spi_session_begin();
 void display_launcher_bounded_spi_session_end();
 bool display_launcher_bounded_spi_session_active();
+// 仅供持有 BoundedSPI session 的 Presenter 调用：在两帧间有界提交 CO5300 亮度命令。
+esp_err_t display_launcher_bounded_spi_set_brightness(uint8_t percent);
 
 // producer 输出的字节序由 present_stream() 的 wire_order 明确声明；true 时 display 层
 // 不再扫描 staging 做 byte swap，可让上层 compositor 直接生成 CO5300 SPI wire-order。

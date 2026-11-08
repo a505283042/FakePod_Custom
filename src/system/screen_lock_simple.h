@@ -81,6 +81,12 @@ bool screen_lock_simple_wake_and_unlock(void);
 esp_err_t screen_lock_simple_set_normal_brightness(uint8_t level);
 uint8_t   screen_lock_simple_get_normal_brightness(void);
 
+// 视频 Presenter 独占 BoundedSPI 时，普通屏幕任务禁止直接发送 CO5300 参数命令。
+// 进入视频前启用，Presenter 结束并释放 SPI session 后关闭。
+void screen_lock_simple_set_video_brightness_mode(bool enabled);
+// 只能从持有 BoundedSPI session 的 Presenter 任务调用；无待提交亮度时立即返回。
+esp_err_t screen_lock_simple_apply_video_brightness_pending();
+
 // 自动熄屏：seconds=0 表示永不；aod_enabled=true 时超时进入 AOD，否则直接全黑。
 // 用户触摸/实体键活动通过 notify_user_activity() 重置计时；system_loop 每轮调用 idle_update()。
 void screen_lock_simple_configure_auto_off(uint16_t seconds, bool aod_enabled);
