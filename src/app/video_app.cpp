@@ -93,6 +93,10 @@ static constexpr int32_t kVideoControlsDragFullScalePx = 220;
 static constexpr int64_t kVideoControlsApplyIntervalUs = 50000LL;
 static constexpr uint16_t kVideoControlsPatchMaxWidth = 340U;
 static constexpr uint16_t kVideoControlsPatchMaxHeight = 180U;
+// 暂停态 SEEK 浮层只占视频画面底部 48 行（kSeekOverlayPanelHeight），
+// 缓存这一条带即可在暂停时局部重绘，背景仍是最后一帧。
+static constexpr uint16_t kVideoSeekPatchMaxWidth = 460U;
+static constexpr uint16_t kVideoSeekPatchRows = 48U;
 
 enum class VideoControlTarget : uint8_t { None = 0, Brightness, Volume };
 
@@ -170,9 +174,36 @@ static uint8_t *g_video_controls_patch_buffer = nullptr;
 static VideoControlsPatchInfo g_video_controls_patch_info = {};
 static portMUX_TYPE g_video_controls_patch_mux = portMUX_INITIALIZER_UNLOCKED;
 
+// 暂停态 SEEK 浮层刷新所需的最后一帧底部条带与几何信息。
+struct VideoSeekPatchInfo
+{
+    bool valid = false;
+    uint16_t frame_x = 0U;
+    uint16_t frame_y = 0U;
+    uint16_t frame_width = 0U;
+    uint16_t frame_height = 0U;
+    uint16_t patch_y = 0U;      // 条带在视频画面内的起始行
+    uint16_t patch_rows = 0U;
+};
+
+static uint8_t *g_video_seek_patch_buffer = nullptr;
+static VideoSeekPatchInfo g_video_seek_patch_info = {};
+static portMUX_TYPE g_video_seek_patch_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t g_pause_seek_patched_target_ms = 0U;
+static uint32_t g_pause_seek_patched_duration_ms = 0U;
+static bool g_pause_seek_patched_active = false;
+static int64_t g_pause_seek_patch_last_us = 0LL;
+static constexpr int64_t kPauseSeekPatchMinGapUs = 60000LL;
+// SEEK 成功后记录用户选择的目标时间：在画面真正推进到该位置之前，
+// 下一次拖动以它为基准，避免旧画面 PTS 把目标时间覆盖回去。
+static bool g_seek_target_hold_valid = false;
+static uint32_t g_seek_target_hold_ms = 0U;
+
 static void benchmark_controls_notify_presenter();
 static void benchmark_controls_patch_ensure_alloc();
 static void benchmark_controls_patch_free();
+static void benchmark_seek_patch_ensure_alloc();
+static void benchmark_seek_patch_free();
 
 static bool benchmark_controls_is_active()
 {
@@ -264,6 +295,7 @@ static void benchmark_controls_reset_for_video()
     gesture_router_set_vertical_adjust_edges_reserved(false);
     gesture_router_set_horizontal_swipe_enabled(true);
     benchmark_controls_patch_ensure_alloc();
+    benchmark_seek_patch_ensure_alloc();
     gesture_router_set_single_tap_enabled(true);
 }
 
@@ -422,6 +454,34 @@ static void benchmark_controls_patch_free()
     g_video_controls_patch_info = {};
     portEXIT_CRITICAL(&g_video_controls_patch_mux);
     if (buffer != nullptr) heap_caps_free(buffer);
+}
+
+static void benchmark_seek_patch_ensure_alloc()
+{
+    if (g_video_seek_patch_buffer != nullptr) return;
+    const size_t bytes = static_cast<size_t>(kVideoSeekPatchMaxWidth) *
+        kVideoSeekPatchRows * 2U;
+    g_video_seek_patch_buffer = static_cast<uint8_t *>(heap_caps_malloc(
+        bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (g_video_seek_patch_buffer == nullptr) {
+        ESP_LOGW(TAG, "暂停态SEEK浮层条带缓存分配失败；暂停时拖动SEEK不刷新浮层");
+    }
+}
+
+static void benchmark_seek_patch_free()
+{
+    uint8_t *buffer = nullptr;
+    portENTER_CRITICAL(&g_video_seek_patch_mux);
+    buffer = g_video_seek_patch_buffer;
+    g_video_seek_patch_buffer = nullptr;
+    g_video_seek_patch_info = {};
+    portEXIT_CRITICAL(&g_video_seek_patch_mux);
+    if (buffer != nullptr) heap_caps_free(buffer);
+    g_pause_seek_patched_active = false;
+    g_pause_seek_patched_target_ms = 0U;
+    g_pause_seek_patched_duration_ms = 0U;
+    g_pause_seek_patch_last_us = 0LL;
+    g_seek_target_hold_valid = false;
 }
 static bool g_music_paused_for_benchmark = false;
 static bool g_music_deep_suspended_for_benchmark = false;
@@ -1468,6 +1528,40 @@ static void benchmark_controls_patch_capture(
     portEXIT_CRITICAL(&g_video_controls_patch_mux);
 }
 
+// 记录最后一帧的底部 SEEK 浮层条带。暂停时没有新帧，只靠这块缓存局部重绘。
+static void benchmark_seek_patch_capture(
+    const uint8_t *frame_rgb565_be,
+    uint16_t frame_x, uint16_t frame_y,
+    uint16_t frame_width, uint16_t frame_height)
+{
+    if (frame_rgb565_be == nullptr || g_video_seek_patch_buffer == nullptr ||
+        frame_width == 0U || frame_width > kVideoSeekPatchMaxWidth) return;
+    if (frame_height <= kSeekOverlayBottomGap + kSeekOverlayPanelHeight) return;
+
+    VideoSeekPatchInfo info = {};
+    info.frame_x = frame_x;
+    info.frame_y = frame_y;
+    info.frame_width = frame_width;
+    info.frame_height = frame_height;
+    info.patch_y = static_cast<uint16_t>(
+        frame_height - kSeekOverlayBottomGap - kSeekOverlayPanelHeight);
+    info.patch_rows = kSeekOverlayPanelHeight;
+
+    const size_t source_stride = static_cast<size_t>(frame_width) * 2U;
+    const size_t target_stride = static_cast<size_t>(kVideoSeekPatchMaxWidth) * 2U;
+    const size_t copy_bytes = static_cast<size_t>(frame_width) * 2U;
+    for (uint16_t row = 0U; row < info.patch_rows; ++row) {
+        const uint8_t *src = frame_rgb565_be +
+            static_cast<size_t>(info.patch_y + row) * source_stride;
+        uint8_t *dst = g_video_seek_patch_buffer + static_cast<size_t>(row) * target_stride;
+        memcpy(dst, src, copy_bytes);
+    }
+    info.valid = true;
+    portENTER_CRITICAL(&g_video_seek_patch_mux);
+    g_video_seek_patch_info = info;
+    portEXIT_CRITICAL(&g_video_seek_patch_mux);
+}
+
 static esp_err_t benchmark_controls_patch_producer(
     void *context,
     uint16_t source_y,
@@ -1540,6 +1634,86 @@ static void benchmark_controls_patch_refresh()
         nullptr);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "暂停状态刷新视频控制浮层失败：%s", esp_err_to_name(ret));
+    }
+}
+
+struct VideoSeekPatchContext
+{
+    const uint8_t *patch_buffer = nullptr;
+    VideoSeekPatchInfo info = {};
+    bool overlay_active = false;
+    uint32_t overlay_target_ms = 0U;
+    uint32_t overlay_duration_ms = 0U;
+};
+
+static esp_err_t benchmark_seek_patch_producer(
+    void *context,
+    uint16_t source_y,
+    uint16_t rows,
+    uint16_t width,
+    uint8_t *dst_rgb565,
+    size_t dst_bytes)
+{
+    auto *patch = static_cast<VideoSeekPatchContext *>(context);
+    if (patch == nullptr || patch->patch_buffer == nullptr || dst_rgb565 == nullptr ||
+        patch->info.patch_rows == 0U || rows == 0U || width != patch->info.frame_width ||
+        static_cast<uint32_t>(source_y) + rows > patch->info.patch_rows) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const size_t width_bytes = static_cast<size_t>(width) * 2U;
+    if (dst_bytes < width_bytes * rows) return ESP_ERR_INVALID_SIZE;
+
+    const size_t source_stride = static_cast<size_t>(kVideoSeekPatchMaxWidth) * 2U;
+    for (uint16_t row = 0U; row < rows; ++row) {
+        const uint8_t *src = patch->patch_buffer +
+            static_cast<size_t>(source_y + row) * source_stride;
+        memcpy(dst_rgb565 + static_cast<size_t>(row) * width_bytes, src, width_bytes);
+    }
+
+    if (patch->overlay_active) {
+        benchmark_seek_overlay_draw(
+            dst_rgb565,
+            static_cast<uint16_t>(patch->info.patch_y + source_y),
+            rows,
+            width,
+            patch->info.frame_height,
+            patch->overlay_target_ms,
+            patch->overlay_duration_ms);
+    }
+    return ESP_OK;
+}
+
+// 暂停时只重绘最后一帧底部 48 行，由它承载 SEEK 浮层。
+static void benchmark_seek_patch_refresh(
+    bool overlay_active, uint32_t target_ms, uint32_t duration_ms)
+{
+    VideoSeekPatchInfo info = {};
+    uint8_t *buffer = nullptr;
+    portENTER_CRITICAL(&g_video_seek_patch_mux);
+    info = g_video_seek_patch_info;
+    buffer = g_video_seek_patch_buffer;
+    portEXIT_CRITICAL(&g_video_seek_patch_mux);
+    if (!info.valid || buffer == nullptr || info.patch_rows == 0U) return;
+
+    VideoSeekPatchContext context = {};
+    context.patch_buffer = buffer;
+    context.info = info;
+    context.overlay_active = overlay_active;
+    context.overlay_target_ms = target_ms;
+    context.overlay_duration_ms = duration_ms;
+
+    const esp_err_t ret = display_launcher_bounded_spi_present_stream(
+        benchmark_seek_patch_producer,
+        &context,
+        info.frame_x,
+        static_cast<uint16_t>(info.frame_y + info.patch_y),
+        info.frame_width,
+        info.patch_rows,
+        true,
+        true,
+        nullptr);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "暂停状态刷新SEEK浮层失败：%s", esp_err_to_name(ret));
     }
 }
 
@@ -1715,12 +1889,34 @@ static bool benchmark_presenter_wait_if_paused(bool clock_started, int64_t *cloc
         g_video_controls_refresh_pending = false;
         portEXIT_CRITICAL(&g_video_controls_mux);
         if (refresh_controls) benchmark_controls_patch_refresh();
+
+        // SEEK 浮层在暂停时没有新帧可叠加，改为只重绘最后一帧底部条带：
+        // 目标时间变化或浮层到期时刷新一次，避免每 5ms 预览都整屏推送。
+        uint32_t seek_target_ms = 0U;
+        uint32_t seek_duration_ms = 0U;
+        const bool seek_overlay_active =
+            benchmark_seek_overlay_snapshot(&seek_target_ms, &seek_duration_ms);
+        const bool seek_patch_needed =
+            seek_overlay_active != g_pause_seek_patched_active ||
+            (seek_overlay_active && seek_target_ms != g_pause_seek_patched_target_ms);
+        const int64_t seek_now_us = esp_timer_get_time();
+        if (seek_patch_needed &&
+            seek_now_us - g_pause_seek_patch_last_us >= kPauseSeekPatchMinGapUs) {
+            g_pause_seek_patched_active = seek_overlay_active;
+            g_pause_seek_patched_target_ms = seek_target_ms;
+            g_pause_seek_patched_duration_ms = seek_duration_ms;
+            g_pause_seek_patch_last_us = seek_now_us;
+            benchmark_seek_patch_refresh(seek_overlay_active, seek_target_ms, seek_duration_ms);
+        }
         // 暂停时没有新视频帧，仍由 Presenter 独占提交亮度命令。
         if (display_launcher_bounded_spi_session_active()) {
             (void)screen_lock_simple_apply_video_brightness_pending();
         }
         vTaskDelay(1);
     }
+    // 恢复播放后由正常帧路径叠加浮层，这里的局部重绘状态作废。
+    g_pause_seek_patched_active = false;
+    g_pause_seek_patch_last_us = 0LL;
     if (benchmark_presenter_should_stop()) return false;
 
     if (clock_started && clock_base_us != nullptr) {
@@ -1982,6 +2178,7 @@ static void benchmark_presenter_task(void *arg)
         const uint16_t frame_x = static_cast<uint16_t>((VideoBenchmark::kWidth - frame_width) / 2U);
         const uint16_t frame_y = static_cast<uint16_t>((VideoBenchmark::kHeight - frame_height) / 2U);
         benchmark_controls_patch_capture(frame.rgb565_be, frame_x, frame_y, frame_width, frame_height);
+        benchmark_seek_patch_capture(frame.rgb565_be, frame_x, frame_y, frame_width, frame_height);
         const uint32_t scan_phase_delay_us = benchmark_scan_phase_delay_us(frame_y);
 
         if (!bounded_session) {
@@ -2204,6 +2401,14 @@ static bool g_seek_preview_active = false;
 static bool g_seek_preview_base_valid = false;
 static uint32_t g_seek_preview_base_ms = 0U;
 
+static uint32_t benchmark_seek_base_from_last_pts(uint32_t last_pts_ms)
+{
+    if (g_seek_target_hold_valid && last_pts_ms < g_seek_target_hold_ms) {
+        return g_seek_target_hold_ms;
+    }
+    return last_pts_ms;
+}
+
 // 根据触摸起点选择固定的 SEEK 步进，拖动跨过屏幕中线也不会改变速度。
 // 上半屏：5px 对应 10 秒（2000ms/px）；下半屏：5px 对应 1 秒（200ms/px）。
 static constexpr int32_t kSeekFineMsPerPx = 200;
@@ -2233,7 +2438,7 @@ static void benchmark_seek_by(int32_t delta_ms)
 
     // 使用手势开始时记录的同一基准，避免拖动3秒后实际比预览多跳3秒。
     const uint32_t base_ms = g_seek_preview_base_valid
-        ? g_seek_preview_base_ms : snapshot.last_pts_ms;
+        ? g_seek_preview_base_ms : benchmark_seek_base_from_last_pts(snapshot.last_pts_ms);
     int64_t target = static_cast<int64_t>(base_ms) + delta_ms;
     if (target < 0) target = 0;
     if (snapshot.duration_ms > 0 && target > static_cast<int64_t>(snapshot.duration_ms)) {
@@ -2241,8 +2446,12 @@ static void benchmark_seek_by(int32_t delta_ms)
     }
     const esp_err_t ret = VideoBenchmark::seek(static_cast<uint32_t>(target));
     if (ret != ESP_OK) {
+        g_seek_target_hold_valid = false;
         ESP_LOGW(TAG, "Seek失败: delta=%dms ret=%s", delta_ms, esp_err_to_name(ret));
     } else {
+        // 目标时间由用户选择，必须保留到画面真正推进到该位置。
+        g_seek_target_hold_valid = true;
+        g_seek_target_hold_ms = static_cast<uint32_t>(target);
         ESP_LOGI(TAG, "Seek: delta=%dms target=%lums",
             delta_ms, static_cast<unsigned long>(target));
         // 抬手后 seek 已完成，显示 2 秒进度条 + 时间浮层（叠加在视频帧上）。
@@ -2321,7 +2530,8 @@ static void benchmark_seek_preview_tick()
         // 同一轮触摸短暂偏离水平后又回到水平时，继续沿用最初的预览基准。
         if (!g_seek_preview_base_valid) {
             g_seek_preview_base_valid = true;
-            g_seek_preview_base_ms = snapshot.last_pts_ms;
+            // seek 后画面可能还没推进到目标位置，此时以保留的目标时间为基准。
+            g_seek_preview_base_ms = benchmark_seek_base_from_last_pts(snapshot.last_pts_ms);
         }
         g_seek_preview_active = true;
     }
@@ -3617,6 +3827,7 @@ static void video_destroy()
     if (!benchmark_presenter_is_running()) benchmark_restore_music_after_exclusive("destroy");
     benchmark_controls_commit_brightness();
     if (!benchmark_presenter_is_running()) benchmark_controls_patch_free();
+    if (!benchmark_presenter_is_running()) benchmark_seek_patch_free();
     g_benchmark_ui = {};
     ESP_LOGI(TAG, "Video destroy完成：LVGL/目录索引/路径PSRAM已释放；Benchmark已请求回收，Exclusive Music状态已处理");
 }
