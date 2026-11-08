@@ -216,7 +216,7 @@ $numFps.Location = New-Object System.Drawing.Point(310,33)
 $numFps.Size = New-Object System.Drawing.Size(80,25)
 $numFps.Minimum = 1
 $numFps.Maximum = 120
-$numFps.Value = 24
+$numFps.Value = 20
 $grpVideo.Controls.Add($numFps)
 
 $l3 = New-Object System.Windows.Forms.Label
@@ -276,14 +276,16 @@ $chkSquare.Text = "方形裁切 460×460"
 $chkSquare.Location = New-Object System.Drawing.Point(300,118)
 $chkSquare.Size = New-Object System.Drawing.Size(170,25)
 $grpVideo.Controls.Add($chkSquare)
+# 默认不裁切，按原比例输出长方形画面；方形裁切由用户按需勾选。
+$chkSquare.Checked = $false
 $chkSquare.Add_CheckedChanged({
     if ($chkSquare.Checked) {
-        # 方形裁切模式推荐参数：20FPS + q=5
-        $numFps.Value = 20
+        # 方形裁切模式推荐参数：16FPS + q=5
+        $numFps.Value = 16
         $numQ.Value = 5
     } else {
-        # 取消方形裁切，帧率恢复默认 24FPS
-        $numFps.Value = 24
+        # 长方形输出走 20FPS
+        $numFps.Value = 20
     }
     Update-CommandPreview
 })
@@ -1100,7 +1102,7 @@ $btnCrop.Add_Click({
 
 $btnPreset.Add_Click({
     $numWidth.Value = 460
-    $numFps.Value = 24
+    $numFps.Value = 20
     $numQ.Value = 5
     $cmbBitrate.SelectedItem = "192k"
     $cmbRate.SelectedIndex = 0
