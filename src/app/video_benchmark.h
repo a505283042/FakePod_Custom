@@ -97,7 +97,8 @@ bool is_paused();
 // 暂停态 SEEK 后短暂恢复，仅用于把目标位置首帧推上屏。
 bool paused_seek_preview_active();
 // Presenter 完成该预览帧上屏后调用，立即回到暂停（音频保持暂停）。
-bool finish_paused_seek_preview();
+// presented_epoch 必须是该帧所属的 seek epoch；期间若发生新 SEEK 则忽略本次收尾。
+bool finish_paused_seek_preview(uint32_t presented_epoch);
 // seek 到指定毫秒位置。依赖侧车索引(.fvix)，无索引时返回 ESP_ERR_NOT_SUPPORTED。
 // seek 过程会清空音视频缓冲并重置时钟。
 esp_err_t seek(uint32_t target_ms);

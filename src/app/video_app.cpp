@@ -2397,7 +2397,9 @@ static void benchmark_presenter_task(void *arg)
 
         // 暂停态 SEEK 的预览帧：整帧已写入 LCD，立即回到暂停，并让暂停循环重绘底部浮层。
         if (paused_preview_frame) {
-            VideoBenchmark::finish_paused_seek_preview();
+            if (!VideoBenchmark::finish_paused_seek_preview(frame.seek_epoch)) {
+                ESP_LOGW(TAG, "暂停态Seek预览帧收尾失败：回到暂停状态失败");
+            }
             g_pause_seek_patched_active = false;
             g_pause_seek_patch_last_us = 0LL;
         }
@@ -2524,22 +2526,39 @@ static void benchmark_seek_by(int32_t delta_ms)
 // 抬手后一次执行，避免拖动过程中连续 seek。
 // 双击切换暂停/继续：视频 pipeline 与视频 MP3 音频必须一起停/一起走，
 // 否则暂停时画面静止但声音继续，恢复后音画不同轴。
-static void benchmark_toggle_pause()
+// 双击手势与 BLE 遥控共用这一份切换逻辑：任一步失败都回滚，避免只成功一半。
+static bool video_toggle_play_pause(bool *pause_out)
 {
-    const bool pause_now = !VideoBenchmark::is_paused();
-    if (pause_now) {
-        if (!VideoBenchmark::set_paused(true)) {
-            ESP_LOGW(TAG, "双击暂停失败：当前状态不可暂停");
-            return;
-        }
-        (void)audio_service_video_mp3_pause(true);
+    const bool pause = !VideoBenchmark::is_paused();
+    if (pause_out != nullptr) *pause_out = pause;
+
+    AudioVideoClockSnapshot audio_clock = {};
+    const bool has_video_audio =
+        audio_service_video_mp3_get_clock(&audio_clock) && audio_clock.active;
+    bool ok = false;
+    if (pause) {
+        ok = VideoBenchmark::set_paused(true);
+        if (ok && has_video_audio) ok = audio_service_video_mp3_pause(true);
+        // 音频没停住就不能停在“画面静止、声音继续”的状态，回滚视频暂停。
+        if (!ok) (void)VideoBenchmark::set_paused(false);
     } else {
         const bool wait_for_seek_frame = VideoBenchmark::seek_audio_resume_pending();
-        if (!wait_for_seek_frame) (void)audio_service_video_mp3_resume(true);
-        if (!VideoBenchmark::set_paused(false)) {
-            if (!wait_for_seek_frame) (void)audio_service_video_mp3_pause(true);
-            ESP_LOGW(TAG, "双击恢复播放失败");
+        // 音频恢复失败时不要放开视频，否则会出现画面走了但没声音。
+        ok = wait_for_seek_frame || !has_video_audio || audio_service_video_mp3_resume(true);
+        if (ok) ok = VideoBenchmark::set_paused(false);
+        if (!ok && has_video_audio && !wait_for_seek_frame) {
+            (void)audio_service_video_mp3_pause(true);
         }
+    }
+    return ok;
+}
+
+static void benchmark_toggle_pause()
+{
+    bool pause_now = false;
+    if (!video_toggle_play_pause(&pause_now)) {
+        ESP_LOGW(TAG, "双击%s失败：音视频未能同步切换", pause_now ? "暂停" : "恢复播放");
+        return;
     }
     ESP_LOGI(TAG, "双击：%s", pause_now ? "暂停播放" : "继续播放");
 }
@@ -3163,24 +3182,8 @@ static void process_remote_command()
     if (!remote_take_pending(&command)) return;
 
     if (command == VideoRemoteCommand::TogglePlayPause) {
-        const bool pause = !VideoBenchmark::is_paused();
-        AudioVideoClockSnapshot audio_clock = {};
-        const bool has_video_audio =
-            audio_service_video_mp3_get_clock(&audio_clock) && audio_clock.active;
-        bool ok = false;
-        if (pause) {
-            ok = VideoBenchmark::set_paused(true);
-            if (ok && has_video_audio) ok = audio_service_video_mp3_pause(true);
-            if (!ok) (void)VideoBenchmark::set_paused(false);
-        } else {
-            const bool wait_for_seek_frame = VideoBenchmark::seek_audio_resume_pending();
-            ok = wait_for_seek_frame || !has_video_audio || audio_service_video_mp3_resume(true);
-            if (ok) ok = VideoBenchmark::set_paused(false);
-            if (!ok && has_video_audio && !wait_for_seek_frame) {
-                (void)audio_service_video_mp3_pause(true);
-            }
-        }
-        if (ok) {
+        bool pause = false;
+        if (video_toggle_play_pause(&pause)) {
             remote_playback_changed();
             ESP_LOGI(TAG, "BLE视频控制：%s", pause ? "暂停" : "继续播放");
         } else {

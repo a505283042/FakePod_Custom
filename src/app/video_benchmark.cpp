@@ -1602,11 +1602,19 @@ bool paused_seek_preview_active()
     return active;
 }
 
-bool finish_paused_seek_preview()
+bool finish_paused_seek_preview(uint32_t presented_epoch)
 {
     portENTER_CRITICAL(&g_mux);
-    const bool was_expected = g_paused_seek_preview;
-    g_paused_seek_preview = false;
+    // 若期间又发生了一次 SEEK，交给新预览自己收尾，不能清掉它的等待标记。
+    const bool was_expected = g_paused_seek_preview && presented_epoch == g_seek_epoch &&
+        g_task != nullptr && g_stop_generation != g_generation;
+    if (was_expected) {
+        g_paused_seek_preview = false;
+        // 目标位置首帧已经真正上屏，"等待首帧"这一条件已满足，清掉标记但不恢复音频。
+        // 音频仍保持暂停，因此这里不会出声；用户再次双击时可以立即恢复音频，
+        // 不必等下一帧走到 Presenter 才解除等待。
+        g_seek_audio_resume_pending = false;
+    }
     portEXIT_CRITICAL(&g_mux);
     if (!was_expected) return true;
     // 首帧已上屏，立即回到暂停；音频保持暂停，等待用户手动恢复。
