@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "sdkconfig.h"
@@ -1388,6 +1389,53 @@ static int start_controller_scan()
     return 0;
 }
 
+// esp_hidh 的 NimBLE 实现不会主动发起配对，而多数 HID 手柄要求 Report Map 等属性
+// 必须加密访问（否则读操作返回 0x05 Insufficient Authentication，设备发现直接中止）。
+// 这里在连接建立后立刻主动发起配对，争取在 esp_hidh 读取属性之前完成加密。
+static bool controller_find_peer_conn(const ControllerCandidate &candidate,
+    struct ble_gap_conn_desc *out_desc)
+{
+    ble_addr_t peer = {};
+    memcpy(peer.val, candidate.address, sizeof(peer.val));
+    peer.type = candidate.address_type;
+    if (ble_gap_conn_find_by_addr(&peer, out_desc) == 0) return true;
+
+    // 兜底：按连接句柄扫描，避免地址类型/隐私地址导致按地址查表失败。
+    for (uint16_t handle = 0; handle < 4; ++handle) {
+        struct ble_gap_conn_desc desc = {};
+        if (ble_gap_conn_find(handle, &desc) != 0) continue;
+        if (memcmp(desc.peer_ota_addr.val, candidate.address, sizeof(peer.val)) != 0 &&
+            memcmp(desc.peer_id_addr.val, candidate.address, sizeof(peer.val)) != 0) {
+            continue;
+        }
+        *out_desc = desc;
+        return true;
+    }
+    return false;
+}
+
+static void controller_security_task(void *arg)
+{
+    const ControllerCandidate candidate = *static_cast<ControllerCandidate *>(arg);
+    free(arg);
+
+    ESP_LOGI(TAG, "BLE手柄配对监视启动：等待链路建立");
+
+    for (int i = 0; i < 1200; ++i) {
+        struct ble_gap_conn_desc desc = {};
+        if (controller_find_peer_conn(candidate, &desc)) {
+            const int rc = ble_gap_security_initiate(desc.conn_handle);
+            ESP_LOGI(TAG, "BLE手柄配对发起：handle=%u rc=%d",
+                static_cast<unsigned>(desc.conn_handle), rc);
+            vTaskDelete(nullptr);
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    ESP_LOGW(TAG, "BLE手柄配对监视超时：未找到已建立的连接");
+    vTaskDelete(nullptr);
+}
+
 static void controller_connect_task(void *)
 {
     ControllerCandidate candidate = {};
@@ -1397,6 +1445,24 @@ static void controller_connect_task(void *)
 
     ESP_LOGI(TAG, "连接BLE手柄：name=%s RSSI=%d",
         candidate.name, static_cast<int>(candidate.rssi));
+
+    auto *pair_arg = static_cast<ControllerCandidate *>(malloc(sizeof(ControllerCandidate)));
+    if (pair_arg != nullptr) {
+        *pair_arg = candidate;
+        if (xTaskCreatePinnedToCore(
+                controller_security_task,
+                "ble_hid_pair",
+                3072,
+                pair_arg,
+                kControllerConnectTaskPriority,
+                nullptr,
+                kControllerConnectTaskCore) != pdPASS) {
+            free(pair_arg);
+            ESP_LOGW(TAG, "BLE手柄配对监视任务创建失败");
+        }
+    } else {
+        ESP_LOGW(TAG, "BLE手柄配对监视内存不足");
+    }
 
     esp_hidh_dev_t *dev = esp_hidh_dev_open(
         candidate.address,
@@ -1532,14 +1598,43 @@ static void gamepad_hidh_event_cb(
                 static_cast<unsigned>(param->battery.level));
             break;
 
-        case ESP_HIDH_INPUT_EVENT:
+        case ESP_HIDH_INPUT_EVENT: {
             gamepad_input_service_submit_report(
                 static_cast<uint8_t>(param->input.usage),
                 param->input.report_id,
                 param->input.map_index,
                 param->input.data,
                 param->input.length);
+
+            // 诊断：仅在报文变化且距上次打印超过 120ms 时输出，避免摇杆数据刷屏。
+            static uint8_t last_report[64] = {};
+            static uint8_t last_report_len = 0;
+            static uint8_t last_report_id = 0;
+            static TickType_t last_log_tick = 0;
+            const uint8_t length = param->input.length < sizeof(last_report)
+                ? static_cast<uint8_t>(param->input.length)
+                : static_cast<uint8_t>(sizeof(last_report));
+            const TickType_t now = xTaskGetTickCount();
+            const bool changed = last_report_len != static_cast<uint8_t>(param->input.length) ||
+                                 last_report_id != param->input.report_id ||
+                                 memcmp(last_report, param->input.data, length) != 0;
+            if (changed && (last_log_tick == 0 || (now - last_log_tick) >= pdMS_TO_TICKS(120))) {
+                last_report_len = static_cast<uint8_t>(param->input.length);
+                last_report_id = param->input.report_id;
+                memcpy(last_report, param->input.data, length);
+                last_log_tick = now;
+                char hex[3 * 64 + 1] = {};
+                for (uint8_t i = 0; i < length; ++i) {
+                    snprintf(hex + i * 3U, 4U, "%02x ", param->input.data[i]);
+                }
+                ESP_LOGI(TAG, "手柄报文：id=%u usage=%u len=%u %s",
+                    static_cast<unsigned>(param->input.report_id),
+                    static_cast<unsigned>(param->input.usage),
+                    static_cast<unsigned>(length),
+                    hex);
+            }
             break;
+        }
 
         case ESP_HIDH_CLOSE_EVENT: {
             portENTER_CRITICAL(&g_lock);
