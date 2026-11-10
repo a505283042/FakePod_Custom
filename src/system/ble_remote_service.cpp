@@ -98,6 +98,7 @@ struct ControllerCandidate {
 
 static bool g_hidh_initialized = false;
 static bool g_controller_scan_active = false;
+static bool g_controller_stop_scan_requested = false;
 static bool g_controller_candidate_ready = false;
 static bool g_controller_connect_task_running = false;
 static TickType_t g_controller_scan_due_tick = 0;
@@ -1303,10 +1304,11 @@ static int controller_gap_event_cb(struct ble_gap_event *event, void *)
                     static_cast<unsigned>(candidate.appearance),
                     static_cast<int>(candidate.rssi),
                     static_cast<unsigned>(candidate.address_type));
-                const int cancel_rc = ble_gap_disc_cancel();
-                if (cancel_rc != 0 && cancel_rc != BLE_HS_EALREADY) {
-                    ESP_LOGW(TAG, "停止手柄扫描失败：rc=%d", cancel_rc);
-                }
+                // 不在 GAP 回调内直接取消扫描：改为置标志，由 update 在回调外调用
+                // ble_gap_disc_cancel()，避免回调内重入导致 DISC_COMPLETE 丢失。
+                portENTER_CRITICAL(&g_lock);
+                g_controller_stop_scan_requested = true;
+                portEXIT_CRITICAL(&g_lock);
             }
             return 0;
         }
@@ -1356,6 +1358,7 @@ static int start_controller_scan()
         return 0;
     }
     g_controller_scan_active = true;
+    g_controller_stop_scan_requested = false;
     g_controller_scan_due_tick = 0;
     g_controller_scan_report_count = 0;
     g_controller_scan_log_budget = 10;
@@ -1436,6 +1439,7 @@ static bool start_controller_connect_task()
         return false;
     }
     g_controller_candidate_ready = false;
+    g_controller_stop_scan_requested = false;
     g_controller_connect_task_running = true;
     set_state_locked(BleRemoteState::ControllerConnecting);
     portEXIT_CRITICAL(&g_lock);
@@ -2059,14 +2063,16 @@ void ble_remote_service_update()
                 // 兜底：若 DISC_COMPLETE 丢失或连接任务未起来，避免永久卡在“连接手柄”。
                 bool connect_running = false;
                 bool candidate_ready = false;
+                bool scan_active = false;
+                bool stop_requested = false;
                 portENTER_CRITICAL(&g_lock);
                 connect_running = g_controller_connect_task_running;
                 candidate_ready = g_controller_candidate_ready;
+                scan_active = g_controller_scan_active;
+                stop_requested = g_controller_stop_scan_requested;
                 portEXIT_CRITICAL(&g_lock);
                 if (connect_running) return;
-                if (candidate_ready) {
-                    (void)start_controller_connect_task();
-                } else {
+                if (!candidate_ready) {
                     bool fell_back = false;
                     portENTER_CRITICAL(&g_lock);
                     if (g_state == BleRemoteState::ControllerConnecting) {
@@ -2076,7 +2082,27 @@ void ble_remote_service_update()
                     }
                     portEXIT_CRITICAL(&g_lock);
                     if (fell_back) ESP_LOGW(TAG, "BLE手柄连接任务未启动：回退到扫描");
+                    return;
                 }
+                if (scan_active) {
+                    if (stop_requested) {
+                        // 在 GAP 回调之外取消扫描，避免回调内重入丢失 DISC_COMPLETE。
+                        portENTER_CRITICAL(&g_lock);
+                        g_controller_stop_scan_requested = false;
+                        portEXIT_CRITICAL(&g_lock);
+                        const int cancel_rc = ble_gap_disc_cancel();
+                        if (cancel_rc != 0 && cancel_rc != BLE_HS_EALREADY) {
+                            ESP_LOGW(TAG, "停止手柄扫描失败：rc=%d", cancel_rc);
+                        }
+                        return;
+                    }
+                    if ((now - state_since) < pdMS_TO_TICKS(1000)) return;
+                    portENTER_CRITICAL(&g_lock);
+                    g_controller_scan_active = false;
+                    portEXIT_CRITICAL(&g_lock);
+                    ESP_LOGW(TAG, "手柄扫描停止确认超时：强制进入连接");
+                }
+                (void)start_controller_connect_task();
                 return;
             }
             if (state == BleRemoteState::Scanning) {
