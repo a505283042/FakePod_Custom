@@ -1531,6 +1531,46 @@ static bool start_controller_connect_task()
     return false;
 }
 
+// 手柄面板按键映射：复用手机遥控命令分发，仅在按下沿触发，避免按住重复执行。
+// report id=4 布局：B4=十字键(0上/2右/4下/6左/0xFF松开)，B5=ABXY/L1/R1，B6=扳机/Start/Select。
+static void controller_handle_gamepad_report(const uint8_t *data, uint16_t length)
+{
+    if (data == nullptr || length < 7U) return;
+
+    static uint8_t prev_hat = 0xFFU;
+    static uint8_t prev_buttons_lo = 0U;
+    static uint8_t prev_buttons_hi = 0U;
+
+    const uint8_t hat = data[4];
+    const uint8_t buttons_lo = data[5];
+    const uint8_t buttons_hi = data[6];
+
+    const auto pressed = [](uint8_t now, uint8_t before, uint8_t mask) {
+        return (now & mask) != 0U && (before & mask) == 0U;
+    };
+
+    if (pressed(buttons_lo, prev_buttons_lo, 0x01U)) (void)execute_control_command(0x01U);  // A：播放/暂停
+    if (pressed(buttons_lo, prev_buttons_lo, 0x08U)) (void)execute_control_command(0x03U);  // X：上一个
+    if (pressed(buttons_lo, prev_buttons_lo, 0x10U)) (void)execute_control_command(0x02U);  // Y：下一个
+    if (pressed(buttons_lo, prev_buttons_lo, 0x40U)) (void)execute_control_command(0x05U);  // L1：音量-
+    if (pressed(buttons_lo, prev_buttons_lo, 0x80U)) (void)execute_control_command(0x04U);  // R1：音量+
+    if (pressed(buttons_hi, prev_buttons_hi, 0x08U)) (void)execute_control_command(0x01U);  // Start：播放/暂停
+
+    if (hat != prev_hat && hat <= 7U) {
+        switch (hat) {
+            case 0U: (void)execute_control_command(0x04U); break;                   // 上：音量+
+            case 4U: (void)execute_control_command(0x05U); break;                   // 下：音量-
+            case 2U: (void)video_app_remote_seek_relative(10000); break;            // 右：快进10秒
+            case 6U: (void)video_app_remote_seek_relative(-10000); break;           // 左：后退10秒
+            default: break;
+        }
+    }
+
+    prev_hat = hat;
+    prev_buttons_lo = buttons_lo;
+    prev_buttons_hi = buttons_hi;
+}
+
 static void gamepad_hidh_event_cb(
     void *,
     esp_event_base_t,
@@ -1599,6 +1639,24 @@ static void gamepad_hidh_event_cb(
             break;
 
         case ESP_HIDH_INPUT_EVENT: {
+            // 多媒体键（Consumer Control，report id=3）：直接复用手机遥控的命令分发。
+            if (param->input.report_id == 3 && param->input.length >= 2) {
+                const uint16_t usage = static_cast<uint16_t>(param->input.data[0]) |
+                    (static_cast<uint16_t>(param->input.data[1]) << 8);
+                switch (usage) {
+                    case 0x00CDU: (void)execute_control_command(0x01U); break;  // 播放/暂停
+                    case 0x00B5U: (void)execute_control_command(0x02U); break;  // 下一曲
+                    case 0x00B6U: (void)execute_control_command(0x03U); break;  // 上一曲
+                    case 0x00E9U: (void)execute_control_command(0x04U); break;  // 音量+
+                    case 0x00EAU: (void)execute_control_command(0x05U); break;  // 音量-
+                    default: break;
+                }
+            }
+
+            if (param->input.report_id == 4) {
+                controller_handle_gamepad_report(param->input.data, param->input.length);
+            }
+
             gamepad_input_service_submit_report(
                 static_cast<uint8_t>(param->input.usage),
                 param->input.report_id,

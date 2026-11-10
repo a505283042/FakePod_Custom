@@ -27,6 +27,8 @@ struct VideoRemoteSnapshot
 // BLE/外部遥控只提交意图；真正的Video状态切换仍由Video LVGL timer串行执行。
 bool video_app_remote_control_active();
 bool video_app_remote_submit(VideoRemoteCommand command);
+// 手柄十字键相对跳转：仅在视频播放上下文生效，正数快进、负数后退。
+bool video_app_remote_seek_relative(int32_t delta_ms);
 bool video_app_get_remote_snapshot(VideoRemoteSnapshot *out_snapshot);
 
 // R.40.2 Video：/sdcard/video AVI Virtual Browser + 460x460 MJPEG Decode/CO5300 Benchmark。

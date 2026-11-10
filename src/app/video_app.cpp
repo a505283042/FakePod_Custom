@@ -502,6 +502,8 @@ static portMUX_TYPE g_remote_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool g_remote_context_active = false;
 static VideoRemoteCommand g_remote_pending = VideoRemoteCommand::TogglePlayPause;
 static bool g_remote_pending_valid = false;
+static int32_t g_remote_pending_seek_delta_ms = 0;
+static bool g_remote_pending_seek_valid = false;
 static uint32_t g_remote_playback_revision = 1U;
 static uint32_t g_remote_metadata_revision = 1U;
 static uint32_t g_remote_item_index = UINT32_MAX;
@@ -560,6 +562,7 @@ static void remote_context_end()
     if (g_remote_context_active) {
         g_remote_context_active = false;
         g_remote_pending_valid = false;
+        g_remote_pending_seek_valid = false;
         remote_bump_revision(&g_remote_playback_revision);
         remote_bump_revision(&g_remote_metadata_revision);
     }
@@ -574,6 +577,20 @@ static bool remote_take_pending(VideoRemoteCommand *out_command)
     if (g_remote_pending_valid) {
         *out_command = g_remote_pending;
         g_remote_pending_valid = false;
+        have = true;
+    }
+    portEXIT_CRITICAL(&g_remote_mux);
+    return have;
+}
+
+static bool remote_take_pending_seek(int32_t *out_delta_ms)
+{
+    if (out_delta_ms == nullptr) return false;
+    bool have = false;
+    portENTER_CRITICAL(&g_remote_mux);
+    if (g_remote_pending_seek_valid) {
+        *out_delta_ms = g_remote_pending_seek_delta_ms;
+        g_remote_pending_seek_valid = false;
         have = true;
     }
     portEXIT_CRITICAL(&g_remote_mux);
@@ -3178,6 +3195,12 @@ static bool remote_switch_video(int direction)
 
 static void process_remote_command()
 {
+    // 手柄十字键相对跳转：与手势 seek 共用同一套基准与浮层逻辑。
+    int32_t seek_delta_ms = 0;
+    if (remote_take_pending_seek(&seek_delta_ms)) {
+        benchmark_seek_by(seek_delta_ms);
+    }
+
     VideoRemoteCommand command = VideoRemoteCommand::TogglePlayPause;
     if (!remote_take_pending(&command)) return;
 
@@ -3924,6 +3947,20 @@ bool video_app_remote_submit(VideoRemoteCommand command)
     if (g_remote_context_active && !g_remote_pending_valid) {
         g_remote_pending = command;
         g_remote_pending_valid = true;
+        accepted = true;
+    }
+    portEXIT_CRITICAL(&g_remote_mux);
+    return accepted;
+}
+
+bool video_app_remote_seek_relative(int32_t delta_ms)
+{
+    if (delta_ms == 0) return false;
+    bool accepted = false;
+    portENTER_CRITICAL(&g_remote_mux);
+    if (g_remote_context_active && !g_remote_pending_seek_valid) {
+        g_remote_pending_seek_delta_ms = delta_ms;
+        g_remote_pending_seek_valid = true;
         accepted = true;
     }
     portEXIT_CRITICAL(&g_remote_mux);
