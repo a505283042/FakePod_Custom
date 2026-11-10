@@ -103,6 +103,9 @@ static bool g_controller_connect_task_running = false;
 static TickType_t g_controller_scan_due_tick = 0;
 static ControllerCandidate g_controller_candidate = {};
 static esp_hidh_dev_t *g_controller_dev = nullptr;
+// 扫描诊断：每轮统计收到的广播条数，并只打印前若干条明细，避免刷屏。
+static uint16_t g_controller_scan_report_count = 0;
+static uint8_t g_controller_scan_log_budget = 0;
 
 // R46.0.12：保留手机写命令，并增加 FakePod -> 手机状态 Notify。
 // Command/Event UUID 固定；Event 使用 20B Status + <=20B Metadata Chunk，默认 MTU=23 也可工作。
@@ -1176,7 +1179,6 @@ static bool parse_controller_candidate(
             break;
         }
     }
-    if (!has_hid_service) return false;
 
     ControllerCandidate candidate = {};
     memcpy(candidate.address, disc->addr.val, sizeof(candidate.address));
@@ -1193,6 +1195,8 @@ static bool parse_controller_candidate(
 
     // Prefer the standard Gamepad/Joystick appearance. Some controllers omit
     // appearance, so accept common controller names when HID service 0x1812 exists.
+    // 很多手柄（Xbox / Switch Pro / 8BitDo）广播里根本不含 0x1812，只按 UUID 过滤会全部漏掉，
+    // 因此 HID 服务、手柄外观、名称关键字三者满足其一即视为候选。
     bool gamepad_like = candidate.appearance == kGamepadAppearance ||
         candidate.appearance == kJoystickAppearance;
     if (!gamepad_like) {
@@ -1207,7 +1211,7 @@ static bool parse_controller_candidate(
             }
         }
     }
-    if (!gamepad_like) return false;
+    if (!gamepad_like && !has_hid_service) return false;
 
     if (candidate.name[0] == '\0') {
         snprintf(candidate.name, sizeof(candidate.name), "%s", "BLE HID Gamepad");
@@ -1216,12 +1220,64 @@ static bool parse_controller_candidate(
     return true;
 }
 
+static void log_controller_adv_report(const struct ble_gap_disc_desc *disc)
+{
+    if (disc == nullptr) return;
+
+    struct ble_hs_adv_fields fields = {};
+    const int rc = ble_hs_adv_parse_fields(&fields, disc->data, disc->length_data);
+
+    char name[32] = {};
+    uint16_t uuid16 = 0U;
+    unsigned appearance = 0U;
+    bool has_mfg = false;
+    if (rc == 0) {
+        if (fields.name != nullptr && fields.name_len > 0U) {
+            size_t copy_length = fields.name_len < sizeof(name) - 1U ? fields.name_len : sizeof(name) - 1U;
+            memcpy(name, fields.name, copy_length);
+            name[copy_length] = '\0';
+        }
+        if (fields.num_uuids16 > 0U) uuid16 = ble_uuid_u16(&fields.uuids16[0].u);
+        if (fields.appearance_is_present) appearance = fields.appearance;
+        has_mfg = fields.mfg_data != nullptr;
+    }
+
+    const uint8_t *addr = disc->addr.val;
+    char raw[3 * 31 + 1] = {};
+    const uint8_t raw_length = disc->length_data < 31U ? disc->length_data : 31U;
+    for (uint8_t i = 0U; i < raw_length; ++i) {
+        snprintf(raw + i * 3U, 4U, "%02x ", disc->data[i]);
+    }
+    ESP_LOGI(TAG,
+        "扫描广播：%02x:%02x:%02x:%02x:%02x:%02x type=%d rssi=%d name=\"%s\" app=0x%04x uuid16=0x%04x mfg=%s raw=%s",
+        addr[5], addr[4], addr[3], addr[2], addr[1], addr[0],
+        static_cast<int>(disc->event_type),
+        static_cast<int>(disc->rssi),
+        name,
+        appearance,
+        static_cast<unsigned>(uuid16),
+        has_mfg ? "yes" : "no",
+        raw);
+}
+
 static int controller_gap_event_cb(struct ble_gap_event *event, void *)
 {
     if (event == nullptr) return 0;
 
     switch (event->type) {
         case BLE_GAP_EVENT_DISC: {
+            // 诊断：统计每轮收到的广播条数，并打印前若干条明细，
+            // 用来区分“根本没收到广播”和“收到了但被过滤条件丢掉”。
+            bool log_this_report = false;
+            portENTER_CRITICAL(&g_lock);
+            ++g_controller_scan_report_count;
+            if (g_controller_scan_log_budget > 0U) {
+                --g_controller_scan_log_budget;
+                log_this_report = true;
+            }
+            portEXIT_CRITICAL(&g_lock);
+            if (log_this_report) log_controller_adv_report(&event->disc);
+
             ControllerCandidate candidate = {};
             if (!parse_controller_candidate(&event->disc, &candidate)) return 0;
 
@@ -1256,9 +1312,10 @@ static int controller_gap_event_cb(struct ble_gap_event *event, void *)
             return 0;
         }
 
-        case BLE_GAP_EVENT_DISC_COMPLETE:
+        case BLE_GAP_EVENT_DISC_COMPLETE: {
             portENTER_CRITICAL(&g_lock);
             g_controller_scan_active = false;
+            const uint16_t report_count = g_controller_scan_report_count;
             if (g_desired_enabled &&
                 g_mode == DeviceBluetoothMode::Controller &&
                 g_state != BleRemoteState::Stopping &&
@@ -1269,8 +1326,10 @@ static int controller_gap_event_cb(struct ble_gap_event *event, void *)
                     ? 0 : xTaskGetTickCount() + kControllerScanRetryDelay;
             }
             portEXIT_CRITICAL(&g_lock);
-            ESP_LOGI(TAG, "BLE手柄扫描轮次结束：reason=%d", event->disc_complete.reason);
+            ESP_LOGI(TAG, "BLE手柄扫描轮次结束：reason=%d 收到广播=%u",
+                event->disc_complete.reason, static_cast<unsigned>(report_count));
             return 0;
+        }
 
         default:
             return 0;
@@ -1299,6 +1358,8 @@ static int start_controller_scan()
     }
     g_controller_scan_active = true;
     g_controller_scan_due_tick = 0;
+    g_controller_scan_report_count = 0;
+    g_controller_scan_log_budget = 10;
     set_state_locked(BleRemoteState::Scanning);
     portEXIT_CRITICAL(&g_lock);
 
