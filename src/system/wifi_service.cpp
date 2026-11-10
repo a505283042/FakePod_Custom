@@ -164,7 +164,11 @@ static void restore_ble_fallback()
     g_state = WifiServiceState::RestoringBle;
     portEXIT_CRITICAL(&g_lock);
 
-    ble_remote_service_set_enabled(enabled);
+    DeviceSettingsSnapshot settings = {};
+    const DeviceBluetoothMode mode =
+        device_settings_get_snapshot(&settings) && enabled
+            ? settings.bluetooth_mode : DeviceBluetoothMode::Off;
+    ble_remote_service_set_mode(mode);
     ble_remote_service_update();
     if (!enabled) {
         ESP_LOGI(TAG, "Wi-Fi不可用：用户BLE设置=关闭，不启动回退BLE");
@@ -176,7 +180,11 @@ static void restore_ble_fallback()
         ble_remote_service_update();
         BleRemoteSnapshot ble = {};
         if (ble_remote_service_get_snapshot(&ble) && ble.stack_initialized &&
-            (ble.state == BleRemoteState::Advertising || ble.state == BleRemoteState::Connected)) {
+            (ble.state == BleRemoteState::Advertising ||
+             ble.state == BleRemoteState::Connected ||
+             ble.state == BleRemoteState::Scanning ||
+             ble.state == BleRemoteState::ControllerConnecting ||
+             ble.state == BleRemoteState::ControllerConnected)) {
             ESP_LOGI(TAG, "Wi-Fi回退：BLE已恢复 state=%s", ble_remote_service_state_name(ble.state));
             return;
         }

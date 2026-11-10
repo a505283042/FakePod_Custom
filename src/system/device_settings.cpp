@@ -76,6 +76,7 @@ static DeviceSettingsSnapshot make_defaults()
     defaults.loaded_from_nvs = false;
     defaults.usb_mode = DeviceUsbMode::Serial;
     defaults.ble_enabled = true;
+    defaults.bluetooth_mode = DeviceBluetoothMode::PhoneRemote;
     defaults.wifi_enabled = false;
     defaults.audio_output_mode = DeviceAudioOutputMode::NormalHeadphones;
     defaults.brightness_level = 60U;
@@ -262,6 +263,12 @@ esp_err_t device_settings_init()
     }
     if (nvs_get_u8(handle, "ble", &u8) == ESP_OK && u8 <= 1U) {
         g_settings.ble_enabled = u8 != 0U;
+        g_settings.bluetooth_mode = u8 != 0U
+            ? DeviceBluetoothMode::PhoneRemote : DeviceBluetoothMode::Off;
+    }
+    if (nvs_get_u8(handle, "blemode", &u8) == ESP_OK && u8 <= 2U) {
+        g_settings.bluetooth_mode = static_cast<DeviceBluetoothMode>(u8);
+        g_settings.ble_enabled = g_settings.bluetooth_mode != DeviceBluetoothMode::Off;
     }
     if (nvs_get_u8(handle, "wifi", &u8) == ESP_OK && u8 <= 1U) {
         g_settings.wifi_enabled = u8 != 0U;
@@ -353,8 +360,9 @@ esp_err_t device_settings_init()
     g_settings.ready = true;
     g_settings.loaded_from_nvs = true;
     if (g_settings.ble_enabled && g_settings.wifi_enabled) {
-        // 异常/手工修改的 NVS 也不能破坏单无线互斥；冲突时固定收敛到 Wi-Fi。
+        // Wi-Fi 与 BLE 仍互斥；冲突时收敛到 Wi-Fi，蓝牙模式也同步为关闭。
         g_settings.ble_enabled = false;
+        g_settings.bluetooth_mode = DeviceBluetoothMode::Off;
         ESP_LOGW(TAG, "无线设置冲突：BLE/Wi-Fi同时为开，运行期收敛为Wi-Fi=开 BLE=关");
     }
 
@@ -428,11 +436,20 @@ esp_err_t device_settings_set_wireless_enabled(bool ble_enabled, bool wifi_enabl
     esp_err_t ret = open_rw(&handle);
     if (ret == ESP_OK) ret = nvs_set_u16(handle, "schema", kSchemaVersion);
     if (ret == ESP_OK) ret = nvs_set_u8(handle, "ble", ble_enabled ? 1U : 0U);
+    // Wi-Fi 暂时接管射频时只关闭当前 BLE，不覆盖用户选择的手机/手柄模式。
+    const DeviceBluetoothMode persisted_mode =
+        (ble_enabled && g_settings.bluetooth_mode == DeviceBluetoothMode::Off)
+            ? DeviceBluetoothMode::PhoneRemote : g_settings.bluetooth_mode;
+    if (ret == ESP_OK && persisted_mode != g_settings.bluetooth_mode) {
+        ret = nvs_set_u8(handle, "blemode", static_cast<uint8_t>(persisted_mode));
+    }
     if (ret == ESP_OK) ret = nvs_set_u8(handle, "wifi", wifi_enabled ? 1U : 0U);
     if (ret == ESP_OK) ret = nvs_commit(handle);
     if (handle != 0) nvs_close(handle);
 
-    if (ret != ESP_OK) {
+    if (ret == ESP_OK) {
+        g_settings.bluetooth_mode = persisted_mode;
+    } else {
         g_settings.ble_enabled = old_ble;
         g_settings.wifi_enabled = old_wifi;
         g_wifi_setting_explicit = old_explicit;
@@ -443,8 +460,34 @@ esp_err_t device_settings_set_wireless_enabled(bool ble_enabled, bool wifi_enabl
 
 esp_err_t device_settings_set_ble_enabled(bool enabled)
 {
-    return device_settings_set_wireless_enabled(
-        enabled, enabled ? false : g_settings.wifi_enabled);
+    return device_settings_set_bluetooth_mode(
+        enabled ? DeviceBluetoothMode::PhoneRemote : DeviceBluetoothMode::Off);
+}
+
+esp_err_t device_settings_set_bluetooth_mode(DeviceBluetoothMode mode)
+{
+    const uint8_t raw = static_cast<uint8_t>(mode);
+    if (raw > static_cast<uint8_t>(DeviceBluetoothMode::Controller)) return ESP_ERR_INVALID_ARG;
+    if (!g_settings.ready) return ESP_ERR_INVALID_STATE;
+    const bool enabled = mode != DeviceBluetoothMode::Off;
+    if (enabled && g_settings.wifi_enabled) return ESP_ERR_INVALID_STATE;
+    const DeviceBluetoothMode old_mode = g_settings.bluetooth_mode;
+    const bool old_enabled = g_settings.ble_enabled;
+    g_settings.bluetooth_mode = mode;
+    g_settings.ble_enabled = enabled;
+    nvs_handle_t handle = 0;
+    esp_err_t ret = open_rw(&handle);
+    if (ret == ESP_OK) ret = nvs_set_u16(handle, "schema", kSchemaVersion);
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, "ble", enabled ? 1U : 0U);
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, "blemode", raw);
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    if (handle != 0) nvs_close(handle);
+    if (ret != ESP_OK) {
+        g_settings.bluetooth_mode = old_mode;
+        g_settings.ble_enabled = old_enabled;
+        log_commit_failure("blemode", ret);
+    }
+    return ret;
 }
 
 esp_err_t device_settings_set_audio_output_mode(DeviceAudioOutputMode mode)
@@ -760,6 +803,7 @@ esp_err_t device_settings_reset_defaults()
     if (ret == ESP_OK) ret = nvs_set_u16(handle, "schema", kSchemaVersion);
     // 恢复默认值使用蓝牙遥控；Wi-Fi 默认关闭，同时写入两个 key，避免触发旧版迁移。
     if (ret == ESP_OK) ret = nvs_set_u8(handle, "ble", 1U);
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, "blemode", static_cast<uint8_t>(DeviceBluetoothMode::PhoneRemote));
     if (ret == ESP_OK) ret = nvs_set_u8(handle, "wifi", 0U);
     if (ret == ESP_OK) ret = nvs_commit(handle);
     nvs_close(handle);
@@ -775,6 +819,16 @@ esp_err_t device_settings_reset_defaults()
         ESP_LOGI(TAG, "Settings V1已恢复默认值");
     }
     return ret;
+}
+
+const char *device_settings_bluetooth_mode_name(DeviceBluetoothMode mode)
+{
+    switch (mode) {
+        case DeviceBluetoothMode::Off: return "关闭";
+        case DeviceBluetoothMode::PhoneRemote: return "手机遥控";
+        case DeviceBluetoothMode::Controller: return "手柄扫描";
+        default: return "未知";
+    }
 }
 
 const char *device_settings_usb_mode_name(DeviceUsbMode mode)

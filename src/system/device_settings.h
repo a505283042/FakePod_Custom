@@ -12,6 +12,12 @@ enum class DeviceUsbMode : uint8_t {
     TfCard,
 };
 
+enum class DeviceBluetoothMode : uint8_t {
+    Off = 0,
+    PhoneRemote,
+    Controller,
+};
+
 enum class DeviceAudioOutputMode : uint8_t {
     NormalHeadphones = 0,
     LineOut,
@@ -66,6 +72,7 @@ struct DeviceSettingsSnapshot {
     bool loaded_from_nvs = false;
     DeviceUsbMode usb_mode = DeviceUsbMode::Serial;
     bool ble_enabled = true;
+    DeviceBluetoothMode bluetooth_mode = DeviceBluetoothMode::PhoneRemote;
     bool wifi_enabled = false;
     DeviceAudioOutputMode audio_output_mode = DeviceAudioOutputMode::NormalHeadphones;
     uint8_t brightness_level = 60U;          // CO5300 正常显示亮度 5~100%；0 保留给熄屏。
@@ -96,6 +103,7 @@ DeviceMusicListScope device_settings_music_list_scope();
 // 后续功能模块统一通过这些 setter 修改设置；每次只提交一个很小的 NVS 事务。
 esp_err_t device_settings_set_usb_mode(DeviceUsbMode mode);
 esp_err_t device_settings_set_ble_enabled(bool enabled);
+esp_err_t device_settings_set_bluetooth_mode(DeviceBluetoothMode mode);
 // 原子保存互斥无线意图：允许 BLE/Wi-Fi 都关闭，但不允许同时开启。
 esp_err_t device_settings_set_wireless_enabled(bool ble_enabled, bool wifi_enabled);
 esp_err_t device_settings_set_audio_output_mode(DeviceAudioOutputMode mode);
@@ -139,6 +147,7 @@ esp_err_t device_settings_set_remember_volume(bool enabled);
 esp_err_t device_settings_reset_defaults();
 
 const char *device_settings_usb_mode_name(DeviceUsbMode mode);
+const char *device_settings_bluetooth_mode_name(DeviceBluetoothMode mode);
 const char *device_settings_audio_output_mode_name(DeviceAudioOutputMode mode);
 const char *device_settings_audio_output_level_name(DeviceAudioOutputMode mode);
 const char *device_settings_aux_key_mode_name(DeviceAuxKeyMode mode);

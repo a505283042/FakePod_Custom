@@ -1561,31 +1561,51 @@ static void bluetooth_switch_click_cb(lv_event_t *event)
     WifiServiceSnapshot wifi = {};
     (void)wifi_service_get_snapshot(&wifi);
     if (wifi.transition_running) {
-        ESP_LOGW(TAG, "Wi-Fi正在切换中，暂不允许切换BLE");
+        ESP_LOGW(TAG, "Wi-Fi正在切换中，暂不允许切换蓝牙模式");
         return;
     }
 
-    const bool requested = !settings.ble_enabled;
+    DeviceBluetoothMode next = DeviceBluetoothMode::Off;
+    switch (settings.bluetooth_mode) {
+        case DeviceBluetoothMode::Off: next = DeviceBluetoothMode::PhoneRemote; break;
+        case DeviceBluetoothMode::PhoneRemote: next = DeviceBluetoothMode::Controller; break;
+        case DeviceBluetoothMode::Controller:
+        default: next = DeviceBluetoothMode::Off; break;
+    }
+
     const bool old_ble = settings.ble_enabled;
     const bool old_wifi = settings.wifi_enabled;
-    const esp_err_t persist_ret = device_settings_set_wireless_enabled(
+    const DeviceBluetoothMode old_mode = settings.bluetooth_mode;
+    const bool requested = next != DeviceBluetoothMode::Off;
+
+    const esp_err_t wireless_ret = device_settings_set_wireless_enabled(
         requested, requested ? false : old_wifi);
-    if (persist_ret != ESP_OK) {
-        ESP_LOGW(TAG, "保存无线开关失败：%s", esp_err_to_name(persist_ret));
+    if (wireless_ret != ESP_OK) {
+        ESP_LOGW(TAG, "保存蓝牙无线状态失败：%s", esp_err_to_name(wireless_ret));
+        return;
+    }
+
+    const esp_err_t mode_ret = device_settings_set_bluetooth_mode(next);
+    if (mode_ret != ESP_OK) {
+        (void)device_settings_set_wireless_enabled(old_ble, old_wifi);
+        ESP_LOGW(TAG, "保存蓝牙模式失败：%s", esp_err_to_name(mode_ret));
         return;
     }
 
     wifi_service_set_ble_fallback_enabled(requested);
+    ble_remote_service_set_mode(next);
+
     if (requested && wifi_service_owns_radio()) {
         const esp_err_t stop_ret = wifi_service_stop();
         if (stop_ret != ESP_OK) {
             (void)device_settings_set_wireless_enabled(old_ble, old_wifi);
+            (void)device_settings_set_bluetooth_mode(old_mode);
             wifi_service_set_ble_fallback_enabled(old_ble);
-            ESP_LOGW(TAG, "关闭Wi-Fi以启动BLE失败：%s", esp_err_to_name(stop_ret));
+            ble_remote_service_set_mode(old_ble ? old_mode : DeviceBluetoothMode::Off);
+            ESP_LOGW(TAG, "关闭Wi-Fi以启动蓝牙失败：%s", esp_err_to_name(stop_ret));
             return;
         }
     } else {
-        ble_remote_service_set_enabled(requested);
         ble_remote_service_update();
     }
 
@@ -1599,10 +1619,8 @@ static void bluetooth_switch_click_cb(lv_event_t *event)
         library_view_on_library_source_changed(DeviceMusicLibrarySource::Local);
     }
 
-    ESP_LOGI(TAG, "蓝牙开关：BLE=%s Wi-Fi=%s",
-        requested ? "开" : "关", requested ? "关" : (old_wifi ? "开" : "关"));
+    ESP_LOGI(TAG, "蓝牙模式切换：%s", device_settings_bluetooth_mode_name(next));
 }
-
 static void wifi_switch_click_cb(lv_event_t *event)
 {
     if (!click_is_valid(event) || g_page != SettingsPage::Connection) return;
@@ -1793,11 +1811,15 @@ static void create_connection_page(const DeviceSettingsSnapshot &settings)
         SettingsDetailIcon::TfFiles,
         usb_tf_storage_enter_click_cb);
     BleRemoteSnapshot ble = {};
-    const char *ble_value = settings.ble_enabled ? "启动中" : "关闭";
-    if (settings.ble_enabled && ble_remote_service_get_snapshot(&ble)) {
-        ble_value = ble_remote_service_state_name(ble.state);
+    char ble_value[48] = {};
+    if (settings.bluetooth_mode == DeviceBluetoothMode::Off) {
+        snprintf(ble_value, sizeof(ble_value), "%s", "关闭");
+    } else if (ble_remote_service_get_snapshot(&ble)) {
+        snprintf(ble_value, sizeof(ble_value), "%s", ble_remote_service_state_name(ble.state));
+    } else {
+        snprintf(ble_value, sizeof(ble_value), "%s", device_settings_bluetooth_mode_name(settings.bluetooth_mode));
     }
-    add_clickable_detail_row(2, "蓝牙开关", ble_value, SettingsDetailIcon::Bluetooth, bluetooth_switch_click_cb);
+    add_clickable_detail_row(2, "蓝牙模式", ble_value, SettingsDetailIcon::Bluetooth, bluetooth_switch_click_cb);
 
     WifiServiceSnapshot wifi = {};
     char wifi_value[64] = "关闭";
@@ -2540,14 +2562,14 @@ static void refresh_timer_cb(lv_timer_t *timer)
         if (!device_settings_get_snapshot(&settings)) return;
 
         if (g_detail_values[2] != nullptr) {
-            if (!settings.ble_enabled) {
+            if (settings.bluetooth_mode == DeviceBluetoothMode::Off) {
                 lv_label_set_text(g_detail_values[2], "关闭");
             } else {
                 BleRemoteSnapshot ble = {};
                 lv_label_set_text(g_detail_values[2],
                     ble_remote_service_get_snapshot(&ble)
                         ? ble_remote_service_state_name(ble.state)
-                        : "启动中");
+                        : device_settings_bluetooth_mode_name(settings.bluetooth_mode));
             }
         }
 

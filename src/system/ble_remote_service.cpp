@@ -1,5 +1,6 @@
 #include "ble_remote_service.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -20,6 +21,7 @@
 #include "wifi_service.h"
 #include "app/video_app.h"
 #include "app/visual_music_app.h"
+#include "gamepad_input_service.h"
 
 #if defined(CONFIG_BT_NIMBLE_ENABLED) && CONFIG_BT_NIMBLE_ENABLED && \
     defined(CONFIG_BT_NIMBLE_ROLE_PERIPHERAL) && CONFIG_BT_NIMBLE_ROLE_PERIPHERAL && \
@@ -31,11 +33,13 @@
 #include "host/ble_gap.h"
 #include "host/ble_gatt.h"
 #include "host/ble_hs.h"
+#include "host/ble_hs_adv.h"
 #include "host/ble_hs_id.h"
 #include "host/ble_uuid.h"
 #include "host/util/util.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
+#include "esp_hidh.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 extern "C" void ble_store_config_init(void);
@@ -57,6 +61,8 @@ static constexpr BaseType_t kTransitionTaskCore = 1;
 static portMUX_TYPE g_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool g_ready = false;
 static bool g_desired_enabled = false;
+static DeviceBluetoothMode g_mode = DeviceBluetoothMode::PhoneRemote;
+static DeviceBluetoothMode g_active_mode = DeviceBluetoothMode::Off;
 static bool g_stack_initialized = false;
 static bool g_connected = false;
 static bool g_transition_running = false;
@@ -68,6 +74,35 @@ static TickType_t g_state_since_tick = 0;
 #if FAKEPOD_BLE_FOUNDATION_ENABLED
 static uint8_t g_own_addr_type = BLE_OWN_ADDR_PUBLIC;
 static uint16_t g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+
+// BLE HID Host state. Only one radio connection is allowed by sdkconfig; phone and
+// controller modes are mutually exclusive and share the same NimBLE host lifecycle.
+static constexpr uint16_t kHidServiceUuid16 = 0x1812U;
+static constexpr uint16_t kGamepadAppearance = 0x03C4U;
+static constexpr uint16_t kJoystickAppearance = 0x03C3U;
+static constexpr uint32_t kControllerScanDurationMs = 8000U;
+static constexpr TickType_t kControllerScanRetryDelay = pdMS_TO_TICKS(1000);
+static constexpr TickType_t kControllerCloseTimeout = pdMS_TO_TICKS(12000);
+static constexpr uint32_t kControllerConnectTaskStackBytes = 6144U;
+static constexpr UBaseType_t kControllerConnectTaskPriority = 2U;
+static constexpr BaseType_t kControllerConnectTaskCore = 1;
+static constexpr size_t kControllerNameBytes = 48U;
+
+struct ControllerCandidate {
+    uint8_t address[6] = {};
+    uint8_t address_type = 0U;
+    int8_t rssi = 0;
+    uint16_t appearance = 0U;
+    char name[kControllerNameBytes] = {};
+};
+
+static bool g_hidh_initialized = false;
+static bool g_controller_scan_active = false;
+static bool g_controller_candidate_ready = false;
+static bool g_controller_connect_task_running = false;
+static TickType_t g_controller_scan_due_tick = 0;
+static ControllerCandidate g_controller_candidate = {};
+static esp_hidh_dev_t *g_controller_dev = nullptr;
 
 // R46.0.12：保留手机写命令，并增加 FakePod -> 手机状态 Notify。
 // Command/Event UUID 固定；Event 使用 20B Status + <=20B Metadata Chunk，默认 MTU=23 也可工作。
@@ -1103,6 +1138,393 @@ static int start_advertising()
     return rc;
 }
 
+
+static void host_reset_cb(int reason);
+static void host_sync_cb();
+
+static bool contains_ascii_case_insensitive(const char *text, const char *needle)
+{
+    if (text == nullptr || needle == nullptr || needle[0] == '\0') return false;
+    const size_t needle_length = strlen(needle);
+    for (const char *p = text; *p != '\0'; ++p) {
+        size_t i = 0U;
+        while (i < needle_length && p[i] != '\0' &&
+               tolower(static_cast<unsigned char>(p[i])) ==
+                   tolower(static_cast<unsigned char>(needle[i]))) {
+            ++i;
+        }
+        if (i == needle_length) return true;
+    }
+    return false;
+}
+
+static bool parse_controller_candidate(
+    const struct ble_gap_disc_desc *disc,
+    ControllerCandidate *out_candidate)
+{
+    if (disc == nullptr || out_candidate == nullptr) return false;
+
+    struct ble_hs_adv_fields fields = {};
+    if (ble_hs_adv_parse_fields(&fields, disc->data, disc->length_data) != 0) {
+        return false;
+    }
+
+    bool has_hid_service = false;
+    for (uint8_t i = 0U; i < fields.num_uuids16; ++i) {
+        if (ble_uuid_u16(&fields.uuids16[i].u) == kHidServiceUuid16) {
+            has_hid_service = true;
+            break;
+        }
+    }
+    if (!has_hid_service) return false;
+
+    ControllerCandidate candidate = {};
+    memcpy(candidate.address, disc->addr.val, sizeof(candidate.address));
+    candidate.address_type = disc->addr.type;
+    candidate.rssi = disc->rssi;
+    candidate.appearance = fields.appearance_is_present ? fields.appearance : 0U;
+
+    if (fields.name != nullptr && fields.name_len > 0U) {
+        size_t copy_length = fields.name_len;
+        if (copy_length >= sizeof(candidate.name)) copy_length = sizeof(candidate.name) - 1U;
+        memcpy(candidate.name, fields.name, copy_length);
+        candidate.name[copy_length] = '\0';
+    }
+
+    // Prefer the standard Gamepad/Joystick appearance. Some controllers omit
+    // appearance, so accept common controller names when HID service 0x1812 exists.
+    bool gamepad_like = candidate.appearance == kGamepadAppearance ||
+        candidate.appearance == kJoystickAppearance;
+    if (!gamepad_like) {
+        static const char *const kNameHints[] = {
+            "gamepad", "game pad", "controller", "joystick", "wireless controller",
+            "8bitdo", "gamesir", "ipega", "dualshock", "dualsense", "xbox", "pro controller"
+        };
+        for (const char *hint : kNameHints) {
+            if (contains_ascii_case_insensitive(candidate.name, hint)) {
+                gamepad_like = true;
+                break;
+            }
+        }
+    }
+    if (!gamepad_like) return false;
+
+    if (candidate.name[0] == '\0') {
+        snprintf(candidate.name, sizeof(candidate.name), "%s", "BLE HID Gamepad");
+    }
+    *out_candidate = candidate;
+    return true;
+}
+
+static int controller_gap_event_cb(struct ble_gap_event *event, void *)
+{
+    if (event == nullptr) return 0;
+
+    switch (event->type) {
+        case BLE_GAP_EVENT_DISC: {
+            ControllerCandidate candidate = {};
+            if (!parse_controller_candidate(&event->disc, &candidate)) return 0;
+
+            bool accepted = false;
+            portENTER_CRITICAL(&g_lock);
+            if (g_desired_enabled &&
+                g_mode == DeviceBluetoothMode::Controller &&
+                g_active_mode == DeviceBluetoothMode::Controller &&
+                !g_controller_candidate_ready &&
+                !g_controller_connect_task_running &&
+                g_state != BleRemoteState::Stopping) {
+                g_controller_candidate = candidate;
+                g_controller_candidate_ready = true;
+                g_controller_scan_due_tick = 0;
+                set_state_locked(BleRemoteState::ControllerConnecting);
+                accepted = true;
+            }
+            portEXIT_CRITICAL(&g_lock);
+
+            if (accepted) {
+                ESP_LOGI(TAG,
+                    "发现BLE手柄候选：name=%s appearance=0x%04x RSSI=%d addr_type=%u",
+                    candidate.name,
+                    static_cast<unsigned>(candidate.appearance),
+                    static_cast<int>(candidate.rssi),
+                    static_cast<unsigned>(candidate.address_type));
+                const int cancel_rc = ble_gap_disc_cancel();
+                if (cancel_rc != 0 && cancel_rc != BLE_HS_EALREADY) {
+                    ESP_LOGW(TAG, "停止手柄扫描失败：rc=%d", cancel_rc);
+                }
+            }
+            return 0;
+        }
+
+        case BLE_GAP_EVENT_DISC_COMPLETE:
+            portENTER_CRITICAL(&g_lock);
+            g_controller_scan_active = false;
+            if (g_desired_enabled &&
+                g_mode == DeviceBluetoothMode::Controller &&
+                g_state != BleRemoteState::Stopping &&
+                !g_controller_connect_task_running) {
+                // A matching candidate is consumed by the runtime pump after scan cancellation completes.
+                set_state_locked(BleRemoteState::Scanning);
+                g_controller_scan_due_tick = g_controller_candidate_ready
+                    ? 0 : xTaskGetTickCount() + kControllerScanRetryDelay;
+            }
+            portEXIT_CRITICAL(&g_lock);
+            ESP_LOGI(TAG, "BLE手柄扫描轮次结束：reason=%d", event->disc_complete.reason);
+            return 0;
+
+        default:
+            return 0;
+    }
+}
+
+static int start_controller_scan()
+{
+    if (!desired_enabled() || g_active_mode != DeviceBluetoothMode::Controller) {
+        return 0;
+    }
+
+    struct ble_gap_disc_params params = {};
+    params.filter_duplicates = 1;
+    params.passive = 0;
+    params.itvl = 0x50;
+    params.window = 0x30;
+    params.filter_policy = 0;
+    params.limited = 0;
+
+    portENTER_CRITICAL(&g_lock);
+    if (g_controller_scan_active || g_controller_connect_task_running ||
+        g_controller_candidate_ready || g_state == BleRemoteState::Stopping) {
+        portEXIT_CRITICAL(&g_lock);
+        return 0;
+    }
+    g_controller_scan_active = true;
+    g_controller_scan_due_tick = 0;
+    set_state_locked(BleRemoteState::Scanning);
+    portEXIT_CRITICAL(&g_lock);
+
+    const int rc = ble_gap_disc(
+        g_own_addr_type,
+        kControllerScanDurationMs,
+        &params,
+        controller_gap_event_cb,
+        nullptr);
+    if (rc != 0) {
+        portENTER_CRITICAL(&g_lock);
+        g_controller_scan_active = false;
+        if (g_desired_enabled && g_mode == DeviceBluetoothMode::Controller) {
+            set_state_locked(BleRemoteState::RetryWait, ESP_FAIL);
+            g_retry_due_tick = xTaskGetTickCount() + kRetryDelay;
+        }
+        portEXIT_CRITICAL(&g_lock);
+        ESP_LOGW(TAG, "BLE手柄扫描启动失败：rc=%d", rc);
+        return rc;
+    }
+
+    ESP_LOGI(TAG, "BLE手柄扫描已启动：窗口=%ums，过滤HID Gamepad/Joystick",
+        static_cast<unsigned>(kControllerScanDurationMs));
+    return 0;
+}
+
+static void controller_connect_task(void *)
+{
+    ControllerCandidate candidate = {};
+    portENTER_CRITICAL(&g_lock);
+    candidate = g_controller_candidate;
+    portEXIT_CRITICAL(&g_lock);
+
+    ESP_LOGI(TAG, "连接BLE手柄：name=%s RSSI=%d",
+        candidate.name, static_cast<int>(candidate.rssi));
+
+    esp_hidh_dev_t *dev = esp_hidh_dev_open(
+        candidate.address,
+        ESP_HID_TRANSPORT_BLE,
+        candidate.address_type);
+
+    const bool dev_exists = dev != nullptr && esp_hidh_dev_exists(dev);
+    portENTER_CRITICAL(&g_lock);
+    g_controller_connect_task_running = false;
+    if (dev_exists && g_controller_dev == nullptr) {
+        // OPEN_EVENT normally stores this first; this is a race-safe fallback.
+        g_controller_dev = dev;
+    }
+    if (!dev_exists &&
+        g_desired_enabled &&
+        g_mode == DeviceBluetoothMode::Controller &&
+        g_state != BleRemoteState::Stopping) {
+        g_connected = false;
+        set_state_locked(BleRemoteState::Scanning);
+        g_controller_scan_due_tick = xTaskGetTickCount() + kControllerScanRetryDelay;
+    }
+    portEXIT_CRITICAL(&g_lock);
+
+    if (!dev_exists) {
+        ESP_LOGW(TAG, "BLE手柄连接失败：稍后重新扫描");
+    }
+    vTaskDelete(nullptr);
+}
+
+static bool start_controller_connect_task()
+{
+    portENTER_CRITICAL(&g_lock);
+    if (!g_controller_candidate_ready ||
+        g_controller_scan_active ||
+        g_controller_connect_task_running ||
+        !g_desired_enabled ||
+        g_mode != DeviceBluetoothMode::Controller ||
+        g_state == BleRemoteState::Stopping) {
+        portEXIT_CRITICAL(&g_lock);
+        return false;
+    }
+    g_controller_candidate_ready = false;
+    g_controller_connect_task_running = true;
+    set_state_locked(BleRemoteState::ControllerConnecting);
+    portEXIT_CRITICAL(&g_lock);
+
+    const BaseType_t created = xTaskCreatePinnedToCore(
+        controller_connect_task,
+        "ble_hid_open",
+        kControllerConnectTaskStackBytes,
+        nullptr,
+        kControllerConnectTaskPriority,
+        nullptr,
+        kControllerConnectTaskCore);
+    if (created == pdPASS) return true;
+
+    portENTER_CRITICAL(&g_lock);
+    g_controller_connect_task_running = false;
+    if (g_desired_enabled && g_mode == DeviceBluetoothMode::Controller) {
+        set_state_locked(BleRemoteState::Scanning, ESP_ERR_NO_MEM);
+        g_controller_scan_due_tick = xTaskGetTickCount() + kControllerScanRetryDelay;
+    }
+    portEXIT_CRITICAL(&g_lock);
+    ESP_LOGW(TAG, "BLE手柄连接任务创建失败：NO_MEM");
+    return false;
+}
+
+static void gamepad_hidh_event_cb(
+    void *,
+    esp_event_base_t,
+    int32_t event_id,
+    void *event_data)
+{
+    if (event_data == nullptr) return;
+    const esp_hidh_event_t event = static_cast<esp_hidh_event_t>(event_id);
+    esp_hidh_event_data_t *param = static_cast<esp_hidh_event_data_t *>(event_data);
+
+    switch (event) {
+        case ESP_HIDH_OPEN_EVENT: {
+            esp_hidh_dev_t *dev = param->open.dev;
+            if (param->open.status != ESP_OK || dev == nullptr) {
+                portENTER_CRITICAL(&g_lock);
+                g_controller_connect_task_running = false;
+                if (g_desired_enabled &&
+                    g_mode == DeviceBluetoothMode::Controller &&
+                    g_state != BleRemoteState::Stopping) {
+                    set_state_locked(BleRemoteState::Scanning);
+                    g_controller_scan_due_tick = xTaskGetTickCount() + kControllerScanRetryDelay;
+                }
+                portEXIT_CRITICAL(&g_lock);
+                ESP_LOGW(TAG, "BLE HID手柄打开失败：%s", esp_err_to_name(param->open.status));
+                break;
+            }
+
+            const char *name = esp_hidh_dev_name_get(dev);
+            const uint16_t vendor_id = esp_hidh_dev_vendor_id_get(dev);
+            const uint16_t product_id = esp_hidh_dev_product_id_get(dev);
+            const uint8_t usage = static_cast<uint8_t>(esp_hidh_dev_usage_get(dev));
+            size_t map_count = 0U;
+            esp_hid_raw_report_map_t *maps = nullptr;
+            (void)esp_hidh_dev_report_maps_get(dev, &map_count, &maps);
+            const uint8_t *map_data = nullptr;
+            size_t map_length = 0U;
+            if (maps != nullptr && map_count > 0U) {
+                map_data = maps[0].data;
+                map_length = maps[0].len;
+            }
+
+            portENTER_CRITICAL(&g_lock);
+            g_controller_dev = dev;
+            g_controller_connect_task_running = false;
+            g_connected = true;
+            set_state_locked(BleRemoteState::ControllerConnected);
+            portEXIT_CRITICAL(&g_lock);
+
+            gamepad_input_service_set_connected(
+                name, vendor_id, product_id, usage, map_data, map_length);
+            ESP_LOGI(TAG,
+                "BLE手柄已连接：name=%s VID=0x%04x PID=0x%04x usage=%u maps=%u map0=%uB",
+                name != nullptr ? name : "Unknown",
+                static_cast<unsigned>(vendor_id),
+                static_cast<unsigned>(product_id),
+                static_cast<unsigned>(usage),
+                static_cast<unsigned>(map_count),
+                static_cast<unsigned>(map_length));
+            break;
+        }
+
+        case ESP_HIDH_BATTERY_EVENT:
+            gamepad_input_service_set_battery(param->battery.level);
+            ESP_LOGI(TAG, "BLE手柄电量：%u%%",
+                static_cast<unsigned>(param->battery.level));
+            break;
+
+        case ESP_HIDH_INPUT_EVENT:
+            gamepad_input_service_submit_report(
+                static_cast<uint8_t>(param->input.usage),
+                param->input.report_id,
+                param->input.map_index,
+                param->input.data,
+                param->input.length);
+            break;
+
+        case ESP_HIDH_CLOSE_EVENT: {
+            portENTER_CRITICAL(&g_lock);
+            if (g_controller_dev == param->close.dev) {
+                g_controller_dev = nullptr;
+            }
+            g_controller_connect_task_running = false;
+            g_connected = false;
+            if (g_desired_enabled &&
+                g_mode == DeviceBluetoothMode::Controller &&
+                g_state != BleRemoteState::Stopping) {
+                set_state_locked(BleRemoteState::Scanning);
+                g_controller_scan_due_tick = xTaskGetTickCount() + kControllerScanRetryDelay;
+            }
+            portEXIT_CRITICAL(&g_lock);
+            gamepad_input_service_set_disconnected();
+            ESP_LOGI(TAG, "BLE手柄已断开：reason=%d", param->close.reason);
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+static esp_err_t init_controller_hid_host()
+{
+    esp_hidh_config_t config = {};
+    config.callback = gamepad_hidh_event_cb;
+    config.event_stack_size = 4096U;
+    config.callback_arg = nullptr;
+
+    const esp_err_t ret = esp_hidh_init(&config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ESP-IDF HID Host初始化失败：%s", esp_err_to_name(ret));
+        return ret;
+    }
+    g_hidh_initialized = true;
+
+    // esp_hidh_init() installs its own no-op NimBLE sync/reset callbacks.
+    // Restore FakePod's callbacks afterwards so phone advertising or controller
+    // scanning is started by the same host lifecycle callback.
+    ble_hs_cfg.reset_cb = host_reset_cb;
+    ble_hs_cfg.sync_cb = host_sync_cb;
+    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+    ESP_LOGI(TAG, "ESP-IDF NimBLE HID Host已初始化");
+    return ESP_OK;
+}
+
 static void host_reset_cb(int reason)
 {
     ESP_LOGW(TAG, "NimBLE Host reset：reason=%d", reason);
@@ -1140,7 +1562,13 @@ static void host_sync_cb()
     int rc = ble_hs_util_ensure_addr(0);
     if (rc == 0) rc = ble_hs_id_infer_auto(0, &g_own_addr_type);
 
-    if (rc == 0) rc = start_advertising();
+    if (rc == 0) {
+        if (g_active_mode == DeviceBluetoothMode::Controller) {
+            rc = start_controller_scan();
+        } else {
+            rc = start_advertising();
+        }
+    }
 
     if (rc != 0) {
         ESP_LOGE(TAG, "BLE广播启动失败：rc=%d", rc);
@@ -1153,7 +1581,11 @@ static void host_sync_cb()
         return;
     }
 
-    ESP_LOGI(TAG, "BLE广播已启动：name=%s interval≈500ms", kDeviceName);
+    if (g_active_mode == DeviceBluetoothMode::Controller) {
+        ESP_LOGI(TAG, "BLE Central已就绪：开始扫描Generic HID手柄");
+    } else {
+        ESP_LOGI(TAG, "BLE广播已启动：name=%s interval≈500ms", kDeviceName);
+    }
 }
 
 static void host_task(void *)
@@ -1170,6 +1602,57 @@ static esp_err_t stop_stack()
     const bool initialized = g_stack_initialized;
     portEXIT_CRITICAL(&g_lock);
     if (!initialized) return ESP_OK;
+
+    if (g_active_mode == DeviceBluetoothMode::Controller) {
+        if (g_controller_scan_active) {
+            const int cancel_rc = ble_gap_disc_cancel();
+            if (cancel_rc != 0 && cancel_rc != BLE_HS_EALREADY) {
+                ESP_LOGW(TAG, "停止手柄扫描失败：rc=%d", cancel_rc);
+            }
+        }
+
+        const TickType_t close_started = xTaskGetTickCount();
+        while (g_controller_connect_task_running &&
+               xTaskGetTickCount() - close_started < pdMS_TO_TICKS(32000)) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        if (g_controller_connect_task_running) {
+            ESP_LOGE(TAG, "HID连接任务未退出，拒绝停止NimBLE以避免释放竞态");
+            return ESP_ERR_TIMEOUT;
+        }
+
+        esp_hidh_dev_t *dev = nullptr;
+        portENTER_CRITICAL(&g_lock);
+        dev = g_controller_dev;
+        portEXIT_CRITICAL(&g_lock);
+        if (dev != nullptr && esp_hidh_dev_exists(dev)) {
+            const esp_err_t close_ret = esp_hidh_dev_close(dev);
+            if (close_ret != ESP_OK && close_ret != ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(TAG, "请求关闭HID手柄失败：%s", esp_err_to_name(close_ret));
+            }
+            const TickType_t started = xTaskGetTickCount();
+            while (g_controller_dev != nullptr &&
+                   xTaskGetTickCount() - started < kControllerCloseTimeout) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+            if (g_controller_dev != nullptr) {
+                ESP_LOGE(TAG, "HID手柄未在超时内完成释放，拒绝停止NimBLE");
+                return ESP_ERR_TIMEOUT;
+            }
+            // CLOSE callback clears the pointer before esp_hidh's postprocessor frees it.
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+
+        if (g_hidh_initialized) {
+            const esp_err_t hidh_ret = esp_hidh_deinit();
+            if (hidh_ret != ESP_OK) {
+                ESP_LOGE(TAG, "ESP-IDF HID Host反初始化失败：%s", esp_err_to_name(hidh_ret));
+                return hidh_ret;
+            }
+            g_hidh_initialized = false;
+        }
+        gamepad_input_service_set_disconnected();
+    }
 
     // nimble_port_stop() 自己会停止 GAP procedure 并终止现有连接。
     // 这里不能先手动 terminate，否则 stop 内部再次终止会命中 BLE_HS_EALREADY。
@@ -1191,7 +1674,14 @@ static esp_err_t stop_stack()
     g_force_metadata_refresh = false;
     g_status_notify_due_tick = 0;
     g_status_event_poll_due_tick = 0;
+    g_active_mode = DeviceBluetoothMode::Off;
+    g_controller_scan_active = false;
+    g_controller_candidate_ready = false;
+    g_controller_connect_task_running = false;
+    g_controller_scan_due_tick = 0;
+    g_controller_dev = nullptr;
     portEXIT_CRITICAL(&g_lock);
+    gamepad_input_service_set_disconnected();
     reset_wifi_provision_assembly();
     return ESP_OK;
 }
@@ -1230,6 +1720,7 @@ static esp_err_t start_stack()
     }
 
     portENTER_CRITICAL(&g_lock);
+    g_active_mode = g_mode;
     g_stack_initialized = true;
     g_connected = false;
     g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -1272,18 +1763,30 @@ static esp_err_t start_stack()
     ble_svc_gap_init();
     ble_svc_gatt_init();
 
-    const int appearance_rc = ble_svc_gap_device_appearance_set(kMediaPlayerAppearance);
-    if (appearance_rc != 0) {
-        ESP_LOGW(TAG, "BLE Media Player Appearance设置失败：rc=%d", appearance_rc);
-        (void)stop_stack();
-        return ESP_FAIL;
-    }
+    if (g_active_mode == DeviceBluetoothMode::PhoneRemote) {
+        const int appearance_rc = ble_svc_gap_device_appearance_set(kMediaPlayerAppearance);
+        if (appearance_rc != 0) {
+            ESP_LOGW(TAG, "BLE Media Player Appearance设置失败：rc=%d", appearance_rc);
+            (void)stop_stack();
+            return ESP_FAIL;
+        }
 
-    const int control_rc = register_control_service();
-    if (control_rc != 0) {
-        ESP_LOGW(TAG, "BLE手机控制服务注册失败：rc=%d", control_rc);
+        const int control_rc = register_control_service();
+        if (control_rc != 0) {
+            ESP_LOGW(TAG, "BLE手机控制服务注册失败：rc=%d", control_rc);
+            (void)stop_stack();
+            return ESP_FAIL;
+        }
+    } else if (g_active_mode == DeviceBluetoothMode::Controller) {
+        const int appearance_rc = ble_svc_gap_device_appearance_set(0U);
+        if (appearance_rc != 0) {
+            ESP_LOGW(TAG, "BLE Central外观配置失败：rc=%d", appearance_rc);
+            (void)stop_stack();
+            return ESP_FAIL;
+        }
+    } else {
         (void)stop_stack();
-        return ESP_FAIL;
+        return ESP_ERR_INVALID_STATE;
     }
 
     const int name_rc = ble_svc_gap_device_name_set(kDeviceName);
@@ -1296,8 +1799,18 @@ static esp_err_t start_stack()
     // NimBLE 安全存储接入默认 NVS，使 Bond/LTK 在设备重启后仍可恢复。
     ble_store_config_init();
 
-    ESP_LOGI(TAG, "BLE手机控制服务已注册：6媒体命令 + Wi-Fi配网分片 + 状态Notify V1");
-    ESP_LOGI(TAG, "BLE安全：Bond=ON SC=ON MITM=OFF KeyDist=ENC|ID");
+    if (g_active_mode == DeviceBluetoothMode::Controller) {
+        const esp_err_t hidh_ret = init_controller_hid_host();
+        if (hidh_ret != ESP_OK) {
+            (void)stop_stack();
+            return hidh_ret;
+        }
+        gamepad_input_service_reset();
+        ESP_LOGI(TAG, "BLE手柄模式：NimBLE Central + ESP-IDF HID Host；不注册手机GATT服务");
+    } else {
+        ESP_LOGI(TAG, "BLE手机控制服务已注册：6媒体命令 + Wi-Fi配网分片 + 状态Notify V1");
+        ESP_LOGI(TAG, "BLE安全：Bond=ON SC=ON MITM=OFF KeyDist=ENC|ID");
+    }
     nimble_port_freertos_init(host_task);
     return ESP_OK;
 }
@@ -1417,7 +1930,7 @@ esp_err_t ble_remote_service_init()
     portEXIT_CRITICAL(&g_lock);
 
 #if FAKEPOD_BLE_FOUNDATION_ENABLED
-    ESP_LOGI(TAG, "BLE Foundation就绪：NimBLE Peripheral/GATT Server，Observer/Scan/Central已裁剪，默认关闭");
+    ESP_LOGI(TAG, "BLE Foundation就绪：NimBLE Peripheral/GATT Server + Central/Observer，默认关闭");
     return ESP_OK;
 #else
     ESP_LOGW(TAG, "BLE Foundation代码已就绪，但 sdkconfig 尚未完整启用 NimBLE Peripheral/Broadcaster/GATT Server/GAP Service");
@@ -1432,10 +1945,31 @@ void ble_remote_service_set_enabled(bool enabled)
         portEXIT_CRITICAL(&g_lock);
         return;
     }
+    if (enabled && g_mode == DeviceBluetoothMode::Off) {
+        g_mode = DeviceBluetoothMode::PhoneRemote;
+    }
     g_desired_enabled = enabled;
     g_retry_due_tick = 0;
     portEXIT_CRITICAL(&g_lock);
     ESP_LOGI(TAG, "BLE用户意图：%s", enabled ? "开启" : "关闭");
+}
+
+void ble_remote_service_set_mode(DeviceBluetoothMode mode)
+{
+    if (mode != DeviceBluetoothMode::Off &&
+        mode != DeviceBluetoothMode::PhoneRemote &&
+        mode != DeviceBluetoothMode::Controller) return;
+    portENTER_CRITICAL(&g_lock);
+    if (!g_ready) {
+        portEXIT_CRITICAL(&g_lock);
+        return;
+    }
+    g_mode = mode;
+    g_desired_enabled = mode != DeviceBluetoothMode::Off;
+    g_retry_due_tick = 0;
+    portEXIT_CRITICAL(&g_lock);
+    if (mode == DeviceBluetoothMode::Off) gamepad_input_service_set_disconnected();
+    ESP_LOGI(TAG, "BLE工作模式：%s", device_settings_bluetooth_mode_name(mode));
 }
 
 void ble_remote_service_update()
@@ -1455,14 +1989,40 @@ void ble_remote_service_update()
 
     const TickType_t now = xTaskGetTickCount();
     if (desired) {
-        if (state == BleRemoteState::Connected) {
+        DeviceBluetoothMode mode = DeviceBluetoothMode::PhoneRemote;
+        portENTER_CRITICAL(&g_lock);
+        mode = g_mode;
+        portEXIT_CRITICAL(&g_lock);
+        if (mode == DeviceBluetoothMode::Controller) {
+            if (state == BleRemoteState::ControllerConnected ||
+                state == BleRemoteState::ControllerConnecting) return;
+            if (state == BleRemoteState::Scanning) {
+                bool scan_active = false;
+                bool candidate_ready = false;
+                bool connect_running = false;
+                TickType_t scan_due = 0;
+                portENTER_CRITICAL(&g_lock);
+                scan_active = g_controller_scan_active;
+                candidate_ready = g_controller_candidate_ready;
+                connect_running = g_controller_connect_task_running;
+                scan_due = g_controller_scan_due_tick;
+                portEXIT_CRITICAL(&g_lock);
+                if (candidate_ready && !scan_active && !connect_running) {
+                    (void)start_controller_connect_task();
+                } else if (!scan_active && !connect_running &&
+                           (scan_due == 0 || tick_due(now, scan_due))) {
+                    (void)start_controller_scan();
+                }
+                return;
+            }
+        } else if (state == BleRemoteState::Connected) {
 #if FAKEPOD_BLE_FOUNDATION_ENABLED
             update_phone_state_notify(now);
             update_phone_library_notify();
 #endif
             return;
         }
-        if (state == BleRemoteState::Advertising) return;
+        if (mode == DeviceBluetoothMode::PhoneRemote && state == BleRemoteState::Advertising) return;
         if (state == BleRemoteState::Stopping) return;
         if (state == BleRemoteState::Starting && !tick_due(now, state_since + kStartTimeout)) return;
         if (state == BleRemoteState::Starting) {
@@ -1503,7 +2063,10 @@ const char *ble_remote_service_state_name(BleRemoteState state)
         case BleRemoteState::Disabled: return "关闭";
         case BleRemoteState::Starting: return "启动中";
         case BleRemoteState::Advertising: return "广播中";
-        case BleRemoteState::Connected: return "已连接";
+        case BleRemoteState::Scanning: return "扫描手柄";
+        case BleRemoteState::ControllerConnecting: return "连接手柄";
+        case BleRemoteState::ControllerConnected: return "手柄已连接";
+        case BleRemoteState::Connected: return "手机已连接";
         case BleRemoteState::Stopping: return "关闭中";
         case BleRemoteState::RetryWait: return "故障重试";
         case BleRemoteState::Unsupported: return "未启用NimBLE";

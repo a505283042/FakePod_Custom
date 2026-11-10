@@ -276,7 +276,8 @@ void system_runtime_update()
                     ESP_LOGW(TAG, "开机无线策略：Wi-Fi=开但尚无有效凭据；BLE保持关闭");
                 }
             } else {
-                ble_remote_service_set_enabled(settings_snapshot.ble_enabled);
+                ble_remote_service_set_mode(settings_snapshot.ble_enabled
+                    ? settings_snapshot.bluetooth_mode : DeviceBluetoothMode::Off);
                 ESP_LOGI(TAG, "开机无线策略：Wi-Fi=关 BLE=%s",
                     settings_snapshot.ble_enabled ? "开" : "关");
             }

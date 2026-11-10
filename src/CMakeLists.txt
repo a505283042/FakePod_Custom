@@ -28,6 +28,7 @@ idf_component_register(
         "system/persistent_state.cpp"
         "system/device_settings.cpp"
         "system/ble_remote_service.cpp"
+        "system/gamepad_input_service.cpp"
         "system/wifi_service.cpp"
         "system/wifi_remote_service.cpp"
         "system/nas_catalog_service.cpp"
@@ -172,6 +173,7 @@ idf_component_register(
         nvs_flash
         fatfs
         bt
+        esp_hid
         esp_event
         esp_netif
         esp_wifi

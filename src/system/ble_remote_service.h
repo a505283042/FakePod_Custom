@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "device_settings.h"
 
 // R46.0：BLE Foundation 负责蓝牙生命周期、广播和连接状态。
 // 手机遥控通过本服务的加密 GATT 写入入口调用现有 Player 控制，不让 APP 直接操作 NimBLE。
@@ -10,6 +11,9 @@ enum class BleRemoteState : uint8_t {
     Disabled = 0,
     Starting,
     Advertising,
+    Scanning,
+    ControllerConnecting,
+    ControllerConnected,
     Connected,
     Stopping,
     RetryWait,
@@ -30,6 +34,7 @@ esp_err_t ble_remote_service_init();
 
 // 只更新“用户意图”，真正的 NimBLE 启停由 update() 异步执行，避免阻塞 LVGL/loopTask。
 void ble_remote_service_set_enabled(bool enabled);
+void ble_remote_service_set_mode(DeviceBluetoothMode mode);
 void ble_remote_service_update();
 
 bool ble_remote_service_get_snapshot(BleRemoteSnapshot *out_snapshot);
