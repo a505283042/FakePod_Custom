@@ -1168,9 +1168,9 @@ static bool parse_controller_candidate(
     if (disc == nullptr || out_candidate == nullptr) return false;
 
     struct ble_hs_adv_fields fields = {};
-    if (ble_hs_adv_parse_fields(&fields, disc->data, disc->length_data) != 0) {
-        return false;
-    }
+    // 广播包末尾常有零长度填充（0x00），NimBLE 解析到填充会返回错误，
+    // 但错误之前的字段已经解析完成并写入 fields，因此这里忽略返回值。
+    (void)ble_hs_adv_parse_fields(&fields, disc->data, disc->length_data);
 
     bool has_hid_service = false;
     for (uint8_t i = 0U; i < fields.num_uuids16; ++i) {
@@ -1225,22 +1225,21 @@ static void log_controller_adv_report(const struct ble_gap_disc_desc *disc)
     if (disc == nullptr) return;
 
     struct ble_hs_adv_fields fields = {};
-    const int rc = ble_hs_adv_parse_fields(&fields, disc->data, disc->length_data);
+    // 同上：零长度填充会让解析提前返回错误，但已解析字段仍然有效。
+    (void)ble_hs_adv_parse_fields(&fields, disc->data, disc->length_data);
 
     char name[32] = {};
     uint16_t uuid16 = 0U;
     unsigned appearance = 0U;
     bool has_mfg = false;
-    if (rc == 0) {
-        if (fields.name != nullptr && fields.name_len > 0U) {
-            size_t copy_length = fields.name_len < sizeof(name) - 1U ? fields.name_len : sizeof(name) - 1U;
-            memcpy(name, fields.name, copy_length);
-            name[copy_length] = '\0';
-        }
-        if (fields.num_uuids16 > 0U) uuid16 = ble_uuid_u16(&fields.uuids16[0].u);
-        if (fields.appearance_is_present) appearance = fields.appearance;
-        has_mfg = fields.mfg_data != nullptr;
+    if (fields.name != nullptr && fields.name_len > 0U) {
+        size_t copy_length = fields.name_len < sizeof(name) - 1U ? fields.name_len : sizeof(name) - 1U;
+        memcpy(name, fields.name, copy_length);
+        name[copy_length] = '\0';
     }
+    if (fields.num_uuids16 > 0U) uuid16 = ble_uuid_u16(&fields.uuids16[0].u);
+    if (fields.appearance_is_present) appearance = fields.appearance;
+    has_mfg = fields.mfg_data != nullptr;
 
     const uint8_t *addr = disc->addr.val;
     char raw[3 * 31 + 1] = {};
@@ -2055,8 +2054,31 @@ void ble_remote_service_update()
         mode = g_mode;
         portEXIT_CRITICAL(&g_lock);
         if (mode == DeviceBluetoothMode::Controller) {
-            if (state == BleRemoteState::ControllerConnected ||
-                state == BleRemoteState::ControllerConnecting) return;
+            if (state == BleRemoteState::ControllerConnected) return;
+            if (state == BleRemoteState::ControllerConnecting) {
+                // 兜底：若 DISC_COMPLETE 丢失或连接任务未起来，避免永久卡在“连接手柄”。
+                bool connect_running = false;
+                bool candidate_ready = false;
+                portENTER_CRITICAL(&g_lock);
+                connect_running = g_controller_connect_task_running;
+                candidate_ready = g_controller_candidate_ready;
+                portEXIT_CRITICAL(&g_lock);
+                if (connect_running) return;
+                if (candidate_ready) {
+                    (void)start_controller_connect_task();
+                } else {
+                    bool fell_back = false;
+                    portENTER_CRITICAL(&g_lock);
+                    if (g_state == BleRemoteState::ControllerConnecting) {
+                        set_state_locked(BleRemoteState::Scanning);
+                        g_controller_scan_due_tick = now + kControllerScanRetryDelay;
+                        fell_back = true;
+                    }
+                    portEXIT_CRITICAL(&g_lock);
+                    if (fell_back) ESP_LOGW(TAG, "BLE手柄连接任务未启动：回退到扫描");
+                }
+                return;
+            }
             if (state == BleRemoteState::Scanning) {
                 bool scan_active = false;
                 bool candidate_ready = false;
