@@ -10,6 +10,7 @@
 #include "ebook_app.h"
 #include "visual_music_app.h"
 #include "video_app.h"
+#include "picture_app.h"
 #include "sdcard.h"
 #include "media_catalog_v2.h"
 #include "artwork_loader.h"
@@ -208,6 +209,13 @@ void system_runtime_update()
     if (video_ret != ESP_OK) {
         ESP_LOGW(TAG, "Video APP 注册失败：%s；Launcher仍保持选择但不会进入",
             esp_err_to_name(video_ret));
+    }
+    const esp_err_t picture_ret = app_ret == ESP_OK
+        ? picture_app_register()
+        : ESP_ERR_INVALID_STATE;
+    if (picture_ret != ESP_OK) {
+        ESP_LOGW(TAG, "图片APP注册失败：%s；Launcher仍保持选择但不会进入",
+            esp_err_to_name(picture_ret));
     }
 
     const esp_err_t device_settings_ret = device_settings_init();
