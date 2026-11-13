@@ -13,6 +13,7 @@
 - [目录结构](#目录结构)
 - [快速开始](#快速开始)
 - [构建环境](#构建环境)
+- [版本基线](#版本基线)
 - [完整固件打包与离线烧录](#完整固件打包与离线烧录)
 - [TF 卡目录约定](#tf-卡目录约定)
 - [视频子系统](#视频子系统)
@@ -150,6 +151,26 @@ pio device monitor
 | fontcache | data/0x40 | 0x810000 | 3M |
 | spiffs | data/spiffs | 0xb10000 | 4992K |
 | coredump | data/coredump | 0xff0000 | 64K |
+
+---
+
+## 版本基线
+
+| 组件 | 版本 | 固定方式 |
+|---|---|---|
+| PlatformIO 平台 | `espressif32 6.13.0` | `platform = espressif32 @ 6.13.0` |
+| ESP-IDF | `5.5.3` | 随平台版本间接锁定 |
+| Xtensa GCC | `14.2.0+20251107` | `platform_packages` |
+| 托管组件（LVGL 9.2.2、esp_extractor 等） | 见 [dependencies.lock](dependencies.lock) | 锁文件入库 |
+| PlatformIO Core | 建议 `6.2.0` 及以上 | 文档约定 |
+| Python | `3.10+`（本机验证 3.13） | 文档约定 |
+
+说明：
+
+- 平台、工具链与组件版本均已固定，换机器时只需安装匹配的 PlatformIO Core 与 Python，即可复现同一构建。
+- `managed_components/` 被 `.gitignore` 忽略，组件由 `dependencies.lock` 复现，不要手工改动其中的版本。
+- PlatformIO Core 只保留一个安装：多版本共存会触发 `Obsolete PIO Core` 警告，并可能在 `C:\PlatformIO\platforms.lock` 上出现 `PermissionError`。
+- `sdkconfig.*` 生成物同样不入库，由 `sdkconfig.defaults` 重新生成，无需固定。
 
 ---
 
