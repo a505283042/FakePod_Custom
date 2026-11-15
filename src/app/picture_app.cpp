@@ -17,6 +17,8 @@
 #include "lvgl.h"
 #include "app_manager.h"
 #include "font/font_manager.h"
+#include "nas_catalog_service.h"
+#include "ui_common.h"
 #include "ui/gesture/gesture_router.h"
 
 static const char *TAG = "图片APP";
@@ -24,6 +26,9 @@ static const char *TAG = "图片APP";
 static constexpr uint16_t kScreenWidth = 460;
 static constexpr uint16_t kScreenHeight = 460;
 static constexpr int kMaxFiles = 500;
+// 开机 NAS 索引检查会占住 TF 卡；此时 opendir 失败不等于没有图片。
+// 保持提示并按 1s 节奏重扫，检查结束会自动出图，不需要重启 App。
+static constexpr uint32_t kNasBusyRetryIntervalMs = 1000U;
 
 enum class PictureState : uint8_t {
     Stopped = 0,
@@ -37,6 +42,8 @@ static lv_obj_t *g_status = nullptr;
 static lv_obj_t *g_counter = nullptr;
 static lv_timer_t *g_timer = nullptr;
 static PictureState g_state = PictureState::Stopped;
+static uint32_t g_last_nas_retry_ms = 0U;
+static bool g_nas_busy_noticed = false;
 
 static std::vector<std::string> g_files;
 static int g_current = -1;
@@ -378,6 +385,44 @@ static void handle_gesture()
     }
 }
 
+// 开机 NAS 索引检查期间图片列表为空不代表 TF 卡没有图片：
+// 弹窗告知并周期性重扫，检查结束后自动出图。
+static void picture_tick()
+{
+    handle_gesture();
+    if (g_state != PictureState::Browsing || !g_files.empty()) return;
+
+    NasCatalogSnapshot nas = {};
+    const bool syncing = nas_catalog_service_get_snapshot(&nas) && nas.syncing;
+    if (!syncing) {
+        if (g_nas_busy_noticed) {
+            g_nas_busy_noticed = false;
+            g_last_nas_retry_ms = 0U;
+            show_status("未找到图片\n请将 JPG/PNG 放入 SD 卡");
+        }
+        return;
+    }
+
+    const uint32_t now_ms = static_cast<uint32_t>(lv_tick_get());
+    if (g_last_nas_retry_ms != 0U && now_ms - g_last_nas_retry_ms < kNasBusyRetryIntervalMs) return;
+    g_last_nas_retry_ms = now_ms;
+
+    scan_files();
+    if (!g_files.empty()) {
+        g_nas_busy_noticed = false;
+        g_last_nas_retry_ms = 0U;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "共 %u 张图片\n左右滑动翻页", static_cast<unsigned>(g_files.size()));
+        show_status(buf);
+        return;
+    }
+    if (!g_nas_busy_noticed) {
+        g_nas_busy_noticed = true;
+        show_status("正在检查 NAS 曲库\n索引检查中，请稍候…");
+        ui_common_show_notice("正在检查 NAS 曲库", "开机索引检查中，请稍候再打开图片");
+    }
+}
+
 // ---------- 生命周期 ----------
 
 static esp_err_t picture_create()
@@ -422,7 +467,7 @@ static esp_err_t picture_create()
         lv_obj_add_flag(g_counter, LV_OBJ_FLAG_HIDDEN);
     }
 
-    g_timer = lv_timer_create([](lv_timer_t *) { handle_gesture(); }, 20, nullptr);
+    g_timer = lv_timer_create([](lv_timer_t *) { picture_tick(); }, 20, nullptr);
     if (g_timer == nullptr) {
         lv_obj_delete(g_root);
         g_root = nullptr;
@@ -432,7 +477,14 @@ static esp_err_t picture_create()
 
     scan_files();
     if (g_files.empty()) {
-        show_status("未找到图片\n请将 JPG/PNG 放入 SD 卡");
+        // 开机阶段 NAS 索引检查会占住 TF 卡：先提示检查中，由 picture_tick 重试。
+        NasCatalogSnapshot nas = {};
+        if (nas_catalog_service_get_snapshot(&nas) && nas.syncing) {
+            g_nas_busy_noticed = true;
+            show_status("正在检查 NAS 曲库\n索引检查中，请稍候…");
+        } else {
+            show_status("未找到图片\n请将 JPG/PNG 放入 SD 卡");
+        }
     } else {
         char buf[64];
         snprintf(buf, sizeof(buf), "共 %u 张图片\n左右滑动翻页", static_cast<unsigned>(g_files.size()));

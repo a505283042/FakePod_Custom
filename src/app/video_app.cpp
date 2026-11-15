@@ -19,6 +19,7 @@
 #include "gesture/gesture_router.h"
 #include "lvgl.h"
 #include "media_library.h"
+#include "nas_catalog_service.h"
 #include "player_state.h"
 #include "player_transport.h"
 #include "device_settings.h"
@@ -62,6 +63,9 @@ static constexpr uint32_t kFlacSafePercent = 90U;
 static constexpr size_t kScanBatchNoFlac = 8U;
 static constexpr size_t kScanBatchWithFlac = 1U;
 static constexpr uint32_t kWaitLogIntervalMs = 1000U;
+// 开机 NAS 索引检查会长时间占用 TF 卡；目录打开拿不到 SD 锁时按 500ms 节奏重试，
+// 避免 20ms 定时器反复以 30ms 超时抢锁，也避免把“卡被占用”误报成“打开失败”。
+static constexpr uint32_t kNasBusyRetryIntervalMs = 500U;
 static constexpr int64_t kVideoLateDropUs = 50000LL;
 // 音频主时钟看门狗：音频欠载时“已提交 PCM 时钟”会停滞，累计落后视频 PTS 超过该值后，
 // 本段改用墙钟节拍，避免音频缺料把整段画面拖成慢放。
@@ -338,6 +342,8 @@ struct BrowserLoadState
     BrowserLoadPhase phase = BrowserLoadPhase::Idle;
     VideoBrowser::DirectoryScanSession scan = {};
     uint32_t last_wait_log_ms = 0U;
+    uint32_t last_nas_busy_retry_ms = 0U;
+    bool nas_busy_noticed = false;
 };
 
 struct CadenceProbeWindow
@@ -944,13 +950,34 @@ static void browser_load_tick()
     }
 
     if (g_browser_load.phase == BrowserLoadPhase::WaitingForAudioWindow) {
+        const uint32_t now_tick = static_cast<uint32_t>(lv_tick_get());
+        if (g_browser_load.last_nas_busy_retry_ms != 0U &&
+            now_tick - g_browser_load.last_nas_busy_retry_ms < kNasBusyRetryIntervalMs) {
+            return;
+        }
         const esp_err_t ret = VideoBrowser::begin_directory_scan(g_current_dir, &g_browser_load.scan);
         if (ret != ESP_OK) {
+            // 开机 NAS 索引检查期间 TF 卡被持续占用：这不是目录/卡片故障，
+            // 弹窗告知并保持等待，检查结束后同一次打开会自动重试成功。
+            NasCatalogSnapshot nas = {};
+            if (nas_catalog_service_get_snapshot(&nas) && nas.syncing) {
+                g_browser_load.last_nas_busy_retry_ms = now_tick;
+                if (!g_browser_load.nas_busy_noticed) {
+                    g_browser_load.nas_busy_noticed = true;
+                    show_status("NAS索引检查中，请稍候", 0x79B9FF);
+                    ui_common_show_notice("正在检查 NAS 曲库", "开机索引检查中，请稍候再打开目录");
+                    ESP_LOGI(TAG, "Video目录等待NAS索引检查：path=%s ret=%s",
+                        g_current_dir, esp_err_to_name(ret));
+                }
+                return;
+            }
             g_browser_load = {};
             show_status(ret == ESP_ERR_NOT_FOUND ? "请在TF卡根目录创建 video 文件夹" : "视频目录打开失败", 0xE18A8A);
             ESP_LOGW(TAG, "Video目录打开失败：path=%s ret=%s", g_current_dir, esp_err_to_name(ret));
             return;
         }
+        g_browser_load.nas_busy_noticed = false;
+        g_browser_load.last_nas_busy_retry_ms = 0U;
         g_browser_load.phase = BrowserLoadPhase::Scanning;
     }
 

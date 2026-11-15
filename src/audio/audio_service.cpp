@@ -329,13 +329,13 @@ struct VideoMp3TimingStats
 static VideoMp3TimingStats g_video_mp3_timing = {};
 
 // VM10：NSF 6502/2A03 由 AudioTask 独占输出硬件；
-// 传统 NSF v1 没有 Subsong 时长：后台确认可靠循环后按“2 遍优先、90 秒下限、3 分钟上限”结束：
-// - 循环段播 2 遍且总时长落在 [90s, 180s]：按 2 遍结束；
-// - 2 遍不足 90s：顺延到 >=90s 的最近完整循环边界（多播 1~2 遍）；
+// 传统 NSF v1 没有 Subsong 时长：后台确认可靠循环后按“2 遍优先、60 秒下限、3 分钟上限”结束：
+// - 循环段播 2 遍且总时长落在 [60s, 180s]：按 2 遍结束；
+// - 2 遍不足 60s：顺延到 >=60s 的最近完整循环边界（多播 1~2 遍）；
 // - 2 遍超过 180s：退到 1 遍；1 遍仍超过 180s 时按 180s 硬截断并淡出。
 // 无循环时后台预读确认自然静音起点并直接作为结束点；实时6秒静音仅保留为分析失败兜底。
 static constexpr uint32_t NSF_SILENCE_END_MS = 6000U;
-static constexpr uint32_t NSF_LOOP_MIN_MS = 90000U;
+static constexpr uint32_t NSF_LOOP_MIN_MS = 60000U;
 static constexpr uint32_t NSF_LOOP_TARGET_MS = 180000U;
 // 淡出降到 2 秒：短曲（2 遍 40~120s）淡出占比更低，不再有“播到一半就淡出”的听感。
 static constexpr uint32_t NSF_TRACK_FADE_MS = 2000U;
@@ -4032,8 +4032,10 @@ static uint64_t nsf_loop_boundary_at_or_after(
     return loop_start + loops * loop_length;
 }
 
-// 按“2 遍优先、90 秒下限、180 秒上限”折算循环时长；除 3 分钟硬截断兜底外，
+// 按“2 遍优先、60 秒下限、180 秒上限”折算循环时长；除 3 分钟硬截断兜底外，
 // 返回值都落在完整循环边界上，保证淡出不切在半拍。
+// 下限取 60s 而不是 90s：76.8s 这类 2 遍已足够长的曲子不该被顺延到第 3 遍，
+// 否则会多播一遍尾段（听感上像下一首）并在其后空走数十秒静音。
 static uint64_t nsf_policy_duration_ms(uint64_t loop_start, uint64_t loop_length)
 {
     if (loop_length == 0ULL) return 0ULL;

@@ -17,6 +17,7 @@
 #include "font/font_manager.h"
 #include "gesture/gesture_router.h"
 #include "lvgl.h"
+#include "nas_catalog_service.h"
 #include "player/player_control.h"
 #include "app_launcher_overlay.h"
 #include "sdcard.h"
@@ -81,6 +82,9 @@ static constexpr uint32_t kEbookBackgroundIoFlacSafePercent = 90;
 static constexpr size_t kBrowserScanBatchNoFlac = 8;
 static constexpr size_t kBrowserScanBatchWithFlac = 1;
 static constexpr uint32_t kBrowserWaitLogIntervalMs = 1000;
+// 开机 NAS 索引检查会长时间占用 TF 卡；目录打开拿不到 SD 锁时按 500ms 节奏重试，
+// 避免 20ms 定时器反复以 30ms 超时抢锁，也避免把“卡被占用”误报成“打开失败”。
+static constexpr uint32_t kNasBusyRetryIntervalMs = 500U;
 // Virtual Browser：Directory Index 可按 PSRAM 动态扩展，但屏幕只复用5个固定 Row。
 // 普通纵向 Flick 每次移动4项，保留1行上下文重叠；不再使用 LVGL native pixel scroll。
 static constexpr size_t kBrowserVisibleRows = 5;
@@ -141,6 +145,8 @@ struct BrowserLoadState
     BrowserLoadPhase phase = BrowserLoadPhase::Idle;
     EbookReader::DirectoryScanSession scan = {};
     uint32_t last_wait_log_ms = 0;
+    uint32_t last_nas_busy_retry_ms = 0U;
+    bool nas_busy_noticed = false;
 };
 static BrowserLoadState g_browser_load = {};
 
@@ -1853,6 +1859,31 @@ static void ebook_browser_load_fail(esp_err_t error)
         esp_err_to_name(error));
 }
 
+// 开机 NAS 索引检查期间 TF 卡被独占：不要把“卡被占用”报成打开失败/读取失败，
+// 弹窗告知后保持等待，检查结束后同一次打开会自动重试成功。
+static bool ebook_browser_handle_nas_busy(esp_err_t error)
+{
+    NasCatalogSnapshot nas = {};
+    if (!nas_catalog_service_get_snapshot(&nas) || !nas.syncing) return false;
+
+    if (g_browser_load.phase == BrowserLoadPhase::Scanning) {
+        // 扫描中途被 NAS 抢走 TF 卡：丢弃半成品索引，退回等待态重新开始。
+        EbookReader::cancel_directory_scan(&g_browser_load.scan);
+        EbookReader::release_directory(&g_directory);
+        g_browser_load.phase = BrowserLoadPhase::WaitingForAudioWindow;
+    }
+    g_browser_load.last_nas_busy_retry_ms = static_cast<uint32_t>(lv_tick_get());
+    if (!g_browser_load.nas_busy_noticed) {
+        g_browser_load.nas_busy_noticed = true;
+        ebook_browser_show_status("正在检查 NAS 曲库\n开机索引检查中，请稍候…", 0x8490A0);
+        ui_common_show_notice("正在检查 NAS 曲库", "开机索引检查中，请稍候再打开目录");
+        ESP_LOGI(TAG, "Ebook目录等待NAS索引检查：path=%s ret=%s",
+            g_current_dir != nullptr ? g_current_dir : "?",
+            esp_err_to_name(error));
+    }
+    return true;
+}
+
 static void ebook_browser_load_tick()
 {
     if (g_browser_load.phase == BrowserLoadPhase::Idle ||
@@ -1880,15 +1911,24 @@ static void ebook_browser_load_tick()
     }
 
     if (g_browser_load.phase == BrowserLoadPhase::WaitingForAudioWindow) {
+        // NAS 占用 TF 卡期间不再每 20ms 抢一次 30ms 锁，统一按 500ms 重试。
+        if (g_browser_load.last_nas_busy_retry_ms != 0U &&
+            static_cast<uint32_t>(lv_tick_get()) - g_browser_load.last_nas_busy_retry_ms <
+                kNasBusyRetryIntervalMs) {
+            return;
+        }
         EbookReader::DirectoryScanSession scan = {};
         const esp_err_t ret = EbookReader::begin_directory_scan(g_current_dir, &scan);
         if (ret != ESP_OK) {
+            if (ebook_browser_handle_nas_busy(ret)) return;
             ebook_browser_load_fail(ret);
             return;
         }
         g_browser_load.scan = scan;
         g_browser_load.phase = BrowserLoadPhase::Scanning;
         g_browser_load.last_wait_log_ms = 0;
+        g_browser_load.last_nas_busy_retry_ms = 0U;
+        g_browser_load.nas_busy_noticed = false;
     }
 
     if (g_browser_load.phase == BrowserLoadPhase::Scanning) {
@@ -1899,6 +1939,7 @@ static void ebook_browser_load_tick()
         const esp_err_t ret = EbookReader::scan_directory_step(
             &g_browser_load.scan, batch, &done);
         if (ret != ESP_OK) {
+            if (ebook_browser_handle_nas_busy(ret)) return;
             ebook_browser_load_fail(ret);
             return;
         }
@@ -1907,6 +1948,7 @@ static void ebook_browser_load_tick()
         const esp_err_t finish_ret =
             EbookReader::finish_directory_scan(&g_browser_load.scan, &g_directory);
         if (finish_ret != ESP_OK) {
+            if (ebook_browser_handle_nas_busy(finish_ret)) return;
             ebook_browser_load_fail(finish_ret);
             return;
         }

@@ -16,6 +16,7 @@
 #include "gesture/gesture_router.h"
 #include "lvgl.h"
 #include "media_library.h"
+#include "nas_catalog_service.h"
 #include "player_state.h"
 #include "player_transport.h"
 #include "ui_common.h"
@@ -60,6 +61,9 @@ static constexpr uint32_t kFlacSafePercent = 90U;
 static constexpr size_t kScanBatchNoFlac = 8U;
 static constexpr size_t kScanBatchWithFlac = 1U;
 static constexpr uint32_t kWaitLogIntervalMs = 1000U;
+// 开机 NAS 索引检查会长时间占用 TF 卡；目录打开拿不到 SD 锁时按 500ms 节奏重试，
+// 避免 20ms 定时器反复以 30ms 超时抢锁，也避免把“卡被占用”误报成“打开失败”。
+static constexpr uint32_t kNasBusyRetryIntervalMs = 500U;
 // R46.0.47：时长分析期回退到约8.3fps，优先保证Sequencer/Timeline；Final仍保持PSRAM双帧25fps。
 static constexpr uint32_t kNsfWaterfallAnalyzingFramePeriodMs = 120U; // ~8.3fps，分析期统一限速
 static constexpr uint32_t kNsfWaterfallFinalFramePeriodMs = 50U;      // 20fps fallback
@@ -102,6 +106,8 @@ struct BrowserLoadState
     BrowserLoadPhase phase = BrowserLoadPhase::Idle;
     VisualMusicBrowser::DirectoryScanSession scan = {};
     uint32_t last_wait_log_ms = 0U;
+    uint32_t last_nas_busy_retry_ms = 0U;
+    bool nas_busy_noticed = false;
 };
 
 struct NsfStartTaskArgs
@@ -160,6 +166,11 @@ static uint32_t g_waterfall_hidden_since_tick = 0U;
 static bool g_nsf_paused = true;
 static bool g_nsf_audio_active = false;
 static bool g_nsf_eof = false;
+// 播放页可随时返回列表（NSF 继续播放），列表据此高亮“正在播放的那一项”。
+// 记录目录是为了避免切到别的文件夹后，同索引的其它文件被误高亮。
+static size_t g_nsf_playing_index = SIZE_MAX;
+static char g_nsf_playing_dir[VisualMusicBrowser::kPathBytes] = {};
+static size_t g_browser_highlight_index = SIZE_MAX;
 // NSF EOF 按 AudioTask Track 实例 revision 去重，和主 Music playback_revision 采用同一模型。
 // 同一 Subsong RepeatOne reset 后 track 不变，但 revision 会变化，因此不会吞掉新实例的 EOF。
 static uint32_t g_last_nsf_eof_revision = 0U;
@@ -1575,6 +1586,10 @@ static void begin_nsf_load()
     g_last_nsf_eof_revision = 0U;
     g_nsf_failed = false;
     g_page = VisualMusicPage::NsfLoading;
+    g_nsf_playing_index = g_selected_index;
+    if (g_current_dir != nullptr) {
+        snprintf(g_nsf_playing_dir, sizeof(g_nsf_playing_dir), "%s", g_current_dir);
+    }
     set_visible(g_browser_host, false);
     set_browser_header_visible(false);
     set_visible(g_player_host, true);
@@ -1854,8 +1869,19 @@ static void show_status(const char *text, uint32_t color)
     }
 }
 
+// 当前列表应高亮的索引：只有“正在播放且就在当前目录”时有效。
+static size_t playing_list_index()
+{
+    if (!g_nsf_audio_active || g_nsf_playing_index == SIZE_MAX ||
+        g_current_dir == nullptr || g_nsf_playing_dir[0] == '\0') {
+        return SIZE_MAX;
+    }
+    return strcmp(g_current_dir, g_nsf_playing_dir) == 0 ? g_nsf_playing_index : SIZE_MAX;
+}
+
 static void update_rows()
 {
+    const size_t playing_index = playing_list_index();
     if (g_directory.entries == nullptr || g_directory.count == 0U) {
         show_status("/synth 中没有 NSF", 0x7F8A99);
         return;
@@ -1885,11 +1911,12 @@ static void update_rows()
         }
 
         const bool is_dir = VisualMusicBrowser::entry_is_directory(entry);
+        const bool playing = index == playing_index;
         lv_label_set_text(ui.name, name);
         lv_label_set_text(ui.kind, VisualMusicBrowser::entry_kind_name(entry));
         lv_obj_set_style_text_color(
             ui.name,
-            lv_color_hex(is_dir ? 0xBCD7FF : 0xEEF1F5),
+            lv_color_hex(playing ? 0xE9DEFF : (is_dir ? 0xBCD7FF : 0xEEF1F5)),
             0);
         lv_obj_set_style_text_color(
             ui.kind,
@@ -1897,8 +1924,11 @@ static void update_rows()
             0);
         lv_obj_set_style_bg_color(
             ui.row,
-            lv_color_hex(is_dir ? 0x172230 : 0x151A21),
+            lv_color_hex(playing ? 0x2A2340 : (is_dir ? 0x172230 : 0x151A21)),
             0);
+        // 正在播放的曲目：紫色描边 + 高亮底色，和普通行/目录行区分开。
+        lv_obj_set_style_border_width(ui.row, playing ? 2 : 0, 0);
+        lv_obj_set_style_border_color(ui.row, lv_color_hex(0x8E79FF), 0);
         set_visible(ui.row, true);
         last = index;
     }
@@ -1915,6 +1945,7 @@ static void update_rows()
         lv_label_set_text(g_browser_position, position);
         set_visible(g_browser_position, true);
     }
+    g_browser_highlight_index = playing_index;
 }
 
 static void shift_window(int direction)
@@ -2011,10 +2042,32 @@ static void browser_load_tick()
     }
 
     if (g_browser_load.phase == BrowserLoadPhase::WaitingForAudioWindow) {
+        const uint32_t now_tick = static_cast<uint32_t>(lv_tick_get());
+        if (g_browser_load.last_nas_busy_retry_ms != 0U &&
+            now_tick - g_browser_load.last_nas_busy_retry_ms < kNasBusyRetryIntervalMs) {
+            return;
+        }
         const esp_err_t ret = VisualMusicBrowser::begin_directory_scan(
             g_current_dir,
             &g_browser_load.scan);
         if (ret != ESP_OK) {
+            // 开机 NAS 索引检查期间 TF 卡被持续占用：这不是目录/卡片故障，
+            // 弹窗告知并保持等待，检查结束后同一次打开会自动重试成功。
+            NasCatalogSnapshot nas = {};
+            if (nas_catalog_service_get_snapshot(&nas) && nas.syncing) {
+                g_browser_load.last_nas_busy_retry_ms = now_tick;
+                if (!g_browser_load.nas_busy_noticed) {
+                    g_browser_load.nas_busy_noticed = true;
+                    show_status("NAS索引检查中，请稍候", 0x79B9FF);
+                    ui_common_show_notice("正在检查 NAS 曲库", "开机索引检查中，请稍候再打开目录");
+                    ESP_LOGI(
+                        TAG,
+                        "电子音流目录等待NAS索引检查：path=%s ret=%s",
+                        g_current_dir,
+                        esp_err_to_name(ret));
+                }
+                return;
+            }
             g_browser_load = {};
             show_status(
                 ret == ESP_ERR_NOT_FOUND
@@ -2028,6 +2081,8 @@ static void browser_load_tick()
                 esp_err_to_name(ret));
             return;
         }
+        g_browser_load.nas_busy_noticed = false;
+        g_browser_load.last_nas_busy_retry_ms = 0U;
         g_browser_load.phase = BrowserLoadPhase::Scanning;
     }
 
@@ -2196,7 +2251,14 @@ static void timer_cb(lv_timer_t *timer)
     process_remote_command();
     nsf_result_tick();
     nsf_start_result_tick();
-    if (g_page == VisualMusicPage::Browser) browser_load_tick();
+    if (g_page == VisualMusicPage::Browser) {
+        browser_load_tick();
+        // 列表页停留时 NSF 仍在播放：只在“高亮目标”变化时重画，避免每帧刷列表。
+        if (g_browser_load.phase == BrowserLoadPhase::Idle &&
+            playing_list_index() != g_browser_highlight_index) {
+            update_rows();
+        }
+    }
     waterfall_hidden_release_tick();
     // NSF 音频会话与页面显示解耦：Browser 中仍持续消费 Clock/EOF/循环状态。
     if (g_nsf_audio_active) {
