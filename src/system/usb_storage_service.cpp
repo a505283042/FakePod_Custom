@@ -96,7 +96,7 @@ static void raw_sd_cleanup()
 static esp_err_t raw_sd_init()
 {
     g_host = SDMMC_HOST_DEFAULT();
-    g_host.max_freq_khz = SDMMC_FREQ_DEFAULT;
+    g_host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
 
     sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
     slot.width = 4;

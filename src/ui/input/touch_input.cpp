@@ -16,6 +16,7 @@ constexpr BaseType_t TOUCH_INPUT_TASK_CORE = 1;
 constexpr UBaseType_t TOUCH_INPUT_TASK_PRIORITY = 3;
 constexpr uint32_t TOUCH_INPUT_TASK_STACK_BYTES = 2560U;
 constexpr UBaseType_t TOUCH_EDGE_QUEUE_LENGTH = 8U;
+constexpr uint8_t TOUCH_PRESS_DEBOUNCE_SAMPLES = 3U;
 constexpr uint8_t TOUCH_RELEASE_DEBOUNCE_SAMPLES = 3U;
 constexpr uint32_t TOUCH_SAMPLE_PERIOD_MS = 8U;
 constexpr TickType_t TOUCH_SAMPLE_PERIOD_TICKS =
@@ -31,6 +32,7 @@ uint32_t g_edge_drop_count = 0U;
 uint32_t g_edge_coalesce_count = 0U;
 uint32_t g_edge_coalesced_events = 0U;
 uint32_t g_release_glitch_suppressed_count = 0U;
+uint32_t g_press_glitch_suppressed_count = 0U;
 
 static int16_t touch_clamp_coord(uint16_t value, uint16_t max_value)
 {
@@ -160,7 +162,10 @@ static void touch_input_task(void *argument)
     (void)argument;
     TickType_t last_wake = xTaskGetTickCount();
     bool stable_pressed = false;
+    uint8_t press_candidate_samples = 0U;
     uint8_t release_candidate_samples = 0U;
+    uint16_t press_candidate_x = 0U;
+    uint16_t press_candidate_y = 0U;
     uint32_t read_error_count = 0U;
 
     for (;;) {
@@ -185,9 +190,22 @@ static void touch_input_task(void *argument)
                 }
                 release_candidate_samples = 0U;
 
-                const bool edge = !stable_pressed;
-                stable_pressed = true;
-                touch_publish_snapshot(point, now_ms, edge);
+                if (stable_pressed) {
+                    touch_publish_snapshot(point, now_ms, false);
+                } else {
+                    // 单帧虚假触点抑制：CST820 偶发上报 1~2 帧噪声触点（多见于显示
+                    // 刷新干扰），必须连续多帧按下才确认为真实 DOWN。
+                    press_candidate_x = point.x;
+                    press_candidate_y = point.y;
+                    if (press_candidate_samples < TOUCH_PRESS_DEBOUNCE_SAMPLES) {
+                        ++press_candidate_samples;
+                    }
+                    if (press_candidate_samples >= TOUCH_PRESS_DEBOUNCE_SAMPLES) {
+                        press_candidate_samples = 0U;
+                        stable_pressed = true;
+                        touch_publish_snapshot(point, now_ms, true);
+                    }
+                }
             } else if (stable_pressed) {
                 if (release_candidate_samples < TOUCH_RELEASE_DEBOUNCE_SAMPLES) {
                     ++release_candidate_samples;
@@ -203,6 +221,19 @@ static void touch_input_task(void *argument)
                 // 未达到确认阈值时保持上一份 pressed 快照，不发布伪 RELEASE。
             } else {
                 release_candidate_samples = 0U;
+                if (press_candidate_samples > 0U) {
+                    ++g_press_glitch_suppressed_count;
+                    if (g_press_glitch_suppressed_count == 1U ||
+                        (g_press_glitch_suppressed_count % 32U) == 0U) {
+                        ESP_LOGI(TAG,
+                            "触摸伪按下已抑制：count=%lu samples=%u last=(%u,%u)",
+                            static_cast<unsigned long>(g_press_glitch_suppressed_count),
+                            static_cast<unsigned>(press_candidate_samples),
+                            static_cast<unsigned>(press_candidate_x),
+                            static_cast<unsigned>(press_candidate_y));
+                    }
+                    press_candidate_samples = 0U;
+                }
             }
         } else {
             // 短暂 I2C 错误时保留最近稳定状态，不推进 RELEASE debounce，
@@ -246,6 +277,7 @@ esp_err_t ui_touch_input_start()
     g_edge_coalesce_count = 0U;
     g_edge_coalesced_events = 0U;
     g_release_glitch_suppressed_count = 0U;
+    g_press_glitch_suppressed_count = 0U;
 
     const BaseType_t created = xTaskCreatePinnedToCore(
         touch_input_task,

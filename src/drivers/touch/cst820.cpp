@@ -1,7 +1,11 @@
 #include "cst820.h"
 
+#include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_log.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "board_pins.h"
 #include "i2c_bus.h"
@@ -41,6 +45,30 @@ static void cst820_rollback_device()
 }
 
 
+// CST820 上电后必须经过一次硬复位才能进入正常上报模式；
+// 未复位时芯片可能停留在上电随机状态并偶发上报虚假触点。
+static void cst820_hardware_reset()
+{
+#if defined(FAKEPOD_TOUCH_RST) && FAKEPOD_TOUCH_RST >= 0
+    gpio_config_t io = {};
+    io.pin_bit_mask = 1ULL << FAKEPOD_TOUCH_RST;
+    io.mode = GPIO_MODE_OUTPUT;
+    io.pull_up_en = GPIO_PULLUP_DISABLE;
+    io.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io.intr_type = GPIO_INTR_DISABLE;
+    if (gpio_config(&io) != ESP_OK) {
+        ESP_LOGW(TAG, "配置触摸 RST(IO%d) 失败", FAKEPOD_TOUCH_RST);
+        return;
+    }
+    gpio_set_level(static_cast<gpio_num_t>(FAKEPOD_TOUCH_RST), 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level(static_cast<gpio_num_t>(FAKEPOD_TOUCH_RST), 1);
+    // 复位释放后给 CST820 固件留出启动时间再访问 I2C。
+    vTaskDelay(pdMS_TO_TICKS(80));
+#endif
+}
+
+
 // ============================================================
 // 初始化 CST820
 // ============================================================
@@ -57,6 +85,9 @@ esp_err_t cst820_init()
         "正在初始化 CST820"
     );
 #endif
+
+
+    cst820_hardware_reset();
 
 
     esp_err_t ret =

@@ -19,10 +19,10 @@
 
 static const char *TAG = "FLAC";
 
-// Simple Decoder 每次最多取 32KB 连续压缩数据，输入工作区与 PCM 输出区都放在 PSRAM。
+// Simple Decoder 每次最多取 48KB 连续压缩数据，输入工作区与 PCM 输出区都放在 PSRAM。
 // SD 读取不再由 AudioTask 同步执行，而是由独立低优先级预取任务填充 PSRAM 环形缓冲。
 // 预取缓存按采样率扩展，未来开放 96/192kHz 时优先增加 PSRAM 吞吐余量，不堆内部 DMA RAM。
-static constexpr size_t FLAC_INPUT_BUFFER_BYTES = 32768;
+static constexpr size_t FLAC_INPUT_BUFFER_BYTES = 48 * 1024;
 // NAS metadata 顺序解析阶段允许网络 ring 短暂补充，但不能让 AudioTask 无限卡在坏链路上。
 static constexpr uint32_t FLAC_STREAMING_METADATA_WAIT_MS = 5000U;
 // NAS FLAC metadata 解析后的首块 PCM 预解码可等网络短暂补充；正式播放不使用这个窗口。
@@ -31,14 +31,16 @@ static constexpr uint32_t FLAC_STREAMING_PREPLAY_WAIT_MS = 1000U;
 // STREAMINFO 的 max_frame_size 再留少量保护字节，避免窗口边界导致一次 PCM refill 需要两轮 process。
 static constexpr size_t FLAC_INPUT_FRAME_GUARD_BYTES = 64;
 static constexpr size_t FLAC_PREFETCH_RING_48K_BYTES = 192 * 1024;
-static constexpr size_t FLAC_PREFETCH_RING_96K_BYTES = 256 * 1024;
-static constexpr size_t FLAC_PREFETCH_RING_192K_BYTES = 256 * 1024;
+// 96k/192k 曲目实测 ring 会周期性掉到 63%~69%（预取任务被 UI/SD 竞争挡住约 60~80KB
+// 的补给），256KB 余量不足；提到 512KB 后同样的停顿仍能保持在 Emergency 阈值以上。
+static constexpr size_t FLAC_PREFETCH_RING_96K_BYTES = 512 * 1024;
+static constexpr size_t FLAC_PREFETCH_RING_192K_BYTES = 512 * 1024;
 static constexpr size_t FLAC_PREFETCH_READ_48K_BYTES = 8192;
 static constexpr size_t FLAC_PREFETCH_READ_96K_BYTES = 32768;
 static constexpr size_t FLAC_PREFETCH_READ_192K_BYTES = 32768;
 static constexpr size_t FLAC_PREFETCH_START_48K_BYTES = 64 * 1024;
 static constexpr size_t FLAC_PREFETCH_START_96K_BYTES = 128 * 1024;
-// 176.4/192k 长测中 256KB ring 最低仍约 198KB、starve=0，128KB 起播预充偏保守。
+// 176.4/192k 长测中 256KB ring 最低仍约 198KB、starve=0；ring 提到 512KB 后余量更宽裕。
 // Stage 9.5.4 将高采样率起播目标降到 64KB，预计减少约两次 32KB SD 读取的等待；
 // 稳态 ring、SD read chunk 和解码窗口均保持不变。
 static constexpr size_t FLAC_PREFETCH_START_192K_BYTES = 64 * 1024;
@@ -571,23 +573,22 @@ static FlacPrefetchQosState flac_prefetch_qos_observe(
     ) {
         context->qos_pressure_active = true;
         context->qos_emergency_entries = context->qos_emergency_entries + 1U;
-        ESP_LOGW(TAG,
-            "FLAC 预取进入 Emergency：ring=%u/%uB (%u%%)，切换到最多%u次连续读取",
-            static_cast<unsigned>(buffered_bytes),
-            static_cast<unsigned>(context->ring_bytes),
-            static_cast<unsigned>(flac_prefetch_qos_percent(buffered_bytes, context->ring_bytes)),
-            static_cast<unsigned>(FLAC_PREFETCH_QOS_BATCH_EMERGENCY));
+        // 高码率曲目（如 96kHz）水位会在阈值附近持续抖动，逐次打印会刷屏；
+        // 仅保留本曲首次进入告警，其余只累计到曲末 QoS 汇总。
+        if (context->qos_emergency_entries == 1U) {
+            ESP_LOGW(TAG,
+                "FLAC 预取进入 Emergency（曲内首次）：ring=%u/%uB (%u%%)，切换到最多%u次连续读取",
+                static_cast<unsigned>(buffered_bytes),
+                static_cast<unsigned>(context->ring_bytes),
+                static_cast<unsigned>(flac_prefetch_qos_percent(buffered_bytes, context->ring_bytes)),
+                static_cast<unsigned>(FLAC_PREFETCH_QOS_BATCH_EMERGENCY));
+        }
     } else if (
         context->qos_pressure_active &&
         (state == FlacPrefetchQosState::Normal || state == FlacPrefetchQosState::Plenty)
     ) {
         context->qos_pressure_active = false;
         context->qos_recovered_count = context->qos_recovered_count + 1U;
-        ESP_LOGI(TAG,
-            "FLAC 预取已恢复 Normal：ring=%u/%uB (%u%%)",
-            static_cast<unsigned>(buffered_bytes),
-            static_cast<unsigned>(context->ring_bytes),
-            static_cast<unsigned>(flac_prefetch_qos_percent(buffered_bytes, context->ring_bytes)));
     }
 
     context->qos_state = state;
