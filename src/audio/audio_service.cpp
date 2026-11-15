@@ -329,11 +329,16 @@ struct VideoMp3TimingStats
 static VideoMp3TimingStats g_video_mp3_timing = {};
 
 // VM10：NSF 6502/2A03 由 AudioTask 独占输出硬件；
-// 传统 NSF v1 没有 Subsong 时长：后台确认可靠循环后，在3分钟附近的完整循环边界结束；
+// 传统 NSF v1 没有 Subsong 时长：后台确认可靠循环后按“2 遍优先、90 秒下限、3 分钟上限”结束：
+// - 循环段播 2 遍且总时长落在 [90s, 180s]：按 2 遍结束；
+// - 2 遍不足 90s：顺延到 >=90s 的最近完整循环边界（多播 1~2 遍）；
+// - 2 遍超过 180s：退到 1 遍；1 遍仍超过 180s 时按 180s 硬截断并淡出。
 // 无循环时后台预读确认自然静音起点并直接作为结束点；实时6秒静音仅保留为分析失败兜底。
 static constexpr uint32_t NSF_SILENCE_END_MS = 6000U;
+static constexpr uint32_t NSF_LOOP_MIN_MS = 90000U;
 static constexpr uint32_t NSF_LOOP_TARGET_MS = 180000U;
-static constexpr uint32_t NSF_TRACK_FADE_MS = 5000U;
+// 淡出降到 2 秒：短曲（2 遍 40~120s）淡出占比更低，不再有“播到一半就淡出”的听感。
+static constexpr uint32_t NSF_TRACK_FADE_MS = 2000U;
 // 普通 NSF 没有 Track 时长。后台在该虚拟时间内仍无法确认 Loop/自然静音时，
 // 必须采用硬上限结束，不能让持续发声或完全静音的异常 Track 永久播放。
 static constexpr uint32_t NSF_UNKNOWN_HARD_END_MS = 360000U;
@@ -4027,21 +4032,25 @@ static uint64_t nsf_loop_boundary_at_or_after(
     return loop_start + loops * loop_length;
 }
 
-static uint64_t nsf_loop_boundary_nearest(
-    uint64_t loop_start,
-    uint64_t loop_length,
-    uint64_t target)
+// 按“2 遍优先、90 秒下限、180 秒上限”折算循环时长；除 3 分钟硬截断兜底外，
+// 返回值都落在完整循环边界上，保证淡出不切在半拍。
+static uint64_t nsf_policy_duration_ms(uint64_t loop_start, uint64_t loop_length)
 {
     if (loop_length == 0ULL) return 0ULL;
-    if (target <= loop_start) return loop_start;
 
-    const uint64_t delta = target - loop_start;
-    const uint64_t loops_before = delta / loop_length;
-    const uint64_t before = loop_start + loops_before * loop_length;
-    if (before == target) return before;
+    const uint64_t two_loops = loop_start + 2ULL * loop_length;
+    if (two_loops <= NSF_LOOP_TARGET_MS) {
+        if (two_loops >= NSF_LOOP_MIN_MS) return two_loops;
+        // 2 遍不足 90s：顺延到 >=90s 的最近循环边界，仍不能越过 3 分钟上限。
+        const uint64_t extended = nsf_loop_boundary_at_or_after(
+            loop_start, loop_length, NSF_LOOP_MIN_MS);
+        if (extended == 0ULL || extended > NSF_LOOP_TARGET_MS) return two_loops;
+        return extended;
+    }
 
-    const uint64_t after = before + loop_length;
-    return target - before <= after - target ? before : after;
+    // 2 遍超过 3 分钟：只播 1 遍；1 遍仍超限时按 180s 硬截断。
+    const uint64_t one_loop = loop_start + loop_length;
+    return one_loop <= NSF_LOOP_TARGET_MS ? one_loop : NSF_LOOP_TARGET_MS;
 }
 
 static bool nsf_analysis_generation_current(uint32_t generation)
@@ -4572,7 +4581,7 @@ static void nsf_analysis_task(void *arg)
                     loop.hint_start_frame * 1000ULL / NSF_ANALYSIS_SAMPLE_RATE_HZ;
                 const uint64_t loop_length_ms =
                     loop.hint_length_frames * 1000ULL / NSF_ANALYSIS_SAMPLE_RATE_HZ;
-                const uint64_t duration_ms = nsf_loop_boundary_nearest(loop_start_ms, loop_length_ms, NSF_LOOP_TARGET_MS);
+                const uint64_t duration_ms = nsf_policy_duration_ms(loop_start_ms, loop_length_ms);
                 nsf_analysis_publish_hint(generation, track, duration_ms);
                 hint_logged = true;
                 ESP_LOGI(TAG,
@@ -4591,8 +4600,8 @@ static void nsf_analysis_task(void *arg)
                     loop.start_frame * 1000ULL / NSF_ANALYSIS_SAMPLE_RATE_HZ;
                 strict_loop_length_ms =
                     loop.length_frames * 1000ULL / NSF_ANALYSIS_SAMPLE_RATE_HZ;
-                final_duration_ms = nsf_loop_boundary_nearest(
-                    strict_loop_start_ms, strict_loop_length_ms, NSF_LOOP_TARGET_MS);
+                final_duration_ms = nsf_policy_duration_ms(
+                    strict_loop_start_ms, strict_loop_length_ms);
                 strict_loop_planned = final_duration_ms > 0ULL;
                 if (strict_loop_planned) {
                     // Strict Loop已足够确定时长和canonical视觉周期；音频Timeline仍继续真实线性生成。
@@ -4952,17 +4961,15 @@ static void audio_task_sync_nsf_analysis_end_plan()
     if (result.end_kind != NsfEndPlanKind::VerifiedLoop) return;
     if (result.loop_length_ms == 0ULL) return;
     const uint64_t fade_frames = rate * NSF_TRACK_FADE_MS / 1000ULL;
-    const uint64_t loop_start_frame = result.loop_start_ms * rate / 1000ULL;
-    const uint64_t loop_length_frame = result.loop_length_ms * rate / 1000ULL;
     uint64_t end_frame = result.duration_ms * rate / 1000ULL;
-    if (loop_length_frame == 0ULL || end_frame == 0ULL) return;
+    if (end_frame == 0ULL) return;
 
-    // 后台正常会远早于播放到达目标；若极端负载导致结果过晚，就顺延一个完整 Loop 保留淡出。
+    // 后台正常会远早于播放到达目标；若极端负载导致结果过晚，直接从当前点保留淡出，
+    // 不再顺延一整遍循环，避免突破“2 遍优先 / 3 分钟上限”的策略。
     const uint64_t earliest_end =
         nsf_apu_renderer_position_frames(&g_nsf_renderer) + fade_frames;
     if (end_frame < earliest_end) {
-        end_frame = nsf_loop_boundary_at_or_after(
-            loop_start_frame, loop_length_frame, earliest_end);
+        end_frame = earliest_end;
     }
 
     g_nsf_end_frame = end_frame;
