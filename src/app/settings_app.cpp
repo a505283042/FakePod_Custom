@@ -654,9 +654,10 @@ static lv_obj_t *create_row(
 
     lv_obj_t *title_label = make_label(row, title, kHeaderRgb);
     if (title_label != nullptr) {
-        // NAS状态较长，给右侧数量与更新结果预留独立空间。
-        lv_obj_set_width(title_label, icon_id == SettingsDetailIcon::NasSync
-            ? 128 : (icon_dsc != nullptr ? 190 : 220));
+        // NAS状态/电池值较长，给右侧数值预留独立空间。
+        lv_obj_set_width(title_label,
+            (icon_id == SettingsDetailIcon::NasSync || icon_id == SettingsDetailIcon::Battery)
+                ? 128 : (icon_dsc != nullptr ? 190 : 220));
         lv_label_set_long_mode(title_label, LV_LABEL_LONG_DOT);
         lv_obj_align(title_label, LV_ALIGN_LEFT_MID, icon_dsc != nullptr ? 52 : 16, 0);
     }
@@ -664,8 +665,9 @@ static lv_obj_t *create_row(
     lv_obj_t *value_label = make_label(row, value, kValueRgb, LV_TEXT_ALIGN_RIGHT);
     if (value_label != nullptr) {
         const bool nas_status = icon_id == SettingsDetailIcon::NasSync;
-        lv_obj_set_width(value_label, nas_status ? 228 : 145);
-        // 此栏必须同一行显示“4227首·已更新”，不能自动换行。
+        const bool battery_status = icon_id == SettingsDetailIcon::Battery;
+        lv_obj_set_width(value_label, (nas_status || battery_status) ? 228 : 145);
+        // NAS 栏必须同一行显示“4227首·已更新”，不能自动换行。
         lv_label_set_long_mode(value_label, nas_status ? LV_LABEL_LONG_CLIP : LV_LABEL_LONG_DOT);
         if (nas_status) lv_obj_set_style_text_letter_space(value_label, -1, 0);
         lv_obj_align(value_label, LV_ALIGN_RIGHT_MID, -16, 0);
@@ -2541,7 +2543,7 @@ static void create_about_page()
     } else {
         snprintf(value, sizeof(value), "--");
     }
-    add_detail_row(5, "当前电池", value, SettingsDetailIcon::None);
+    add_detail_row(5, "当前电池", value, SettingsDetailIcon::Battery);
 
 }
 

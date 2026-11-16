@@ -37,6 +37,7 @@ enum class SettingsDetailIcon : uint8_t {
     SdCard,
     NasSync,
     NasPair,
+    Battery,
     UiFont,
     Count,
 };
