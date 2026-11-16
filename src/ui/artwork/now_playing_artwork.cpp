@@ -388,9 +388,11 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
             // R.27：双 staging 临时拿不到时不要黑屏、不要切换 LVGL source。
             // 释放刚 acquire 的新 lease，继续保持旧封面；下一次 Artwork update 会自动重试。
             ESP_LOGW(TAG,
-                "封面 BoundedSPI 暂缓：%lu -> %lu 双staging内存不足，保持旧封面并重试",
+                "封面 BoundedSPI 暂缓：%lu -> %lu 双staging内存不足（DMA可用=%uB 内部可用=%uB），保持旧封面并重试",
                 static_cast<unsigned long>(previous_track),
-                static_cast<unsigned long>(track_index));
+                static_cast<unsigned long>(track_index),
+                static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)),
+                static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
             cover_surface_cache_release(&lease);
             return false;
         }
