@@ -565,7 +565,7 @@ static esp_err_t validate_demuxer_stream(
             return ESP_ERR_NOT_SUPPORTED;
         }
         ESP_LOGI(TAG,
-            "AVI MP3 Audio Pipeline V1：%uHz/%uch bits=%u bitrate=%lu duration=%ums；Demuxer->32KB PSRAM Bridge->AudioTask->MP3->PCM",
+            "AVI MP3 Audio Pipeline V1：%uHz/%uch bits=%u bitrate=%lu duration=%ums；Demuxer->96KB PSRAM Bridge->AudioTask->MP3->PCM",
             static_cast<unsigned>(snapshot->audio_sample_rate),
             static_cast<unsigned>(snapshot->audio_channels),
             static_cast<unsigned>(snapshot->audio_bits_per_sample),
@@ -1011,12 +1011,8 @@ static void benchmark_task(void *arg)
         if (jpeg_dec_open(&config, &decoder) != JPEG_ERR_OK || decoder == nullptr) ret = ESP_FAIL;
     }
 
-    if (ret == ESP_OK && generation_current(args->generation) && result.audio_streams != 0U) {
-        ret = avi_mp3_bridge_begin(kAudioBridgeBytes);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "创建AVI MP3 32KB PSRAM Bridge失败：%s", esp_err_to_name(ret));
-        }
-    }
+    // 音频桥已在 start() 中预分配（早于 4MB 视频槽），此处不再重复申请；
+    // 重复调用会先释放再重分配 96KB，在碎片化后的 PSRAM 上必然再次 NO_MEM。
 
     uint64_t copy_us_total = 0ULL;
     uint32_t copy_us_max = 0U;
@@ -1410,11 +1406,30 @@ esp_err_t start(const char *path, bool allow_fullcanvas_over20, bool music_suspe
     portEXIT_CRITICAL(&g_mux);
     if (busy) return ESP_ERR_INVALID_STATE;
 
+    // 帧槽+压缩槽合计约4.3MB PSRAM；先记录基线，便于定位 NO_MEM 是基线占用还是碎片。
+    ESP_LOGI(TAG, "Video启动PSRAM基线：可用=%uB 最大块=%uB 内部可用=%uB",
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)),
+        static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
+
+    // 96KB 音频桥必须在 4.2MB 视频槽之前分配：槽位会把 PSRAM 大块切碎，
+    // 之后再申请 96KB 容易因“最大连续块不足”失败（ESP_ERR_NO_MEM）。
+    const esp_err_t bridge_ret = avi_mp3_bridge_begin(kAudioBridgeBytes);
+    if (bridge_ret != ESP_OK) {
+        ESP_LOGE(TAG, "预分配AVI MP3 PSRAM Bridge失败：%s；PSRAM可用=%uB 最大块=%uB 内部可用=%uB",
+            esp_err_to_name(bridge_ret),
+            static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)),
+            static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)),
+            static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
+        return bridge_ret;
+    }
+
     for (FrameSlot &slot : g_slots) {
         slot.rgb565_be = static_cast<uint8_t *>(heap_caps_aligned_alloc(
             16U, kRgb565Bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         if (slot.rgb565_be == nullptr) {
             free_resources_unlocked();
+            (void)avi_mp3_bridge_release();
             return ESP_ERR_NO_MEM;
         }
     }
@@ -1423,6 +1438,7 @@ esp_err_t start(const char *path, bool allow_fullcanvas_over20, bool music_suspe
             16U, kCompressedSlotBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         if (slot.data == nullptr) {
             free_resources_unlocked();
+            (void)avi_mp3_bridge_release();
             return ESP_ERR_NO_MEM;
         }
     }

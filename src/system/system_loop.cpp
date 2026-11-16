@@ -104,7 +104,7 @@ static void system_ram_low_water_monitor_update()
 
     if (now - g_ram_mon_window_start_tick >= RAM_MON_REPORT_INTERVAL) {
         ESP_LOGI(TAG,
-            "内存监控：60秒汇总：当前内部可用=%uB 60秒最低=%uB 低于12K次数=%lu 累计低于12K=%lu 启动最低=%uB 最大块=%uB DMA可用=%uB 主循环栈剩余=%uB",
+            "内存监控：60秒汇总：当前内部可用=%uB 60秒最低=%uB 低于12K次数=%lu 累计低于12K=%lu 启动最低=%uB 最大块=%uB DMA可用=%uB PSRAM可用=%uB PSRAM最大块=%uB 主循环栈剩余=%uB",
             static_cast<unsigned>(internal_free),
             static_cast<unsigned>(g_ram_mon_min_60s),
             static_cast<unsigned long>(g_ram_mon_below_12k_60s),
@@ -112,6 +112,8 @@ static void system_ram_low_water_monitor_update()
             static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA)),
+            static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)),
+            static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)),
             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
 
         g_ram_mon_window_start_tick = now;
