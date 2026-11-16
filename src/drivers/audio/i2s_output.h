@@ -11,7 +11,8 @@ extern "C" {
 
 // 正式播放器接口：按统一 Rate Profile 启动 32bit slot / 立体声 / Philips I2S TX。
 // 当前 44.1~192kHz 播放统一复用这一 PCM 输出层。
-esp_err_t i2s_output_stream_start_32bit(uint32_t sample_rate_hz);
+// bits_per_sample 用于给 24/32bit 补足 DMA 余量（24bit 单块解码更慢，偶发掉音）。
+esp_err_t i2s_output_stream_start_32bit(uint32_t sample_rate_hz, uint16_t bits_per_sample);
 
 // NSF 专用稳定档：固定 16×256，避免普通 Music 降低 DMA 后影响电子音流渲染余量。
 esp_err_t i2s_output_stream_start_32bit_nsf(uint32_t sample_rate_hz);

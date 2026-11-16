@@ -1815,7 +1815,7 @@ static esp_err_t audio_task_start_output_hardware(
     } else if (nsf_i2s_profile) {
         ret = i2s_output_stream_start_32bit_nsf(sample_rate_hz);
     } else {
-        ret = i2s_output_stream_start_32bit(sample_rate_hz);
+        ret = i2s_output_stream_start_32bit(sample_rate_hz, bits_per_sample);
     }
     if (ret != ESP_OK) {
         audio_task_shutdown_output_hardware(sample_rate_hz, label);

@@ -84,6 +84,22 @@ static inline bool audio_rate_profile_get(uint32_t sample_rate_hz, AudioRateProf
     return true;
 }
 
+// 24/32bit FLAC 的 LPC 恢复走 64bit wide 路径，单块解码耗时明显高于 16bit；
+// 44.1/48kHz 原先 8 个描述符只有约 46ms 余量，偶发单次掉音时补到 16（约 92ms）。
+// 16bit 保持原有档位，避免无谓占用可 DMA 内部 RAM。
+static inline uint8_t audio_rate_profile_dma_desc_num_for_pcm(
+    uint32_t sample_rate_hz, uint16_t bits_per_sample)
+{
+    AudioRateProfile profile;
+    profile.sample_rate_hz = 0U;
+    profile.cs43131_asp_sprate = 0U;
+    profile.i2s_dma_desc_num = 0U;
+    profile.flac_stage_enabled = false;
+    if (!audio_rate_profile_get(sample_rate_hz, &profile)) return 0U;
+    if (bits_per_sample > 16U && profile.i2s_dma_desc_num < 16U) return 16U;
+    return profile.i2s_dma_desc_num;
+}
+
 static inline bool audio_rate_profile_flac_enabled(uint32_t sample_rate_hz)
 {
     AudioRateProfile profile;

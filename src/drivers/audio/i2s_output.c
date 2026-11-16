@@ -205,16 +205,18 @@ static esp_err_t i2s_output_write_all(const void *data, size_t bytes, uint32_t t
     return ESP_OK;
 }
 
-esp_err_t i2s_output_stream_start_32bit(uint32_t sample_rate_hz)
+esp_err_t i2s_output_stream_start_32bit(uint32_t sample_rate_hz, uint16_t bits_per_sample)
 {
-    AudioRateProfile rate_profile = {0};
-    if (!audio_rate_profile_get(sample_rate_hz, &rate_profile)) {
+    const uint8_t dma_desc_num =
+        audio_rate_profile_dma_desc_num_for_pcm(sample_rate_hz, bits_per_sample);
+    if (dma_desc_num == 0U) {
         return ESP_ERR_NOT_SUPPORTED;
     }
-    ESP_LOGI(TAG, "Music I2S DMA档：desc=%u frames=%u",
-        (unsigned)rate_profile.i2s_dma_desc_num,
-        (unsigned)I2S_DMA_FRAME_NUM);
-    return i2s_output_create_channel(sample_rate_hz, 0U);
+    ESP_LOGI(TAG, "Music I2S DMA档：desc=%u frames=%u bits=%u",
+        (unsigned)dma_desc_num,
+        (unsigned)I2S_DMA_FRAME_NUM,
+        (unsigned)bits_per_sample);
+    return i2s_output_create_channel(sample_rate_hz, dma_desc_num);
 }
 
 esp_err_t i2s_output_stream_start_32bit_nsf(uint32_t sample_rate_hz)
