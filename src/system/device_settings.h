@@ -84,6 +84,8 @@ struct DeviceSettingsSnapshot {
     DeviceMusicLibrarySource music_library_source = DeviceMusicLibrarySource::Local;
     bool cassette_dynamic_tint_enabled = true;
     bool motion_controls_enabled = false;
+    // 音乐播放页控件页自动关闭：关闭后控件保持展开，必须手动收起。
+    bool player_controls_auto_hide_enabled = true;
     uint8_t nsf_gain_compensation_db = 3U;  // 电子音流专用 CS43131 数字衰减补偿，0~6dB。
     bool remember_volume = true;
     char ui_font_file[DEVICE_UI_FONT_FILENAME_MAX] = "思源粗黑.bin";  // /FONTS 下的默认界面字体文件名。
@@ -116,6 +118,7 @@ esp_err_t device_settings_set_music_list_scope(DeviceMusicListScope scope);
 esp_err_t device_settings_set_music_library_source(DeviceMusicLibrarySource source);
 esp_err_t device_settings_set_cassette_dynamic_tint_enabled(bool enabled);
 esp_err_t device_settings_set_motion_controls_enabled(bool enabled);
+esp_err_t device_settings_set_player_controls_auto_hide_enabled(bool enabled);
 esp_err_t device_settings_set_nsf_gain_compensation_db(uint8_t db);
 esp_err_t device_settings_set_ui_font_file(const char *filename);
 

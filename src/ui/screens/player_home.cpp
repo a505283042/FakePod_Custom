@@ -2630,6 +2630,13 @@ static void player_home_overlay_arm_timeout()
     if (g_overlay_timer == nullptr || !g_overlay_visible) {
         return;
     }
+    // 设置-应用-音乐播放器关闭“控件页自动关闭”后，不再启动超时计时；
+    // 控件保持展开，只能由用户手动收起。
+    DeviceSettingsSnapshot settings = {};
+    if (device_settings_get_snapshot(&settings) && !settings.player_controls_auto_hide_enabled) {
+        lv_timer_pause(g_overlay_timer);
+        return;
+    }
     lv_timer_set_period(g_overlay_timer, kOverlayTimeoutMs);
     lv_timer_reset(g_overlay_timer);
     lv_timer_resume(g_overlay_timer);
@@ -2834,6 +2841,12 @@ static void player_home_overlay_timeout_cb(lv_timer_t *timer)
     (void)timer;
     if (g_progress_dragging || g_progress_seek_pending || g_volume_dragging) {
         player_home_overlay_arm_timeout();
+        return;
+    }
+    DeviceSettingsSnapshot settings = {};
+    if (device_settings_get_snapshot(&settings) && !settings.player_controls_auto_hide_enabled) {
+        // 自动关闭已关闭：保持控件展开，等用户手动收起。
+        if (g_overlay_timer != nullptr) lv_timer_pause(g_overlay_timer);
         return;
     }
     player_home_overlay_hide();

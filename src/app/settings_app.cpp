@@ -78,6 +78,9 @@ static constexpr uint8_t kBrightnessMax = 100U;
 static constexpr int16_t kBrightnessFullScalePx = 280;
 static constexpr int32_t kDetailInertiaStartPxPerSec = 180;
 static constexpr int32_t kDetailInertiaStopPxPerSec = 45;
+static constexpr int16_t kDetailScrollbarWidth = 4;
+static constexpr int16_t kDetailScrollbarRight = 2;
+static constexpr int32_t kDetailScrollbarMinThumbHeight = 36;
 
 enum class SettingsPage : uint8_t {
     Main = 0,
@@ -154,6 +157,9 @@ static bool g_cassette_tint_dirty = false;
 static bool g_motion_controls_saved = false;
 static bool g_motion_controls_pending = false;
 static bool g_motion_controls_dirty = false;
+static bool g_controls_auto_hide_saved = true;
+static bool g_controls_auto_hide_pending = true;
+static bool g_controls_auto_hide_dirty = false;
 static uint8_t g_nsf_gain_saved_db = 3U;
 static uint8_t g_nsf_gain_pending_db = 3U;
 static bool g_nsf_gain_dirty = false;
@@ -167,6 +173,9 @@ static uint32_t g_detail_drag_sequence = 0U;
 static uint32_t g_detail_drag_last_tick_ms = 0U;
 static uint32_t g_detail_inertia_last_tick_ms = 0U;
 static bool g_detail_inertia_active = false;
+static lv_obj_t *g_detail_scrollbar_track = nullptr;
+static lv_obj_t *g_detail_scrollbar_thumb = nullptr;
+static int32_t g_detail_scrollbar_thumb_h = 0;
 
 static void music_list_commit_on_exit();
 static void music_player_commit_on_exit();
@@ -250,6 +259,9 @@ static void clear_detail_value_refs()
     g_detail_host = nullptr;
     g_brightness_card = nullptr;
     g_brightness_value = nullptr;
+    g_detail_scrollbar_track = nullptr;
+    g_detail_scrollbar_thumb = nullptr;
+    g_detail_scrollbar_thumb_h = 0;
 }
 
 static size_t settings_page_index(SettingsPage page)
@@ -270,6 +282,55 @@ static int32_t detail_clamp_scroll_y(int32_t y)
     return y;
 }
 
+static void detail_scrollbar_update()
+{
+    if (g_detail_scrollbar_thumb == nullptr || g_detail_scroll_max_y <= 0) return;
+    const int32_t travel = static_cast<int32_t>(kContentHeight) - g_detail_scrollbar_thumb_h;
+    const int32_t thumb_y = travel > 0
+        ? (g_detail_scroll_y * travel) / g_detail_scroll_max_y
+        : 0;
+    lv_obj_set_y(g_detail_scrollbar_thumb, thumb_y);
+}
+
+// 仅当详情内容超出可视区时创建细滚动条：轨道固定在 g_content 右侧，滑块跟随手动滚动位移。
+static void detail_scrollbar_attach(int32_t content_h)
+{
+    if (g_content == nullptr || content_h <= kContentHeight) return;
+
+    g_detail_scrollbar_track = lv_obj_create(g_content);
+    if (g_detail_scrollbar_track == nullptr) return;
+    ui_common_lock_object(g_detail_scrollbar_track);
+    lv_obj_set_size(g_detail_scrollbar_track, kDetailScrollbarWidth, kContentHeight);
+    lv_obj_set_pos(g_detail_scrollbar_track,
+        static_cast<int16_t>(kContentWidth - kDetailScrollbarWidth - kDetailScrollbarRight), 0);
+    lv_obj_set_style_radius(g_detail_scrollbar_track, kDetailScrollbarWidth / 2, 0);
+    lv_obj_set_style_border_width(g_detail_scrollbar_track, 0, 0);
+    lv_obj_set_style_pad_all(g_detail_scrollbar_track, 0, 0);
+    lv_obj_set_style_bg_color(g_detail_scrollbar_track, lv_color_hex(kRowBorderRgb), 0);
+    lv_obj_set_style_bg_opa(g_detail_scrollbar_track, LV_OPA_50, 0);
+    lv_obj_remove_flag(g_detail_scrollbar_track, LV_OBJ_FLAG_CLICKABLE);
+
+    int32_t thumb_h = static_cast<int32_t>(kContentHeight) *
+        static_cast<int32_t>(kContentHeight) / content_h;
+    if (thumb_h < kDetailScrollbarMinThumbHeight) thumb_h = kDetailScrollbarMinThumbHeight;
+    if (thumb_h > kContentHeight) thumb_h = kContentHeight;
+    g_detail_scrollbar_thumb_h = thumb_h;
+
+    g_detail_scrollbar_thumb = lv_obj_create(g_detail_scrollbar_track);
+    if (g_detail_scrollbar_thumb == nullptr) return;
+    ui_common_lock_object(g_detail_scrollbar_thumb);
+    lv_obj_set_size(g_detail_scrollbar_thumb, kDetailScrollbarWidth, static_cast<int16_t>(thumb_h));
+    lv_obj_set_pos(g_detail_scrollbar_thumb, 0, 0);
+    lv_obj_set_style_radius(g_detail_scrollbar_thumb, kDetailScrollbarWidth / 2, 0);
+    lv_obj_set_style_border_width(g_detail_scrollbar_thumb, 0, 0);
+    lv_obj_set_style_pad_all(g_detail_scrollbar_thumb, 0, 0);
+    lv_obj_set_style_bg_color(g_detail_scrollbar_thumb, lv_color_hex(kMutedRgb), 0);
+    lv_obj_set_style_bg_opa(g_detail_scrollbar_thumb, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(g_detail_scrollbar_thumb, LV_OBJ_FLAG_CLICKABLE);
+
+    detail_scrollbar_update();
+}
+
 static void detail_apply_scroll_y(int32_t y)
 {
     if (g_detail_host == nullptr) return;
@@ -277,6 +338,7 @@ static void detail_apply_scroll_y(int32_t y)
     g_detail_scroll_y = clamped;
     g_detail_saved_scroll_y[settings_page_index(g_page)] = clamped;
     lv_obj_set_y(g_detail_host, -clamped);
+    detail_scrollbar_update();
     lv_obj_invalidate(g_content);
 }
 
@@ -285,7 +347,7 @@ static uint16_t detail_row_count_for_page(SettingsPage page)
     switch (page) {
         case SettingsPage::Connection: return 6U;
         case SettingsPage::Applications: return 5U;
-        case SettingsPage::MusicPlayer: return 3U;
+        case SettingsPage::MusicPlayer: return 5U;
         case SettingsPage::ElectronicFlow: return 1U;
         case SettingsPage::System: return 6U;
         case SettingsPage::About: return 6U;
@@ -328,6 +390,8 @@ static void detail_prepare(SettingsPage page)
     lv_obj_set_style_pad_all(g_detail_host, 0, 0);
     lv_obj_set_style_bg_opa(g_detail_host, LV_OPA_TRANSP, 0);
     lv_obj_remove_flag(g_detail_host, LV_OBJ_FLAG_SCROLLABLE);
+
+    detail_scrollbar_attach(content_h);
 }
 
 static void settings_update_vertical_adjust_channel()
@@ -958,6 +1022,19 @@ static void motion_controls_click_cb(lv_event_t *event)
     }
     ESP_LOGI(TAG, "手势控歌待保存：%s（退出设置时生效）",
         g_motion_controls_pending ? "开" : "关");
+}
+
+static void controls_auto_hide_click_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event) || g_page != SettingsPage::MusicPlayer) return;
+    g_controls_auto_hide_pending = !g_controls_auto_hide_pending;
+    g_controls_auto_hide_dirty = g_controls_auto_hide_pending != g_controls_auto_hide_saved;
+    if (g_detail_values[4] != nullptr) {
+        lv_label_set_text(g_detail_values[4], g_controls_auto_hide_pending ? "开" : "关");
+        lv_obj_invalidate(g_detail_values[4]);
+    }
+    ESP_LOGI(TAG, "控件页自动关闭待保存：%s（退出设置时生效）",
+        g_controls_auto_hide_pending ? "开" : "关");
 }
 
 static void brightness_card_click_cb(lv_event_t *event)
@@ -2180,6 +2257,20 @@ static void music_player_commit_on_exit()
         }
         g_motion_controls_dirty = false;
     }
+
+    if (g_controls_auto_hide_dirty) {
+        const bool requested = g_controls_auto_hide_pending;
+        const esp_err_t ret = device_settings_set_player_controls_auto_hide_enabled(requested);
+        if (ret == ESP_OK) {
+            g_controls_auto_hide_saved = requested;
+            g_controls_auto_hide_pending = requested;
+            ESP_LOGI(TAG, "退出设置保存控件页自动关闭：%s", requested ? "开" : "关");
+        } else {
+            ESP_LOGW(TAG, "退出设置保存控件页自动关闭失败：%s", esp_err_to_name(ret));
+            g_controls_auto_hide_pending = g_controls_auto_hide_saved;
+        }
+        g_controls_auto_hide_dirty = false;
+    }
 }
 
 static const char *nsf_gain_compensation_name(uint8_t db)
@@ -2379,6 +2470,12 @@ static void create_music_player_page(const DeviceSettingsSnapshot &settings)
         device_settings_music_library_source_name(g_music_source_pending),
         SettingsDetailIcon::Music,
         music_library_source_click_cb);
+    add_clickable_detail_row(
+        4,
+        "控件页自动关闭",
+        g_controls_auto_hide_pending ? "开" : "关",
+        SettingsDetailIcon::Music,
+        controls_auto_hide_click_cb);
 }
 
 static void create_system_page(const DeviceSettingsSnapshot &settings)
@@ -2757,6 +2854,8 @@ static esp_err_t settings_enter()
         g_cassette_tint_pending = settings.cassette_dynamic_tint_enabled;
         g_motion_controls_saved = settings.motion_controls_enabled;
         g_motion_controls_pending = settings.motion_controls_enabled;
+        g_controls_auto_hide_saved = settings.player_controls_auto_hide_enabled;
+        g_controls_auto_hide_pending = settings.player_controls_auto_hide_enabled;
         g_nsf_gain_saved_db = settings.nsf_gain_compensation_db;
         g_nsf_gain_pending_db = settings.nsf_gain_compensation_db;
     } else {
@@ -2769,6 +2868,7 @@ static esp_err_t settings_enter()
     g_music_source_dirty = false;
     g_cassette_tint_dirty = false;
     g_motion_controls_dirty = false;
+    g_controls_auto_hide_dirty = false;
     g_nsf_gain_dirty = false;
     show_page(SettingsPage::Main);
     lv_timer_reset(g_timer);

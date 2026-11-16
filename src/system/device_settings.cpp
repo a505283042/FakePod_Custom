@@ -88,6 +88,7 @@ static DeviceSettingsSnapshot make_defaults()
     defaults.music_library_source = DeviceMusicLibrarySource::Local;
     defaults.cassette_dynamic_tint_enabled = true;
     defaults.motion_controls_enabled = false;
+    defaults.player_controls_auto_hide_enabled = true;
     defaults.nsf_gain_compensation_db = 3U;
     defaults.remember_volume = true;
     snprintf(defaults.ui_font_file, sizeof(defaults.ui_font_file), "%s", "思源粗黑.bin");
@@ -342,6 +343,9 @@ esp_err_t device_settings_init()
     if (nvs_get_u8(handle, "motion", &u8) == ESP_OK && u8 <= 1U) {
         g_settings.motion_controls_enabled = u8 != 0U;
     }
+    if (nvs_get_u8(handle, "plhide", &u8) == ESP_OK && u8 <= 1U) {
+        g_settings.player_controls_auto_hide_enabled = u8 != 0U;
+    }
     if (nvs_get_u8(handle, "nsfgain", &u8) == ESP_OK && nsf_gain_compensation_valid(u8)) {
         g_settings.nsf_gain_compensation_db = u8;
     }
@@ -366,7 +370,7 @@ esp_err_t device_settings_init()
         ESP_LOGW(TAG, "无线设置冲突：BLE/Wi-Fi同时为开，运行期收敛为Wi-Fi=开 BLE=关");
     }
 
-    ESP_LOGI(TAG, "Settings V1加载完成：USB=%s BLE=%s WiFi=%s audio=%s bright=%u aux=%s library=%s local_scope=%s nas_scope=%s cassette=%s motion=%s nsfgain=+%udB",
+    ESP_LOGI(TAG, "Settings V1加载完成：USB=%s BLE=%s WiFi=%s audio=%s bright=%u aux=%s library=%s local_scope=%s nas_scope=%s cassette=%s motion=%s plhide=%s nsfgain=+%udB",
         device_settings_usb_mode_name(g_settings.usb_mode),
         g_settings.ble_enabled ? "开" : "关",
         g_settings.wifi_enabled ? "开" : "关",
@@ -378,6 +382,7 @@ esp_err_t device_settings_init()
         device_settings_music_list_scope_name(g_music_selection[1].scope),
         g_settings.cassette_dynamic_tint_enabled ? "封面变色" : "原装粉色",
         g_settings.motion_controls_enabled ? "开" : "关",
+        g_settings.player_controls_auto_hide_enabled ? "开" : "关",
         static_cast<unsigned>(g_settings.nsf_gain_compensation_db));
     return ESP_OK;
 }
@@ -743,6 +748,16 @@ esp_err_t device_settings_set_motion_controls_enabled(bool enabled)
     const esp_err_t ret = commit_u8("motion", enabled ? 1U : 0U);
     if (ret != ESP_OK) g_settings.motion_controls_enabled = old;
     log_commit_failure("motion", ret);
+    return ret;
+}
+
+esp_err_t device_settings_set_player_controls_auto_hide_enabled(bool enabled)
+{
+    const bool old = g_settings.player_controls_auto_hide_enabled;
+    g_settings.player_controls_auto_hide_enabled = enabled;
+    const esp_err_t ret = commit_u8("plhide", enabled ? 1U : 0U);
+    if (ret != ESP_OK) g_settings.player_controls_auto_hide_enabled = old;
+    log_commit_failure("plhide", ret);
     return ret;
 }
 
