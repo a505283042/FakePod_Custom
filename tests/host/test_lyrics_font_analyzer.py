@@ -99,7 +99,7 @@ class LyricsFontAnalyzerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp)
             files = analyzer.export_results(result, output)
-            self.assertEqual(len(files), 9)
+            self.assertEqual(len(files), 11)
             charset24 = (output / "lyrics_charset_24.txt").read_text(encoding="utf-8")
             charset32 = (output / "lyrics_charset_32.txt").read_text(encoding="utf-8")
             self.assertEqual(charset24, charset32)
