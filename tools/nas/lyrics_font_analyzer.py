@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
-import html
 import json
 import os
 import queue
@@ -20,7 +19,7 @@ import sys
 import threading
 import time
 import unicodedata
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
@@ -86,6 +85,32 @@ def is_lrc_timestamp(tag: str) -> bool:
     return int(match.group(2)) < 60
 
 
+ENTITY_RE = re.compile(r"&(?:amp|lt|gt|quot|apos|nbsp|#\d+|#x[0-9A-Fa-f]+);")
+NAMED_ENTITIES = {
+    "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"',
+    "&apos;": "'", "&nbsp;": "\u00a0",
+}
+
+
+def decode_supported_html_entities(value: str) -> str:
+    """Match the deliberately small HTML-entity set decoded by LyricsService."""
+    def replace_entity(match):
+        token = match.group(0)
+        if token in NAMED_ENTITIES:
+            return NAMED_ENTITIES[token]
+        try:
+            if token.startswith(("&#x", "&#X")):
+                codepoint = int(token[3:-1], 16)
+            else:
+                codepoint = int(token[2:-1], 10)
+        except ValueError:
+            return token
+        if codepoint <= 0 or codepoint > 0x10FFFF or 0xD800 <= codepoint <= 0xDFFF:
+            return token
+        return chr(codepoint)
+    return ENTITY_RE.sub(replace_entity, value)
+
+
 def extract_lrc_text(decoded: str) -> list[str]:
     """Return only timestamped lyric text, matching LyricsService's LRC rules."""
     result: list[str] = []
@@ -110,7 +135,7 @@ def extract_lrc_text(decoded: str) -> list[str]:
         lyric = line[cursor:].strip(" \t")
         if not lyric:
             continue
-        lyric = normalize_visible_text(html.unescape(lyric)).strip()
+        lyric = normalize_visible_text(decode_supported_html_entities(lyric)).strip()
         if lyric:
             result.append(lyric)
     return result
