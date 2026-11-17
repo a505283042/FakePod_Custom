@@ -29,6 +29,7 @@ from xml.etree import ElementTree
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 BUILDER = SCRIPT_DIR / "build_nas_catalog_v2.py"
+LYRICS_ANALYZER = SCRIPT_DIR / "lyrics_font_analyzer.py"
 META_FILE = "fakepod_catalog.meta"
 EXTRA_FILES = ("fakepod_scan_cache_v1.json", "fakepod_change_report_v1.json", "fakepod_incremental_update.sh")
 # Write the meta *last* as the visible commit marker for ESP32 index sync.
@@ -279,6 +280,8 @@ class App:
         self.generate_button.pack(side="left")
         self.cancel_scan_button = ttk.Button(line, text="取消扫描", command=self.cancel_scan, state="disabled")
         self.cancel_scan_button.pack(side="left", padx=6)
+        self.lyrics_button = ttk.Button(line, text="歌词字符扫描", command=self.open_lyrics_analyzer, state="disabled")
+        self.lyrics_button.pack(side="left", padx=6)
         self.force_full = tk.BooleanVar(value=False)
         ttk.Checkbutton(line, text="重建全部元数据缓存", variable=self.force_full).pack(side="left", padx=10)
         self.change_label = ttk.Label(actions, text="尚未生成增量报告", foreground="#265f76", wraplength=920)
@@ -391,6 +394,7 @@ class App:
         self.select_button.config(state="disabled" if value or not self.browse_path else "normal")
         self.back_button.config(state="disabled" if value or self.browse_path == "/" else "normal")
         self.generate_button.config(state="disabled" if value or not self.selected_smb else "normal")
+        self.lyrics_button.config(state="disabled" if value or not self.selected_smb else "normal")
         self.publish_button.config(state="disabled" if value or not self.staging or self.published else "normal")
         self.alias_button.config(state="disabled" if value or not self.staging or self.published or not self.report or
                                  not (self.report["prepare_paths"] or self.report["prepare_lyrics"] or self.report["remove_aliases"]) else "normal")
@@ -488,6 +492,31 @@ class App:
             self.progress_label.config(text=f"文件检查/缓存复用：{done}/{total} 首（{done * 100 // max(1, total)}%）")
             if done == total or done % 250 == 0:
                 self.log(f"文件检查/缓存复用：{done}/{total} 首")
+
+    def open_lyrics_analyzer(self):
+        if self.busy:
+            return
+        if not self.selected_smb:
+            messagebox.showerror("尚未选择音乐目录", "请先连接 NAS 并选择 Music 根目录。")
+            return
+        root = Path(self.selected_smb)
+        if not root.is_dir():
+            messagebox.showerror("音乐目录不可访问", "Windows 当前无法访问所选 SMB Music 目录：\\n" + str(root))
+            return
+        if not LYRICS_ANALYZER.is_file():
+            messagebox.showerror("缺少扫描器", "找不到歌词字符扫描器：\\n" + str(LYRICS_ANALYZER))
+            return
+        try:
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+            subprocess.Popen(
+                [sys.executable, str(LYRICS_ANALYZER), "--root", str(root)],
+                cwd=str(SCRIPT_DIR),
+                creationflags=creationflags,
+            )
+            self.log("已启动歌词字符扫描器；扫描范围：" + str(root))
+            self.log("扫描器仅读取歌曲/LRC，报告与缓存保存在电脑，不修改 NAS 索引。")
+        except Exception as exc:
+            messagebox.showerror("无法启动扫描器", str(exc))
 
     def generate(self):
         if self.busy or not self.selected_smb: return
