@@ -135,7 +135,7 @@ def extract_lrc_text(decoded: str) -> list[str]:
         lyric = line[cursor:].strip(" \t")
         if not lyric:
             continue
-        lyric = normalize_visible_text(decode_supported_html_entities(lyric)).strip()
+        lyric = normalize_visible_text(decode_supported_html_entities(lyric)).strip(" ")
         if lyric:
             result.append(lyric)
     return result
