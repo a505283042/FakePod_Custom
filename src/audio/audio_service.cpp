@@ -1335,6 +1335,36 @@ static esp_err_t audio_task_fade_music_output_to_zero(uint32_t sample_rate_hz)
     return ESP_OK;
 }
 
+// 淡出 PCM 只是进入 I2S DMA 队列；不能在 write 返回后立刻 mute DAC，
+// 否则 DMA 中仍可能排着旧曲 PCM，数字淡出尚未播放就被硬件静音截断。
+// 向 DMA 再提交一个完整 runway 的零 PCM，利用阻塞写入等待旧队列（含淡出）真正播放完。
+static esp_err_t audio_task_drain_music_dma_after_fade(uint32_t sample_rate_hz)
+{
+    if (!g_pipeline_i2s_started || !i2s_output_is_started()) {
+        return ESP_OK;
+    }
+
+    const uint32_t rate = sample_rate_hz > 0U ? sample_rate_hz : 48000U;
+    const uint8_t dma_desc_num =
+        audio_rate_profile_dma_desc_num_for_pcm(rate, g_task_bits_per_sample);
+    if (dma_desc_num == 0U) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    const size_t drain_frames =
+        static_cast<size_t>(dma_desc_num) * AUDIO_STREAM_FRAMES;
+    const esp_err_t ret =
+        i2s_output_stream_write_silence(drain_frames, AUDIO_I2S_WRITE_TIMEOUT_MS);
+    if (ret == ESP_OK) {
+        AUDIO_POP_TRACE_LOG(
+            "DMA_DRAIN_AFTER_FADE rate=%lu desc=%u frames=%u",
+            static_cast<unsigned long>(rate),
+            static_cast<unsigned>(dma_desc_num),
+            static_cast<unsigned>(drain_frames));
+    }
+    return ret;
+}
+
 static constexpr uint8_t audio_volume_interp_half_db_steps(
     uint8_t percent,
     uint8_t p0,
@@ -1529,6 +1559,9 @@ static esp_err_t audio_task_quiesce_output_hardware(
     if (owner != nullptr && strcmp(owner, "Music") == 0) {
         audio_task_remember_first_error(
             audio_task_fade_music_output_to_zero(settle_rate), &first_error);
+        // 必须先等淡出及其之前排队的 PCM 真正从 DAC 输出，再切换硬件 mute。
+        audio_task_remember_first_error(
+            audio_task_drain_music_dma_after_fade(settle_rate), &first_error);
     }
 
     const esp_err_t mute_ret = cs43131_set_pcm_mute(true);
@@ -6079,7 +6112,14 @@ static void audio_task_handle_pause(AudioRequest *request)
 
     AUDIO_POP_TRACE_LOG("PAUSE_MUTE_BEGIN frame=%llu",
         static_cast<unsigned long long>(g_playback_clock.submitted_frames));
-    esp_err_t ret = cs43131_set_pcm_mute(true);
+    // Pause 与切歌使用相同的 pop-free 顺序：数字淡出 -> DMA 排空 -> DAC soft mute。
+    esp_err_t ret = audio_task_fade_music_output_to_zero(g_task_sample_rate_hz);
+    if (ret == ESP_OK) {
+        ret = audio_task_drain_music_dma_after_fade(g_task_sample_rate_hz);
+    }
+    if (ret == ESP_OK) {
+        ret = cs43131_set_pcm_mute(true);
+    }
     if (ret != ESP_OK) {
         audio_task_fail_stream(ret, "暂停静音");
         audio_request_complete(request, false, ret);
