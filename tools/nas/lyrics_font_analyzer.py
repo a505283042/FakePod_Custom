@@ -38,7 +38,6 @@ APP_TITLE = "FakePod · 歌词字符扫描器"
 CACHE_VERSION = 1
 LYRICS_MAX_BYTES = 256 * 1024
 AUDIO_SUFFIXES = tuple(FORMAT_MAP.keys())
-TIMESTAMP_RE = re.compile(r"^(\d+):(\d{1,2})(?:[.:](\d+))?$")
 BASELINE_ASCII = "".join(chr(code) for code in range(0x20, 0x7F))
 
 
@@ -82,11 +81,11 @@ def is_lrc_timestamp(tag: str) -> bool:
     if colon <= 0:
         return False
     minute_text = tag[:colon]
-    if not minute_text.isdigit():
+    if not minute_text or any(ch < "0" or ch > "9" for ch in minute_text):
         return False
     cursor = colon + 1
     second_start = cursor
-    while cursor < len(tag) and tag[cursor].isdigit():
+    while cursor < len(tag) and "0" <= tag[cursor] <= "9":
         cursor += 1
     if cursor == second_start:
         return False
@@ -98,7 +97,7 @@ def is_lrc_timestamp(tag: str) -> bool:
     if cursor < len(tag) and tag[cursor] in ".:":
         cursor += 1
         fraction_start = cursor
-        while cursor < len(tag) and tag[cursor].isdigit():
+        while cursor < len(tag) and "0" <= tag[cursor] <= "9":
             cursor += 1
         fraction = tag[fraction_start:cursor]
         if fraction:
@@ -110,7 +109,7 @@ def is_lrc_timestamp(tag: str) -> bool:
     return total_ms <= 0xFFFFFFFF
 
 
-ENTITY_RE = re.compile(r"&(?:amp|lt|gt|quot|apos|nbsp|#\d+|#[xX][0-9A-Fa-f]+);")
+ENTITY_RE = re.compile(r"&(?:amp|lt|gt|quot|apos|nbsp|#\d{1,9}|#[xX][0-9A-Fa-f]{1,8});")
 NAMED_ENTITIES = {
     "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"',
     "&apos;": "'", "&nbsp;": "\u00a0",
