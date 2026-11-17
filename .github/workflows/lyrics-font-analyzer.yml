@@ -1,0 +1,23 @@
+name: FakePod lyric analyzer tests
+
+on:
+  push:
+    branches:
+      - feature/lyrics-font-analyzer
+  pull_request:
+    paths:
+      - "tools/nas/lyrics_font_analyzer.py"
+      - "tools/nas/build_nas_catalog_v2.py"
+      - "tools/nas/desktop_scan_support.py"
+      - "tests/host/test_lyrics_font_analyzer.py"
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run lyric analyzer regression tests
+        run: python tests/host/test_lyrics_font_analyzer.py
