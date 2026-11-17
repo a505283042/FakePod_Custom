@@ -47,15 +47,13 @@ class ScanCancelled(Exception):
 
 
 def normalize_visible_text(value: str) -> str:
-    """Mirror TextEncoding::normalize_plain_text_codepoint for lyric display."""
+    """Mirror TextEncoding::normalize_plain_text_codepoint used by LyricsService."""
     out = []
     for char in value:
         code = ord(char)
-        if code in (0x00A0, 0x3000, 0x0009):
+        if code in (0x00A0, 0x3000):
             out.append(" ")
         elif code in (0x200B, 0xFEFF):
-            continue
-        elif unicodedata.category(char) == "Cc":
             continue
         else:
             out.append(char)
@@ -79,10 +77,37 @@ def decode_lrc_bytes(raw: bytes) -> str:
 
 
 def is_lrc_timestamp(tag: str) -> bool:
-    match = TIMESTAMP_RE.fullmatch(tag)
-    if not match:
+    """Mirror LyricsService::lyrics_parse_timestamp_tag."""
+    colon = tag.find(":")
+    if colon <= 0:
         return False
-    return int(match.group(2)) < 60
+    minute_text = tag[:colon]
+    if not minute_text.isdigit():
+        return False
+    cursor = colon + 1
+    second_start = cursor
+    while cursor < len(tag) and tag[cursor].isdigit():
+        cursor += 1
+    if cursor == second_start:
+        return False
+    seconds = int(tag[second_start:cursor])
+    if seconds >= 60:
+        return False
+
+    fraction_ms = 0
+    if cursor < len(tag) and tag[cursor] in ".:":
+        cursor += 1
+        fraction_start = cursor
+        while cursor < len(tag) and tag[cursor].isdigit():
+            cursor += 1
+        fraction = tag[fraction_start:cursor]
+        if fraction:
+            first_three = fraction[:3]
+            fraction_ms = int(first_three) * (100 if len(first_three) == 1 else 10 if len(first_three) == 2 else 1)
+    if cursor != len(tag):
+        return False
+    total_ms = int(minute_text) * 60000 + seconds * 1000 + fraction_ms
+    return total_ms <= 0xFFFFFFFF
 
 
 ENTITY_RE = re.compile(r"&(?:amp|lt|gt|quot|apos|nbsp|#\d+|#[xX][0-9A-Fa-f]+);")
@@ -115,8 +140,8 @@ def extract_lrc_text(decoded: str) -> list[str]:
     """Return only timestamped lyric text, matching LyricsService's LRC rules."""
     result: list[str] = []
     for raw_line in decoded.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-        line = raw_line.lstrip("\ufeff")
-        if not line.strip():
+        line = raw_line
+        if not line:
             continue
         cursor = 0
         has_timestamp = False
@@ -132,10 +157,10 @@ def extract_lrc_text(decoded: str) -> list[str]:
             cursor = close + 1
         if not has_timestamp:
             continue
-        lyric = line[cursor:].strip(" \t")
-        if not lyric:
-            continue
-        lyric = normalize_visible_text(decode_supported_html_entities(lyric)).strip(" ")
+        lyric = normalize_visible_text(decode_supported_html_entities(line[cursor:]))
+        # Firmware ignores leading spaces/tabs and trims only trailing ASCII
+        # spaces/tabs after HTML entity decoding and Unicode normalization.
+        lyric = lyric.lstrip(" \t").rstrip(" \t")
         if lyric:
             result.append(lyric)
     return result
@@ -410,7 +435,8 @@ def scan_library(root: Path, progress=None, cancel_event=None) -> dict:
     no_lyric_tracks = total - lyric_tracks
     bmp_chars = {char for char in stats if ord(char) <= 0xFFFF}
     non_bmp_chars = {char for char in stats if ord(char) > 0xFFFF}
-    font_chars = bmp_chars | set(BASELINE_ASCII)
+    # C0/C1 controls can occur in malformed LRC text, but they are not glyphs.
+    font_chars = {char for char in bmp_chars if unicodedata.category(char) != "Cc"} | set(BASELINE_ASCII)
     summary = {
         "tracks_total": total,
         "tracks_with_lyrics": lyric_tracks,
@@ -449,7 +475,10 @@ def export_results(result: dict, output_dir: Path) -> list[Path]:
     all_chars = sorted(stats, key=ord)
     bmp_chars = sorted((char for char in all_chars if ord(char) <= 0xFFFF), key=ord)
     non_bmp_chars = sorted((char for char in all_chars if ord(char) > 0xFFFF), key=ord)
-    font_chars = sorted(set(bmp_chars) | set(BASELINE_ASCII), key=ord)
+    font_chars = sorted(
+        {char for char in bmp_chars if unicodedata.category(char) != "Cc"} | set(BASELINE_ASCII),
+        key=ord,
+    )
     charset_text = "".join(font_chars)
     all_charset_text = "".join(all_chars)
 
