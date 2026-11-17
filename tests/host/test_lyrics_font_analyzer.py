@@ -28,6 +28,20 @@ class LyricsFontAnalyzerTests(unittest.TestCase):
             ["你好，世界！", "I & you <3"],
         )
 
+    def test_lrc_parser_matches_firmware_whitespace_and_timestamp_rules(self):
+        source = (
+            " [00:01.00]leading space is not a timestamp\n"
+            "[00:01.1239]  keep\tthis\t\n"
+            "[00:02:]fraction may be empty\n"
+            "[00:03.123456789]fraction is truncated after milliseconds\n"
+            "[00:60.00]invalid seconds\n"
+            "[٠٠:01.00]non-ASCII digits are invalid\n"
+        )
+        self.assertEqual(
+            analyzer.extract_lrc_text(source),
+            ["keep\tthis", "fraction may be empty", "fraction is truncated after milliseconds"],
+        )
+
     def test_firmware_supported_encodings(self):
         text = "[00:01.00]你好"
         self.assertEqual(analyzer.decode_lrc_bytes(b"\xef\xbb\xbf" + text.encode("utf-8")), text)
@@ -39,11 +53,15 @@ class LyricsFontAnalyzerTests(unittest.TestCase):
             "&amp; &lt; &#20320; &#x597D; &eacute;"
         )
         self.assertEqual(text, "& < 你 好 &eacute;")
+        self.assertEqual(
+            analyzer.decode_supported_html_entities("&#1234567890; &#x123456789;"),
+            "&#1234567890; &#x123456789;",
+        )
 
     def test_whitespace_normalization_matches_firmware(self):
         self.assertEqual(
             analyzer.normalize_visible_text("A\u00a0B\u3000C\u200bD\ufeff\tE"),
-            "A B CDE E",
+            "A B CD\tE",
         )
 
     def test_character_categories_and_bmp_limit(self):
