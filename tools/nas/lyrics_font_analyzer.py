@@ -85,7 +85,7 @@ def is_lrc_timestamp(tag: str) -> bool:
     return int(match.group(2)) < 60
 
 
-ENTITY_RE = re.compile(r"&(?:amp|lt|gt|quot|apos|nbsp|#\d+|#x[0-9A-Fa-f]+);")
+ENTITY_RE = re.compile(r"&(?:amp|lt|gt|quot|apos|nbsp|#\d+|#[xX][0-9A-Fa-f]+);")
 NAMED_ENTITIES = {
     "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"',
     "&apos;": "'", "&nbsp;": "\u00a0",
@@ -115,8 +115,8 @@ def extract_lrc_text(decoded: str) -> list[str]:
     """Return only timestamped lyric text, matching LyricsService's LRC rules."""
     result: list[str] = []
     for raw_line in decoded.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-        line = raw_line.lstrip("\ufeff").strip()
-        if not line:
+        line = raw_line.lstrip("\ufeff")
+        if not line.strip():
             continue
         cursor = 0
         has_timestamp = False
