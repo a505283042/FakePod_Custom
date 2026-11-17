@@ -38,7 +38,7 @@ APP_TITLE = "FakePod · 歌词字符扫描器"
 CACHE_VERSION = 1
 LYRICS_MAX_BYTES = 256 * 1024
 AUDIO_SUFFIXES = tuple(FORMAT_MAP.keys())
-TIMESTAMP_RE = re.compile(r"^(\d+):(\d{1,2})(?:[.:](\d{1,3}))?$")
+TIMESTAMP_RE = re.compile(r"^(\d+):(\d{1,2})(?:[.:](\d+))?$")
 BASELINE_ASCII = "".join(chr(code) for code in range(0x20, 0x7F))
 
 
@@ -360,6 +360,9 @@ def scan_library(root: Path, progress=None, cancel_event=None) -> dict:
             }
             scanned += 1
 
+        final_audio_stat = audio_path.stat()
+        if (final_audio_stat.st_size, final_audio_stat.st_mtime_ns) != (audio_stat.st_size, audio_stat.st_mtime_ns):
+            raise RuntimeError(f"扫描期间歌曲文件发生变化，请重新扫描：{relative}")
         new_cache[relative] = entry
         has_lyrics = entry.get("lyric_status") == "external_lrc"
         track = {
