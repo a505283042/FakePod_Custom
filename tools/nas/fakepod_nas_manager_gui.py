@@ -501,10 +501,10 @@ class App:
             return
         root = Path(self.selected_smb)
         if not root.is_dir():
-            messagebox.showerror("音乐目录不可访问", "Windows 当前无法访问所选 SMB Music 目录：\\n" + str(root))
+            messagebox.showerror("音乐目录不可访问", "Windows 当前无法访问所选 SMB Music 目录：\n" + str(root))
             return
         if not LYRICS_ANALYZER.is_file():
-            messagebox.showerror("缺少扫描器", "找不到歌词字符扫描器：\\n" + str(LYRICS_ANALYZER))
+            messagebox.showerror("缺少扫描器", "找不到歌词字符扫描器：\n" + str(LYRICS_ANALYZER))
             return
         try:
             creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
