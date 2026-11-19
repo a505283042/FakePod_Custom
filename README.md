@@ -136,6 +136,14 @@ pio device monitor
 关键配置：
 
 - `board_build.esp-idf.sdkconfig_path = sdkconfig.fakepod_nano_usbcdc`（由 `sdkconfig.defaults;sdkconfig.ble.defaults` 生成）。
+- 入库的是三个 **片段**：`sdkconfig.defaults`、`sdkconfig.ble.defaults`、`sdkconfig.overlay.defaults`；`sdkconfig.fakepod_nano_usbcdc` / `sdkconfig.fakepod_overlay` 是生成物，不入库。
+- 修改片段或同步片段后必须删掉生成物再编译（PlatformIO 仅在 sdkconfig 不存在时重建）：
+
+```powershell
+Remove-Item sdkconfig.fakepod_nano_usbcdc, sdkconfig.fakepod_overlay -ErrorAction SilentlyContinue
+pio run -e fakepod_nano
+```
+
 - `sdkconfig.defaults` 关键项：240MHz、PERF 优化、DIO/80MHz/16MB、8MB Octal PSRAM、`CONFIG_SPIRAM_USE_MALLOC`、AVI 之外的其他解封装器全部关闭、TinyUSB MSC+CDC、NimBLE 双角色。
 - LVGL 使用内置 TLSF，但 128KB pool 强制落在 PSRAM（见 [src/CMakeLists.txt](src/CMakeLists.txt)）。
 - `esp_lcd_panel_rgb.c` 单独使用 `-O0`，规避 Xtensa GCC 14.2.0 的 IRA 阶段编译崩溃；本项目实际走 QSPI CO5300，不使用 RGB 数据路径。
@@ -267,12 +275,12 @@ python tests/host/test_audio_perf_math.py   # 需要 g++
 
 | 现象 | 原因与处理 |
 |---|---|
-| CMake 报 `SDKCONFIG_DEFAULTS 'sdkconfig.ble.defaults' does not exist` | 该文件被 `.gitignore` 的 `sdkconfig.*` 规则忽略，不在版本库中。首次克隆需自行补齐该文件，或删除 `board_build.cmake_extra_args` 中的对应项后重新配置。 |
+| CMake 报 `SDKCONFIG_DEFAULTS 'sdkconfig.ble.defaults' does not exist` | 该片段已入库（`.gitignore` 已对其做例外）。若仍缺失，通常是本地删除了文件或使用了旧版本库：从仓库恢复后，按「关键配置」小节删除生成物并重新编译。 |
 | `PermissionError: 'C:\PlatformIO\platforms.lock'` | 系统存在多个 PlatformIO Core（提示 obsolete PIO Core），或对 `C:\PlatformIO` 无写权限。清理多余安装、统一 Core 版本后重试。 |
 | 烧录成功但串口反复复位 | 检查 `monitor_dtr` / `monitor_rts` 是否为 0；USB CDC 与 UART 的串口号可能不同。 |
 | 视频无法快进/快退 | 缺少同名 `.fvix` 索引，用视频转换工具重新生成。 |
 | 改动设置后未生效 | 「设置 → 应用 → 音乐播放器」中的部分选项需**离开整个设置 APP** 后才正式保存生效。 |
-| `fakepod_overlay` 环境配置失败 | 该环境额外引用 `sdkconfig.overlay.defaults`，需本地自备该文件。 |
+| `fakepod_overlay` 环境配置失败 | 该环境额外引用 `sdkconfig.overlay.defaults`（已入库）。从仓库恢复该文件后，删除 `sdkconfig.fakepod_overlay` 再执行 `pio run -e fakepod_overlay`。 |
 
 ---
 

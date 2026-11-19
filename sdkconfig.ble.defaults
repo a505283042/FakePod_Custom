@@ -1,0 +1,49 @@
+# R46.0.20：BLE defaults 必须能从空白 sdkconfig 独立恢复基础功能；不再依赖旧生成文件残留。
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_CONTROLLER_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+# R46.0.32：FakePod 固定为 Peripheral/GATT Server；扫描、Observer、Central/GATT Client 全部关闭。
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_GATT_CLIENT=n
+CONFIG_BT_NIMBLE_GATT_SERVER=y
+CONFIG_BT_NIMBLE_GAP_SERVICE=y
+CONFIG_BT_NIMBLE_SECURITY_ENABLE=y
+CONFIG_BT_CTRL_BLE_ADV=y
+CONFIG_BT_CTRL_BLE_SCAN=n
+# ESP32-S3 的 BLE_MASTER 实际控制“连接功能”；connectable ADV/手机连接仍需要它，不能随 Central 一起关闭。
+CONFIG_BT_CTRL_BLE_MASTER=y
+# R46.0.33：FakePod 不使用 BLE Direct Test Mode；关闭 Controller DTM 以减少常驻资源，不影响广播/连接/GATT。
+CONFIG_BT_CTRL_DTM_ENABLE=n
+# R46.0.7：Bond/LTK 必须跨设备重启持久化。
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+# R46.0.19：禁用 NimBLE 对 HCI 0x3E 的内建连接/广播重试；广播恢复统一交给 FakePod GAP 状态机。
+CONFIG_BT_NIMBLE_ENABLE_CONN_REATTEMPT=n
+# R46.0.35：MAX_ACT=1 实机证实会导致 connectable advertising 启动报 BLE_ERR_MEM_CAPACITY；回滚为 2。
+# FakePod 仍保持 1 条 NimBLE 连接；Controller 保留 2 个 activity 槽位以支持可连接广播与连接状态机制。
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_CTRL_BLE_MAX_ACT=2
+# R46.0.23：NimBLE Host 动态分配转移到外部 PSRAM；保留 Controller/任务栈等必须使用内部 RAM 的部分。
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+# R46.0.23：单连接 + 小控制包/Notify 场景适度收紧 Host 缓冲；保留 255B ACL，给未来歌词/封面分片留 MTU/吞吐余量。
+CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=12
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=8
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=16
+CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=15
+# R46.0.32：扫描已关闭；本轮暂不同时改 Host event pool，便于把 RAM 差异归因到角色/Controller Scan 裁剪。
+CONFIG_BT_NIMBLE_TRANSPORT_EVT_DISCARD_COUNT=8
+# R46.0.26：仅允许 Video Decode/Extractor 使用显式 PSRAM task stack；不开启全局 task stack 外置。
+CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y
+
+# NAS 六位验证码页面：LVGL 内置 48px 数字字体驻留 Flash，无需额外运行时字体缓存。
+CONFIG_LV_FONT_MONTSERRAT_48=y
+
+# FPN2 6-digit PIN: PBKDF2-HMAC-SHA256, use existing mbedTLS crypto (no new resident task).
+CONFIG_MBEDTLS_PKCS5_C=y
+CONFIG_MBEDTLS_SHA256_C=y
+
+# USB MSC V3: 8192B FIFO requested 32944B of contiguous DMA RAM; maximum observed was 31744B.
+# 4096B FIFO reduces expected storage-object allocation to 16560B without changing TinyUSB internals.
+CONFIG_TINYUSB_MSC_BUFSIZE=4096

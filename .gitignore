@@ -3,6 +3,8 @@
 managed_components/
 sdkconfig.*
 !sdkconfig.defaults
+!sdkconfig.ble.defaults
+!sdkconfig.overlay.defaults
 
 *.bin
 *.elf
