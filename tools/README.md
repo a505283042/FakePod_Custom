@@ -5,6 +5,7 @@
 | 用途 | 启动位置 | 操作说明 |
 |---|---|---|
 | 电脑管理 NAS 曲库 | [nas/启动NAS曲库管理器.bat](nas/启动NAS曲库管理器.bat) | [NAS 工具说明](nas/FakePod_NAS_GUI_使用说明.md) |
+| 扫描歌词字符 / 导出字库清单 | [nas/启动歌词字符扫描器.bat](nas/启动歌词字符扫描器.bat)，或在 NAS 管理器中点击「歌词字符扫描」 | [歌词扫描说明](nas/FakePod_NAS_GUI_使用说明.md#六扫描歌词字符并导出字库清单) |
 | 转换视频 | [video/FFmpeg_MJPEG_GUI_v4/start.bat](video/FFmpeg_MJPEG_GUI_v4/start.bat) | [视频转换说明](video/FFmpeg_MJPEG_GUI_v4/README.md) |
 | 合并完整固件 | [firmware/merge_fakepod_full.bat](firmware/merge_fakepod_full.bat) | 需要先完成工程编译，再运行合并工具 |
 

@@ -11,12 +11,14 @@
 | test_nas_folder_count.py | NAS 目录计数 |
 | test_nas_server_playback_bind.py | NAS 服务器切换后的播放绑定 |
 | test_remote_power.py | BLE 状态发送节流 |
+| test_lyrics_font_analyzer.py | LRC 编码、时间戳解析、字符分类和字符集导出 |
 
 从项目根目录运行，例如：
 
 ```text
 python tests/host/test_independent_browse.py
 python tests/host/test_nas_exclusive_restore.py
+python tests/host/test_lyrics_font_analyzer.py
 ```
 
 需要 Python 3；执行 C++ 主机回归的脚本还需要 g++。这些测试使用主机替身，不能代替完整固件构建及真机验收。

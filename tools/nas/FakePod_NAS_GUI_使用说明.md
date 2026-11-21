@@ -115,7 +115,48 @@ track_url=http://192.168.1.105:5005/%E9%BA%A6%E7%94%B0%E5%B9%BF%E5%91%8A/Music/_
 
 不确定文件是否能从 WebDAV 读取时，可以在 Windows PowerShell 使用 `curl.exe --basic -u "webdav"` 访问相应文件（系统会询问密码），检查 HTTP 状态码。索引 Meta 或歌词文件正常读取一般应为 `200`；若是 `401/403/404`，优先检查认证、权限或实际路径。**不要把 NAS 密码写进截图、日志或发给他人。**
 
-## 六、平时维护记住三句话
+## 六、扫描歌词字符并导出字库清单
+
+选择 Music 根目录后，可以在 NAS 曲库管理器的扫描区域点击 **「歌词字符扫描」**；也可以直接双击：
+
+```text
+tools\nas\启动歌词字符扫描器.bat
+```
+
+独立窗口会自动带入已选择的 Music 根目录。点击「开始扫描全部歌曲」后，工具会逐首读取歌曲对应的歌词，并统计歌词、歌曲标题、歌手和专辑中实际出现的字符。第一次扫描读取全部歌词；后续根据音频文件与 LRC 的大小、修改时间复用本机缓存。缓存保存在 Windows 的 `%LOCALAPPDATA%\FakePod\lyrics-font-analyzer\`，不会写入 NAS。
+
+### 扫描规则与当前固件保持一致
+
+- 只扫描与歌曲**同目录、同名主干**的外置同步 `.lrc` 文件；大小写匹配沿用 NAS 曲库索引器的真实文件名查找逻辑。
+- 当前 LyricsService 只读取 Catalog 中的 **External + Synced LRC**。因此本工具不会把 MP3 USLT/SYLT、FLAC 内嵌歌词等当前固件不会显示的内容误算进实际歌词字库。
+- 编码按固件当前支持范围处理：UTF-8、带 BOM 的 UTF-16、GBK；不会用乱码替换无法识别的编码。
+- 当前固件单个 LRC 上限为 **256 KiB**；超过上限、没有时间戳行、编码异常或读取失败的文件会单独列出。
+- 字符统计只取带时间戳的歌词正文，并按固件规则处理常见 HTML 实体、全角空格、不换行空格和零宽空格。
+- 同时统计标题、歌手和专辑元数据，避免歌词字库齐全但歌曲名称或歌手名称缺字。
+
+### 导出文件
+
+默认导出到 Windows 的 `Documents\FakePod_Font_Exports`，也可以在窗口中更改：
+
+| 文件 | 用途 |
+|---|---|
+| `lyrics_charset_24.txt` | 24px 字库候选字符集 |
+| `lyrics_charset_32.txt` | 32px 字库候选字符集；与 24px 使用相同字符集合 |
+| `lyrics_charset_bmp.txt` | 当前 FakePod 字体 BIN 可用的 BMP 字符 |
+| `lyrics_charset_all.txt` | 包含非 BMP 字符的完整扫描结果 |
+| `lyrics_charset_codepoints.txt` | 字符、Unicode 码点、分类和名称 |
+| `character_statistics.csv` | 字符出现频率、覆盖歌曲数及示例歌曲 |
+| `track_lyrics_report.csv` | 每首歌曲的歌词来源、字符数量和扫描状态 |
+| `tracks_without_lyrics.csv` | 没有可用外置同步 LRC 的歌曲 |
+| `scan_errors.csv` | 编码、读取、文件过大或歌词匹配异常 |
+| `unsupported_non_bmp.txt` | 当前 16-bit Unicode 字体索引格式无法覆盖的补充平面字符 |
+| `font_manifest.json` | 扫描摘要、字符集版本和字体规格说明 |
+
+24px 和 32px 字符集会额外保留可打印 ASCII 基础字符，确保拉丁基线、数字和常见标点齐全。当前 FakePod 自定义字体 BIN 的 Unicode 索引范围为 BMP（U+0000 至 U+FFFF）；非 BMP 字符会单独报告，不会悄悄混入可用字库。
+
+**本阶段导出的是完整字符集和统计报告，不会直接生成最终 `.bin` 字体文件。** FakePod 使用自定义 2bpp 字体 BIN 格式，后续生成器还需要指定实际使用的 TTF/OTF 字体，并按固件的字形记录、基线和位图打包规则生成，不能直接把普通 LVGL 字体文件改名为 `.bin`。
+
+## 七、平时维护记住三句话
 
 **新增或修改：先扫描；需要短 ID 才做①；最后一定做②。**
 
